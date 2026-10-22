@@ -804,7 +804,7 @@ def invalidates(of: _Of, *, deletes: bool = False, records: bool = True) -> Call
     With a transaction, the tables are also noted on it as written with records (issue #304:
     ``Transaction._note_record_write``, which ``define_indexes(tx=…)`` reads) — unless ``records=False``, which marks
     a method that applies definitions (``define_table()``, ``remove_index()``…) and writes no record: its tables are
-    noted for the query cache only.
+    noted for the query cache only. The wrapper carries the flag as ``__surreal_record_writes__``.
 
     The one error of its own (v0.29.0): with ``"self"``, ``"edge"`` or ``"cls"``, a ``tx`` of another connection than
     the model's raises ``SurrealDbError`` (``routing.check_transaction()``) before the write is put in flight or noted
@@ -836,6 +836,7 @@ def invalidates(of: _Of, *, deletes: bool = False, records: bool = True) -> Call
                 return await func(*args, **kwargs)
 
         wrapper.__surreal_cache_writes__ = True  # type: ignore[attr-defined]
+        wrapper.__surreal_record_writes__ = records  # type: ignore[attr-defined]
         return cast(F, wrapper)
 
     return decorate

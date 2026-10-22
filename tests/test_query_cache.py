@@ -2378,6 +2378,17 @@ _CLASS_METHOD_WRITES = {
     (SurrealDBConnectionManager, "signup"),
 }
 
+#: The invalidating writes that apply definitions and write no record: ``invalidates(records=False)`` — issue #304, a
+#: transaction that ran them may still define an index (``define_indexes(tx=…)``).
+_DEFINITION_WRITES = {
+    (BaseSurrealModel, "define_computed_fields"),
+    (BaseSurrealModel, "define_view"),
+    (BaseSurrealModel, "remove_view"),
+    (BaseSurrealModel, "define_table"),
+    (BaseSurrealModel, "remove_index"),
+    (AuthenticatedUserMixin, "define_access"),
+}
+
 
 def _defined(cls: type, name: str) -> Any:
     """The function *cls* defines as *name*, class and static methods unwrapped."""
@@ -2412,6 +2423,15 @@ class TestExhaustiveness:
             for name in names:
                 wrapped = getattr(_defined(cls, name), "__surreal_cache_writes__", False) is True
                 assert wrapped is (group == "invalidating writes"), f"{cls.__name__}.{name}"
+
+    @pytest.mark.parametrize("cls", list(_INVALIDATING_WRITES), ids=_ids(_INVALIDATING_WRITES))
+    def test_only_the_definitions_write_no_record(self, cls: type) -> None:
+        """Issue #304: ``__surreal_record_writes__`` is ``False`` for exactly the writes that apply definitions, so a
+        ``remove_index(tx=…)`` or ``define_view(tx=…)`` does not make ``define_indexes(tx=…)`` refuse, and ``True`` for
+        every other invalidating write."""
+        for name in _INVALIDATING_WRITES[cls]:
+            records = getattr(_defined(cls, name), "__surreal_record_writes__", None)
+            assert records is ((cls, name) not in _DEFINITION_WRITES), f"{cls.__name__}.{name}"
 
     def test_save_naming_is_wrapped(self) -> None:
         """The create of ``get_or_create()``/``update_or_create()`` and of ``relate(EdgeModel, …)``."""

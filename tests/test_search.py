@@ -3151,9 +3151,9 @@ class TestDefineIndexesE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_what_a_transaction_may_still_define(self, kind: str) -> None:
-        """Issue #304, no false positive: ``define_table(tx=…)`` and ``define_relation(tx=…)`` define, they write no
-        record; a write to another table does not count; a call with nothing to apply is never refused, whatever the
-        block wrote."""
+        """Issue #304, no false positive: ``define_table(tx=…)``, ``define_relation(tx=…)`` and ``remove_index(tx=…)``
+        define, they write no record; a write to another table does not count; a call with nothing to apply is never
+        refused, whatever the block wrote."""
         async with _fts_models(kind) as client:
             line = await _keyword_line(client)
             await _apply_ddl(client, _A1)
@@ -3161,6 +3161,7 @@ class TestDefineIndexesE2E:
                 await FtsPlain(id="p1", title="Physics p1").save(tx=tx)
                 await FtsArticle.define_table(tx=tx)
                 await FtsCites.define_relation(tx=tx)
+                removed = await FtsArticle.remove_index("fts_article_title", tx=tx)
                 article = await FtsArticle.define_indexes(tx=tx)
                 cites = await FtsCites.define_indexes(tx=tx)
             async with SurrealDBConnectionManager.transaction("fts") as tx:
@@ -3170,6 +3171,7 @@ class TestDefineIndexesE2E:
             cites_indexes = await _indexes(client, "fts_cites")
             found = _ids(await FtsArticle.objects().search(title="physics").exec())
             plain = _ids(await FtsPlain.objects().exec())
+        assert removed == "REMOVE INDEX IF EXISTS `fts_article_title` ON `fts_article`;"
         assert article == FtsArticle.index_ddl(line=line)[1:]
         assert cites == FtsCites.index_ddl(line=line)[1:]
         assert again == []
