@@ -783,7 +783,14 @@ def _resolve(
         return None, tx
 
 
-def invalidates(of: _Of, *, deletes: bool = False) -> Callable[[F], F]:
+def _note_records(tables: frozenset[str] | None, tx: Any) -> None:
+    """Note *tables* (``None``: every table) as written with records on *tx* (issue #304), when its class has
+    ``_note_record_write`` — recognised by its class, as :func:`writing` recognises a transaction."""
+    if callable(getattr(type(tx), "_note_record_write", None)):
+        tx._note_record_write(tables)
+
+
+def invalidates(of: _Of, *, deletes: bool = False, records: bool = True) -> Callable[[F], F]:
     """Decorate an ORM write method so that it invalidates the cached reads it can change.
 
     ``of`` says which tables the call writes, from its first argument: ``"self"`` (the instance's model table),
@@ -793,6 +800,11 @@ def invalidates(of: _Of, *, deletes: bool = False) -> Callable[[F], F]:
     the call's ``tx`` argument when the method has one. A resolver that raises means every table. Under
     ``@classmethod``, this is the inner decorator. The wrapper keeps the signature, the docstring and
     ``__wrapped__``, sends nothing, and carries ``__surreal_cache_writes__``.
+
+    With a transaction, the tables are also noted on it as written with records (issue #304:
+    ``Transaction._note_record_write``, which ``define_indexes(tx=…)`` reads) — unless ``records=False``, which marks
+    a method that applies definitions (``define_table()``, ``remove_index()``…) and writes no record: its tables are
+    noted for the query cache only.
 
     The one error of its own (v0.29.0): with ``"self"``, ``"edge"`` or ``"cls"``, a ``tx`` of another connection than
     the model's raises ``SurrealDbError`` (``routing.check_transaction()``) before the write is put in flight or noted
@@ -818,6 +830,8 @@ def invalidates(of: _Of, *, deletes: bool = False) -> Callable[[F], F]:
                 arg0 = bound.arguments[first]
                 model = arg0 if isinstance(arg0, type) else type(arg0)
                 _routing.check_transaction(model, tx, f"{model.__name__}.{func.__name__}()")
+            if records and tx is not None:
+                _note_records(tables, tx)
             async with writing(tables, tx):
                 return await func(*args, **kwargs)
 

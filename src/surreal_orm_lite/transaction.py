@@ -25,6 +25,11 @@ Query cache (v0.28.0): an ORM write that joins a transaction notes the tables it
 it returns or raises (a failed commit's state is unknown). ``cancel()`` forgets them: nothing
 became visible.
 
+Records written (issue #304): an ORM write of records that joins a transaction also notes the tables it writes
+(``_note_record_write``), apart from the query cache's — a definition such as ``define_table(tx=…)`` notes its table
+for the cache only. ``define_indexes(tx=…)`` reads them (``_records_written``): SurrealDB servers do not index the
+records a transaction wrote before the index was defined. A raw ``tx.add()`` is not noted.
+
 Errors (issue #278): the errors a failed transaction raises give the server's reason and the failed statement's
 position, without the server's excerpt of the statement; the server's own text stays reachable as their suppressed
 ``__context__``. A query the server or the embedded engine refuses at a buffered commit raises ``SurrealDbError`` on
@@ -223,6 +228,10 @@ class Transaction(ABC):
         # Query cache: the tables written in this transaction, invalidated at commit.
         self._cache_tables: set[str] = set()
         self._cache_all = False
+        # Issue #304: the tables an ORM write of records changed in this transaction (definitions excluded), kept
+        # until the transaction ends.
+        self._record_tables: set[str] = set()
+        self._record_all = False
         # Issue #268: the errors of the statements that failed in this transaction (interactive strategy).
         self._failures: list[BaseException] = []
 
@@ -263,6 +272,23 @@ class Transaction(ABC):
         """Clear the tables noted (after a commit, or on cancel without invalidating)."""
         self._cache_tables.clear()
         self._cache_all = False
+
+    def _note_record_write(self, tables: Iterable[str] | None) -> None:
+        """Note the tables an ORM write of records in this transaction changes (``None``: every table) — issue #304.
+
+        ``cache.invalidates()`` calls it for each write method of records that joins the transaction, before the write
+        is sent or queued — never for a definition (``define_table()``, ``remove_index()``…), whose table is noted for
+        the query cache only. Unlike the query cache's tables, the commit and the cancel keep them.
+        """
+        if tables is None:
+            self._record_all = True
+        else:
+            self._record_tables |= set(tables)
+
+    def _records_written(self) -> frozenset[str] | None:
+        """The tables an ORM write of records changed so far in this transaction (issue #304): ``None`` when one noted
+        every table. ``define_indexes(tx=…)`` reads it; a raw ``tx.add()`` is not counted."""
+        return None if self._record_all else frozenset(self._record_tables)
 
     @property
     @abstractmethod
