@@ -25,13 +25,17 @@ with no ``OVERWRITE``/``IF NOT EXISTS`` clause and no final ``;``, the form ``pa
 embedded engine of the SDK's 2.x range. ``index_statement()``, ``remove_index_statement()``,
 ``remove_analyzer_statement()`` and ``rebuild_index_statement()`` render the rest.
 
+A model declares its indexes with ``SurrealConfigDict(indexes=[Index(...)])``: ``check_indexes_config()`` checks the
+key at the ``class`` statement, ``declared_analyzers()`` lists the analyzers the indexes hold as ``Analyzer`` objects
+and ``model_index_statements()`` renders what ``index_ddl()`` returns.
+
 The module sits low in the package: it imports neither ``model_base``, ``query_set`` nor ``connection_manager``, so
 each of them can import it.
 """
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from numbers import Real
 from typing import Literal
@@ -645,3 +649,97 @@ def remove_analyzer_statement(name: str, missing_ok: bool) -> str:
     """
     name = _identifier_name(name, what="Analyzer")
     return f"REMOVE ANALYZER{_missing_clause(missing_ok)} {_identifier(name)};"
+
+
+# --- the model's indexes --------------------------------------------------------------------------------------------
+
+
+def check_indexes_config(model: type, value: object, *, view: bool, column: Callable[[str], str]) -> None:
+    """The ``indexes`` key of a model's ``SurrealConfigDict``, checked when the class is defined (v0.35.0).
+
+    ``None`` (no indexes) is not passed here. The first fault raises, in this order: *value* is not a ``list`` or a
+    ``tuple``; an item is not an ``Index``; two indexes share a name (the second definition would replace the first);
+    the model is a materialized view (*view*) and declares an index (SurrealDB 3.x does not update an index on a view as
+    the view changes, and ``define_view()`` drops them); two full-text indexes cover one column, each field translated
+    by *column* — the model's ``to_db_field`` — so an aliased field counts under its column (SurrealDB would use either
+    for ``search()``, with different scores); two different ``Analyzer`` objects share a name (an analyzer belongs to
+    the database: one definition per name). Each ``Index`` was checked when it was built. The messages name *model*.
+
+    :raises TypeError: *value* is not a ``list`` or a ``tuple``, or holds something other than an ``Index``.
+    :raises ValueError: two indexes share a name; a view declares an index; two full-text indexes cover one column;
+        two different analyzers share a name.
+    """
+    owner = model.__name__
+    key = f"{owner}: model_config['indexes']"
+    if not isinstance(value, list | tuple):
+        raise TypeError(f"{key} must be a list or tuple of Index, got {type(value).__name__}.")
+    indexes: list[Index] = []
+    for position, item in enumerate(value):
+        if not isinstance(item, Index):
+            raise TypeError(f"{key}[{position}] is not an Index, got {type(item).__name__}.")
+        indexes.append(item)
+    names: set[str] = set()
+    for index in indexes:
+        if index.name in names:
+            raise ValueError(f"{owner}: two indexes are named {index.name!r} in model_config['indexes'].")
+        names.add(index.name)
+    if view and indexes:
+        raise ValueError(
+            f"{owner}: a materialized view (view_query) declares no indexes: SurrealDB 3.x does not update an index on a "
+            "view as the view changes, and define_view() drops them."
+        )
+    covered: dict[str, str] = {}
+    for index in indexes:
+        if index.search_analyzer is None:
+            continue
+        # A full-text index covers one field (Index checked it).
+        target = column(index.fields[0])
+        if target in covered:
+            raise ValueError(
+                f"{owner}: two full-text indexes cover column {target!r} ({covered[target]!r}, {index.name!r}); "
+                "SurrealDB would use either for search(), with different scores. Keep one."
+            )
+        covered[target] = index.name
+    analyzers: dict[str, Analyzer] = {}
+    for index in indexes:
+        analyzer = index.search_analyzer
+        if isinstance(analyzer, Analyzer) and analyzers.setdefault(analyzer.name, analyzer) != analyzer:
+            raise ValueError(
+                f"{key} holds two definitions of analyzer {analyzer.name!r}; declare one Analyzer object and reference "
+                "it from every index."
+            )
+
+
+def declared_analyzers(indexes: Iterable[Index]) -> tuple[Analyzer, ...]:
+    """The analyzers *indexes* hold as ``Analyzer`` objects, each name once, in declaration order.
+
+    An analyzer named by a ``str`` is the database's: it is not listed. A model's indexes hold one definition per
+    analyzer name (:func:`check_indexes_config`), so the first object of a name stands for every other.
+    """
+    found: dict[str, Analyzer] = {}
+    for index in indexes:
+        if isinstance(index.search_analyzer, Analyzer):
+            found.setdefault(index.search_analyzer.name, index.search_analyzer)
+    return tuple(found.values())
+
+
+def model_index_statements(
+    indexes: Sequence[Index], table: str, *, column: Callable[[str], str], overwrite: bool, line: int
+) -> list[str]:
+    """The statements of a model's *indexes* on *table* — what ``index_ddl()`` returns. Pure.
+
+    The ``DEFINE ANALYZER`` of each analyzer of :func:`declared_analyzers`, then one ``DEFINE INDEX`` per index, in
+    declaration order, each field written as the column *column* (the model's ``to_db_field``) gives it, with the
+    full-text keyword of *line*. *overwrite* and *line* are checked first, even when *indexes* is empty.
+
+    :raises TypeError: *overwrite* is not a ``bool``; *line* is not an ``int`` (a ``bool`` included).
+    :raises ValueError: *line* is an ``int`` other than 2 or 3.
+    """
+    _overwrite_clause(overwrite)
+    keyword = fulltext_keyword(checked_line(line))
+    statements = [analyzer_statement(analyzer, overwrite) for analyzer in declared_analyzers(indexes)]
+    statements.extend(
+        index_statement(index, table, [column(field) for field in index.fields], overwrite=overwrite, keyword=keyword)
+        for index in indexes
+    )
+    return statements

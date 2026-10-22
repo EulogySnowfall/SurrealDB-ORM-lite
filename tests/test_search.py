@@ -22,18 +22,38 @@ field, is never ``UNIQUE``, and alone takes ``bm25=``/``highlights=``. ``ddl(tab
 INDEX … FIELDS `<a>`.`<b>` …`` with the line's keyword (``FULLTEXT`` on 3.x, ``SEARCH`` on 2.x), BM25's ``k1`` and
 ``b`` written as Python floats, with no connection. ``search.remove_index_statement()``,
 ``remove_analyzer_statement()`` and ``rebuild_index_statement()`` render the removals and the rebuild.
+
+The model's indexes (``TestIndexesConfig``, ``TestGetIndexes``, ``TestIndexDdl``): ``SurrealConfigDict(indexes=[...])``
+is checked at the ``class`` statement — a ``list`` or ``tuple`` of ``Index``, distinct names, none on a materialized
+view, at most one full-text index per column (an aliased field counted under its column), one ``Analyzer`` definition
+per analyzer name —, the first fault raising with its exact text; a subclass inherits the key unless it sets its own.
+``get_indexes()`` returns them in declaration order; ``index_ddl()`` renders, with no connection, the analyzers the
+indexes hold as ``Analyzer`` objects (each name once) and then one ``DEFINE INDEX`` per index on the model's table, each
+field under its column, with the line's keyword.
 """
 
 import ast
 import math
 import pickle
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import Field
 
 import surreal_orm_lite
-from surreal_orm_lite import Analyzer, Index, SearchHighlight, SearchOffsets, SearchScore, search
+from surreal_orm_lite import (
+    Analyzer,
+    BaseSurrealModel,
+    Index,
+    SearchHighlight,
+    SearchOffsets,
+    SearchScore,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+    search,
+)
 from surreal_orm_lite.define_parser import parse_define_analyzer
 from surreal_orm_lite.functions import normalize_function_name
 
@@ -608,3 +628,340 @@ class TestIndex:
         assert search.fulltext_keyword(3) == "FULLTEXT"
         assert search.fulltext_keyword(4) == "FULLTEXT"
         assert search.fulltext_keyword(2) == "SEARCH"
+
+
+# --- the model's indexes --------------------------------------------------------------------------------------------
+
+
+class FtsArticle(BaseSurrealModel):
+    """The model of the goldens and of the E2E tests: four full-text indexes holding ``FTS_ENGLISH``, one naming it,
+    one ``UNIQUE``, on plain, dotted, array and aliased fields."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_article",
+        indexes=[
+            Index("fts_article_title", "title", search_analyzer=FTS_ENGLISH, bm25=True, highlights=True),
+            Index("fts_article_body", ["body"], search_analyzer="fts_english", bm25=(1.2, 0.75)),
+            Index("fts_article_slug", "slug", unique=True, comment="it's unique"),
+            Index("fts_article_head", "meta.headline", search_analyzer=FTS_ENGLISH),
+            Index("fts_article_tags", "tags", search_analyzer=FTS_ENGLISH, highlights=True),
+            Index("fts_article_heading", "heading", search_analyzer=FTS_ENGLISH, highlights=True),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    body: str = ""
+    slug: str
+    meta: dict[str, Any] = {}
+    tags: list[str] = []
+    heading: str = Field(default="", alias="head_text")
+    views: int = 0
+
+
+class FtsPlain(BaseSurrealModel):
+    """A model that declares no index."""
+
+    model_config = SurrealConfigDict(table_name="fts_plain")
+
+    id: str | None = None
+    title: str = ""
+
+
+_ARTICLE_INDEXES = [
+    "fts_article_title",
+    "fts_article_body",
+    "fts_article_slug",
+    "fts_article_head",
+    "fts_article_tags",
+    "fts_article_heading",
+]
+
+#: I1's index statements, after A1.
+_I1_INDEXES = [
+    "DEFINE INDEX OVERWRITE `fts_article_title` ON `fts_article` FIELDS `title` FULLTEXT ANALYZER `fts_english` BM25 "
+    "HIGHLIGHTS;",
+    "DEFINE INDEX OVERWRITE `fts_article_body` ON `fts_article` FIELDS `body` FULLTEXT ANALYZER `fts_english` BM25(1.2,0.75);",
+    "DEFINE INDEX OVERWRITE `fts_article_slug` ON `fts_article` FIELDS `slug` UNIQUE COMMENT 'it\\'s unique';",
+    "DEFINE INDEX OVERWRITE `fts_article_head` ON `fts_article` FIELDS `meta`.`headline` FULLTEXT ANALYZER `fts_english`;",
+    "DEFINE INDEX OVERWRITE `fts_article_tags` ON `fts_article` FIELDS `tags` FULLTEXT ANALYZER `fts_english` HIGHLIGHTS;",
+    "DEFINE INDEX OVERWRITE `fts_article_heading` ON `fts_article` FIELDS `head_text` FULLTEXT ANALYZER `fts_english` "
+    "HIGHLIGHTS;",
+]
+_I1 = [_A1, *_I1_INDEXES]
+_I2 = [_A1, *(statement.replace(" FULLTEXT ", " SEARCH ") for statement in _I1_INDEXES)]
+_I3 = [_A2, *(statement.replace("DEFINE INDEX OVERWRITE ", "DEFINE INDEX IF NOT EXISTS ") for statement in _I1_INDEXES)]
+
+_IC1 = "FtsBad: model_config['indexes'] must be a list or tuple of Index, got {}."
+_IC3 = "FtsBad: two indexes are named {!r} in model_config['indexes']."
+_IC4 = (
+    "FtsBad: two full-text indexes cover column {!r} ({!r}, {!r}); SurrealDB would use either for search(), with "
+    "different scores. Keep one."
+)
+_IC5 = (
+    "FtsBad: model_config['indexes'] holds two definitions of analyzer {!r}; declare one Analyzer object and reference "
+    "it from every index."
+)
+_IC6 = (
+    "{}: a materialized view (view_query) declares no indexes: SurrealDB 3.x does not update an index on a view as "
+    "the view changes, and define_view() drops them."
+)
+
+
+def _text(name: str) -> Index:
+    """A full-text index on ``title`` holding ``FTS_ENGLISH``."""
+    return Index(name, "title", search_analyzer=FTS_ENGLISH)
+
+
+def _bad_model(indexes: object, **config: Any) -> type[BaseSurrealModel]:
+    """A model ``FtsBad`` with ``indexes=`` *indexes* and the other keys of *config*, built by its ``class``
+    statement."""
+
+    class FtsBad(BaseSurrealModel):
+        model_config = SurrealConfigDict(table_name="fts_bad", indexes=indexes, **config)  # type: ignore[typeddict-item]
+
+        id: str | None = None
+        title: str = ""
+        body: str = ""
+        heading: str = Field(default="", alias="head_text")
+
+    return FtsBad
+
+
+class TestIndexesConfig:
+    """``SurrealConfigDict(indexes=[...])``, checked at the ``class`` statement — the first fault raises, in the order
+    list or tuple, ``Index`` items, distinct names, no view, one full-text index per column, one definition per
+    analyzer name."""
+
+    def test_the_golden_model_is_accepted(self) -> None:
+        assert FtsArticle.get_table_name() == "fts_article"
+        assert [index.name for index in FtsArticle.get_indexes()] == _ARTICLE_INDEXES
+        assert FtsArticle.to_db_field("heading") == "head_text"
+
+    def test_indexes_is_a_config_key(self) -> None:
+        assert SurrealConfigDict.__annotations__["indexes"] == Sequence[Index] | None
+        assert "indexes" in SurrealConfigDict.__optional_keys__
+        doc = " ".join((SurrealConfigDict.__doc__ or "").split())
+        assert "indexes (Sequence[Index] | None): The table's indexes (v0.35.0)" in doc
+
+    @pytest.mark.parametrize(
+        ("indexes", "error", "text"),
+        [
+            ({}, TypeError, _IC1.format("dict")),
+            ("x", TypeError, _IC1.format("str")),
+            (Index("fts_x", "a"), TypeError, _IC1.format("Index")),
+            ({Index("fts_x", "a")}, TypeError, _IC1.format("set")),
+            (["x"], TypeError, "FtsBad: model_config['indexes'][0] is not an Index, got str."),
+            ((Index("fts_x", "a"), 1), TypeError, "FtsBad: model_config['indexes'][1] is not an Index, got int."),
+            ([FTS_ENGLISH], TypeError, "FtsBad: model_config['indexes'][0] is not an Index, got Analyzer."),
+            ([Index("fts_x", "a"), Index("fts_x", "b", unique=True)], ValueError, _IC3.format("fts_x")),
+            (
+                [_text("fts_t1"), Index("fts_t2", "title", search_analyzer="fts_other")],
+                ValueError,
+                _IC4.format("title", "fts_t1", "fts_t2"),
+            ),
+            (
+                [
+                    Index("fts_h1", "heading", search_analyzer=FTS_ENGLISH),
+                    Index("fts_h2", "head_text", search_analyzer=FTS_ENGLISH),
+                ],
+                ValueError,
+                _IC4.format("head_text", "fts_h1", "fts_h2"),
+            ),
+            (
+                [
+                    Index("fts_a", "title", search_analyzer=Analyzer("fts_english", ["blank"], ["lowercase"])),
+                    Index("fts_b", "body", search_analyzer=Analyzer("fts_english", ["blank"], ["ascii"])),
+                ],
+                ValueError,
+                _IC5.format("fts_english"),
+            ),
+        ],
+        ids=[
+            "ic1-dict",
+            "ic1-str",
+            "ic1-index",
+            "ic1-set",
+            "ic2-str",
+            "ic2-int",
+            "ic2-analyzer",
+            "ic3",
+            "ic4",
+            "ic4-alias",
+            "ic5",
+        ],
+    )
+    def test_refused_at_the_class_statement(self, indexes: object, error: type[Exception], text: str) -> None:
+        assert _raised(error, _bad_model, indexes) == text
+
+    def test_ic6_a_materialized_view_declares_no_index(self) -> None:
+        assert _raised(ValueError, _bad_model, [Index("fts_v", "title")], view_query="SELECT title FROM fts_src") == (
+            _IC6.format("FtsBad")
+        )
+
+    def test_an_inherited_value_is_checked_again_naming_the_subclass(self) -> None:
+        with pytest.raises(ValueError) as raised:
+
+            class FtsArticleView(FtsArticle):
+                model_config = SurrealConfigDict(table_name="fts_article_view", view_query="SELECT * FROM fts_article")
+
+        assert str(raised.value) == _IC6.format("FtsArticleView")
+
+    @pytest.mark.parametrize(
+        ("indexes", "config", "error", "text"),
+        [
+            # IC2 before IC3: the item that is not an Index comes last.
+            (
+                [Index("fts_x", "a"), Index("fts_x", "b"), 1],
+                {},
+                TypeError,
+                "FtsBad: model_config['indexes'][2] is not an Index, got int.",
+            ),
+            # IC3 before IC6.
+            (
+                [Index("fts_x", "a"), Index("fts_x", "b")],
+                {"view_query": "SELECT * FROM fts_src"},
+                ValueError,
+                _IC3.format("fts_x"),
+            ),
+            # IC3 before IC4: two full-text indexes on one column, under one name.
+            ([_text("fts_x"), _text("fts_x")], {}, ValueError, _IC3.format("fts_x")),
+            # IC6 before IC4.
+            ([_text("fts_t1"), _text("fts_t2")], {"view_query": "SELECT * FROM fts_src"}, ValueError, _IC6.format("FtsBad")),
+            # IC4 before IC5.
+            (
+                [
+                    Index("fts_t1", "title", search_analyzer=Analyzer("fts_english", ["blank"])),
+                    Index("fts_t2", "title", search_analyzer=Analyzer("fts_english", ["punct"])),
+                ],
+                {},
+                ValueError,
+                _IC4.format("title", "fts_t1", "fts_t2"),
+            ),
+        ],
+        ids=["ic2-before-ic3", "ic3-before-ic6", "ic3-before-ic4", "ic6-before-ic4", "ic4-before-ic5"],
+    )
+    def test_the_first_fault_raises(self, indexes: object, config: dict[str, Any], error: type[Exception], text: str) -> None:
+        assert _raised(error, _bad_model, indexes, **config) == text
+
+    @pytest.mark.parametrize("indexes", [None, [], ()], ids=["none", "empty-list", "empty-tuple"])
+    def test_no_index_accepted(self, indexes: object) -> None:
+        assert _bad_model(indexes).get_indexes() == ()
+        assert _bad_model(indexes, view_query="SELECT * FROM fts_src").get_indexes() == ()
+
+    def test_a_plain_a_unique_and_a_full_text_index_on_one_field_accepted(self) -> None:
+        indexes = [Index("fts_s", "title"), _text("fts_t"), Index("fts_u", "title", unique=True)]
+        assert _bad_model(indexes).get_indexes() == tuple(indexes)
+
+    def test_one_analyzer_name_given_as_an_object_and_as_a_str_accepted(self) -> None:
+        indexes = [_text("fts_t"), Index("fts_b", "body", search_analyzer="fts_english")]
+        assert _bad_model(indexes).get_indexes() == tuple(indexes)
+
+    def test_two_equal_analyzer_objects_under_one_name_accepted(self) -> None:
+        twin = Analyzer("fts_english", ["CLASS", "blank"], ["lowercase", "ASCII", "snowball(English)"], comment="English text")
+        assert twin == FTS_ENGLISH
+        assert twin is not FTS_ENGLISH
+        indexes = [_text("fts_t"), Index("fts_b", "body", search_analyzer=twin)]
+        assert _bad_model(indexes).get_indexes() == tuple(indexes)
+
+    def test_a_subclass_inherits_the_indexes(self) -> None:
+        class FtsArticleCopy(FtsArticle):
+            model_config = SurrealConfigDict(table_name="fts_article_copy")
+
+        assert FtsArticleCopy.get_indexes() == FtsArticle.get_indexes()
+
+    def test_an_empty_list_drops_the_inherited_indexes(self) -> None:
+        class FtsArticleBare(FtsArticle):
+            model_config = SurrealConfigDict(indexes=[])
+
+        assert FtsArticleBare.get_indexes() == ()
+        assert FtsArticleBare.index_ddl() == []
+
+
+class TestGetIndexes:
+    """``get_indexes()``: the declared indexes, a ``tuple`` in declaration order; ``()`` when none."""
+
+    def test_declaration_order(self) -> None:
+        indexes = FtsArticle.get_indexes()
+        assert isinstance(indexes, tuple)
+        assert indexes == tuple(FtsArticle.model_config["indexes"] or ())
+        assert [index.name for index in indexes] == _ARTICLE_INDEXES
+
+    def test_a_tuple_declaration(self) -> None:
+        indexes = (Index("fts_z", "title", unique=True), Index("fts_a", "body"))
+        assert _bad_model(indexes).get_indexes() == indexes
+
+    def test_none_declared(self) -> None:
+        assert FtsPlain.get_indexes() == ()
+
+
+class TestIndexDdl:
+    """``index_ddl()``: the analyzers the indexes hold as objects, each once, then the indexes on the model's table,
+    each field under its column — pure, with no connection."""
+
+    def test_i1(self) -> None:
+        assert FtsArticle.index_ddl() == _I1
+        assert FtsArticle.index_ddl(line=3) == _I1
+
+    def test_i2(self) -> None:
+        assert FtsArticle.index_ddl(line=2) == _I2
+        assert not any("FULLTEXT" in statement for statement in _I2)
+
+    def test_i3(self) -> None:
+        assert FtsArticle.index_ddl(overwrite=False) == _I3
+        assert FtsArticle.index_ddl(overwrite=False, line=2) == [
+            _A2,
+            *(statement.replace(" FULLTEXT ", " SEARCH ") for statement in _I3[1:]),
+        ]
+
+    def test_none_declared(self) -> None:
+        assert FtsPlain.index_ddl() == []
+        assert FtsPlain.index_ddl(overwrite=False, line=2) == []
+
+    def test_each_analyzer_once_in_declaration_order(self) -> None:
+        other = Analyzer("fts_other", ["blank"], ["lowercase"])
+        twin = Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"], comment="English text")
+        model = _bad_model(
+            [
+                Index("fts_t", "title", search_analyzer=FTS_ENGLISH),
+                Index("fts_b", "body", search_analyzer=other),
+                Index("fts_h", "heading", search_analyzer=twin),
+            ]
+        )
+        assert model.index_ddl() == [
+            _A1,
+            "DEFINE ANALYZER OVERWRITE `fts_other` TOKENIZERS blank FILTERS lowercase;",
+            "DEFINE INDEX OVERWRITE `fts_t` ON `fts_bad` FIELDS `title` FULLTEXT ANALYZER `fts_english`;",
+            "DEFINE INDEX OVERWRITE `fts_b` ON `fts_bad` FIELDS `body` FULLTEXT ANALYZER `fts_other`;",
+            "DEFINE INDEX OVERWRITE `fts_h` ON `fts_bad` FIELDS `head_text` FULLTEXT ANALYZER `fts_english`;",
+        ]
+
+    def test_an_analyzer_named_by_a_str_is_not_rendered(self) -> None:
+        model = _bad_model([Index("fts_b", "body", search_analyzer="fts_english", bm25=True)])
+        assert model.index_ddl() == [
+            "DEFINE INDEX OVERWRITE `fts_b` ON `fts_bad` FIELDS `body` FULLTEXT ANALYZER `fts_english` BM25;"
+        ]
+
+    def test_a_subclass_renders_on_its_own_table(self) -> None:
+        class FtsArticleCopy(FtsArticle):
+            model_config = SurrealConfigDict(table_name="fts_article_copy")
+
+        assert FtsArticleCopy.index_ddl() == [
+            statement.replace("ON `fts_article`", "ON `fts_article_copy`") for statement in _I1
+        ]
+
+    @pytest.mark.parametrize("model", [FtsArticle, FtsPlain], ids=["indexes", "none"])
+    def test_overwrite_not_a_bool(self, model: type[BaseSurrealModel]) -> None:
+        assert _raised(TypeError, model.index_ddl, overwrite=1) == "overwrite= must be a bool, got int."
+
+    @pytest.mark.parametrize(("line", "error"), [(4, ValueError), (1, ValueError), ("3", TypeError), (True, TypeError)])
+    @pytest.mark.parametrize("model", [FtsArticle, FtsPlain], ids=["indexes", "none"])
+    def test_line_refused(self, model: type[BaseSurrealModel], line: object, error: type[Exception]) -> None:
+        assert _raised(error, model.index_ddl, line=line) == _LINE.format(line)
+
+    async def test_works_with_no_connection_configured(self) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        assert SurrealDBConnectionManager.is_connection_set() is False
+        assert FtsArticle.index_ddl() == _I1
+        assert FtsArticle.index_ddl() == FtsArticle.index_ddl()
+        assert SurrealDBConnectionManager.is_connection_set() is False

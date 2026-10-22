@@ -61,6 +61,7 @@ from .schema import (
     view_write_refused,
 )
 from .schema_state import FieldState, TableState
+from .search import Index, check_indexes_config, model_index_statements
 from .signals import (
     around_delete,
     around_save,
@@ -631,6 +632,14 @@ class SurrealConfigDict(ConfigDict, total=False):
             keys the model does not declare. The model's Python field names, checked when the
             class is defined (none on a materialized view); Field(json_schema_extra={"flexible":
             True}) requests it for one field.
+        indexes (Sequence[Index] | None): The table's indexes (v0.35.0) — Index(...) objects with
+            the full SurrealDB-ORM's CreateIndex arguments: plain, UNIQUE and full-text
+            (search_analyzer=) indexes, rendered by index_ddl() and applied by define_indexes().
+            Checked when the class is defined: a list or tuple of Index with distinct names, none
+            on a materialized view, at most one full-text index per column (an aliased field
+            counted under its column), and one Analyzer object per analyzer name. Inherited by
+            subclasses unless they set their own (indexes=[] drops them) — a subclass with another
+            table defines the same indexes on its own table.
 
     The five table keys of v0.34.0 are inherited by subclasses unless they set their own (None
     resets one to "not declared").
@@ -674,6 +683,9 @@ class SurrealConfigDict(ConfigDict, total=False):
 
     flexible_fields: list[str] | tuple[str, ...] | None
     " Fields written FLEXIBLE on a SCHEMAFULL table (v0.34.0): object fields that keep keys the model does not declare. Full SurrealDB-ORM key. "
+
+    indexes: Sequence[Index] | None
+    " The table's indexes (v0.35.0): Index(...) objects, applied by define_indexes(). "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -807,11 +819,15 @@ class BaseSurrealModel(BaseModel):
         names — an inherited value is checked again, the messages naming the subclass. So is the
         ``view_query`` key (v0.32.0): ``None``, or one ``SELECT`` (``schema.check_view_query()``)
         on a model that is not an edge, does not mix in ``AuthenticatedUserMixin`` and declares no
-        computed field (``schema.check_view_config()``) — inherited values included. So are the
-        ``table_type``, ``relation_in``, ``relation_out`` and ``enforced`` keys (v0.33.0), when any
-        of them is not ``None``: a ``TableType`` (``RELATION`` on an edge only), and the relation
-        keys on an edge model only (``schema.check_relation_config()``). So are, on every model and
-        after the relation keys, the ``schema_mode``, ``changefeed``, ``permissions``, ``comment`` and
+        computed field (``schema.check_view_config()``) — inherited values included. So is, right
+        after it, the ``indexes`` key (v0.35.0, ``search.check_indexes_config()``): ``None``, or a
+        ``list`` or ``tuple`` of ``Index`` with distinct names, none on a view, one full-text index
+        per column and one ``Analyzer`` definition per analyzer name — inherited values included,
+        the messages naming the subclass. So are the ``table_type``, ``relation_in``,
+        ``relation_out`` and ``enforced`` keys (v0.33.0), when any of them is not ``None``: a
+        ``TableType`` (``RELATION`` on an edge only), and the relation keys on an edge model only
+        (``schema.check_relation_config()``). So are, on every model and after the relation keys,
+        the ``schema_mode``, ``changefeed``, ``permissions``, ``comment`` and
         ``flexible_fields`` keys (v0.34.0), inherited values included (``schema.check_table_config()``):
         validated, never rewritten.
 
@@ -840,6 +856,9 @@ class BaseSurrealModel(BaseModel):
                 user=issubclass(cls, AuthenticatedUserMixin),
                 computed=tuple(cls.__surreal_computed__),
             )
+        indexes = cls.model_config.get("indexes")
+        if indexes is not None:
+            check_indexes_config(cls, indexes, view=cls._is_view(), column=cls.to_db_field)
         relation = {key: cls.model_config.get(key) for key in ("table_type", "relation_in", "relation_out", "enforced")}
         if any(value is not None for value in relation.values()):
             check_relation_config(cls, edge=cls.__surreal_edge__, **relation)
@@ -1134,6 +1153,52 @@ class BaseSurrealModel(BaseModel):
         value = cls.model_config.get("permissions")
         # Checked at the class statement: a Mapping or None.
         return dict(value) if isinstance(value, Mapping) else {}
+
+    # ==================== Indexes and full-text search (v0.35.0) ====================
+
+    @classmethod
+    def get_indexes(cls) -> tuple[Index, ...]:
+        """Return the indexes declared in ``model_config = SurrealConfigDict(indexes=[...])``, in declaration order
+        (v0.35.0).
+
+        A tuple; ``()`` when the model declares none. A subclass inherits its parent's indexes unless it sets
+        ``indexes`` itself (``indexes=[]`` drops them); a subclass with another table defines the same indexes on its
+        own table.
+        """
+        indexes = cls.model_config.get("indexes")
+        # Checked at the class statement: a list or tuple of Index, or None.
+        return tuple(indexes) if isinstance(indexes, (list, tuple)) else ()
+
+    @classmethod
+    def index_ddl(cls, *, overwrite: bool = True, line: Literal[2, 3] = 3) -> list[str]:
+        """Render the ``DEFINE ANALYZER`` and ``DEFINE INDEX`` statements of this model's indexes (v0.35.0).
+
+        Pure: builds the SurrealQL without touching the database (no connection needed), the same text every time,
+        so it can be printed, diffed or fed into a migration — the statements a fresh database receives. First the
+        analyzers the indexes of :meth:`get_indexes` hold as ``Analyzer`` objects, each name once, in declaration
+        order (an analyzer named by a ``str`` is the database's and is not rendered); then one ``DEFINE INDEX`` per
+        index, in declaration order, on :meth:`get_table_name`, each field written as its column (an aliased field
+        under its alias, each dotted segment in backticks). ``[]`` when the model declares none.
+
+        Args:
+            overwrite: ``True`` (default) emits ``OVERWRITE`` in each statement, which redefines what exists.
+                ``False`` emits ``IF NOT EXISTS``, which leaves an existing analyzer or index as it is.
+            line: the SurrealDB major line the statements are for: a full-text index is written ``FULLTEXT`` for
+                ``3`` (default) and ``SEARCH`` for ``2`` — SurrealDB 2.x and the embedded engine of the SDK's 2.x
+                range; each line refuses the other's keyword.
+
+        Raises:
+            TypeError: *overwrite* is not a ``bool``; *line* is not an ``int`` (a ``bool`` included).
+            ValueError: *line* is an ``int`` other than 2 or 3.
+
+        Example:
+            >>> print("\\n".join(Article.index_ddl()))
+            DEFINE ANALYZER OVERWRITE `english` TOKENIZERS class,blank FILTERS lowercase,ascii,snowball(english);
+            DEFINE INDEX OVERWRITE `article_title` ON `article` FIELDS `title` FULLTEXT ANALYZER `english` BM25 HIGHLIGHTS;
+        """
+        return model_index_statements(
+            cls.get_indexes(), cls.get_table_name(), column=cls.to_db_field, overwrite=overwrite, line=line
+        )
 
     # ==================== Materialized views (v0.32.0) ====================
 

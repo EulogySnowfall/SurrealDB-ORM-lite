@@ -622,6 +622,37 @@ def search_value_forms() -> None:
     assert_type(title.ddl("post", overwrite=False, line=2), str)
 
 
+_POST_ENGLISH = Analyzer("indexed_english", ["class", "blank"], ["lowercase", "snowball(english)"])
+
+
+class IndexedPost(BaseSurrealModel):
+    """v0.35.0: ``SurrealConfigDict(indexes=...)`` takes a sequence of ``Index``."""
+
+    model_config = SurrealConfigDict(
+        table_name="indexed_post",
+        indexes=[
+            Index("indexed_post_title", "title", search_analyzer=_POST_ENGLISH, bm25=True, highlights=True),
+            Index("indexed_post_slug", "slug", unique=True),
+        ],
+    )
+
+    id: RecordID | None = None
+    title: str = ""
+    slug: str = ""
+
+
+def index_forms() -> None:
+    """v0.35.0: ``get_indexes()`` is a ``tuple[Index, ...]``, ``index_ddl()`` a ``list[str]``."""
+    indexes: tuple[Index, ...] = IndexedPost.get_indexes()
+    assert_type(indexes, tuple[Index, ...])
+    statements: list[str] = IndexedPost.index_ddl()
+    assert_type(statements, list[str])
+    assert_type(IndexedPost.index_ddl(overwrite=False, line=2), list[str])
+    declared: Sequence[Index] = (Index("indexed_post_body", "body", search_analyzer="indexed_english"),)
+    assert_type(SurrealConfigDict(indexes=declared), SurrealConfigDict)
+    assert_type(SurrealConfigDict(indexes=None), SurrealConfigDict)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""
