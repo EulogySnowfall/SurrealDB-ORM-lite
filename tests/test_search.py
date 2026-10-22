@@ -110,9 +110,23 @@ of a term in more than half the documents" and "BM25 statistics after a rebuild,
 field of an AND scored as if searched alone, SurrealDB 3.1 also returning records that match one field only; a common
 term scored ``0.0`` on 3.x and below zero on 2.x and the embedded engine; after a rebuild or a deleted record, 3.x
 keeps the scores of the freshly built index while 2.x and the embedded engine count the records again.
+
+``search()`` with the rest of the ORM, on every engine: it restricts a ``values()`` group, ``count()``, ``exists()``
+and the other aggregations, and the writes by filter — ``bulk_update()``, ``patch()``, ``bulk_delete()``
+(``TestSearchAggregatesE2E``); a ``Subquery`` holding it restricts the outer statement, whose own search and
+annotations keep their references (``TestSearchSubqueryE2E``), and in a live query, over WebSocket, notifies the
+creation of a matching record and the update that makes a record match — not a record that does not match, a
+deletion, nor an update that stops a record matching (``TestSearchLiveSubqueryE2E``, README section 36, Live
+queries). A searched read is cached by its text, and dropped by a write to the table and by any model's
+``define_indexes()`` (``TestSearchCacheE2E``). In an interactive transaction the search sees the transaction's write
+and the indexes ``define_indexes(tx=…)`` defined; in a buffered one a read raises, as every read does there, and the
+indexes are applied at the commit (``TestSearchTransactionsE2E``). A model on a named connection applies its indexes
+and searches there, ``define_analyzer()`` runs on the ``using()`` connection, and a transaction of another connection
+is refused before any request (``TestSearchMultiDbE2E``).
 """
 
 import ast
+import asyncio
 import contextlib
 import dataclasses
 import inspect
@@ -143,6 +157,7 @@ from surreal_orm_lite import (
     GeoDistance,
     Index,
     IndexState,
+    LiveAction,
     Q,
     QueryCache,
     SearchHighlight,
@@ -4142,4 +4157,356 @@ class TestSearchLinesE2E:
         else:
             assert all(after[key] > fresh[key] for key in fresh), (
                 f"{_ROW_STATISTICS}: 2.x and the embedded engine keep counting a deleted record"
+            )
+
+
+# --- search() with the rest of the ORM ------------------------------------------------------------------------------
+
+
+def _physics() -> Any:
+    """A new queryset of the articles whose title matches "physics" (a1 and a2): ``values()`` and the aggregations
+    change the queryset they are called on."""
+    return FtsArticle.objects().search(title="physics")
+
+
+class TestSearchAggregatesE2E:
+    """``search()`` restricts the aggregations and the writes by filter on every engine (SurrealDB 3.x and 2.x over
+    WebSocket and HTTP, and the embedded engine): a ``values()`` group, ``count()``, ``exists()``, ``sum()`` and the
+    other aggregations read the matching records only; ``bulk_update()``, ``patch()`` and ``bulk_delete()`` write
+    them only."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_aggregations(self, kind: str) -> None:
+        async with _corpus(kind):
+            groups = await _physics().values("views").annotate(n=Count()).exec()
+            count = await _physics().count()
+            exists = await _physics().exists()
+            total = await _physics().sum("views")
+            average = await _physics().avg("views")
+            lowest = await _physics().min("views")
+            highest = await _physics().max("views")
+            filtered = await FtsArticle.objects().filter(views__gt=1).search(title="quantum").count()
+            nothing = (
+                await FtsArticle.objects().search(title="knitting").count(),
+                await FtsArticle.objects().search(title="knitting").exists(),
+            )
+        assert sorted(groups, key=lambda row: row["views"]) == [{"views": 1, "n": 1}, {"views": 2, "n": 1}]
+        assert (count, exists, total, average, lowest, highest) == (2, True, 3, 1.5, 1, 2)
+        assert filtered == 1
+        assert nothing == (0, False)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_bulk_update_and_patch(self, kind: str) -> None:
+        async with _corpus(kind):
+            updated = await _physics().bulk_update(views=99)
+            patched = await (
+                FtsArticle.objects().search(title="quantum").patch([{"op": "replace", "path": "/body", "value": "Patched"}])
+            )
+            stored = {article.id: (article.views, article.body) for article in await FtsArticle.objects().all()}
+        assert (updated, patched) == (2, 2)
+        assert stored == {
+            "a1": (99, "Patched"),
+            "a2": (99, "Heat and physics in the kitchen"),
+            "a3": (3, "Plants and soil"),
+            "a4": (4, "Patched"),
+            "a5": (5, "Flour water salt"),
+            "a6": (6, "Needles and thread"),
+        }
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_bulk_delete(self, kind: str) -> None:
+        """The matching records are deleted. Afterwards only matches and counts are asserted: a deletion changes the
+        BM25 statistics of SurrealDB 2.x and the embedded engine (README row "BM25 statistics after a rebuild, a
+        redefinition or a deletion")."""
+        async with _corpus(kind):
+            deleted = await _physics().bulk_delete()
+            stored = _ids(await FtsArticle.objects().all())
+            quantum = _ids(await FtsArticle.objects().search(title="quantum").exec())
+            physics = await _physics().count()
+        assert deleted == 2
+        assert stored == ["a3", "a4", "a5", "a6"]
+        assert quantum == ["a4"]
+        assert physics == 0
+
+
+async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
+    """The next *count* items of *stream*, failing after *timeout* seconds (``tests/test_live_queryset.py``)."""
+
+    async def _read() -> list[Any]:
+        seen: list[Any] = []
+        async for item in stream:
+            seen.append(item)
+            if len(seen) >= count:
+                break
+        return seen
+
+    return await asyncio.wait_for(_read(), timeout=timeout)
+
+
+async def _assert_silent(stream: Any, wait: float = 0.5) -> None:
+    """Nothing more arrives (``tests/test_live_queryset.py``)."""
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(stream.__anext__(), timeout=wait)
+
+
+class TestSearchSubqueryE2E:
+    """A ``Subquery`` holding ``search()`` on every engine: its matches restrict the outer statement, its references
+    start again at 0 — the outer queryset's own search and annotations keep theirs — and its texts continue the
+    statement's numbering."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_q7(self, kind: str) -> None:
+        async with _corpus(kind):
+            rows = await _q7().exec()
+        assert _ids(rows) == ["a1", "a4"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_outer_and_an_inner_search(self, kind: str) -> None:
+        def outer(inner_body: str) -> Any:
+            inner = FtsArticle.objects().search(body=inner_body)
+            return (
+                FtsArticle.objects()
+                .search(title="quantum")
+                .filter(id__in=Subquery(inner))
+                .annotate(relevance=SearchScore(0), snippet=SearchHighlight())
+            )
+
+        query, variables = outer("quantum")._compile_query()
+        assert query.startswith("{ LET $_sq0 = (SELECT VALUE id FROM fts_article WHERE body @0@ $_f0); (SELECT *, ")
+        assert "WHERE id IN $_sq0 AND title @0@ $_f1" in query
+        assert (variables["_f0"], variables["_f1"]) == ("quantum", "quantum")
+        async with _corpus(kind):
+            rows = await outer("quantum").exec()
+            alone = await _scores(title="quantum")
+            none = await outer("kitchen").exec()
+        assert [(row.id, row.snippet) for row in rows] == [("a1", "<b>Quantum</b> physics for beginners")]
+        assert rows[0].relevance == _approx(alone["a1"]), "the outer reference 0 scores the outer field"
+        assert none == []
+
+
+@pytest.mark.usefixtures("_live_registry")
+class TestSearchLiveSubqueryE2E:
+    """A live query whose subquery searches, over WebSocket on every server line (the embedded engine has no live
+    queries). README section 36, Live queries: it notifies the creation of a matching record and the update that
+    makes a record match — not a record that does not match, a deletion, nor an update that stops a record matching.
+    The writes that must not notify come before one that must, so the first event read proves they did not."""
+
+    async def test_matching_creates_and_updates_are_notified(self) -> None:
+        async with _corpus("ws"):
+            queryset = FtsArticle.objects().filter(id__in=Subquery(FtsArticle.objects().search(title="physics")))
+            async with queryset.live() as stream:
+                await FtsArticle(id="a7", title="Knitting basics", slug="a7").save()
+                await FtsArticle(id="a8", title="Physics of knitting", slug="a8").save()
+                [created] = await _take(stream, 1)
+                await (await FtsArticle.objects().get("a2")).merge(title="Cooking basics")
+                await (await FtsArticle.objects().get("a1")).delete()
+                await (await FtsArticle.objects().get("a3")).merge(title="Gardening physics")
+                [updated] = await _take(stream, 1)
+                await _assert_silent(stream)
+        assert (created.action, created.instance.id, created.instance.title) == (
+            LiveAction.CREATE,
+            "a8",
+            "Physics of knitting",
+        )
+        assert isinstance(created.instance, FtsArticle)
+        assert (updated.action, updated.instance.id, updated.instance.title) == (
+            LiveAction.UPDATE,
+            "a3",
+            "Gardening physics",
+        )
+
+    async def test_watch_gives_the_raw_notifications(self) -> None:
+        async with _corpus("ws"):
+            queryset = FtsArticle.objects().filter(id__in=Subquery(FtsArticle.objects().search(title="physics")))
+            async with queryset.watch() as stream:
+                await FtsArticle(id="a7", title="Knitting basics", slug="a7").save()
+                await FtsArticle(id="a8", title="Physics of knitting", slug="a8").save()
+                [envelope] = await _take(stream, 1)
+                await _assert_silent(stream)
+        assert envelope["action"] == LiveAction.CREATE
+        assert str(envelope["record"].id) == "a8"
+        assert envelope["result"]["title"] == "Physics of knitting"
+
+
+class TestSearchCacheE2E:
+    """``cache()`` on a searched read, on every engine: a second identical search is answered from the cache, another
+    text is not; a write to the table and ``define_indexes()`` — any model's, which may rebuild an index another
+    table's search reads — drop it."""
+
+    @pytest.mark.usefixtures("empty_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_keyed_by_the_text(self, kind: str) -> None:
+        async with _corpus(kind):
+
+            async def cached(text: str) -> list[str]:
+                return _ids(await FtsArticle.objects().search(title=text).cache(ttl=30).exec())
+
+            before = QueryCache.stats()
+            first = await cached("physics")
+            again = await cached("physics")
+            other = await cached("quantum")
+            after = QueryCache.stats()
+        assert (first, again, other) == (["a1", "a2"], ["a1", "a2"], ["a1", "a4"])
+        assert (after["hits"] - before["hits"], after["misses"] - before["misses"]) == (1, 2)
+
+    @pytest.mark.usefixtures("empty_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_save_and_define_indexes_invalidate(self, kind: str) -> None:
+        async with _corpus(kind):
+
+            async def cached() -> list[str]:
+                return _ids(await FtsArticle.objects().search(title="physics").cache(ttl=30).exec())
+
+            assert await cached() == ["a1", "a2"]
+            hits = _hits()
+            assert await cached() == ["a1", "a2"]
+            assert _hits() == hits + 1
+            await FtsArticle(id="a7", title="Physics of knitting", slug="a7").save()
+            assert await cached() == ["a1", "a2", "a7"]
+            assert _hits() == hits + 1
+            assert await cached() == ["a1", "a2", "a7"]
+            assert _hits() == hits + 2
+            assert await FtsArticle.define_indexes() == [], "unchanged: nothing applied, the cache dropped all the same"
+            assert await cached() == ["a1", "a2", "a7"]
+            assert _hits() == hits + 2
+            assert await cached() == ["a1", "a2", "a7"]
+            assert _hits() == hits + 3
+            assert await FtsPage.define_indexes() != []
+            assert await cached() == ["a1", "a2", "a7"]
+            assert _hits() == hits + 3
+
+
+#: The existing refusal of a read inside a buffered transaction.
+_BUFFERED_READ = (
+    "Reads inside a transaction require a WebSocket connection to SurrealDB 3.x (native interactive transactions); "
+    "the current transaction is buffered (HTTP or SurrealDB 2.6.x)."
+)
+
+
+class TestSearchTransactionsE2E:
+    """``search()`` and ``define_indexes()`` in a transaction, on every engine: in an interactive one (SurrealDB 3.x
+    over WebSocket) the search sees the transaction's own writes and the indexes it defined; in a buffered one (HTTP,
+    SurrealDB 2.x, the embedded engine) a read raises, as every read does there, and the indexes are applied at the
+    commit."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_search_sees_the_transaction_s_write(self, kind: str) -> None:
+        async with _corpus(kind) as client:
+            interactive = await _native_transactions(kind, client)
+            refused: pytest.ExceptionInfo[SurrealDbError] | None = None
+            inside: list[str] | None = None
+            outside: list[str] | None = None
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsArticle(id="a7", title="Physics of knitting", slug="a7").save(tx=tx)
+                if interactive:
+                    inside = _ids(await FtsArticle.objects(tx=tx).search(title="physics").exec())
+                    outside = _ids(await FtsArticle.objects().search(title="physics").exec())
+                else:
+                    with pytest.raises(SurrealDbError) as refused:
+                        await FtsArticle.objects(tx=tx).search(title="physics").exec()
+            after = _ids(await FtsArticle.objects().search(title="physics").exec())
+        assert after == ["a1", "a2", "a7"]
+        if interactive:
+            assert inside == ["a1", "a2", "a7"]
+            assert outside == ["a1", "a2"], "the others see the write after the commit"
+        else:
+            assert refused is not None
+            assert type(refused.value) is SurrealDbError
+            assert str(refused.value) == _BUFFERED_READ
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_defined_in_the_transaction_serves_the_search(self, kind: str) -> None:
+        """The analyzer committed first, then ``define_indexes(tx=…)`` as the transaction's first statement, on a table
+        holding records. Interactive (SurrealDB 3.x over WebSocket): the indexes serve at once the search of a record
+        the transaction then writes. Buffered (HTTP, SurrealDB 2.x, the embedded engine): they are applied at the
+        commit. After the commit the search finds the records written before the transaction (and the one written in
+        it)."""
+        async with _fts_models(kind) as client:
+            interactive = await _native_transactions(kind, client)
+            await _apply_ddl(client, _A1)
+            await _seed()
+            inside: list[str] | None = None
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                assert await FtsArticle.define_indexes(tx=tx) == FtsArticle.index_ddl(line=await _keyword_line(client))[1:]
+                if interactive:
+                    await FtsArticle(id="a7", title="Physics of knitting", slug="a7").save(tx=tx)
+                    inside = _ids(await FtsArticle.objects(tx=tx).search(title="knitting").exec())
+            after = _ids(await FtsArticle.objects().search(title="physics").exec())
+        if interactive:
+            assert inside == ["a7"]
+            assert after == ["a1", "a2", "a7"]
+        else:
+            assert inside is None
+            assert after == ["a1", "a2"]
+
+
+class FtsRouted(BaseSurrealModel):
+    """A model on the connection ``"fts"`` (``SurrealConfigDict(connection=…)``), its index naming the analyzer
+    ``fts_english`` by ``str``."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_routed",
+        connection="fts",
+        indexes=[Index("fts_routed_title", "title", search_analyzer="fts_english", bm25=True, highlights=True)],
+    )
+
+    id: str | None = None
+    title: str = ""
+
+
+def _set_default(kind: str) -> None:
+    """The default connection, on *kind*'s engine and the database ``db``."""
+    if kind == "mem":
+        SurrealDBConnectionManager.set_connection(url="mem://", namespace="ns", database="db")
+    else:
+        SurrealDBConnectionManager.set_connection(url=_url(kind), user="root", password="root", namespace="ns", database="db")
+
+
+class TestSearchMultiDbE2E:
+    """A named connection on every engine: ``define_analyzer()`` inside ``using()`` runs on that connection; a model
+    whose ``SurrealConfigDict(connection=…)`` names it applies its indexes and searches there with no ``using()``
+    block; a transaction of another connection is refused before any request."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_on_a_named_connection(self, kind: str) -> None:
+        async with _fts(kind) as client:
+            async with SurrealDBConnectionManager.using("fts"):
+                defined = await SurrealDBConnectionManager.define_analyzer(FTS_ENGLISH)
+            applied = await FtsRouted.define_indexes()
+            await FtsRouted(id="r1", title="Quantum physics for beginners").save()
+            await FtsRouted(id="r2", title="Gardening in spring").save()
+            rows = await FtsRouted.objects().search(title="physics").annotate(snippet=SearchHighlight()).exec()
+            count = await FtsRouted.objects().search(title="physics").count()
+            indexes = await _indexes(client, "fts_routed")
+            line = await _keyword_line(client)
+        assert defined == [FTS_ENGLISH.ddl()]
+        assert applied == FtsRouted.index_ddl(line=line)
+        assert [(row.id, row.snippet) for row in rows] == [("r1", "Quantum <b>physics</b> for beginners")]
+        assert count == 1
+        assert sorted(indexes) == ["fts_routed_title"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_of_the_default_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts(kind) as client:
+            _set_default(kind)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                default = await SurrealDBConnectionManager.get_client()
+                calls = _spy(monkeypatch, client)
+                default_calls = _spy(monkeypatch, default)
+                with pytest.raises(SurrealDbError) as definition:
+                    await FtsRouted.define_indexes(tx=tx)
+                with pytest.raises(SurrealDbError) as removal:
+                    await FtsRouted.remove_index("fts_routed_title", tx=tx)
+                sent = (_calls(calls), _calls(default_calls))
+                queued = getattr(tx, "statements", None)
+                monkeypatch.undo()
+            tables = await _tables(client)
+        assert sent == ([], [])
+        assert queued in (None, [])
+        assert "fts_routed" not in tables
+        for raised, method in ((definition, "define_indexes"), (removal, "remove_index")):
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value).startswith(
+                f"FtsRouted.{method}() cannot run in this transaction: the transaction belongs to connection 'default' "
+                "and FtsRouted runs on connection 'fts'."
             )
