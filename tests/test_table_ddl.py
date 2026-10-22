@@ -5936,24 +5936,35 @@ class TestSubModelListsE2E:
         and a sub-object drops it — the facts of the README 2.x/3.x row on a write naming a field a ``SCHEMAFULL``
         table does not define.
 
-        3.x keeps it only once an item field is defined (``v.*.n``): it refuses it in the items of an array that
-        defines none (``w``), as SurrealDB's documentation of ``FLEXIBLE`` says of every item of an array that is not
-        ``FLEXIBLE``. A 3.x that starts refusing it in ``v`` too fails here with ``_UNDECLARED_CHANGED``."""
+        3.x keeps it only once a field of the object is defined: in the items of ``v`` (``v.*.n``) and in an object
+        inside an item that defines one (``z.*.s.k``), not in the items of an array that defines none (``w``).
+        SurrealDB's documentation of ``FLEXIBLE`` says every object of an array that is not ``FLEXIBLE`` refuses such
+        a key. Every write goes through ``_refusal()``: a 3.x that starts refusing it in ``v`` or ``z`` too fails here
+        with ``_UNDECLARED_CHANGED``, which names the README rows to update."""
         async with _tdl(kind) as client:
             major = await _major(client)
+            flex = " FLEXIBLE" if flexible else ""
             await _apply_ddl(
                 client,
                 "DEFINE TABLE tdl_raw SCHEMAFULL; "
-                f"DEFINE FIELD v ON tdl_raw TYPE array<object>{' FLEXIBLE' if flexible else ''}; "
+                f"DEFINE FIELD v ON tdl_raw TYPE array<object>{flex}; "
                 "DEFINE FIELD v.*.n ON tdl_raw TYPE string; "
                 "DEFINE FIELD o ON tdl_raw TYPE option<object>; "
                 "DEFINE FIELD o.n ON tdl_raw TYPE string; "
-                "DEFINE FIELD w ON tdl_raw TYPE option<array<object>>;",
+                "DEFINE FIELD w ON tdl_raw TYPE option<array<object>>; "
+                f"DEFINE FIELD z ON tdl_raw TYPE option<array<object>>{flex}; "
+                "DEFINE FIELD z.*.s ON tdl_raw TYPE object; "
+                "DEFINE FIELD z.*.s.k ON tdl_raw TYPE int;",
             )
-            await _apply_ddl(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
+            refused = await _refusal(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
+            assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
             kept = flexible or major >= 3
             stored = [{"n": "a", "stray": {"deep": 1}}] if kept else [{"n": "a"}]
             assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _UNDECLARED_CHANGED
+            refused = await _refusal(client, "CREATE tdl_raw:4 SET v = [], z = [{s: {k: 1, stray: 1}}] RETURN NONE;")
+            assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
+            stored = [{"s": {"k": 1, "stray": 1}}] if kept else [{"s": {"k": 1}}]
+            assert await client.query("SELECT VALUE z FROM tdl_raw:4;", {}) == [stored], _UNDECLARED_CHANGED
             refused = await _refusal(client, "CREATE tdl_raw:2 SET v = [], o = {n: 'a', stray: 1} RETURN NONE;")
             if major >= 3:
                 assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
@@ -5970,11 +5981,13 @@ class TestSubModelListsE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_undeclared_key_in_an_item_after_define_table(self, kind: str) -> None:
         """After ``define_table()``, the items of a list of sub-models holding a ``FLEXIBLE`` column keep a key the
-        model does not declare, written raw, on every engine: 3.x keeps it in any array of objects, 2.x and the
-        embedded engine because ``define_table()`` writes the list ``FLEXIBLE`` there. The ORM never sends such a key."""
+        model does not declare, written raw, on every engine: 3.x keeps it in an array whose items define a field, 2.x
+        and the embedded engine because ``define_table()`` writes the list ``FLEXIBLE`` there. The ORM never sends such
+        a key. A refusal fails with ``_UNDECLARED_CHANGED``."""
         async with _tdl(kind) as client:
             await TdlOrderPlain.define_table()
-            await _apply_ddl(client, "CREATE tdl_order:p1 SET tags = [{label: 'a', meta: {}, stray: 1}] RETURN NONE;")
+            refused = await _refusal(client, "CREATE tdl_order:p1 SET tags = [{label: 'a', meta: {}, stray: 1}] RETURN NONE;")
+            assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
             tags = await client.query("SELECT VALUE tags FROM tdl_order:p1;", {})
             assert tags == [[{"label": "a", "meta": {}, "stray": 1}]], _UNDECLARED_CHANGED
 
@@ -7404,18 +7417,21 @@ _PART_NEEDLES_35 = {
         "On 2.x and the embedded engine, the items of such a list then also keep a key the model does not declare, "
         "written raw or by another client (the ORM never sends one), which they drop from a list that is not "
         "`FLEXIBLE`: a 2.x limitation, since `FLEXIBLE` there covers the whole item.",
-        "3.x keeps such a key in the items of any list of objects, `FLEXIBLE` or not, and refuses it at the top level or "
-        "in a sub-model.",
+        "3.x keeps such a key, `FLEXIBLE` or not, in the items of a list of objects whose items define a field (every "
+        "list of sub-models `define_table()` writes) and in an object inside them that defines one; it refuses it at the "
+        "top level, in a sub-model outside such a list, and in the items of a list that defines no item field (an "
+        "`array<object>` defined by hand without `v.*.n`).",
         "SurrealDB's [documentation of `FLEXIBLE`]"
-        "(https://surrealdb.com/docs/surrealql/statements/define/field#flexible-data-types) says every object of a "
-        "`SCHEMAFULL` table, an item of a list included, accepts only the keys defined for it unless its field is "
-        "`FLEXIBLE`; 3.x follows it only for a list that defines no item field (an `array<object>` defined by hand "
-        "without `v.*.n`), so a later 3.x may refuse such a key in a list of sub-models too: do not rely on it.",
+        "(https://surrealdb.com/docs/reference/query-language/statements/define/field#flexible-data-types) says every "
+        "object of a `SCHEMAFULL` table, an item of a list included, accepts only the keys defined for it unless its "
+        "field is `FLEXIBLE`: 3.x departs from it in a list whose items define a field, so a later 3.x may refuse such "
+        "a key there too: do not rely on it.",
         "`table_ddl()`, which needs no connection, writes the 3.x form",
         "the item definition `TYPE any` (`bag.*`) on every line",
         "refused on 3.x and dropped on 2.x and the embedded engine",
-        "except in the items of a list of objects: of any such list on 3.x, of a list `define_table()` writes `FLEXIBLE` "
-        "on 2.x and the embedded engine",
+        "except in the items of a list of objects: on 3.x of a list whose items define a field (every list of "
+        "sub-models `define_table()` writes), on 2.x and the embedded engine of a list `define_table()` writes "
+        "`FLEXIBLE`.",
         "`COMPUTED` fields are SurrealDB 3.x's",
         "(#orm-behaviour-surrealdb-2x-vs-3x)",
         "(#orm-behaviour-the-embedded-engine)",
@@ -7556,7 +7572,8 @@ _TABLE_DDL_ROWS = [
         "A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records "
         "predating `SCHEMAFULL`)",
         "the field is dropped, silently; kept in the items of a list `define_table()` writes `FLEXIBLE` (a 2.x limitation)",
-        "the write is refused (`no such field exists`), except in the items of a list of objects, which keep it",
+        "the write is refused (`no such field exists`), except in the items of a list whose items define a field (every "
+        "list of sub-models `define_table()` writes), which keep it",
         "v0.34.0",
     ],
 ]
@@ -7571,7 +7588,7 @@ _EMBEDDED_TABLE_DDL_ROW = [
     "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and "
     "to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops "
     "that field, except in the items of a list `define_table()` writes `FLEXIBLE`, which keep it",
-    "3.x keeps those values without `FLEXIBLE` and refuses that write, except in the items of a list of objects",
+    "3.x keeps those values without `FLEXIBLE` and refuses that write, except in list items that define a field",
     "v0.34.0",
 ]
 #: The v0.7.0 row of the 2.x/3.x table on the same writes, cell by cell: the list-item exception in the words of the
@@ -7580,8 +7597,8 @@ _SCHEMAFULL_WRITE_ROW_07 = [
     _SCHEMAFULL_WRITE_FIRST_07,
     "silently dropped: the record is stored without it; kept in the items of a list `define_table()` writes `FLEXIBLE` "
     "(a 2.x limitation)",
-    'rejected ("Found field …, but no such field exists"): nothing is stored, except in the items of a list of objects, '
-    "which keep it",
+    'rejected ("Found field …, but no such field exists"): nothing is stored, except in the items of a list whose '
+    "items define a field (every list of sub-models), which keep it",
     "v0.7.0",
 ]
 _FEATURES_ROW_35 = ["Model table DDL (`define_table()`, `schema_mode`, `permissions`)", "✅"]
