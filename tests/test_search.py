@@ -30,31 +30,58 @@ per analyzer name —, the first fault raising with its exact text; a subclass i
 ``get_indexes()`` returns them in declaration order; ``index_ddl()`` renders, with no connection, the analyzers the
 indexes hold as ``Analyzer`` objects (each name once) and then one ``DEFINE INDEX`` per index on the model's table, each
 field under its column, with the line's keyword.
+
+The comparison with what the database stores (``TestMatches``): ``search.analyzer_matches()`` holds an ``Analyzer``
+equal to a stored definition as SurrealDB 3.x renders it (``LOWERCASE, ASCII``) and as 2.x and the embedded engine do
+(``LOWERCASE,ASCII``), a ``mapper()`` path compared without its quotes and case (the embedded engine renders it
+unquoted), and never parses the analyzer's own statement; ``search.index_matches()`` holds an ``Index`` equal to its
+stored definition on both lines (2.x's tuning options aside, ``bm25=None`` and ``True`` equal to ``BM25(1.2,0.75)``,
+the BM25 numbers compared as floats), and never to a vector or ``COUNT`` index.
+
+The reads (``TestReads``, ``TestReadsE2E``): ``search.read_database_info()`` sends ``INFO FOR DB`` once and returns the
+stored analyzers and the table names, ``search.read_table_indexes()`` sends ``INFO FOR TABLE`` once and returns the
+table's indexes; a definition the parser cannot read is ``None`` under its name, a missing table has no index, and a
+session that may not read gets ``SurrealDbAuthenticationError``.
+
+On every engine (``TestGoldensE2E``: SurrealDB 3.x and 2.x over WebSocket and HTTP, and the embedded engine) each
+golden statement is accepted with the line's keyword, what ``INFO`` returns matches its declaration, and the
+introspector reads the indexes and the analyzer as declared. Pinned (README row "Full-text index"): each line refuses
+the other's keyword; the embedded engine reports major version 2 and takes ``SEARCH`` — the keyword tripwire.
 """
 
 import ast
+import contextlib
+import dataclasses
 import math
+import os
 import pickle
-from collections.abc import Sequence
+import re
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from pydantic import Field
+from surrealdb import InternalError, NotAllowedError
 
 import surreal_orm_lite
 from surreal_orm_lite import (
     Analyzer,
+    AnalyzerState,
     BaseSurrealModel,
+    DatabaseIntrospector,
     Index,
+    IndexState,
     SearchHighlight,
     SearchOffsets,
     SearchScore,
     SurrealConfigDict,
+    SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
+    SurrealDbError,
     search,
 )
-from surreal_orm_lite.define_parser import parse_define_analyzer
+from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyzer, parse_define_index
 from surreal_orm_lite.functions import normalize_function_name
 
 FTS_ENGLISH = Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"], comment="English text")
@@ -965,3 +992,626 @@ class TestIndexDdl:
         assert FtsArticle.index_ddl() == _I1
         assert FtsArticle.index_ddl() == FtsArticle.index_ddl()
         assert SurrealDBConnectionManager.is_connection_set() is False
+
+
+# --- the comparison with the stored definitions ---------------------------------------------------------------------
+
+#: How ``INFO FOR DB`` renders the goldens' analyzers on SurrealDB 3.x (measured on 3.3.4 and 3.1.5).
+_ANALYZERS_3X = {
+    "fts_english": (
+        "DEFINE ANALYZER fts_english TOKENIZERS CLASS,BLANK FILTERS LOWERCASE, ASCII, SNOWBALL(ENGLISH) COMMENT 'English text'"
+    ),
+    "fts_fn": "DEFINE ANALYZER fts_fn FUNCTION fn::fts_low TOKENIZERS BLANK FILTERS ASCII",
+    "fts_empty": "DEFINE ANALYZER fts_empty",
+    "fts_grams": (
+        "DEFINE ANALYZER fts_grams TOKENIZERS BLANK,PUNCT FILTERS NGRAM(1,3), EDGENGRAM(2,10), SNOWBALL(FRENCH), UPPERCASE"
+    ),
+}
+
+#: The same on SurrealDB 2.x and the embedded engine (measured on 2.7.0 and ``mem://``): no space after a comma.
+_ANALYZERS_2X = {name: statement.replace(", ", ",") for name, statement in _ANALYZERS_3X.items()}
+
+#: The tuning options SurrealDB 2.x renders after a full-text index's ``BM25`` (measured on 2.7.0 and ``mem://``).
+_TUNING_2X = (
+    " DOC_IDS_ORDER 100 DOC_LENGTHS_ORDER 100 POSTINGS_ORDER 100 TERMS_ORDER 100 DOC_IDS_CACHE 100 DOC_LENGTHS_CACHE 100"
+    " POSTINGS_CACHE 100 TERMS_CACHE 100"
+)
+
+#: How ``INFO FOR TABLE`` renders the goldens' indexes on SurrealDB 3.x (measured on 3.3.4 and 3.1.5).
+_INDEXES_3X = {
+    "fts_article_title": (
+        "DEFINE INDEX fts_article_title ON fts_article FIELDS title FULLTEXT ANALYZER fts_english BM25(1.2,0.75) HIGHLIGHTS"
+    ),
+    "fts_article_body": "DEFINE INDEX fts_article_body ON fts_article FIELDS body FULLTEXT ANALYZER fts_english BM25(1.2,0.75)",
+    "fts_article_slug": 'DEFINE INDEX fts_article_slug ON fts_article FIELDS slug UNIQUE COMMENT "it\'s unique"',
+    "fts_article_head": (
+        "DEFINE INDEX fts_article_head ON fts_article FIELDS meta.headline FULLTEXT ANALYZER fts_english BM25(1.2,0.75)"
+    ),
+    "fts_k": "DEFINE INDEX fts_k ON fts_t FIELDS k FULLTEXT ANALYZER fts_english BM25(2,1)",
+    "fts_k2": "DEFINE INDEX fts_k2 ON fts_t FIELDS k2 FULLTEXT ANALYZER fts_english BM25(0.00001,0.5)",
+    "fts_ab": "DEFINE INDEX fts_ab ON fts_t FIELDS a, b.c",
+}
+
+
+def _index_2x(statement: str) -> str:
+    """*statement* (a 3.x rendering) as SurrealDB 2.x renders it: ``SEARCH``, the tuning options after ``BM25``."""
+    statement = statement.replace(" FULLTEXT ", " SEARCH ")
+    return re.sub(r"( BM25\([^)]*\))", lambda found: found.group(1) + _TUNING_2X, statement)
+
+
+#: The same on SurrealDB 2.x and the embedded engine (measured on 2.7.0 and ``mem://``).
+_INDEXES_2X = {name: _index_2x(statement) for name, statement in _INDEXES_3X.items()}
+
+#: The declarations of ``_INDEXES_3X``'s indexes on ``fts_t``.
+_FTS_T_INDEXES = {
+    "fts_k": Index("fts_k", "k", search_analyzer="fts_english", bm25=(2, 1)),
+    "fts_k2": Index("fts_k2", "k2", search_analyzer="fts_english", bm25=(1e-05, 0.5)),
+    "fts_ab": Index("fts_ab", ["a", "b.c"]),
+}
+
+
+def _article_index(name: str) -> Index:
+    """The index *name* of ``FtsArticle``."""
+    return next(index for index in FtsArticle.get_indexes() if index.name == name)
+
+
+def _columns(index: Index) -> list[str]:
+    """The columns of *index*'s fields on ``FtsArticle`` (``heading`` → ``head_text``)."""
+    return [FtsArticle.to_db_field(field) for field in index.fields]
+
+
+def _golden_analyzers() -> list[Analyzer]:
+    """The analyzers of A1, A3, A4 and A5: the goldens applied on the engines (A6 reads a server file)."""
+    return [FTS_ENGLISH, _a3(), Analyzer("fts_empty"), _a5()]
+
+
+class TestMatches:
+    """``analyzer_matches()`` and ``index_matches()``: a declaration against what ``INFO`` stores, on both lines'
+    renderings — pure."""
+
+    @pytest.mark.parametrize("rendering", [_ANALYZERS_3X, _ANALYZERS_2X], ids=["3x", "2x"])
+    def test_analyzers_match_each_lines_rendering(self, rendering: dict[str, str]) -> None:
+        for analyzer in _golden_analyzers():
+            assert search.analyzer_matches(analyzer, parse_define_analyzer(rendering[analyzer.name])), analyzer.name
+
+    def test_two_spellings_of_one_analyzer_match(self) -> None:
+        twin = Analyzer(
+            "fts_english", ["CLASS", "Blank"], ["LowerCase", " ascii ", "Snowball( English )"], comment="English text"
+        )
+        assert search.analyzer_matches(twin, parse_define_analyzer(_ANALYZERS_3X["fts_english"]))
+
+    @pytest.mark.parametrize(
+        "analyzer",
+        [
+            Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(french)"], comment="English text"),
+            Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii"], comment="English text"),
+            Analyzer("fts_english", ["class", "blank"], ["ascii", "lowercase", "snowball(english)"], comment="English text"),
+            Analyzer("fts_english", ["blank", "class"], ["lowercase", "ascii", "snowball(english)"], comment="English text"),
+            Analyzer("fts_english", ["class"], ["lowercase", "ascii", "snowball(english)"], comment="English text"),
+            Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"], comment="Other text"),
+            Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"]),
+            Analyzer(
+                "fts_english",
+                ["class", "blank"],
+                ["lowercase", "ascii", "snowball(english)"],
+                function="fts_low",
+                comment="English text",
+            ),
+        ],
+        ids=[
+            "filter",
+            "filter-missing",
+            "filter-order",
+            "tokenizer-order",
+            "tokenizer-missing",
+            "comment",
+            "no-comment",
+            "function",
+        ],
+    )
+    def test_an_analyzer_that_differs(self, analyzer: Analyzer) -> None:
+        assert not search.analyzer_matches(analyzer, parse_define_analyzer(_ANALYZERS_3X["fts_english"]))
+        assert not search.analyzer_matches(analyzer, parse_define_analyzer(_ANALYZERS_2X["fts_english"]))
+
+    def test_another_function(self) -> None:
+        assert not search.analyzer_matches(
+            Analyzer("fts_fn", ["blank"], ["ascii"], function="fts_up"), parse_define_analyzer(_ANALYZERS_3X["fts_fn"])
+        )
+        assert not search.analyzer_matches(
+            Analyzer("fts_fn", ["blank"], ["ascii"]), parse_define_analyzer(_ANALYZERS_3X["fts_fn"])
+        )
+
+    def test_no_analyzer_stored(self) -> None:
+        assert not search.analyzer_matches(FTS_ENGLISH, None)
+
+    def test_a_mapper_path_without_its_quotes_and_case(self) -> None:
+        """The embedded engine renders a ``mapper()`` path unquoted, which ``parse_define_analyzer()`` lower-cases."""
+        mapper = Analyzer("fts_map", ["blank"], ["mapper('/tmp/Dict/map.txt')", "lowercase"])
+        embedded = parse_define_analyzer("DEFINE ANALYZER fts_map TOKENIZERS BLANK FILTERS MAPPER(/tmp/Dict/map.txt),LOWERCASE")
+        assert embedded.filters == ("mapper(/tmp/dict/map.txt)", "lowercase")
+        assert search.analyzer_matches(mapper, embedded)
+        quoted = parse_define_analyzer(
+            "DEFINE ANALYZER fts_map TOKENIZERS BLANK FILTERS MAPPER('/tmp/Dict/map.txt'), LOWERCASE"
+        )
+        assert search.analyzer_matches(mapper, quoted)
+        other = parse_define_analyzer("DEFINE ANALYZER fts_map TOKENIZERS BLANK FILTERS MAPPER(/tmp/other.txt),LOWERCASE")
+        assert not search.analyzer_matches(mapper, other)
+        assert not search.analyzer_matches(Analyzer("fts_map", ["blank"], ["mapper('/tmp/Dict/map.txt')"]), embedded)
+
+    def test_a_mapper_path_with_an_escape(self) -> None:
+        mapper = Analyzer("fts_map", ["blank"], ["mapper('C:\\\\Dict\\\\map.txt')"])
+        assert mapper.filters == ("mapper('C:\\\\Dict\\\\map.txt')",)
+        assert search.analyzer_matches(mapper, parse_define_analyzer(search.analyzer_definition(mapper)))
+        # A quoted path is compared decoded: the ORM's escaped quote equals a double-quoted one, and a path whose
+        # quotes are not one literal is compared without its outer pair.
+        quote = Analyzer("fts_map", ["blank"], ['mapper("dict/it\'s.txt")'])
+        assert quote.filters == ("mapper('dict/it\\'s.txt')",)
+        assert search.analyzer_matches(quote, AnalyzerState("fts_map", ("blank",), ('mapper("dict/it\'s.txt")',)))
+        assert search.analyzer_matches(quote, AnalyzerState("fts_map", ("blank",), ("mapper('dict/it's.txt')",)))
+        assert not search.analyzer_matches(quote, AnalyzerState("fts_map", ("blank",), ("mapper('dict/its.txt')",)))
+
+    @pytest.mark.parametrize(("analyzer", "statement"), _analyzers(), ids=["a1", "a3", "a4", "a5", "a6"])
+    def test_never_parses_the_analyzers_own_statement(self, analyzer: Analyzer, statement: str) -> None:
+        """``parse_define_analyzer()`` reads no ``OVERWRITE`` clause and no final ``;``: ``analyzer_matches()`` reads
+        the definition without them, so it never raises for an analyzer the ORM renders."""
+        with pytest.raises(DefineParseError):
+            parse_define_analyzer(analyzer.ddl())
+        stored = parse_define_analyzer(search.analyzer_definition(analyzer))
+        assert search.analyzer_matches(analyzer, stored)
+
+    @pytest.mark.parametrize("rendering", [_INDEXES_3X, _INDEXES_2X], ids=["3x", "2x"])
+    def test_indexes_match_each_lines_rendering(self, rendering: dict[str, str]) -> None:
+        for name in ("fts_article_title", "fts_article_body", "fts_article_slug", "fts_article_head"):
+            index = _article_index(name)
+            assert search.index_matches(index, _columns(index), parse_define_index(rendering[name])), name
+        for name, index in _FTS_T_INDEXES.items():
+            assert search.index_matches(index, index.fields, parse_define_index(rendering[name])), name
+
+    @pytest.mark.parametrize("bm25", [None, True, (1.2, 0.75), (1.2000000001, 0.75)])
+    def test_the_default_bm25(self, bm25: Any) -> None:
+        """``bm25=None`` and ``True`` are SurrealDB's ``BM25(1.2,0.75)``, which every line renders."""
+        index = Index("fts_article_body", "body", search_analyzer="fts_english", bm25=bm25)
+        for rendering in (_INDEXES_3X, _INDEXES_2X):
+            assert search.index_matches(index, ["body"], parse_define_index(rendering["fts_article_body"]))
+        for stored in ("BM25", ""):
+            state = parse_define_index(
+                f"DEFINE INDEX fts_article_body ON fts_article FIELDS body FULLTEXT ANALYZER fts_english {stored}"
+            )
+            assert search.index_matches(index, ["body"], state), stored
+
+    @pytest.mark.parametrize("bm25", [(1.2, 0.7), (1.3, 0.75), (2, 1), (0, 0)])
+    def test_other_bm25_numbers(self, bm25: tuple[float, float]) -> None:
+        index = Index("fts_article_body", "body", search_analyzer="fts_english", bm25=bm25)
+        assert not search.index_matches(index, ["body"], parse_define_index(_INDEXES_3X["fts_article_body"]))
+
+    @pytest.mark.parametrize(
+        ("index", "columns"),
+        [
+            (_article_index("fts_article_title"), ["body"]),
+            (_article_index("fts_article_title"), ["title", "body"]),
+            (Index("fts_article_title", "title", search_analyzer="fts_other", bm25=True, highlights=True), ["title"]),
+            (Index("fts_article_title", "title", search_analyzer=FTS_ENGLISH, bm25=True), ["title"]),
+            (
+                Index("fts_article_title", "title", search_analyzer=FTS_ENGLISH, bm25=True, highlights=True, comment="c"),
+                ["title"],
+            ),
+            (Index("fts_article_title", "title"), ["title"]),
+        ],
+        ids=["field", "fields", "analyzer", "highlights", "comment", "plain"],
+    )
+    def test_an_index_that_differs(self, index: Index, columns: list[str]) -> None:
+        for rendering in (_INDEXES_3X, _INDEXES_2X):
+            assert not search.index_matches(index, columns, parse_define_index(rendering["fts_article_title"]))
+
+    def test_unique_and_comment(self) -> None:
+        stored = parse_define_index(_INDEXES_3X["fts_article_slug"])
+        assert search.index_matches(Index("fts_article_slug", "slug", unique=True, comment="it's unique"), ["slug"], stored)
+        assert not search.index_matches(Index("fts_article_slug", "slug", comment="it's unique"), ["slug"], stored)
+        assert not search.index_matches(Index("fts_article_slug", "slug", unique=True), ["slug"], stored)
+        assert not search.index_matches(Index("fts_article_slug", "slug", unique=True, comment="its unique"), ["slug"], stored)
+        plain = parse_define_index('DEFINE INDEX fts_article_slug ON fts_article FIELDS slug COMMENT "it\'s unique"')
+        assert not search.index_matches(Index("fts_article_slug", "slug", unique=True, comment="it's unique"), ["slug"], plain)
+
+    def test_the_fields_in_order(self) -> None:
+        stored = parse_define_index(_INDEXES_3X["fts_ab"])
+        assert search.index_matches(Index("fts_ab", ["a", "b.c"]), ["a", "b.c"], stored)
+        assert not search.index_matches(Index("fts_ab", ["b.c", "a"]), ["b.c", "a"], stored)
+
+    @pytest.mark.parametrize("flag", ["hnsw", "mtree", "count"])
+    def test_a_vector_or_count_index_never_matches(self, flag: str) -> None:
+        index = Index("fts_ab", ["a", "b.c"])
+        assert search.index_matches(index, ["a", "b.c"], IndexState("fts_ab", ("a", "b.c")))
+        assert not search.index_matches(index, ["a", "b.c"], IndexState("fts_ab", ("a", "b.c"), **{flag: True}))
+
+    def test_no_index_stored(self) -> None:
+        assert not search.index_matches(_article_index("fts_article_title"), ["title"], None)
+
+
+# --- the reads (a fake client) --------------------------------------------------------------------------------------
+
+#: A record user's refusal, as the servers word it.
+_NOT_ENOUGH_PERMISSIONS = "IAM error: Not enough permissions to perform this action"
+
+
+class _InfoClient:
+    """A client answering every statement with *answer*, or raising *error*; it records each statement."""
+
+    def __init__(self, answer: object = None, *, error: BaseException | None = None) -> None:
+        self.answer = answer
+        self.error = error
+        self.queries: list[str] = []
+
+    async def query(self, statement: str, variables: object) -> object:
+        assert variables == {}
+        self.queries.append(statement)
+        if self.error is not None:
+            raise self.error
+        return self.answer
+
+
+def _db_answer(analyzers: object, tables: object) -> dict[str, object]:
+    """``INFO FOR DB``'s answer holding *analyzers* and *tables*."""
+    return {"accesses": {}, "analyzers": analyzers, "functions": {}, "params": {}, "tables": tables, "users": {}}
+
+
+def _table_answer(indexes: object) -> dict[str, object]:
+    """``INFO FOR TABLE``'s answer holding *indexes*."""
+    return {"events": {}, "fields": {}, "indexes": indexes, "lives": {}, "tables": {}}
+
+
+_REFUSALS = [
+    (InternalError("Internal", _NOT_ENOUGH_PERMISSIONS), SurrealDbAuthenticationError),
+    (NotAllowedError("NotAllowed", _NOT_ENOUGH_PERMISSIONS), SurrealDbAuthenticationError),
+    (InternalError("Internal", "There was a problem with the database"), SurrealDbError),
+    (RuntimeError("the engine is closed"), SurrealDbError),
+]
+_REFUSAL_IDS = ["permissions-internal", "permissions-not-allowed", "internal", "runtime"]
+
+
+class TestReads:
+    """``read_database_info()`` and ``read_table_indexes()``: one ``INFO`` each, the definitions parsed and keyed by
+    name, ``None`` for one the parser cannot read; a refused read raises the DDL's refusal, naming its subject."""
+
+    @pytest.mark.parametrize("rendering", [_ANALYZERS_3X, _ANALYZERS_2X], ids=["3x", "2x"])
+    async def test_the_database_info(self, rendering: dict[str, str]) -> None:
+        client = _InfoClient(_db_answer(rendering, {"fts_t": "DEFINE TABLE fts_t", "fts_article": "DEFINE TABLE fts_article"}))
+        analyzers, tables = await search.read_database_info(client, what="index", kind="definition", subject="table 'fts_t'")
+        assert analyzers == {name: parse_define_analyzer(statement) for name, statement in rendering.items()}
+        assert tables == ("fts_article", "fts_t")
+        assert client.queries == ["INFO FOR DB;"]
+
+    async def test_an_unreadable_analyzer_is_none_under_its_name(self) -> None:
+        stored = {"fts_english": _ANALYZERS_3X["fts_english"], "fts_bad": "DEFINE ANALYZER fts_bad FILTERS", "fts_odd": 3}
+        client = _InfoClient(_db_answer(stored, {}))
+        analyzers, tables = await search.read_database_info(client, what="index", kind="definition", subject="table 'fts_t'")
+        assert analyzers == {
+            "fts_english": parse_define_analyzer(_ANALYZERS_3X["fts_english"]),
+            "fts_bad": None,
+            "fts_odd": None,
+        }
+        assert tables == ()
+
+    @pytest.mark.parametrize(
+        "answer",
+        [_db_answer({}, {}), _db_answer(None, None), _db_answer([], []), {"functions": {}}, [], None],
+        ids=["empty", "none", "lists", "no-sections", "a-list", "nothing"],
+    )
+    async def test_no_analyzer_and_no_table(self, answer: object) -> None:
+        client = _InfoClient(answer)
+        assert await search.read_database_info(client, what="index", kind="definition", subject="table 'fts_t'") == ({}, ())
+
+    @pytest.mark.parametrize("rendering", [_INDEXES_3X, _INDEXES_2X], ids=["3x", "2x"])
+    async def test_the_table_indexes(self, rendering: dict[str, str]) -> None:
+        client = _InfoClient(_table_answer(rendering))
+        indexes = await search.read_table_indexes(client, "fts_t", what="index", kind="definition")
+        assert indexes == {name: parse_define_index(statement) for name, statement in rendering.items()}
+        assert client.queries == ["INFO FOR TABLE `fts_t`;"]
+
+    async def test_an_unreadable_index_is_none_under_its_name(self) -> None:
+        stored = {
+            "fts_ab": _INDEXES_3X["fts_ab"],
+            "fts_bad": "DEFINE INDEX fts_bad ON fts_t",
+            "fts_odd": None,
+        }
+        indexes = await search.read_table_indexes(_InfoClient(_table_answer(stored)), "fts_t", what="index", kind="definition")
+        assert indexes == {"fts_ab": parse_define_index(_INDEXES_3X["fts_ab"]), "fts_bad": None, "fts_odd": None}
+
+    @pytest.mark.parametrize(
+        "answer",
+        [_table_answer({}), _table_answer(None), {"fields": {}}, [], None],
+        ids=["empty", "none", "no-section", "a-list", "nothing"],
+    )
+    async def test_no_index(self, answer: object) -> None:
+        assert await search.read_table_indexes(_InfoClient(answer), "fts_t", what="index", kind="definition") == {}
+
+    @pytest.mark.parametrize(("error", "refusal"), _REFUSALS, ids=_REFUSAL_IDS)
+    async def test_a_refused_database_info(self, error: BaseException, refusal: type[SurrealDbError]) -> None:
+        client = _InfoClient(error=error)
+        with pytest.raises(SurrealDbError) as raised:
+            await search.read_database_info(client, what="analyzer", kind="removal", subject="'fts_english'")
+        assert type(raised.value) is refusal
+        assert str(raised.value) == f"Can't apply analyzer removal: 'fts_english' -> {error}"
+        assert raised.value.__cause__ is error
+        assert client.queries == ["INFO FOR DB;"]
+
+    @pytest.mark.parametrize(("error", "refusal"), _REFUSALS, ids=_REFUSAL_IDS)
+    async def test_a_refused_table_read(self, error: BaseException, refusal: type[SurrealDbError]) -> None:
+        client = _InfoClient(error=error)
+        with pytest.raises(SurrealDbError) as raised:
+            await search.read_table_indexes(client, "fts_t", what="index", kind="rebuild")
+        assert type(raised.value) is refusal
+        assert str(raised.value) == f"Can't apply index rebuild: table 'fts_t' -> {error}"
+        assert raised.value.__cause__ is error
+        assert client.queries == ["INFO FOR TABLE `fts_t`;"]
+
+    @pytest.mark.parametrize(("table", "error"), [("a-b", ValueError), (3, TypeError)], ids=repr)
+    async def test_the_table_name_is_checked(self, table: Any, error: type[Exception]) -> None:
+        client = _InfoClient(_table_answer({}))
+        with pytest.raises(error):
+            await search.read_table_indexes(client, table, what="index", kind="definition")
+        assert client.queries == []
+
+
+# === E2E: the connection "fts" on the database fts_db, over WebSocket and HTTP, and mem:// =========================
+
+#: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
+_KINDS = ["ws", "http", "mem"]
+
+#: The reset before each E2E test, in one query.
+_FTS_RESET = "REMOVE DATABASE IF EXISTS fts_db; DEFINE DATABASE fts_db;"
+
+#: The function A3's analyzer applies.
+_FN_LOW = "DEFINE FUNCTION fn::fts_low($s: string) { RETURN string::lowercase($s); };"
+
+
+def _url(kind: str) -> str:
+    """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
+    if kind == "mem":
+        return "mem://"
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def _register_fts(kind: str) -> None:
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection("fts", url="mem://", namespace="ns", database="fts_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            "fts", url=_url(kind), user="root", password="root", namespace="ns", database="fts_db"
+        )
+
+
+async def _apply_ddl(client: Any, ddl: str) -> None:
+    """Run *ddl* and check every statement: ``query()`` checks only the first one."""
+    response = await client.query_raw(ddl, {})
+    assert "error" not in response, response["error"]
+    refused = [result for result in response["result"] if result["status"] != "OK"]
+    assert response["result"] and not refused, refused
+
+
+async def _refusal(client: Any, query: str) -> str | None:
+    """Run *query* raw: ``None`` when SurrealDB accepts every statement, else the first refusal's text (a parse error
+    refuses the whole query; the embedded engine raises it)."""
+    try:
+        response = await client.query_raw(query, {})
+    except RuntimeError as error:
+        return str(error)
+    if "error" in response:
+        return str(response["error"])
+    refused = [str(result["result"]) for result in response["result"] if result["status"] != "OK"]
+    return refused[0] if refused else None
+
+
+@contextlib.asynccontextmanager
+async def _fts(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"fts"`` on *kind*, its database ``fts_db`` reset in one query; removed, then unregistered, on
+    exit."""
+    _register_fts(kind)
+    client = await SurrealDBConnectionManager.get_client("fts")
+    await _apply_ddl(client, _FTS_RESET)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("fts")
+            await cleanup.query("REMOVE DATABASE IF EXISTS fts_db;", {})
+        await SurrealDBConnectionManager.remove_connection("fts")
+
+
+async def _line(client: Any) -> tuple[int, int]:
+    """``(major, minor)`` of the engine *client* talks to: ``"surrealdb-3.1.5"`` → ``(3, 1)``; ``mem://`` →
+    ``(2, 0)`` (the SDK's version, whose core is 2.x)."""
+    match = re.search(r"(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _major(client: Any) -> int:
+    """The major version of the engine *client* talks to: ``"surrealdb-3.3.4"`` → 3; ``mem://`` → 2."""
+    return (await _line(client))[0]
+
+
+async def _keyword_line(client: Any) -> Literal[2, 3]:
+    """The ``line=`` of the renderers for the engine *client* talks to: 3 from SurrealDB 3.x on, else 2."""
+    return 3 if await _major(client) >= 3 else 2
+
+
+class TestGoldensE2E:
+    """Every golden statement applied on every engine with the line's keyword (SurrealDB 3.x ``FULLTEXT``, 2.x and the
+    embedded engine ``SEARCH``): accepted, matched by what ``INFO`` returns, and read by the introspector as
+    declared."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_goldens_are_applied_and_match(self, kind: str) -> None:
+        async with _fts(kind) as client:
+            line = await _keyword_line(client)
+            article = FtsArticle.index_ddl(line=line)
+            assert article == (_I1 if line == 3 else _I2)
+            i5 = _FTS_T_INDEXES["fts_k"]
+            statements = [
+                _A1,
+                _FN_LOW,
+                _A3,
+                _A4,
+                _A5,
+                *article,
+                _I4,
+                i5.ddl("fts_t", line=line),
+                _FTS_T_INDEXES["fts_k2"].ddl("fts_t", line=line),
+            ]
+            if line == 2:
+                assert i5.ddl("fts_t", line=line) == _I5
+            for statement in statements:
+                await _apply_ddl(client, statement)
+            analyzers, tables = await search.read_database_info(
+                client, what="index", kind="definition", subject="table 'fts_article'"
+            )
+            article_indexes = await search.read_table_indexes(client, "fts_article", what="index", kind="definition")
+            other_indexes = await search.read_table_indexes(client, "fts_t", what="index", kind="definition")
+        assert sorted(analyzers) == ["fts_empty", "fts_english", "fts_fn", "fts_grams"]
+        for analyzer in _golden_analyzers():
+            assert search.analyzer_matches(analyzer, analyzers[analyzer.name]), analyzer.name
+        assert tables == ("fts_article", "fts_t")
+        assert sorted(article_indexes) == sorted(_ARTICLE_INDEXES)
+        for index in FtsArticle.get_indexes():
+            assert search.index_matches(index, _columns(index), article_indexes[index.name]), index.name
+        assert sorted(other_indexes) == sorted(_FTS_T_INDEXES)
+        for name, index in _FTS_T_INDEXES.items():
+            assert search.index_matches(index, index.fields, other_indexes[name]), name
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_introspector_reads_them_as_declared(self, kind: str) -> None:
+        async with _fts(kind) as client:
+            for statement in FtsArticle.index_ddl(line=await _keyword_line(client)):
+                await _apply_ddl(client, statement)
+            schema = await DatabaseIntrospector("fts", tables=["fts_article"]).introspect()
+        assert schema.issues == ()
+        assert dataclasses.replace(schema.analyzers["fts_english"], raw="") == AnalyzerState(
+            "fts_english", ("class", "blank"), ("lowercase", "ascii", "snowball(english)"), comment="English text"
+        )
+        indexes = schema.tables["fts_article"].indexes
+        assert sorted(indexes) == sorted(_ARTICLE_INDEXES)
+        title = indexes["fts_article_title"]
+        assert (title.fields, title.search_analyzer, title.bm25, title.highlights) == (
+            ("title",),
+            "fts_english",
+            (1.2, 0.75),
+            True,
+        )
+        body = indexes["fts_article_body"]
+        assert (body.search_analyzer, body.bm25, body.highlights) == ("fts_english", (1.2, 0.75), False)
+        head = indexes["fts_article_head"]
+        assert (head.fields, head.search_analyzer, head.bm25, head.highlights) == (
+            ("meta.headline",),
+            "fts_english",
+            (1.2, 0.75),
+            False,
+        )
+        assert indexes["fts_article_heading"].fields == ("head_text",)
+        assert indexes["fts_article_tags"].highlights is True
+        slug = indexes["fts_article_slug"]
+        assert (slug.unique, slug.comment, slug.search_analyzer, slug.bm25) == (True, "it's unique", None, None)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_each_line_refuses_the_others_keyword(self, kind: str) -> None:
+        """README row "Full-text index": SurrealDB 3.x writes a full-text index ``FULLTEXT`` and refuses ``SEARCH``;
+        2.x and the embedded engine write it ``SEARCH`` and refuse ``FULLTEXT`` — a parse error."""
+        async with _fts(kind) as client:
+            line = await _keyword_line(client)
+            other: Literal[2, 3] = 2 if line == 3 else 3
+            await _apply_ddl(client, _A1)
+            index = Index("fts_k", "k", search_analyzer="fts_english")
+            refused = await _refusal(client, index.ddl("fts_t", line=other))
+            accepted = await _refusal(client, index.ddl("fts_t", line=line))
+        assert refused is not None and "Parse error" in refused, (
+            f"README row 'Full-text index': SurrealDB {line}.x refuses the {search.fulltext_keyword(other)} keyword"
+        )
+        assert accepted is None, f"README row 'Full-text index': SurrealDB {line}.x takes {search.fulltext_keyword(line)}"
+
+    async def test_the_embedded_engine_takes_search(self) -> None:
+        """The keyword tripwire: an SDK whose embedded core changes line must change the keyword dispatch. The
+        embedded engine reports the SDK's version (major 2, its core's line) and takes ``SEARCH``, refusing
+        ``FULLTEXT``; the ORM writes the keyword of the major version the engine reports."""
+        async with _fts("mem") as client:
+            major = await _major(client)
+            await _apply_ddl(client, _A1)
+            index = Index("fts_k", "k", search_analyzer="fts_english")
+            fulltext = await _refusal(client, index.ddl("fts_t", line=3))
+            keyword = await _refusal(client, index.ddl("fts_t", line=2))
+        assert major == 2, "the embedded engine's major version changed: check the full-text keyword it takes"
+        assert fulltext is not None and "Parse error" in fulltext, "the embedded engine now takes FULLTEXT"
+        assert keyword is None, "the embedded engine now refuses SEARCH"
+
+
+#: A record access on ``fts_db``: a user signed up through it is a record user, who may not read the schema.
+_FTS_ACCESS = (
+    "DEFINE ACCESS fts_acc ON DATABASE TYPE RECORD SIGNUP (CREATE fts_user SET name = $name) "
+    "SIGNIN (SELECT * FROM fts_user WHERE name = $name);"
+)
+
+
+class TestReadsE2E:
+    """``read_table_indexes()`` and ``read_database_info()`` on every engine: a missing table has no index, a
+    definition the parser cannot read is ``None`` under its name, and a record user's read is refused with
+    ``SurrealDbAuthenticationError``."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_missing_table_and_an_empty_database(self, kind: str) -> None:
+        async with _fts(kind) as client:
+            indexes = await search.read_table_indexes(client, "fts_missing", what="index", kind="definition")
+            info = await search.read_database_info(client, what="index", kind="definition", subject="table 'fts_missing'")
+        assert indexes == {}
+        assert info == ({}, ())
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_unreadable_definition_is_none_under_its_name(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts(kind) as client:
+            for statement in FtsArticle.index_ddl(line=await _keyword_line(client)):
+                await _apply_ddl(client, statement)
+            real = client.query
+            sent: list[str] = []
+
+            async def answering(statement: str, variables: Any) -> Any:
+                sent.append(statement)
+                answer = await real(statement, variables)
+                if statement.startswith("INFO FOR TABLE "):
+                    answer = {**answer, "indexes": {**answer["indexes"], "fts_article_title": "DEFINE INDEX fts_article_title"}}
+                elif statement == "INFO FOR DB;":
+                    answer = {**answer, "analyzers": {"fts_english": "DEFINE ANALYZER fts_english FILTERS"}}
+                return answer
+
+            monkeypatch.setattr(client, "query", answering)
+            indexes = await search.read_table_indexes(client, "fts_article", what="index", kind="definition")
+            analyzers, tables = await search.read_database_info(
+                client, what="index", kind="definition", subject="table 'fts_article'"
+            )
+            monkeypatch.undo()
+        assert sent == ["INFO FOR TABLE `fts_article`;", "INFO FOR DB;"]
+        assert sorted(indexes) == sorted(_ARTICLE_INDEXES)
+        assert indexes["fts_article_title"] is None
+        body = _article_index("fts_article_body")
+        assert search.index_matches(body, _columns(body), indexes["fts_article_body"])
+        assert analyzers == {"fts_english": None}
+        assert tables == ("fts_article",)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_record_user_may_not_read(self, kind: str) -> None:
+        if kind == "mem":
+            pytest.skip("the embedded engine's session is its owner: it may always read")
+        async with _fts(kind) as client, SurrealDBConnectionManager.using("fts"):
+            await _apply_ddl(client, _FTS_ACCESS)
+            await SurrealDBConnectionManager.signup(access="fts_acc", variables={"name": "fts-user"})
+            try:
+                with pytest.raises(SurrealDbError) as table_read:
+                    await search.read_table_indexes(client, "fts_article", what="index", kind="definition")
+                with pytest.raises(SurrealDbError) as database_read:
+                    await search.read_database_info(client, what="analyzer", kind="definition", subject="'fts_english'")
+            finally:
+                await SurrealDBConnectionManager.invalidate()
+        assert type(table_read.value) is SurrealDbAuthenticationError
+        assert str(table_read.value).startswith("Can't apply index definition: table 'fts_article' -> ")
+        assert "not enough permissions" in str(table_read.value).lower()
+        assert type(database_read.value) is SurrealDbAuthenticationError
+        assert str(database_read.value).startswith("Can't apply analyzer definition: 'fts_english' -> ")
+        assert "not enough permissions" in str(database_read.value).lower()

@@ -29,6 +29,14 @@ A model declares its indexes with ``SurrealConfigDict(indexes=[Index(...)])``: `
 key at the ``class`` statement, ``declared_analyzers()`` lists the analyzers the indexes hold as ``Analyzer`` objects
 and ``model_index_statements()`` renders what ``index_ddl()`` returns.
 
+**What the database stores.** ``read_database_info()`` sends ``INFO FOR DB`` once and returns the stored analyzers,
+each read by ``parse_define_analyzer()``, and the table names; ``read_table_indexes()`` sends ``INFO FOR TABLE`` once
+and returns a table's indexes, each read by ``parse_define_index()``. A definition the parser cannot read is ``None``
+under its name, so the caller redefines it rather than trusting it. ``analyzer_matches()`` and ``index_matches()``
+compare a declaration with a stored definition, pure, attribute by attribute, whichever line rendered it (3.x's
+``LOWERCASE, ASCII`` or 2.x's ``LOWERCASE,ASCII``, 2.x's tuning options, ``BM25(1.2,0.75)`` for ``BM25`` and for no
+clause), so an unchanged index or analyzer is never redefined — which would rebuild the index.
+
 The module sits low in the package: it imports neither ``model_base``, ``query_set`` nor ``connection_manager``, so
 each of them can import it.
 """
@@ -38,13 +46,16 @@ import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from numbers import Real
-from typing import Literal
+from typing import Any, Literal
 
-from .define_parser import DefineParseError, unquote
+from ._sdk import ServerError
+from .define_parser import DefineParseError, parse_define_analyzer, parse_define_index, unquote
+from .exceptions import SurrealDbError
 from .functions import normalize_function_name
 from .schema import _comment_text, _identifier_name, _missing_clause, _overwrite_clause
+from .schema_state import AnalyzerState, IndexState
 from .surql_literal import _identifier, _quoted
-from .utils import VALID_FIELD_PATTERN
+from .utils import VALID_FIELD_PATTERN, _ddl_refusal_class
 
 __all__ = ["SearchScore", "SearchHighlight", "SearchOffsets", "Analyzer", "Index"]
 
@@ -743,3 +754,164 @@ def model_index_statements(
         for index in indexes
     )
     return statements
+
+
+# --- the comparison with the stored definitions ---------------------------------------------------------------------
+
+#: SurrealDB's BM25 parameters ``(k1, b)`` for ``BM25`` and for a full-text index without the clause.
+DEFAULT_BM25 = (1.2, 0.75)
+
+#: The relative tolerance of a BM25 parameter read back (``1e-05`` is rendered ``0.00001``).
+_BM25_TOLERANCE = 1e-6
+
+
+def _filter_key(item: str) -> str:
+    """A filter of a parsed analyzer as :func:`analyzer_matches` compares it.
+
+    A ``mapper(…)`` filter by its path, case-folded, without one pair of surrounding quotes — a quoted path decoded
+    (``unquote()``), since the embedded engine renders the path bare (``MAPPER(/tmp/Dict/map.txt)``), which
+    ``parse_define_analyzer()`` reads lower-cased, while the ORM writes it quoted. Any other filter as the parser
+    normalised it (``snowball(english)``, ``ngram(1,3)``).
+    """
+    if not (item.startswith("mapper(") and item.endswith(")")):
+        return item
+    path = item[len("mapper(") : -1]
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "'\"":
+        try:
+            path = unquote(path)
+        except DefineParseError:
+            path = path[1:-1]
+    return f"mapper({path.casefold()})"
+
+
+def analyzer_matches(analyzer: Analyzer, state: AnalyzerState | None) -> bool:
+    """Whether the stored analyzer *state* (``INFO FOR DB``'s, read by ``parse_define_analyzer()``) is *analyzer*'s
+    definition — pure.
+
+    ``False`` when nothing is stored (``None``: missing or unreadable). Otherwise *analyzer* is read back by the same
+    parser from :func:`analyzer_definition` — never from ``analyzer.ddl()``, whose ``OVERWRITE`` clause and final
+    ``;`` the parser does not read — and compared attribute by attribute: tokenizers, function and comment equal, the
+    filters equal one by one in order (a ``mapper()`` path without its quotes and case, :func:`_filter_key`). Both
+    lines' renderings compare alike (3.x's ``LOWERCASE, ASCII``, 2.x's ``LOWERCASE,ASCII``).
+    """
+    if state is None:
+        return False
+    mine = parse_define_analyzer(analyzer_definition(analyzer))
+    return (
+        tuple(mine.tokenizers) == tuple(state.tokenizers)
+        and mine.function == state.function
+        and mine.comment == state.comment
+        and [_filter_key(item) for item in mine.filters] == [_filter_key(item) for item in state.filters]
+    )
+
+
+def _bm25_pair(value: object) -> tuple[float, float]:
+    """BM25's ``(k1, b)`` of a full-text index: a pair as given, :data:`DEFAULT_BM25` for ``True`` (``BM25``) and for
+    ``None`` (no clause)."""
+    if isinstance(value, tuple) and len(value) == 2:
+        return float(value[0]), float(value[1])
+    return DEFAULT_BM25
+
+
+def index_matches(index: Index, columns: Sequence[str], state: IndexState | None) -> bool:
+    """Whether the stored index *state* (``INFO FOR TABLE``'s, read by ``parse_define_index()``) is *index*'s
+    definition over *columns* — its fields as the table's columns (``index_ddl()``'s translation) — pure.
+
+    ``False`` when nothing is stored (``None``: missing or unreadable) and for a vector (``HNSW``, ``MTREE``) or
+    ``COUNT`` index. Otherwise compared attribute by attribute: the fields in order, ``UNIQUE``, the analyzer, for a
+    full-text index BM25's ``k1`` and ``b`` (``None`` and ``True`` read as ``BM25(1.2,0.75)``, which every line
+    renders, each number within a relative ``1e-6``: ``1e-05`` reads back ``0.00001``) and ``HIGHLIGHTS``, and the
+    comment. 2.x's tuning options are not compared: the ORM never writes them.
+    """
+    if state is None or state.hnsw or state.mtree or state.count:
+        return False
+    if tuple(columns) != tuple(state.fields) or index.unique is not state.unique:
+        return False
+    if index.analyzer_name != state.search_analyzer or index.highlights is not state.highlights:
+        return False
+    if index.comment != state.comment:
+        return False
+    if index.analyzer_name is None:
+        return True
+    declared, stored = _bm25_pair(index.bm25), _bm25_pair(state.bm25)
+    return all(math.isclose(mine, theirs, rel_tol=_BM25_TOLERANCE) for mine, theirs in zip(declared, stored, strict=True))
+
+
+# --- the reads ------------------------------------------------------------------------------------------------------
+
+#: The read of the database's analyzers and tables.
+_INFO_FOR_DB = "INFO FOR DB;"
+
+
+def _read_refused(statement: str, error: BaseException, *, what: str, kind: str, subject: str) -> SurrealDbError:
+    """The refusal of a read (*statement*) a DDL of *what* needs: the text of a refused DDL, ``Can't apply {what}
+    {kind}: {subject} -> <the server's message>`` — ``SurrealDbAuthenticationError`` when the session may not read
+    (a record user), ``SurrealDbError`` otherwise, as ``schema._guard_read_refused()`` does."""
+    refusal = _ddl_refusal_class(statement, error)
+    return refusal(f"Can't apply {what} {kind}: {subject} -> {error}")
+
+
+def _parsed(definition: object, parse: Callable[[str], Any]) -> Any:
+    """*definition* read by *parse*, or ``None`` when it is not a ``str`` or the parser cannot read it."""
+    if not isinstance(definition, str):
+        return None
+    try:
+        return parse(definition)
+    except DefineParseError:
+        return None
+
+
+async def read_database_info(
+    client: Any, *, what: str, kind: str, subject: str
+) -> tuple[dict[str, AnalyzerState | None], tuple[str, ...]]:
+    """The analyzers and the table names of *client*'s database, read once with ``INFO FOR DB;``.
+
+    The analyzers by name (``INFO FOR DB``'s key), each read by ``parse_define_analyzer()`` — ``None`` for a
+    definition the parser cannot read, or that is not a ``str``, so the caller redefines it rather than trusting it —
+    and the table names, sorted. ``({}, ())`` when the answer holds neither. The read is on *client* outside any
+    transaction (committed state).
+
+    :param what: what the read is for, for the message of a refusal (``"index"``, ``"analyzer"``).
+    :param kind: ``"definition"``, ``"removal"`` or ``"rebuild"``, likewise.
+    :param subject: what is applied, likewise, already quoted (``"'english'"``, ``"table 'post'"``).
+    :raises SurrealDbAuthenticationError: the session may not read the database's definitions (a record user).
+    :raises SurrealDbError: any other refusal of the ``INFO``.
+    """
+    try:
+        info = await client.query(_INFO_FOR_DB, {})
+    except (ServerError, SurrealDbError, RuntimeError) as error:
+        raise _read_refused(_INFO_FOR_DB, error, what=what, kind=kind, subject=subject) from error
+    analyzers = info.get("analyzers") if isinstance(info, dict) else None
+    tables = info.get("tables") if isinstance(info, dict) else None
+    stored: dict[str, AnalyzerState | None] = {}
+    if isinstance(analyzers, dict):
+        stored = {name: _parsed(definition, parse_define_analyzer) for name, definition in analyzers.items()}
+    names = tuple(sorted(name for name in tables if isinstance(name, str))) if isinstance(tables, dict) else ()
+    return stored, names
+
+
+async def read_table_indexes(client: Any, table: str, *, what: str, kind: str) -> dict[str, IndexState | None]:
+    """The indexes of *table*, read once with ``INFO FOR TABLE `<table>`;``, by name.
+
+    Each definition is read by ``parse_define_index()`` under its ``INFO FOR TABLE`` key — ``None`` for one the
+    parser cannot read, or that is not a ``str``, so the caller redefines it rather than trusting it. ``{}`` for a
+    table without indexes, and for a missing one (SurrealDB answers empty maps). *table* is checked as an identifier
+    and written in backticks; the read is on *client* outside any transaction (committed state).
+
+    :param what: what the read is for, for the message of a refusal (``"index"``, ``"analyzer"``), which names
+        ``table '<table>'``.
+    :param kind: ``"definition"``, ``"removal"`` or ``"rebuild"``, likewise.
+    :raises TypeError: *table* is not a ``str``.
+    :raises ValueError: *table* is not an identifier.
+    :raises SurrealDbAuthenticationError: the session may not read the table's definitions (a record user).
+    :raises SurrealDbError: any other refusal of the ``INFO``.
+    """
+    statement = f"INFO FOR TABLE {_identifier(_identifier_name(table, what='Table'))};"
+    try:
+        info = await client.query(statement, {})
+    except (ServerError, SurrealDbError, RuntimeError) as error:
+        raise _read_refused(statement, error, what=what, kind=kind, subject=f"table {table!r}") from error
+    indexes = info.get("indexes") if isinstance(info, dict) else None
+    if not isinstance(indexes, dict):
+        return {}
+    return {name: _parsed(definition, parse_define_index) for name, definition in indexes.items()}
