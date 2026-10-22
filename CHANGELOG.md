@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Notes
+
+- **Undeclared keys in list items on SurrealDB 3.x** (#301): the 0.34.1 entry below says 3.x
+  keeps a key a `SCHEMAFULL` table does not define "in the items of any list of objects,
+  `FLEXIBLE` or not". It keeps it only in the items of a list whose items define a field, such as
+  a list of sub-models `define_table()` writes, and in an object inside them that defines one. It
+  refuses it in the items of a list that defines no item field (an `array<object>` defined by hand
+  without `v.*.n`), at the top level and in a sub-model outside such a list. SurrealDB's
+  documentation of `FLEXIBLE` says every object of a `SCHEMAFULL` table, list items included,
+  accepts only the keys defined for it, so do not rely on 3.x keeping such a key. README section
+  35, the v0.7.0 and v0.34.0 rows of "ORM behaviour: SurrealDB 2.x vs 3.x" and the embedded
+  engine's "Model table DDL (v0.34.0)" row now state the exception. No ORM behaviour changes.
+
 ## [0.35.0] - 2026-10-22
 
 Full-text search: a queryset searches text with the full SurrealDB-ORM's `search()`, and scores and
