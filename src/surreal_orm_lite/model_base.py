@@ -1264,9 +1264,10 @@ class BaseSurrealModel(BaseModel):
         written records to the model's table — an ORM write (``save()``, ``objects(tx=…).bulk_create()``, …) or one
         noted on every table; a definition such as ``define_table(tx=…)`` does not count, nor does a raw ``tx.add()``,
         which the ORM does not track: SurrealDB servers do not index the records a transaction wrote before the index
-        was defined, which stay out of it after the commit (the embedded engine indexes them). The refusal does not
-        fail the transaction; call ``define_indexes()`` without *tx* first. With *tx* and the analyzers in place,
-        the index statements join the transaction — applied at once in an interactive one (WebSocket, SurrealDB 3.x),
+        was defined, which stay out of it after the commit — a server defect (surrealdb/surrealdb#7618 on 3.x, the
+        same on 2.x; the embedded engine indexes them). The refusal does not fail the transaction; call
+        ``define_indexes()`` without *tx* first. With *tx* and the analyzers in place, the index statements join the
+        transaction — applied at once in an interactive one (WebSocket, SurrealDB 3.x),
         at the commit in a buffered one (HTTP, SurrealDB 2.x, the embedded engine), where a refusal comes back as the
         transaction's own error; a block that raises applies nothing. On SurrealDB 2.x, a write to a table that held
         records, after its index in the same block, fails the commit with a retryable ``SurrealDbConflictError`` that a

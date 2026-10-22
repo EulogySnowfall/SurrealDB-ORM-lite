@@ -64,9 +64,10 @@ materialized view's table, which SurrealDB 3.x does not update with the records 
 supported: surrealdb/surrealdb#7377). With a transaction that already wrote records to the model's table (an ORM write,
 or one noted on every table), an index to define is refused before any DDL (issue #304), on both strategies, without
 failing the transaction; a definition (``define_table()``, ``define_relation()``), a write to another table and a call
-with nothing to apply are accepted. Pinned below that refusal (README section 36, Transactions): an index defined after
-a write in the same transaction leaves that record out on SurrealDB servers, a write after it fails a 2.x commit with a
-retryable conflict that a retry meets again, and the embedded engine indexes every record.
+with nothing to apply are accepted. Pinned below that refusal (README section 36, Transactions, and the v0.35.3 rows of
+both behaviour tables): an index defined after a write in the same transaction leaves that record out on SurrealDB
+servers (surrealdb/surrealdb#7618 on 3.x), a write after it fails a 2.x commit with a retryable conflict that a retry
+meets again, and the embedded engine indexes every record.
 
 A changed analyzer (``TestAnalyzerScan``, ``TestAnalyzerChangeE2E``, every engine): ``define_indexes()`` redefines it,
 then rebuilds every index of the database that uses it — the other tables' (one ``INFO FOR TABLE`` each, sorted by
@@ -2742,9 +2743,10 @@ _DI3 = (
 
 #: The assertion message of the pin of an index defined after a write in the same transaction, on SurrealDB 3.x.
 _TX_WRITE_PIN_3X = (
-    "README section 36, Transactions (issue #304): a SurrealDB 3.x server leaves out of an index the records the "
-    "transaction wrote before defining it. If this fails, the server changed: define_indexes(tx=…)'s refusal after a "
-    "write to the table, and the README sentence, can be reconsidered."
+    "README section 36, Transactions, and the v0.35.3 row of the 2.x/3.x table (issue #304): SurrealDB 3.x leaves out "
+    "of an index the records the transaction wrote before defining it (surrealdb/surrealdb#7618). If this fails, the "
+    "fix reached this line: define_indexes(tx=…)'s refusal after a write to the table, the README sentence and the "
+    "row can be reconsidered."
 )
 
 #: The assertion message of the materialized-view pin on SurrealDB 3.x.
@@ -4862,6 +4864,8 @@ _PART_NEEDLES_36 = {
         "`remove_analyzer(tx=…)`",
         "sees the transaction's writes",
         "do not index the records a transaction wrote before the index was defined",
+        "It is a server defect ([surrealdb/surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618) on 3.x, "
+        "the same on 2.x); only the embedded engine indexes them.",
         "already written records to the model's table",
         "The refusal does not fail the block.",
         "a raw `tx.add()` is not tracked",
@@ -4947,6 +4951,28 @@ _EMBEDDED_SEARCH_ROW = [
     "defined in the transaction that defines its analyzer sees it, which `define_indexes(tx=…)` refuses all the same",
     "3.x writes `FULLTEXT ANALYZER`, scores such a term `0.0`, keeps BM25 statistics exact and refuses that removal",
     "v0.35.0",
+]
+#: Issue #304: the sentence v0.35.3 adds to the 2.x/3.x table's intro, its row there and its row in the embedded
+#: engine's table, cell by cell — what ``test_an_index_defined_in_a_transaction_that_writes_to_its_table`` and the
+#: refusal tests pin.
+_HEADER_SENTENCE_353 = (
+    "The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
+    "identical on 3.1.5."
+)
+_TX_WRITE_ROW = [
+    "`define_indexes(tx=)` in a block that writes to the model's table (an ORM write before the index, a write after it)",
+    "a write before it: refused (left out of the index); a write after it, to a table holding records, fails the commit "
+    "with a retryable `SurrealDbConflictError`, again on retry",
+    "a write before it: refused (left out of the index, "
+    "[surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618)); a write after it is committed and indexed",
+    "v0.35.3",
+]
+_EMBEDDED_TX_WRITE_ROW = [
+    "`define_indexes(tx=)` in a block that writes to the model's table",
+    "an ORM write before it: refused all the same, although this engine indexes its records; a write after it is "
+    "committed and indexed",
+    "refused (left out of the index); on 2.x a write after it, to a table holding records, fails the commit",
+    "v0.35.3",
 ]
 _FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
 _ROADMAP_ROWS_36 = [
@@ -5072,6 +5098,13 @@ class TestReadmeSection36:
     def test_embedded_table_row(self) -> None:
         """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
         assert_embedded_rows([_EMBEDDED_SEARCH_ROW])
+
+    def test_transaction_write_rows(self) -> None:
+        """Issue #304: v0.35.3's one row in each behaviour table, cell by cell and in version order (the 3.x cell
+        links surrealdb/surrealdb#7618), and its sentence in the 2.x/3.x table's intro; widths kept."""
+        assert_server_rows([_TX_WRITE_ROW])
+        assert_server_header_sentence(_HEADER_SENTENCE_353)
+        assert_embedded_rows([_EMBEDDED_TX_WRITE_ROW])
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]
