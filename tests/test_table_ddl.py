@@ -145,7 +145,8 @@ a ``SCHEMAFULL`` table with its fields and the access's permissions, and signup 
 afterwards, or a second ``define_access()``, sends the carried statements and changes nothing; a view under the table is
 refused, naming ``define_access()``. SG1 is refused before any request — without it, 3.x refused the signup and 2.x
 dropped the excluded password —, while the same model with ``with_table=False`` over a table defined by hand, and an
-excluded password on a ``SCHEMALESS`` table, sign up and sign in.
+excluded password on a ``SCHEMALESS`` table, sign up and sign in. A model that declares no ``table_type`` gets ``TYPE
+ANY`` from ``define_access()`` and ``TYPE NORMAL`` from ``define_table()``, one declaring it the same type from both.
 
 The round trip (``TestRoundTripE2E``, every engine of both lines): ``generate_models_from_db()`` writes a table's
 clauses as keys, and each generated model's ``define_table()`` on a fresh database reads back the same table clauses
@@ -6678,6 +6679,25 @@ class TestAccessE2E:
         async with _tdl("ws") as client:
             assert await TdlAuthHiddenPlain.define_access() == [_A0, _A_ACCESS]
             await _signup_and_signin(TdlAuthHiddenPlain, client)
+
+    @pytest.mark.parametrize(
+        ("model", "types"),
+        [(TdlAuthPlain, ["any", "normal", "any"]), (TdlAuthHash, ["normal", "normal", "normal"])],
+        ids=["no-table-type", "table-type"],
+    )
+    async def test_the_table_type_between_define_access_and_define_table(
+        self, model: type[TdlAuthPlain], types: list[str]
+    ) -> None:
+        """README "User models": a model that declares no ``table_type`` gets no ``TYPE`` from ``define_access()``,
+        which SurrealDB stores as ``TYPE ANY``, and ``TYPE NORMAL`` from ``define_table()``, so calling both changes the
+        type each time; declaring ``table_type`` keeps one. The schema mode and the permissions stay the same."""
+        async with _tdl("ws") as client:
+            seen: list[tuple[str | None, str | None, Mapping[str, str] | None]] = []
+            for define in (model.define_access, model.define_table, model.define_access):
+                await define()
+                state = parse_define_table((await _tables(client))["tdl_user"])
+                seen.append((state.table_type, state.schema_mode, state.permissions))
+            assert seen == [(table_type, "SCHEMALESS", _A1_PERMISSIONS) for table_type in types]
 
 
 # === the generator writes the keys back: the round trip ==============================================================
