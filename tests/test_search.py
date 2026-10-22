@@ -4861,6 +4861,11 @@ _PART_NEEDLES_36 = {
         "`define_analyzer(tx=…)`",
         "`remove_analyzer(tx=…)`",
         "sees the transaction's writes",
+        "do not index the records a transaction wrote before the index was defined",
+        "already written records to the model's table",
+        "The refusal does not fail the block.",
+        "a raw `tx.add()` is not tracked",
+        "a retryable `SurrealDbConflictError` that a retry meets again",
     ),
     "Live queries": (
         "`live()` and `watch()` refuse `search()`",

@@ -5983,11 +5983,12 @@ SurrealDB keeps the tokens of the records an index holds when their analyzer cha
 misses them — the records written afterwards use the new analyzer — until the index is rebuilt. So when
 `define_indexes()`, or `SurrealDBConnectionManager.define_analyzer()`, redefines an analyzer, it rebuilds every index of
 the database that uses it (`REBUILD INDEX`, sorted by table then index; `define_indexes()` rebuilds the model's table's
-last), and logs one warning naming them (logger `surreal_orm_lite.search`). A rebuild re-reads the table: seconds
-per thousands of records on SurrealDB 2.x and the embedded engine. An analyzer belongs to the database, not to a table:
-declare one `Analyzer` per name (a module constant) and reference it from every index that uses it — two definitions
-under one name would redefine it in turn, each time rebuilding its indexes. An unchanged index is never redefined, so
-start-up never rebuilds (and, on SurrealDB 2.x, never inflates its scores).
+last), and logs one warning naming them, an index it redefines at the same time included (logger
+`surreal_orm_lite.search`). A rebuild re-reads the table: seconds per thousands of records on SurrealDB 2.x and the
+embedded engine. An analyzer belongs to the database, not to a table: declare one `Analyzer` per name (a module
+constant) and reference it from every index that uses it — two definitions under one name would redefine it in turn,
+each time rebuilding its indexes. An unchanged index is never redefined, so start-up never rebuilds (and, on SurrealDB
+2.x, never inflates its scores).
 
 ```python
 PLAIN = Analyzer("plain", ["blank"], ["ascii"])
@@ -6031,9 +6032,14 @@ print(await NoteV2.objects().search(text="physics").count())
   So `define_indexes(tx=…)` raises `SurrealDbError` before any DDL when an analyzer must be defined or redefined, and
   `define_analyzer(tx=…)` when a redefinition has indexes to rebuild (a new analyzer, or a redefinition no index uses,
   joins the transaction): call `define_analyzer()` without `tx=` first.
-- Prefer `define_indexes()` outside the block: in a transaction that also writes to the model's table, SurrealDB may
-  leave out of the index a record the block wrote before the index was defined, and may fail the block on a write
-  after it.
+- The block must not have written to the model's table yet: SurrealDB servers do not index the records a transaction
+  wrote before the index was defined, which stay out of it after the commit (only the embedded engine indexes them).
+  So `define_indexes(tx=…)` raises `SurrealDbError` before any DDL, naming the model and the table, when an index must
+  be defined or redefined and the block has already written records to the model's table with the ORM (`save()`,
+  `objects(tx=…).bulk_create()`, …). The refusal does not fail the block. `define_table(tx=…)`,
+  `define_relation(tx=…)` and a write to another table do not count; a raw `tx.add()` is not tracked.
+- Prefer `define_indexes()` outside the block: on SurrealDB 2.x, a write to a table that held records, after its index
+  in the same block, fails the commit with a retryable `SurrealDbConflictError` that a retry meets again.
 - `remove_analyzer(tx=…)` reads committed state to find the indexes that use the analyzer: an index queued earlier in
   a buffered block is not seen.
 - A search in an interactive transaction sees the transaction's writes; in a buffered one, a read raises, as every
