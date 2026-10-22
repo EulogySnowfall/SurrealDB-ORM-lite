@@ -2224,7 +2224,7 @@ class TestUncachedUnchanged:
 # --- AC-11, AC-12: every public coroutine is classified; every write is wrapped ------------------------------
 
 #: The 26 writes of spec §5.4, by the class that defines them (``vars(cls)``), and v0.32.0's ``define_view`` and
-#: ``remove_view``, and v0.34.0's ``define_table``.
+#: ``remove_view``, v0.34.0's ``define_table`` and v0.35.0's ``remove_index``.
 _INVALIDATING_WRITES: dict[type, frozenset[str]] = {
     BaseSurrealModel: frozenset(
         {
@@ -2248,6 +2248,7 @@ _INVALIDATING_WRITES: dict[type, frozenset[str]] = {
             "define_view",
             "remove_view",
             "define_table",
+            "remove_index",
         }
     ),
     BaseSurrealEdge: frozenset({"save"}),
@@ -2263,6 +2264,8 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
         "invalidating writes": _INVALIDATING_WRITES[BaseSurrealModel],
         "raw, refused or not cached": frozenset({"raw_query", "call_function", "refresh", "get_related", "traverse"}),
         "DDL that changes no row": frozenset({"define_events", "remove_event"}),
+        # v0.35.0: checks its transaction first, then runs the wrapped _define_indexes() (every cached read dropped).
+        "writes through wrapped helpers": frozenset({"define_indexes"}),
     },
     BaseSurrealEdge: {
         "invalidating writes": _INVALIDATING_WRITES[BaseSurrealEdge],
@@ -2311,6 +2314,7 @@ _CLASS_METHOD_WRITES = {
     (BaseSurrealModel, "define_view"),
     (BaseSurrealModel, "remove_view"),
     (BaseSurrealModel, "define_table"),
+    (BaseSurrealModel, "remove_index"),
     (AuthenticatedUserMixin, "define_access"),
     (AuthenticatedUserMixin, "signup"),
     (SurrealDBConnectionManager, "signup"),
@@ -2341,8 +2345,8 @@ class TestExhaustiveness:
         assert len(classified) == len(set(classified)), "a coroutine is in two classes"
         assert _public_coroutines(cls) == set(classified)
 
-    def test_the_29_writes_of_the_spec(self) -> None:
-        assert sum(len(names) for names in _INVALIDATING_WRITES.values()) == 29
+    def test_the_30_writes_of_the_spec(self) -> None:
+        assert sum(len(names) for names in _INVALIDATING_WRITES.values()) == 30
 
     @pytest.mark.parametrize("cls", list(_CLASSIFIED), ids=_ids(_CLASSIFIED))
     def test_every_invalidating_write_is_wrapped_and_nothing_else(self, cls: type) -> None:
@@ -2354,6 +2358,10 @@ class TestExhaustiveness:
     def test_save_naming_is_wrapped(self) -> None:
         """The create of ``get_or_create()``/``update_or_create()`` and of ``relate(EdgeModel, …)``."""
         assert BaseSurrealModel._save_naming.__surreal_cache_writes__ is True  # type: ignore[attr-defined]
+
+    def test_define_indexes_body_is_wrapped(self) -> None:
+        """v0.35.0: ``define_indexes()`` checks its transaction, then applies through the wrapped body."""
+        assert BaseSurrealModel._define_indexes.__surreal_cache_writes__ is True  # type: ignore[attr-defined]
 
     @pytest.mark.parametrize("cls", list(_INVALIDATING_WRITES), ids=_ids(_INVALIDATING_WRITES))
     def test_a_wrapped_write_keeps_its_signature_and_docs(self, cls: type) -> None:

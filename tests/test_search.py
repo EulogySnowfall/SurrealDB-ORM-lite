@@ -47,6 +47,21 @@ On every engine (``TestGoldensE2E``: SurrealDB 3.x and 2.x over WebSocket and HT
 golden statement is accepted with the line's keyword, what ``INFO`` returns matches its declaration, and the
 introspector reads the indexes and the analyzer as declared. Pinned (README row "Full-text index"): each line refuses
 the other's keyword; the embedded engine reports major version 2 and takes ``SEARCH`` — the keyword tripwire.
+
+Applying them (``TestDefineIndexesE2E``, ``TestRemoveIndexE2E``, every engine): ``define_indexes()`` reads ``INFO FOR
+DB``, the line (``client.version()``, when a full-text index is declared) and ``INFO FOR TABLE``, then applies only
+what changed — on a fresh database the analyzers and the indexes ``index_ddl()`` renders with the line's keyword, on an
+unchanged one nothing (``[]``, the reads alone sent), a changed or unreadable index redefined (``overwrite=False``
+keeps it), the indexes of a redefined analyzer rebuilt. An analyzer an index names by ``str`` must exist in the
+database or among the model's ``Analyzer`` objects, and ``define_indexes(tx=…)`` defines no analyzer: each refusal
+comes before any DDL. With a transaction the index statements join it (applied at the commit when buffered, at once
+when interactive, not at all when the block raises). ``remove_index()`` removes by name, ``missing_ok`` deciding
+whether a missing index is an error, and drops the model's cached reads; a transaction of another connection is refused
+before any request. Pinned: an analyzer and an index using it defined in one transaction, on a table holding records
+(README row "Full-text index"); the table ``DEFINE INDEX`` creates, which ``define_table(overwrite=False)`` keeps and
+``define_table()`` replaces (README section 36, the order of ``define_table()`` and ``define_indexes()``); an index on a
+materialized view's table, which SurrealDB 3.x does not update with the records the view gains (README section 36, Not
+supported: surrealdb/surrealdb#7377).
 """
 
 import ast
@@ -56,7 +71,7 @@ import math
 import os
 import pickle
 import re
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -68,10 +83,12 @@ import surreal_orm_lite
 from surreal_orm_lite import (
     Analyzer,
     AnalyzerState,
+    BaseSurrealEdge,
     BaseSurrealModel,
     DatabaseIntrospector,
     Index,
     IndexState,
+    QueryCache,
     SearchHighlight,
     SearchOffsets,
     SearchScore,
@@ -79,6 +96,7 @@ from surreal_orm_lite import (
     SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
     SurrealDbError,
+    SurrealDbNotFoundError,
     search,
 )
 from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyzer, parse_define_index
@@ -1352,6 +1370,98 @@ class TestReads:
         assert client.queries == []
 
 
+# --- what define_indexes() applies (pure) ---------------------------------------------------------------------------
+
+#: ``fts_english`` as SurrealDB 3.x stores it, parsed.
+_STORED_ENGLISH = parse_define_analyzer(_ANALYZERS_3X["fts_english"])
+
+#: Another definition of ``fts_english``.
+_PLAIN_ENGLISH = Analyzer("fts_english", ["blank"], ["ascii"])
+
+
+class TestPlans:
+    """The pure steps of ``define_indexes()``: the analyzers to define or redefine, the index definitions and rebuilds
+    a table needs, and the refusals before any DDL."""
+
+    def test_the_analyzers_to_define_and_to_redefine(self) -> None:
+        fts_fn, grams = _a3(), _a5()
+        stored = {
+            "fts_english": _STORED_ENGLISH,
+            "fts_fn": parse_define_analyzer(_ANALYZERS_3X["fts_english"]),
+            "fts_odd": None,
+        }
+        odd = Analyzer("fts_odd", ["blank"])
+        analyzers = [FTS_ENGLISH, fts_fn, grams, odd]
+        # fts_english equal, fts_fn different, fts_grams missing, fts_odd unreadable.
+        assert search.plan_analyzers(analyzers, stored, True) == ([grams], [fts_fn, odd])
+        assert search.plan_analyzers(analyzers, stored, False) == ([grams], [])
+        assert search.plan_analyzers([_PLAIN_ENGLISH], stored, True) == ([], [_PLAIN_ENGLISH])
+        assert search.plan_analyzers([], stored, True) == ([], [])
+
+    def test_the_index_definitions_and_rebuilds(self) -> None:
+        indexes = FtsArticle.get_indexes()
+        title, body, slug = indexes[0], indexes[1], indexes[2]
+        stored: dict[str, IndexState | None] = {
+            "fts_article_title": parse_define_index(
+                "DEFINE INDEX fts_article_title ON fts_article FIELDS title FULLTEXT ANALYZER fts_english BM25(1.2,0.75) HIGHLIGHTS"
+            ),
+            "fts_article_body": parse_define_index(
+                "DEFINE INDEX fts_article_body ON fts_article FIELDS body FULLTEXT ANALYZER fts_english BM25(2,1)"
+            ),
+            "fts_article_slug": None,
+        }
+        statements = dict(zip(_ARTICLE_INDEXES, _I1_INDEXES, strict=True))
+
+        def plan(overwrite: bool, redefined: set[str]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+            return search.plan_indexes(
+                [title, body, slug, indexes[3]],
+                "fts_article",
+                stored,
+                column=FtsArticle.to_db_field,
+                overwrite=overwrite,
+                keyword="FULLTEXT",
+                redefined=redefined,
+            )
+
+        # title equal, body different, slug unreadable, fts_article_head missing.
+        changed = [(name, statements[name]) for name in ("fts_article_body", "fts_article_slug", "fts_article_head")]
+        assert plan(True, set()) == (changed, [])
+        assert plan(True, {"fts_english"}) == (
+            changed,
+            [("fts_article_title", "REBUILD INDEX `fts_article_title` ON `fts_article`;")],
+        )
+        missing = statements["fts_article_head"].replace(" OVERWRITE ", " IF NOT EXISTS ")
+        assert plan(False, set()) == ([("fts_article_head", missing)], [])
+        assert plan(False, {"other"}) == ([("fts_article_head", missing)], [])
+
+    def test_an_analyzer_named_by_str(self) -> None:
+        index = Index("fts_x", "x", search_analyzer="fts_none")
+        with pytest.raises(SurrealDbError) as raised:
+            search.check_named_analyzers([_text("fts_t"), index], [FTS_ENGLISH], {}, table="fts_doc")
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == (
+            "Can't apply index definition: 'fts_x' on table 'fts_doc' -> the analyzer 'fts_none' does not exist; pass "
+            "search_analyzer=Analyzer(...) or define it with SurrealDBConnectionManager.define_analyzer() first."
+        )
+        named = Index("fts_y", "y", search_analyzer="fts_english")
+        # Stored (even unreadable), or one of the model's own Analyzer objects: it exists.
+        search.check_named_analyzers([named], [], {"fts_english": None}, table="fts_doc")
+        search.check_named_analyzers([named], [FTS_ENGLISH], {}, table="fts_doc")
+        search.check_named_analyzers([Index("fts_p", "p")], [], {}, table="fts_doc")
+
+    def test_the_texts(self) -> None:
+        assert search.transaction_analyzer_refused("FtsArticle", "fts_english") == (
+            "FtsArticle.define_indexes(tx=…) cannot define analyzer 'fts_english' in a transaction: SurrealDB builds an "
+            "index with the analyzers committed before the transaction began. Call "
+            "SurrealDBConnectionManager.define_analyzer() without tx= first, then define_indexes(tx=…)."
+        )
+        assert search.index_subject("fts_article_title", "fts_article") == "'fts_article_title' on table 'fts_article'"
+        assert search.checked_overwrite(True) is True
+        assert search.checked_overwrite(False) is False
+        assert _raised(TypeError, search.checked_overwrite, 1) == "overwrite= must be a bool, got int."
+        assert _raised(TypeError, search.checked_overwrite, None) == "overwrite= must be a bool, got NoneType."
+
+
 # === E2E: the connection "fts" on the database fts_db, over WebSocket and HTTP, and mem:// =========================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -1615,3 +1725,534 @@ class TestReadsE2E:
         assert type(database_read.value) is SurrealDbAuthenticationError
         assert str(database_read.value).startswith("Can't apply analyzer definition: 'fts_english' -> ")
         assert "not enough permissions" in str(database_read.value).lower()
+
+
+# --- define_indexes() and remove_index() on the engines -------------------------------------------------------------
+
+
+class FtsArticleV2(FtsArticle):
+    """``FtsArticle`` on the same table, ``fts_article_title`` redeclared without ``HIGHLIGHTS``."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_article",
+        indexes=[
+            Index("fts_article_title", "title", search_analyzer=FTS_ENGLISH, bm25=True),
+            *FtsArticle.get_indexes()[1:],
+        ],
+    )
+
+
+class FtsDoc(BaseSurrealModel):
+    """An index naming by ``str`` an analyzer neither the model nor the database defines."""
+
+    model_config = SurrealConfigDict(table_name="fts_doc", indexes=[Index("fts_x", "x", search_analyzer="fts_none")])
+
+    id: str | None = None
+    x: str = ""
+
+
+class FtsNamed(BaseSurrealModel):
+    """An index naming by ``str`` the analyzer ``fts_english``, which the model does not declare."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_named", indexes=[Index("fts_named_x", "x", search_analyzer="fts_english", bm25=True)]
+    )
+
+    id: str | None = None
+    x: str = ""
+
+
+class FtsCites(BaseSurrealEdge):
+    """An edge model with a full-text index."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_cites", indexes=[Index("fts_cites_note", "note", search_analyzer=FTS_ENGLISH)]
+    )
+
+    note: str = ""
+
+
+#: The reads ``define_indexes()`` sends, as the ORM writes them.
+_INFO_DB = "INFO FOR DB;"
+_INFO_ARTICLE = "INFO FOR TABLE `fts_article`;"
+
+_DI1 = (
+    "Can't apply index definition: 'fts_x' on table 'fts_doc' -> the analyzer 'fts_none' does not exist; pass "
+    "search_analyzer=Analyzer(...) or define it with SurrealDBConnectionManager.define_analyzer() first."
+)
+_DI2 = (
+    "FtsArticle.define_indexes(tx=…) cannot define analyzer 'fts_english' in a transaction: SurrealDB builds an index "
+    "with the analyzers committed before the transaction began. Call SurrealDBConnectionManager.define_analyzer() "
+    "without tx= first, then define_indexes(tx=…)."
+)
+
+#: The assertion message of the materialized-view pin on SurrealDB 3.x.
+_VIEW_PIN_3X = (
+    "README section 36, Not supported (_S36_VIEWS): SurrealDB 3.x does not index the records a view gains after the "
+    "index is defined (surrealdb/surrealdb#7377, fixed in SurrealDB 4.0). If this fails, the fix reached this line: "
+    "indexes= on view models can be reconsidered."
+)
+
+
+class _Rollback(Exception):
+    """Raised inside a ``transaction()`` block to roll it back."""
+
+
+@contextlib.asynccontextmanager
+async def _fts_models(kind: str) -> AsyncIterator[Any]:
+    """:func:`_fts`, the models routed to the connection ``"fts"`` for the block (``using("fts")``)."""
+    async with _fts(kind) as client, SurrealDBConnectionManager.using("fts"):
+        yield client
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
+    through) — v0.31.0's spy."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+def _calls(calls: list[tuple[str, tuple[object, ...]]]) -> list[tuple[str, object]]:
+    """What *calls* (:func:`_spy`'s) sent: each method with its first argument (``None`` for ``version()``)."""
+    return [(method, args[0] if args else None) for method, args in calls]
+
+
+def _query(statement: str) -> list[tuple[str, object]]:
+    """The calls of one ``client.query(statement, {})``: the SDK's ``query()`` sends it through ``query_raw()``."""
+    return [("query", statement), ("query_raw", statement)]
+
+
+#: The reads of ``FtsArticle.define_indexes()``: ``INFO FOR DB``, the line, ``INFO FOR TABLE``.
+_ARTICLE_READS = [*_query(_INFO_DB), ("version", None), *_query(_INFO_ARTICLE)]
+
+
+async def _tables(client: Any) -> dict[str, Any]:
+    """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
+    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+
+
+async def _indexes(client: Any, table: str = "fts_article") -> dict[str, IndexState | None]:
+    """The indexes of *table*, as ``read_table_indexes()`` reads them."""
+    return await search.read_table_indexes(client, table, what="index", kind="definition")
+
+
+async def _refusals(client: Any, query: str) -> list[str]:
+    """Run *query* raw: the text of every statement SurrealDB refused, ``[]`` when it accepts them all (a parse error
+    refuses the whole query; the embedded engine raises it)."""
+    try:
+        response = await client.query_raw(query, {})
+    except RuntimeError as error:
+        return [str(error)]
+    if "error" in response:
+        return [str(response["error"])]
+    return [str(result["result"]) for result in response["result"] if result["status"] != "OK"]
+
+
+def _register_other(kind: str) -> None:
+    """The connection ``"fts2"``, on the same database as ``"fts"``."""
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection("fts2", url="mem://", namespace="ns", database="fts_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            "fts2", url=_url(kind), user="root", password="root", namespace="ns", database="fts_db"
+        )
+
+
+class TestDefineIndexesE2E:
+    """``define_indexes()`` on every engine (SurrealDB 3.x and 2.x over WebSocket and HTTP, and the embedded engine):
+    it reads ``INFO FOR DB``, the line and ``INFO FOR TABLE``, then applies only what changed, with the line's keyword;
+    an analyzer an index names must exist, and a transaction defines no analyzer — both refused before any DDL."""
+
+    @pytest.mark.parametrize("overwrite", [True, False])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_fresh_database_then_nothing_changed(
+        self, kind: str, overwrite: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _fts_models(kind) as client:
+            expected = FtsArticle.index_ddl(overwrite=overwrite, line=await _keyword_line(client))
+            # fts_article_body names "fts_english" by str: one of the model's Analyzer objects defines it.
+            assert await FtsArticle.define_indexes(overwrite=overwrite) == expected
+            analyzers, tables = await search.read_database_info(
+                client, what="index", kind="definition", subject="table 'fts_article'"
+            )
+            indexes = await _indexes(client)
+            calls = _spy(monkeypatch, client)
+            assert await FtsArticle.define_indexes(overwrite=overwrite) == []
+            sent = _calls(calls)
+            monkeypatch.undo()
+        assert sent == _ARTICLE_READS
+        assert sorted(analyzers) == ["fts_english"]
+        assert search.analyzer_matches(FTS_ENGLISH, analyzers["fts_english"])
+        assert tables == ("fts_article",)
+        assert sorted(indexes) == sorted(_ARTICLE_INDEXES)
+        for index in FtsArticle.get_indexes():
+            assert search.index_matches(index, _columns(index), indexes[index.name]), index.name
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_only_a_changed_index_is_redefined(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            keyword = search.fulltext_keyword(await _keyword_line(client))
+            await FtsArticle.define_indexes()
+            changed = (
+                f"DEFINE INDEX OVERWRITE `fts_article_title` ON `fts_article` FIELDS `title` {keyword} ANALYZER "
+                "`fts_english` BM25;"
+            )
+            calls = _spy(monkeypatch, client)
+            assert await FtsArticleV2.define_indexes(overwrite=False) == []
+            kept = _calls(calls)
+            kept_title = (await _indexes(client))["fts_article_title"]
+            calls.clear()
+            assert await FtsArticleV2.define_indexes() == [changed]
+            sent = _calls(calls)
+            monkeypatch.undo()
+            title = (await _indexes(client))["fts_article_title"]
+            # The model wins again: FtsArticle redefines its own title index, nothing else.
+            assert await FtsArticle.define_indexes() == [FtsArticle.index_ddl(line=await _keyword_line(client))[1]]
+        assert kept == _ARTICLE_READS
+        assert kept_title is not None and kept_title.highlights is True
+        assert sent == [*_ARTICLE_READS, *_query(changed)]
+        assert title is not None and title.highlights is False
+        assert search.index_matches(FtsArticleV2.get_indexes()[0], ["title"], title)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_unreadable_stored_index_is_redefined(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            await FtsArticle.define_indexes()
+            real = client.query
+
+            async def answering(statement: str, variables: Any) -> Any:
+                answer = await real(statement, variables)
+                if statement == _INFO_ARTICLE:
+                    answer = {**answer, "indexes": {**answer["indexes"], "fts_article_title": "DEFINE INDEX fts_article_title"}}
+                return answer
+
+            monkeypatch.setattr(client, "query", answering)
+            applied = await FtsArticle.define_indexes()
+            monkeypatch.undo()
+            title = FtsArticle.index_ddl(line=await _keyword_line(client))[1]
+            indexes = await _indexes(client)
+        assert applied == [title]
+        assert sorted(indexes) == sorted(_ARTICLE_INDEXES)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_unreadable_stored_analyzer_is_redefined_and_its_indexes_rebuilt(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An analyzer redefined leaves the records indexed before with their old tokens: every index of the table that
+        uses it is rebuilt, after the index definitions, in declaration order."""
+        async with _fts_models(kind) as client:
+            await FtsArticle.define_indexes()
+            real = client.query
+
+            async def answering(statement: str, variables: Any) -> Any:
+                answer = await real(statement, variables)
+                if statement == _INFO_DB:
+                    answer = {**answer, "analyzers": {"fts_english": "DEFINE ANALYZER fts_english FILTERS"}}
+                return answer
+
+            monkeypatch.setattr(client, "query", answering)
+            applied = await FtsArticle.define_indexes()
+            monkeypatch.undo()
+            analyzers, _ = await search.read_database_info(
+                client, what="index", kind="definition", subject="table 'fts_article'"
+            )
+        rebuilt = [name for name in _ARTICLE_INDEXES if name != "fts_article_slug"]
+        assert applied == [_A1, *(f"REBUILD INDEX `{name}` ON `fts_article`;" for name in rebuilt)]
+        assert search.analyzer_matches(FTS_ENGLISH, analyzers["fts_english"])
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_without_indexes_sends_nothing(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            calls = _spy(monkeypatch, client)
+            assert await FtsPlain.define_indexes() == []
+            assert await FtsPlain.define_indexes(overwrite=False) == []
+            with pytest.raises(TypeError) as plain:
+                await FtsPlain.define_indexes(overwrite=1)  # type: ignore[arg-type]
+            with pytest.raises(TypeError) as article:
+                await FtsArticle.define_indexes(overwrite="yes")  # type: ignore[arg-type]
+            sent = _calls(calls)
+            monkeypatch.undo()
+        assert sent == []
+        assert str(plain.value) == "overwrite= must be a bool, got int."
+        assert str(article.value) == "overwrite= must be a bool, got str."
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_analyzer_named_by_str_must_exist(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await FtsDoc.define_indexes()
+            sent = _calls(calls)
+            monkeypatch.undo()
+            tables = await _tables(client)
+            # Once the database defines it, an analyzer named by str is not defined again: only the index is.
+            await _apply_ddl(client, _A1)
+            keyword = search.fulltext_keyword(await _keyword_line(client))
+            applied = await FtsNamed.define_indexes()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _DI1
+        assert sent == _query(_INFO_DB)
+        assert tables == {}
+        assert applied == [
+            f"DEFINE INDEX OVERWRITE `fts_named_x` ON `fts_named` FIELDS `x` {keyword} ANALYZER `fts_english` BM25;"
+        ]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_defines_no_analyzer(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Refused before any DDL, for an analyzer to define (a fresh database) and to redefine (another definition
+        stored): SurrealDB builds an index with the analyzers committed before the transaction began."""
+        async with _fts_models(kind) as client:
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as fresh:
+                    await FtsArticle.define_indexes(tx=tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                queued = getattr(tx, "statements", None)
+            await _apply_ddl(client, Analyzer("fts_english", ["blank"], ["ascii"]).ddl())
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                with pytest.raises(SurrealDbError) as changed:
+                    await FtsArticle.define_indexes(tx=tx)
+            tables = await _tables(client)
+        assert type(fresh.value) is SurrealDbError
+        assert str(fresh.value) == _DI2
+        assert sent == _query(_INFO_DB)
+        assert queued in (None, [])
+        assert type(changed.value) is SurrealDbError
+        assert str(changed.value) == _DI2
+        assert "fts_article" not in tables
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_index_statements_join_the_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the analyzers in place, the index statements join the block: queued and applied at the commit in a
+        buffered transaction (HTTP, SurrealDB 2.x, the embedded engine), applied at once in an interactive one (3.x over
+        WebSocket); the reads see the committed state before anything joins it."""
+        async with _fts_models(kind) as client:
+            interactive = kind == "ws" and await _major(client) >= 3
+            await _apply_ddl(client, _A1)
+            statements = FtsArticle.index_ddl(line=await _keyword_line(client))[1:]
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                assert tx.is_interactive is interactive
+                calls = _spy(monkeypatch, client)
+                assert await FtsArticle.define_indexes(tx=tx) == statements
+                sent = _calls(calls)
+                monkeypatch.undo()
+                queued = getattr(tx, "statements", None)
+                # Outside the block, until the commit, there is no index.
+                before = await _indexes(client)
+            after = await _indexes(client)
+        if interactive:
+            assert sent == [*_ARTICLE_READS, *(("query_raw", statement) for statement in statements)]
+        else:
+            assert sent == _ARTICLE_READS
+            assert queued == statements
+        assert before == {}
+        assert sorted(after) == sorted(_ARTICLE_INDEXES)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_applies_no_index(self, kind: str) -> None:
+        async with _fts_models(kind) as client:
+            await _apply_ddl(client, _A1)
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    assert await FtsArticle.define_indexes(tx=tx) != []
+                    raise _Rollback
+            indexes = await _indexes(client)
+            tables = await _tables(client)
+        assert indexes == {}
+        assert "fts_article" not in tables
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_analyzer_and_its_index_in_one_transaction(self, kind: str) -> None:
+        """README row "Full-text index" and section 36, Transactions: on a table holding records, a transaction that
+        defines an analyzer and then an index using it fails on every SurrealDB server — the server builds the index
+        with the analyzers committed before the transaction began — and succeeds on the embedded engine. Hence
+        ``define_indexes(tx=…)`` defines no analyzer, on every engine."""
+        async with _fts(kind) as client:
+            keyword_line = await _keyword_line(client)
+            await _apply_ddl(client, "CREATE fts_note:n1 SET title = 'Physics rocks';")
+            index = Index("fts_note_title", "title", search_analyzer=FTS_ENGLISH).ddl("fts_note", line=keyword_line)
+            refusals = await _refusals(client, f"BEGIN TRANSACTION; {_A1} {index} COMMIT TRANSACTION;")
+            analyzers, _ = await search.read_database_info(client, what="index", kind="definition", subject="table 'fts_note'")
+            indexes = await _indexes(client, "fts_note")
+        if kind == "mem":
+            assert refusals == [], "README row 'Full-text index': the embedded engine sees the analyzer"
+            assert sorted(analyzers) == ["fts_english"]
+            assert sorted(indexes) == ["fts_note_title"]
+        else:
+            assert any("The analyzer 'fts_english' does not exist" in text for text in refusals), (
+                f"README row 'Full-text index': a SurrealDB server refuses the index, got {refusals}"
+            )
+            assert analyzers == {}
+            assert indexes == {}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_table_an_index_creates(self, kind: str) -> None:
+        """README section 36, the sentence on calling ``define_table()`` before ``define_indexes()``: on a missing table
+        ``DEFINE INDEX`` creates it ``TYPE ANY SCHEMALESS PERMISSIONS NONE``, which ``define_table(overwrite=False)``
+        leaves as it is and ``define_table()`` replaces, keeping the indexes."""
+        async with _fts_models(kind) as client:
+            await FtsArticle.define_indexes()
+            created = (await _tables(client))["fts_article"]
+            await FtsArticle.define_table(overwrite=False)
+            kept = (await _tables(client))["fts_article"]
+            await FtsArticle.define_table()
+            replaced = (await _tables(client))["fts_article"]
+            indexes = await _indexes(client)
+        assert created == "DEFINE TABLE fts_article TYPE ANY SCHEMALESS PERMISSIONS NONE", "README section 36, _S36_ORDER"
+        assert kept == created, "README section 36, _S36_ORDER: define_table(overwrite=False) leaves the table as it is"
+        assert replaced.startswith("DEFINE TABLE fts_article TYPE NORMAL "), "README section 36, _S36_ORDER"
+        assert sorted(indexes) == sorted(_ARTICLE_INDEXES), "README section 36, _S36_ORDER: the indexes are kept"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_edge_model_before_define_relation(self, kind: str) -> None:
+        async with _fts_models(kind) as client:
+            applied = await FtsCites.define_indexes()
+            expected = FtsCites.index_ddl(line=await _keyword_line(client))
+            created = (await _tables(client))["fts_cites"]
+            await FtsCites.define_relation()
+            related = (await _tables(client))["fts_cites"]
+            indexes = await _indexes(client, "fts_cites")
+        assert applied == expected
+        assert " TYPE ANY " in created
+        assert " TYPE RELATION" in related
+        assert sorted(indexes) == ["fts_cites_note"]
+
+
+@pytest.fixture
+def empty_cache() -> Iterator[None]:
+    """An empty query cache around the test."""
+    QueryCache.clear()
+    yield
+    QueryCache.clear()
+
+
+def _hits() -> int:
+    """The query cache's hits so far."""
+    return int(QueryCache.stats()["hits"])
+
+
+class TestRemoveIndexE2E:
+    """``remove_index()`` on every engine: ``REMOVE INDEX [IF EXISTS] `<name>` ON `<table>`;`` by name, applied and
+    returned; ``missing_ok=False`` raises ``SurrealDbNotFoundError`` for a missing index; the arguments are checked and a
+    transaction of another connection refused before any request; the model's cached reads are dropped."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_statements_and_missing_ok(self, kind: str) -> None:
+        async with _fts_models(kind) as client:
+            await FtsArticle.define_indexes()
+            removed = await FtsArticle.remove_index("fts_article_title")
+            strict = await FtsArticle.remove_index("fts_article_body", missing_ok=False)
+            again = await FtsArticle.remove_index("fts_article_title")
+            with pytest.raises(SurrealDbError) as missing:
+                await FtsArticle.remove_index("fts_article_title", missing_ok=False)
+            indexes = await _indexes(client)
+        assert removed == again == "REMOVE INDEX IF EXISTS `fts_article_title` ON `fts_article`;"
+        assert strict == "REMOVE INDEX `fts_article_body` ON `fts_article`;"
+        assert type(missing.value) is SurrealDbNotFoundError
+        assert str(missing.value).startswith("Can't apply index removal: 'fts_article_title' on table 'fts_article' -> ")
+        assert "fts_article_title" in str(missing.value) and "REMOVE" not in str(missing.value)
+        assert sorted(indexes) == sorted(set(_ARTICLE_INDEXES) - {"fts_article_title", "fts_article_body"})
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_arguments_are_checked_before_any_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(ValueError) as bad_name:
+                await FtsArticle.remove_index("fts-title")
+            with pytest.raises(TypeError) as not_a_name:
+                await FtsArticle.remove_index(3)  # type: ignore[arg-type]
+            with pytest.raises(TypeError) as missing_ok:
+                await FtsArticle.remove_index("fts_article_title", missing_ok=1)  # type: ignore[arg-type]
+            sent = _calls(calls)
+            monkeypatch.undo()
+        assert sent == []
+        assert str(bad_name.value) == f"Invalid index name 'fts-title': {_IDENTIFIER}"
+        assert str(not_a_name.value) == "Index name must be a str, got int."
+        assert str(missing_ok.value) == "missing_ok= must be a bool, got int."
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            _register_other(kind)
+            try:
+                async with SurrealDBConnectionManager.transaction("fts2") as tx:
+                    other = await SurrealDBConnectionManager.get_client("fts2")
+                    calls = _spy(monkeypatch, client)
+                    other_calls = _spy(monkeypatch, other)
+                    with pytest.raises(SurrealDbError) as removal:
+                        await FtsArticle.remove_index("fts_article_title", tx=tx)
+                    with pytest.raises(SurrealDbError) as definition:
+                        await FtsArticle.define_indexes(tx=tx)
+                    sent = (_calls(calls), _calls(other_calls))
+                    queued = getattr(tx, "statements", None)
+                    monkeypatch.undo()
+            finally:
+                await SurrealDBConnectionManager.remove_connection("fts2")
+        assert sent == ([], [])
+        assert queued in (None, [])
+        for raised, method in ((removal, "remove_index"), (definition, "define_indexes")):
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value).startswith(
+                f"FtsArticle.{method}() cannot run in this transaction: the transaction belongs to connection 'fts2' and "
+                "FtsArticle runs on connection 'fts'."
+            )
+
+    @pytest.mark.usefixtures("empty_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_cached_read_of_the_model_is_dropped(self, kind: str) -> None:
+        async with _fts_models(kind):
+            await FtsArticle.define_indexes()
+            await FtsArticle(id="a1", title="Quantum physics for beginners", slug="a1").save()
+
+            async def cached() -> list[str | None]:
+                return [article.id for article in await FtsArticle.objects().cache(60).exec()]
+
+            assert await cached() == ["a1"]
+            hits = _hits()
+            assert await cached() == ["a1"]
+            assert _hits() == hits + 1
+            await FtsArticle.remove_index("fts_article_title")
+            assert await cached() == ["a1"]
+            assert _hits() == hits + 1
+
+
+class TestViewIndexPinE2E:
+    """README section 36, Not supported: a materialized view model declares no ``indexes=``. Pinned on every engine
+    with raw statements: a full-text index on a view's table is defined and searchable, but SurrealDB 3.x does not index
+    the records the view gains after the index is defined (surrealdb/surrealdb#7377, fixed in SurrealDB 4.0), while
+    2.x and the embedded engine do."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_on_a_view_misses_the_records_the_view_gains_on_3x(self, kind: str) -> None:
+        async with _fts(kind) as client:
+            major = await _major(client)
+            keyword = search.fulltext_keyword(major)
+            for statement in (
+                "CREATE fts_src:b1 SET title = 'Quantum physics for beginners';",
+                "DEFINE TABLE `fts_view` AS SELECT title FROM fts_src;",
+                _A1,
+                f"DEFINE INDEX `fts_view_title` ON `fts_view` FIELDS `title` {keyword} ANALYZER `fts_english` BM25;",
+                "CREATE fts_src:b2 SET title = 'Cooking with physics';",
+            ):
+                await _apply_ddl(client, statement)
+            held = await client.query("SELECT VALUE title FROM fts_view;", {})
+            found = await client.query("SELECT VALUE title FROM fts_view WHERE title @0@ 'physics';", {})
+        both = ["Cooking with physics", "Quantum physics for beginners"]
+        assert sorted(held) == both
+        if major >= 3:
+            assert found == ["Quantum physics for beginners"], _VIEW_PIN_3X
+        else:
+            assert sorted(found) == both, "README section 36, Not supported: 2.x and the embedded engine index them"

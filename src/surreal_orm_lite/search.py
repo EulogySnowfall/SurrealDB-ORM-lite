@@ -37,13 +37,19 @@ compare a declaration with a stored definition, pure, attribute by attribute, wh
 ``LOWERCASE, ASCII`` or 2.x's ``LOWERCASE,ASCII``, 2.x's tuning options, ``BM25(1.2,0.75)`` for ``BM25`` and for no
 clause), so an unchanged index or analyzer is never redefined — which would rebuild the index.
 
+**What ``define_indexes()`` applies.** ``check_named_analyzers()`` refuses an index naming by ``str`` an analyzer the
+database lacks; ``plan_analyzers()`` sorts the model's analyzers into those to define and those to redefine;
+``plan_indexes()`` gives the index definitions and the rebuilds the table needs, comparing each index with its stored
+definition; ``transaction_analyzer_refused()`` words the refusal of an analyzer to define in a transaction. All pure:
+the model's method reads, decides, then applies.
+
 The module sits low in the package: it imports neither ``model_base``, ``query_set`` nor ``connection_manager``, so
 each of them can import it.
 """
 
 import math
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
@@ -915,3 +921,106 @@ async def read_table_indexes(client: Any, table: str, *, what: str, kind: str) -
     if not isinstance(indexes, dict):
         return {}
     return {name: _parsed(definition, parse_define_index) for name, definition in indexes.items()}
+
+
+# --- the appliers' plans --------------------------------------------------------------------------------------------
+
+
+def checked_overwrite(value: object) -> bool:
+    """*value*, checked as the ``overwrite=`` argument of an applier: a ``bool``.
+
+    :raises TypeError: ``overwrite= must be a bool, got <type>.``
+    """
+    _overwrite_clause(value)
+    return value is True
+
+
+def index_subject(name: str, table: str) -> str:
+    """How a refusal names the index *name* of *table*: ``'<name>' on table '<table>'``."""
+    return f"{name!r} on table {table!r}"
+
+
+def check_named_analyzers(
+    indexes: Iterable[Index], analyzers: Iterable[Analyzer], stored: Mapping[str, AnalyzerState | None], *, table: str
+) -> None:
+    """Refuse an index of *table* that names by ``str`` an analyzer the database lacks — before any DDL.
+
+    An analyzer named by a ``str`` exists when the database stores it (*stored*, ``INFO FOR DB``'s, a definition the
+    parser cannot read included) or when it is one of the model's own ``Analyzer`` objects (*analyzers*), which the
+    applier defines first. The first such index in declaration order raises.
+
+    :raises SurrealDbError: ``Can't apply index definition: '<index>' on table '<table>' -> the analyzer '<name>' does
+        not exist; …``.
+    """
+    own = {analyzer.name for analyzer in analyzers}
+    for index in indexes:
+        name = index.search_analyzer
+        if isinstance(name, str) and name not in own and name not in stored:
+            raise SurrealDbError(
+                f"Can't apply index definition: {index_subject(index.name, table)} -> the analyzer {name!r} does not "
+                "exist; pass search_analyzer=Analyzer(...) or define it with "
+                "SurrealDBConnectionManager.define_analyzer() first."
+            )
+
+
+def plan_analyzers(
+    analyzers: Iterable[Analyzer], stored: Mapping[str, AnalyzerState | None], overwrite: bool
+) -> tuple[list[Analyzer], list[Analyzer]]:
+    """The analyzers to define and the analyzers to redefine, each in the order of *analyzers* — pure.
+
+    An analyzer the database does not store (*stored*: ``INFO FOR DB``'s, by name) is to define; one it stores equal
+    (:func:`analyzer_matches`) is left as it is; one it stores different, or in a definition the parser cannot read, is
+    to redefine with *overwrite* (``DEFINE ANALYZER OVERWRITE``) and left as it is without.
+    """
+    define: list[Analyzer] = []
+    redefine: list[Analyzer] = []
+    for analyzer in analyzers:
+        if analyzer.name not in stored:
+            define.append(analyzer)
+        elif overwrite and not analyzer_matches(analyzer, stored[analyzer.name]):
+            redefine.append(analyzer)
+    return define, redefine
+
+
+def transaction_analyzer_refused(model: str, name: str) -> str:
+    """The refusal of ``define_indexes(tx=…)`` when the analyzer *name* must be defined or redefined: the servers build
+    an index with the analyzers committed before the transaction began."""
+    return (
+        f"{model}.define_indexes(tx=…) cannot define analyzer {name!r} in a transaction: SurrealDB builds an index with "
+        "the analyzers committed before the transaction began. Call SurrealDBConnectionManager.define_analyzer() "
+        "without tx= first, then define_indexes(tx=…)."
+    )
+
+
+def plan_indexes(
+    indexes: Iterable[Index],
+    table: str,
+    stored: Mapping[str, IndexState | None],
+    *,
+    column: Callable[[str], str],
+    overwrite: bool,
+    keyword: str,
+    redefined: Collection[str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The index definitions and the rebuilds a model's *indexes* need on *table* — pure — each as ``(index name,
+    statement)``, in declaration order.
+
+    Each field is written as the column *column* (the model's ``to_db_field``) gives it, a full-text index with
+    *keyword* (:func:`fulltext_keyword`). An index *stored* (``INFO FOR TABLE``'s, by name) does not hold is defined
+    (``OVERWRITE``, or ``IF NOT EXISTS`` without *overwrite*); one it holds equal (:func:`index_matches`) is left as it
+    is — but rebuilt when its analyzer is among *redefined*, since SurrealDB leaves the records indexed before with
+    their old tokens; one it holds different, or in a definition the parser cannot read, is redefined
+    (``OVERWRITE``, which rebuilds it) with *overwrite* and left as it is without.
+    """
+    definitions: list[tuple[str, str]] = []
+    rebuilds: list[tuple[str, str]] = []
+    for index in indexes:
+        columns = [column(field) for field in index.fields]
+        if index.name not in stored:
+            definitions.append((index.name, index_statement(index, table, columns, overwrite=overwrite, keyword=keyword)))
+        elif index_matches(index, columns, stored[index.name]):
+            if index.analyzer_name is not None and index.analyzer_name in redefined:
+                rebuilds.append((index.name, rebuild_index_statement(index.name, table)))
+        elif overwrite:
+            definitions.append((index.name, index_statement(index, table, columns, overwrite=True, keyword=keyword)))
+    return definitions, rebuilds

@@ -653,6 +653,17 @@ def index_forms() -> None:
     assert_type(SurrealConfigDict(indexes=None), SurrealConfigDict)
 
 
+async def index_appliers(tx: Transaction) -> None:
+    """v0.35.0: ``define_indexes()`` returns the statements applied (a ``list[str]``), ``remove_index()`` the one
+    statement (a ``str``)."""
+    applied: list[str] = await IndexedPost.define_indexes()
+    assert_type(applied, list[str])
+    assert_type(await IndexedPost.define_indexes(overwrite=False, tx=tx), list[str])
+    removed: str = await IndexedPost.remove_index("indexed_post_slug")
+    assert_type(removed, str)
+    assert_type(await IndexedPost.remove_index("indexed_post_slug", missing_ok=False, tx=tx), str)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""

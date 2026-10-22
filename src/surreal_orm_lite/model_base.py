@@ -61,7 +61,23 @@ from .schema import (
     view_write_refused,
 )
 from .schema_state import FieldState, TableState
-from .search import Index, check_indexes_config, model_index_statements
+from .search import (
+    Index,
+    analyzer_statement,
+    check_indexes_config,
+    check_named_analyzers,
+    checked_overwrite,
+    declared_analyzers,
+    fulltext_keyword,
+    index_subject,
+    model_index_statements,
+    plan_analyzers,
+    plan_indexes,
+    read_database_info,
+    read_table_indexes,
+    remove_index_statement,
+    transaction_analyzer_refused,
+)
 from .signals import (
     around_delete,
     around_save,
@@ -1199,6 +1215,184 @@ class BaseSurrealModel(BaseModel):
         return model_index_statements(
             cls.get_indexes(), cls.get_table_name(), column=cls.to_db_field, overwrite=overwrite, line=line
         )
+
+    @classmethod
+    async def define_indexes(cls, *, overwrite: bool = True, tx: Transaction | None = None) -> list[str]:
+        """Apply this model's analyzers and indexes (v0.35.0), redefining only what changed, and return the statements
+        applied — or queued, with a buffered transaction — in the order sent; ``[]`` when nothing changed.
+
+        On the model's connection (the ``using()`` block's, else ``SurrealConfigDict(connection=…)``, else
+        ``"default"``), compares, then applies. It reads ``INFO FOR DB`` once (the stored analyzers), the line once
+        (``client.version()``, only when a full-text index is declared: ``FULLTEXT`` on SurrealDB 3.x, ``SEARCH`` on 2.x
+        and the embedded engine), and ``INFO FOR TABLE`` once (the table's indexes) — committed state, outside any
+        transaction. Then, one statement per call: each ``Analyzer`` the indexes hold that the database lacks
+        (``DEFINE ANALYZER``) or stores differently (``DEFINE ANALYZER OVERWRITE``); each index the table lacks
+        (``DEFINE INDEX``) or holds differently (``DEFINE INDEX OVERWRITE``); then ``REBUILD INDEX`` for each unchanged
+        index of the table whose analyzer was redefined — SurrealDB leaves the records indexed before with their old
+        tokens until the index is rebuilt. An analyzer or index stored in a definition the ORM cannot read back counts
+        as different.
+
+        **Safe at start-up.** On an unchanged database the call sends the reads alone and returns ``[]``: an equal
+        index is never redefined, since redefining a full-text index rebuilds it — seconds per thousands of records on
+        SurrealDB 2.x and the embedded engine, whose BM25 statistics each rebuild also inflates. Nothing is removed: an
+        index or analyzer the model no longer declares stays (:meth:`remove_index`). An analyzer belongs to the
+        database: declare each one once (a module constant) and reference that object from every index that uses it.
+
+        **Call** :meth:`define_table` **(or** ``define_relation()`` **for an edge model) before** ``define_indexes()``:
+        on a table that does not exist yet, SurrealDB's ``DEFINE INDEX`` creates it ``TYPE ANY SCHEMALESS PERMISSIONS
+        NONE``, which ``define_table()`` replaces (keeping the indexes) but ``define_table(overwrite=False)`` leaves as
+        it is.
+
+        Before any DDL (nothing sent but the reads): an index that names by ``str`` an analyzer neither the database
+        nor the model's ``Analyzer`` objects define is refused; with *tx*, an analyzer to define or redefine is refused
+        — SurrealDB builds an index with the analyzers committed before the transaction began: define it first,
+        outside the block. With *tx* and the analyzers in place, the index statements join the transaction — applied at
+        once in an interactive one (WebSocket, SurrealDB 3.x), at the commit in a buffered one (HTTP, SurrealDB 2.x,
+        the embedded engine), where a refusal comes back as the transaction's own error; a block that raises applies
+        nothing. In a buffered transaction an index queued earlier in the block is not seen by the reads, and is
+        queued again (the same statement). Every cached read is dropped.
+
+        Names are written in backticks, filters re-rendered from a closed grammar, numbers from Python numbers,
+        comments as string literals. A refusal names the analyzer or the index and its table, never the statement:
+        ``Can't apply index definition: 'post_title' on table 'post' -> <reason>``. Applying needs a session allowed to
+        read the definitions and to define (a system user such as root, or a namespace or database
+        ``OWNER``/``EDITOR``).
+
+        Args:
+            overwrite: ``True`` (default) redefines a changed analyzer or index — the model wins. ``False`` defines
+                what is missing (``IF NOT EXISTS``) and leaves what exists as it is.
+            tx: optional transaction the index statements are applied with; the reads happen before anything is
+                queued.
+
+        Raises:
+            TypeError: *overwrite* is not a ``bool`` — before any request.
+            SurrealDbError: *tx* belongs to another connection — before any request; an analyzer named by ``str`` does
+                not exist, or *tx* is given and an analyzer must be defined or redefined — before any DDL; the server
+                refused a statement (``Can't apply analyzer definition: …``, ``Can't apply index definition: …``).
+            SurrealDbAuthenticationError: the session may not read the definitions or define the analyzers and
+                indexes.
+
+        Example:
+            >>> table = await Article.define_table()  # the table first
+            >>> await Article.define_indexes()
+            ['DEFINE ANALYZER OVERWRITE `english` TOKENIZERS class,blank FILTERS lowercase,ascii,snowball(english);',
+             'DEFINE INDEX OVERWRITE `article_title` ON `article` FIELDS `title` FULLTEXT ANALYZER `english` BM25 HIGHLIGHTS;']
+            >>> await Article.define_indexes()
+            []
+        """
+        # Every check comes before the cache write of _define_indexes(): invalidates("all") checks no transaction, and
+        # a refused call — or a model without indexes — leaves the cache as it is.
+        check_transaction(cls, tx, f"{cls.__name__}.define_indexes()")
+        checked_overwrite(overwrite)
+        if not cls.get_indexes():
+            return []
+        return await cls._define_indexes(overwrite=overwrite, tx=tx)
+
+    @classmethod
+    @_cache.invalidates("all")
+    async def _define_indexes(cls, *, overwrite: bool, tx: Transaction | None) -> list[str]:
+        """The body of :meth:`define_indexes` for a model that declares indexes, its transaction and *overwrite*
+        checked: compare with ``INFO``, then apply. Every cached read is dropped around it — a rebuilt index may serve
+        any table's ``search()``."""
+        indexes = cls.get_indexes()
+        table = cls.get_table_name()
+        # Cheap even inside a transaction: get_client() returns the already-connected client.
+        client = await cls._connection_manager().get_client()
+        stored_analyzers, _tables = await read_database_info(
+            client, what="index", kind="definition", subject=f"table {table!r}"
+        )
+        analyzers = declared_analyzers(indexes)
+        check_named_analyzers(indexes, analyzers, stored_analyzers, table=table)
+        define, redefine = plan_analyzers(analyzers, stored_analyzers, overwrite)
+        changed = [analyzer for analyzer in analyzers if analyzer in define or analyzer in redefine]
+        if tx is not None and changed:
+            raise SurrealDbError(transaction_analyzer_refused(cls.__name__, changed[0].name))
+        keyword = "FULLTEXT"
+        if any(index.search_analyzer is not None for index in indexes):
+            keyword = fulltext_keyword(_time_travel.line_major(await client.version()))
+        stored_indexes = await read_table_indexes(client, table, what="index", kind="definition")
+        definitions, rebuilds = plan_indexes(
+            indexes,
+            table,
+            stored_indexes,
+            column=cls.to_db_field,
+            overwrite=overwrite,
+            keyword=keyword,
+            redefined={analyzer.name for analyzer in redefine},
+        )
+        applied = await apply_ddl_statements(
+            # A redefinition is planned only with overwrite=True, so the clause is OVERWRITE for it.
+            [analyzer_statement(analyzer, overwrite) for analyzer in changed],
+            client=client,
+            tx=tx,
+            what="analyzer",
+            classify=True,
+            subjects=[repr(analyzer.name) for analyzer in changed],
+        )
+        applied += await apply_ddl_statements(
+            [statement for _, statement in definitions],
+            client=client,
+            tx=tx,
+            what="index",
+            classify=True,
+            subjects=[index_subject(name, table) for name, _ in definitions],
+        )
+        applied += await apply_ddl_statements(
+            [statement for _, statement in rebuilds],
+            client=client,
+            tx=tx,
+            what="index",
+            kind="rebuild",
+            classify=True,
+            subjects=[index_subject(name, table) for name, _ in rebuilds],
+        )
+        return applied
+
+    @classmethod
+    @_cache.invalidates("cls")
+    async def remove_index(cls, name: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove the index named *name* from this model's table (v0.35.0) and return the statement applied.
+
+        Sends ``REMOVE INDEX [IF EXISTS] `<name>` ON `<table>`;`` on the model's connection. Removal is by name: the
+        index need not be declared in ``SurrealConfigDict(indexes=…)`` — removing an index the model no longer declares
+        is the point; :meth:`define_indexes` never removes one. *name* is an identifier (letters, digits, underscores;
+        not starting with a digit), checked before any request. The model's cached reads are dropped. A ``search()`` of
+        the field afterwards raises ``SurrealDbError`` until an index covers it again.
+
+        Args:
+            name: the index's name.
+            missing_ok: ``True`` (default) emits ``REMOVE INDEX IF EXISTS …``, so a missing index is not an error;
+                ``False`` raises ``SurrealDbNotFoundError`` for it.
+            tx: optional transaction the statement is applied with.
+
+        Raises:
+            TypeError, ValueError: *name* is not an identifier, or *missing_ok* not a ``bool`` — before any request.
+            SurrealDbNotFoundError: ``missing_ok=False`` and the table has no such index.
+            SurrealDbAuthenticationError: the session may not remove indexes.
+            SurrealDbError: *tx* belongs to another connection — before any request; any other refusal (``Can't apply
+                index removal: '<name>' on table '<table>' -> <reason>``). In a buffered transaction (*tx* over HTTP, on
+                SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes back when the block
+                commits, as the transaction's own ``SurrealDbError``, never as ``SurrealDbNotFoundError`` or
+                ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
+
+        Example:
+            >>> await Article.remove_index("article_title")
+            'REMOVE INDEX IF EXISTS `article_title` ON `article`;'
+        """
+        check_transaction(cls, tx, f"{cls.__name__}.remove_index()")
+        table = cls.get_table_name()
+        statement = remove_index_statement(name, table, missing_ok)
+        client = await cls._connection_manager().get_client()
+        await apply_ddl_statements(
+            [statement],
+            client=client,
+            tx=tx,
+            what="index",
+            kind="removal",
+            classify=True,
+            subjects=[index_subject(name, table)],
+        )
+        return statement
 
     # ==================== Materialized views (v0.32.0) ====================
 
