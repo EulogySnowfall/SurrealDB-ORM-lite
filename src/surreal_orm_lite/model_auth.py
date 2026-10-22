@@ -387,9 +387,11 @@ class AuthenticatedUserMixin:
                 ``Field(exclude=True)`` keeps out of ``model_dump()`` and so out of the table
                 (SurrealDB 3.x would refuse every signup, 2.x drop the value — a password hash,
                 failing every signin); the message names the model and the fields, in
-                declaration order. ``table_ddl()`` and ``define_table()`` refuse that model too,
-                so remove ``exclude=True``, or define the table by hand with a column for each
-                field named and pass ``with_table=False``.
+                declaration order. ``table_ddl()`` and ``define_table()`` refuse that model too.
+                Remove ``exclude=True`` and pass ``exclude=`` to ``model_dump()`` where you
+                serialise the model: ``update()`` and ``upsert()`` replace the record with what
+                ``model_dump()`` writes, so a table defined by hand would refuse them or drop the
+                value.
             ValueError: an auth key naming no field of the model, an unknown hashing family or
                 duration, a primary key SIGNUP cannot bind; with ``with_table=True`` and a
                 ``SCHEMAFULL`` schema mode, a ``FLEXIBLE`` request on a kind without an object

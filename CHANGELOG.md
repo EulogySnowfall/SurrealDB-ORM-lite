@@ -23,9 +23,11 @@ writes, and the README describes three behaviours of v0.34.0 more precisely. No 
   password hash, so every signin failed. For such an auth model (`AuthenticatedUserMixin`),
   `access_ddl()` and `define_access()` with `with_table=True`, and `table_ddl()` and
   `define_table()`, now raise `TypeError` before any request, naming the model and the fields.
-  Remove `exclude=True`, or define the table by hand with a column for each field named and pass
-  `with_table=False`. `define_access(with_table=False)`, a `SCHEMALESS` table and a model that is
-  not an auth model (whose excluded field `save()` never writes) behave as before.
+  Remove `exclude=True` and leave the field out where you serialise the model instead
+  (`model_dump(exclude={"password"})`): a table defined by hand does not help, since `update()` and
+  `upsert()` replace the record with what `model_dump()` writes, which a required column refuses
+  and an optional one loses. `define_access(with_table=False)`, a `SCHEMALESS` table and a model
+  that is not an auth model (whose excluded field `save()` never writes) behave as before.
 
 ### Notes
 

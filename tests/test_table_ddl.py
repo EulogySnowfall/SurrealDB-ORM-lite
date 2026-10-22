@@ -188,7 +188,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 from surrealdb import Datetime as SdkDatetime
 from surrealdb import Duration as SdkDuration
-from surrealdb import InternalError, NotAllowedError, RecordID
+from surrealdb import InternalError, NotAllowedError, RecordID, SurrealError
 from surrealdb import Range as SdkRange
 
 import surreal_orm_lite
@@ -6312,8 +6312,9 @@ def _sg1(name: str, fields: str, pronoun: str = "it") -> str:
         f"{name}: SIGNUP writes {fields}, but Field(exclude=True) keeps {pronoun} out of model_dump() and so out of the "
         f"SCHEMAFULL table that table_ddl(), define_table() and define_access() define for the model; that table would "
         f"refuse {pronoun} (SurrealDB 3.x) or drop {pronoun} (2.x), so no signup or signin would work. Remove "
-        f"exclude=True, or define the table by hand with a column for each field named here and call "
-        f"define_access(with_table=False)."
+        f"exclude=True and leave {pronoun} out where you serialise the model instead (model_dump(exclude={{{fields}}})): "
+        f"update() and upsert() replace the record with what model_dump() writes, so even over a table defined by "
+        f"hand they would be refused or drop {pronoun}."
     )
 
 
@@ -6414,8 +6415,8 @@ class TestAccessDdl:
     )
     @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
     def test_sg1_from_table_ddl(self, model: type[TdlAuthHidden], message: str, overwrite: bool) -> None:
-        """SG1 is a refusal of the model's ``SCHEMAFULL`` table, as UX1 is: ``table_ddl()`` refuses the model too, so the
-        table the refusal's way out asks for cannot come from ``define_table()`` without the excluded columns."""
+        """SG1 is a refusal of the model's ``SCHEMAFULL`` table, as UX1 is: ``table_ddl()`` refuses the model too, so
+        ``define_table()`` cannot build the table that would fail SIGNUP."""
         with pytest.raises(TypeError) as raised:
             model.table_ddl(overwrite=overwrite)
         assert (type(raised.value), str(raised.value)) == (TypeError, message)
@@ -6612,8 +6613,9 @@ _TDL_EMAIL = "ada@example.test"
 _TDL_PASSWORD = "s3cret-passphrase"
 
 
-async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> None:
-    """``signup()`` then ``signin()`` of *model* succeed, and the record reads back its email."""
+async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> Any:
+    """``signup()`` then ``signin()`` of *model* succeed, and the record reads back its email; returns the user
+    ``signin()`` read."""
     created = await model.signup(email=_TDL_EMAIL, password=_TDL_PASSWORD)
     assert created.tokens.access
     assert created.user.email == _TDL_EMAIL
@@ -6622,6 +6624,15 @@ async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> None:
     assert signed_in.user.get_id() == created.user.get_id()
     assert signed_in.user.email == _TDL_EMAIL
     assert await client.query("SELECT VALUE email FROM tdl_user;", {}) == [_TDL_EMAIL]
+    return signed_in.user
+
+
+async def _stored_hash(client: Any) -> str:
+    """The one password hash stored in ``tdl_user`` (an argon2 hash, never the password)."""
+    [stored] = await client.query("SELECT VALUE password FROM tdl_user;", {})
+    assert isinstance(stored, str)
+    assert stored.startswith("$argon2")
+    return stored
 
 
 async def _user_table(client: Any) -> tuple[Any, dict[str, Any]]:
@@ -6738,8 +6749,11 @@ class TestAccessE2E:
             assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
 
     async def test_sg1_with_table_false_over_a_table_defined_by_hand(self) -> None:
-        """The refusal's way out: the table defined by hand with the excluded column, then ``with_table=False`` applies
-        the access statement alone, as before; signup and signin work."""
+        """``with_table=False`` is not refused, since SG1 is a check of the model table DDL: over a table defined by
+        hand with the excluded column, the access statement alone is applied as before, and signup and signin work.
+        But ``update()`` replaces the record with what ``model_dump()`` writes, without the excluded column, and the
+        required column refuses it on both lines, which is why the refusal advises removing ``exclude=True``. The
+        stored hash stays, and signin with the original credentials still works."""
         async with _tdl("ws") as client:
             await _apply_ddl(
                 client,
@@ -6747,7 +6761,31 @@ class TestAccessE2E:
                 "DEFINE FIELD email ON tdl_user TYPE string; DEFINE FIELD password ON tdl_user TYPE string;",
             )
             assert await TdlAuthHidden.define_access(with_table=False) == [_A_ACCESS]
-            await _signup_and_signin(TdlAuthHidden, client)
+            user = await _signup_and_signin(TdlAuthHidden, client)
+            stored = await _stored_hash(client)
+
+            user.email = "grace@example.test"
+            with pytest.raises((SurrealError, SurrealDbError), match="password"):
+                await user.update()
+            assert await _stored_hash(client) == stored
+            assert await client.query("SELECT VALUE email FROM tdl_user;", {}) == [_TDL_EMAIL]
+            signed_in = await TdlAuthHidden.signin(email=_TDL_EMAIL, password=_TDL_PASSWORD)
+            assert signed_in.user.get_id() == user.get_id()
+
+    async def test_sg1_the_advised_model_keeps_its_hash_through_update(self) -> None:
+        """The way the refusal advises, ``exclude=True`` removed: ``update()`` of another field writes back the hash the
+        instance read, so the stored password is unchanged and signin with the same password works, on both lines."""
+        async with _tdl("ws") as client:
+            assert await TdlAuthUser.define_access() == [*_A1, _A_ACCESS]
+            user = await _signup_and_signin(TdlAuthUser, client)
+            stored = await _stored_hash(client)
+
+            user.email = "grace@example.test"
+            await user.update()
+            assert await _stored_hash(client) == stored
+            signed_in = await TdlAuthUser.signin(email="grace@example.test", password=_TDL_PASSWORD)
+            assert signed_in.user.get_id() == user.get_id()
+            assert signed_in.user.email == "grace@example.test"
 
     async def test_sg1_does_not_apply_to_a_schemaless_table(self) -> None:
         """v0.17.0's ``SCHEMALESS`` table keeps the excluded password SIGNUP writes: applied as before, and signup and
@@ -7212,8 +7250,10 @@ _SENTENCES_35 = {
         "Field(exclude=True)`) raises `TypeError` too, naming the field, before any request (with a `SCHEMAFULL` schema "
         "mode): `define_access()` with `with_table=True` and `define_table()` both refuse it, since the table would not "
         "define it, so SurrealDB 3.x would refuse every signup and 2.x drop the password hash, failing every signin. "
-        "Remove `exclude=True`, or define the table by hand with a column for each field named and pass "
-        "`with_table=False`.",
+        "Remove `exclude=True` and leave the field out where you serialise the model instead "
+        '(`model_dump(exclude={"password"})`): `update()` and `upsert()` replace the record with what `model_dump()` '
+        "writes, so even over a table defined by hand (`with_table=False`) they would be refused (a required column) "
+        "or drop the hash (an optional one), failing every later signin.",
     ),
     "Transactions, connections and the cache": (
         'A definition of the same table or field queued earlier in the block (`tx.add("DEFINE FIELD …")`) is not seen '

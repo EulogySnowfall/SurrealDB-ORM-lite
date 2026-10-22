@@ -5655,8 +5655,10 @@ print(*table, sep="\n")
 - A field SIGNUP writes that `Field(exclude=True)` keeps out of `model_dump()` (`password: str = Field(exclude=True)`)
   raises `TypeError` too, naming the field, before any request (with a `SCHEMAFULL` schema mode): `define_access()`
   with `with_table=True` and `define_table()` both refuse it, since the table would not define it, so SurrealDB 3.x
-  would refuse every signup and 2.x drop the password hash, failing every signin. Remove `exclude=True`, or define the
-  table by hand with a column for each field named and pass `with_table=False`.
+  would refuse every signup and 2.x drop the password hash, failing every signin. Remove `exclude=True` and leave the
+  field out where you serialise the model instead (`model_dump(exclude={"password"})`): `update()` and `upsert()`
+  replace the record with what `model_dump()` writes, so even over a table defined by hand (`with_table=False`) they
+  would be refused (a required column) or drop the hash (an optional one), failing every later signin.
 - Upgrading: a 0.33 `TableType.USER` model's table turns `SCHEMAFULL` at its next `define_access()`; records already
   there are checked at their next write.
 

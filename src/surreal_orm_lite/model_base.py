@@ -1563,7 +1563,8 @@ class BaseSurrealModel(BaseModel):
                 (``AuthenticatedUserMixin``) whose declared schema mode is ``SCHEMAFULL`` with a field SIGNUP writes
                 that ``Field(exclude=True)`` keeps out of the columns (``password: str = Field(exclude=True)``), which
                 the table would refuse or drop, failing every signup or signin — ``define_access()`` refuses it too;
-                remove ``exclude=True``, or define the table by hand with a column for each field the message names.
+                remove ``exclude=True`` (a table defined by hand would not help: ``update()`` and ``upsert()`` replace
+                the record with what ``model_dump()`` writes).
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
                 SurrealQL the ORM can embed.
 

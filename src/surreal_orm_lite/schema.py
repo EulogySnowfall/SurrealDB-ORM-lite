@@ -1958,6 +1958,7 @@ def signup_excluded_refused(model: str, fields: Sequence[str]) -> str:
         f"{model}: SIGNUP writes {names}, but Field(exclude=True) keeps {pronoun} out of model_dump() and so out of the "
         f"SCHEMAFULL table that table_ddl(), define_table() and define_access() define for the model; that table would "
         f"refuse {pronoun} (SurrealDB 3.x) or drop {pronoun} (2.x), so no signup or signin would work. Remove "
-        f"exclude=True, or define the table by hand with a column for each field named here and call "
-        f"define_access(with_table=False)."
+        f"exclude=True and leave {pronoun} out where you serialise the model instead (model_dump(exclude={{{names}}})): "
+        f"update() and upsert() replace the record with what model_dump() writes, so even over a table defined by "
+        f"hand they would be refused or drop {pronoun}."
     )
