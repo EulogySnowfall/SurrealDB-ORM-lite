@@ -7532,6 +7532,9 @@ class TestReadmeSection35:
         assert rows["a union of `int`, `float` and `Decimal`, in any order"] == "`number`", rows
         assert rows["`datetime`, `date`"] == "`datetime`", rows
         assert rows["`RecordID`"] == "`record`", rows
+        assert rows["an `enum.Flag` or `IntFlag`"] == (
+            "`int`: Pydantic also accepts any combination of its members, and zero"
+        ), rows
         assert rows["`list`, `list[Any]`"] == "`array`, and an item definition (below)", rows
         assert rows["`dict`, `dict[K, V]`, `Mapping[K, V]`"] == "`object`, free-form", rows
         assert rows["`Optional[X]`, a union with `None`"] == "`option<X>`", rows
