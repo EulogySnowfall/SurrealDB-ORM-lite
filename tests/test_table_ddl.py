@@ -233,6 +233,7 @@ from tests._readme_tables import cells as _cells
 from tests._readme_tables import normalised as _normalised
 from tests._readme_tables import readme as _readme
 from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import server_rows as _server_rows
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
@@ -5589,6 +5590,9 @@ _LISTS_ROW = (
     "A `list` of sub-models (`list[M]`, at any depth) holding a `dict`, an `Any` or an untyped `list`, in a `SCHEMAFULL` model"
 )
 _UNDECLARED_ROW = "A write naming a field a `SCHEMAFULL` table does not define"
+#: The other README rows stating the same rule: the 2.x/3.x table's v0.7.0 row and the embedded engine's v0.34.0 row.
+_SCHEMAFULL_WRITE_FIRST_07 = "Writing a field a `SCHEMAFULL` table does not define (`CREATE`, `INSERT`, `INSERT RELATION`)"
+_EMBEDDED_TABLE_DDL_FIRST = "Model table DDL (v0.34.0)"
 
 #: The failures of the line-fact pins once a SurrealDB line changes.
 _UNTYPED_CHANGED = (
@@ -5597,7 +5601,8 @@ _UNTYPED_CHANGED = (
 )
 _UNDECLARED_CHANGED = (
     "SurrealDB changed how this line treats a write naming a field a SCHEMAFULL table does not define: re-measure it, "
-    f"then update this test's expectation and the README 2.x/3.x row '{_UNDECLARED_ROW}'"
+    f"then update this test's expectation and the README 2.x/3.x row '{_UNDECLARED_ROW}', with the 2.x/3.x row "
+    f"'{_SCHEMAFULL_WRITE_FIRST_07}' and the embedded engine's row '{_EMBEDDED_TABLE_DDL_FIRST}' that state the same rule"
 )
 
 _NO_SUCH_FIELD = _Refused("no such field exists")
@@ -5929,7 +5934,11 @@ class TestSubModelListsE2E:
         """A key the table does not define, written raw in the items of an array of objects: 3.x keeps it, ``FLEXIBLE``
         or not, while it refuses one in a sub-object; before 3 the items keep it only when the array is ``FLEXIBLE``,
         and a sub-object drops it — the facts of the README 2.x/3.x row on a write naming a field a ``SCHEMAFULL``
-        table does not define."""
+        table does not define.
+
+        3.x keeps it only once an item field is defined (``v.*.n``): it refuses it in the items of an array that
+        defines none (``w``), as SurrealDB's documentation of ``FLEXIBLE`` says of every item of an array that is not
+        ``FLEXIBLE``. A 3.x that starts refusing it in ``v`` too fails here with ``_UNDECLARED_CHANGED``."""
         async with _tdl(kind) as client:
             major = await _major(client)
             await _apply_ddl(
@@ -5938,7 +5947,8 @@ class TestSubModelListsE2E:
                 f"DEFINE FIELD v ON tdl_raw TYPE array<object>{' FLEXIBLE' if flexible else ''}; "
                 "DEFINE FIELD v.*.n ON tdl_raw TYPE string; "
                 "DEFINE FIELD o ON tdl_raw TYPE option<object>; "
-                "DEFINE FIELD o.n ON tdl_raw TYPE string;",
+                "DEFINE FIELD o.n ON tdl_raw TYPE string; "
+                "DEFINE FIELD w ON tdl_raw TYPE option<array<object>>;",
             )
             await _apply_ddl(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
             kept = flexible or major >= 3
@@ -5950,6 +5960,12 @@ class TestSubModelListsE2E:
             else:
                 assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
                 assert await client.query("SELECT VALUE o FROM tdl_raw:2;", {}) == [{"n": "a"}], _UNDECLARED_CHANGED
+            refused = await _refusal(client, "CREATE tdl_raw:3 SET v = [], w = [{stray: 1}] RETURN NONE;")
+            if major >= 3:
+                assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
+            else:
+                assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
+                assert await client.query("SELECT VALUE w FROM tdl_raw:3;", {}) == [[{}]], _UNDECLARED_CHANGED
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_undeclared_key_in_an_item_after_define_table(self, kind: str) -> None:
@@ -7390,9 +7406,16 @@ _PART_NEEDLES_35 = {
         "`FLEXIBLE`: a 2.x limitation, since `FLEXIBLE` there covers the whole item.",
         "3.x keeps such a key in the items of any list of objects, `FLEXIBLE` or not, and refuses it at the top level or "
         "in a sub-model.",
+        "SurrealDB's [documentation of `FLEXIBLE`]"
+        "(https://surrealdb.com/docs/surrealql/statements/define/field#flexible-data-types) says every object of a "
+        "`SCHEMAFULL` table, an item of a list included, accepts only the keys defined for it unless its field is "
+        "`FLEXIBLE`; 3.x follows it only for a list that defines no item field (an `array<object>` defined by hand "
+        "without `v.*.n`), so a later 3.x may refuse such a key in a list of sub-models too: do not rely on it.",
         "`table_ddl()`, which needs no connection, writes the 3.x form",
         "the item definition `TYPE any` (`bag.*`) on every line",
         "refused on 3.x and dropped on 2.x and the embedded engine",
+        "except in the items of a list of objects: of any such list on 3.x, of a list `define_table()` writes `FLEXIBLE` "
+        "on 2.x and the embedded engine",
         "`COMPUTED` fields are SurrealDB 3.x's",
         "(#orm-behaviour-surrealdb-2x-vs-3x)",
         "(#orm-behaviour-the-embedded-engine)",
@@ -7541,14 +7564,25 @@ _HEADER_SENTENCE_34 = (
     "Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it "
     "refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`."
 )
-#: The row v0.34.0 adds to the embedded engine's table, cell by cell.
+#: The row v0.34.0 adds to the embedded engine's table, cell by cell: the list-item exception in the words of the
+#: 2.x/3.x row ``_UNDECLARED_ROW``.
 _EMBEDDED_TABLE_DDL_ROW = [
-    "Model table DDL (v0.34.0)",
+    _EMBEDDED_TABLE_DDL_FIRST,
     "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and "
     "to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops "
-    "that field",
-    "3.x keeps those values without `FLEXIBLE` and refuses that write",
+    "that field, except in the items of a list `define_table()` writes `FLEXIBLE`, which keep it",
+    "3.x keeps those values without `FLEXIBLE` and refuses that write, except in the items of a list of objects",
     "v0.34.0",
+]
+#: The v0.7.0 row of the 2.x/3.x table on the same writes, cell by cell: the list-item exception in the words of the
+#: row ``_UNDECLARED_ROW``.
+_SCHEMAFULL_WRITE_ROW_07 = [
+    _SCHEMAFULL_WRITE_FIRST_07,
+    "silently dropped: the record is stored without it; kept in the items of a list `define_table()` writes `FLEXIBLE` "
+    "(a 2.x limitation)",
+    'rejected ("Found field …, but no such field exists"): nothing is stored, except in the items of a list of objects, '
+    "which keep it",
+    "v0.7.0",
 ]
 _FEATURES_ROW_35 = ["Model table DDL (`define_table()`, `schema_mode`, `permissions`)", "✅"]
 _ROADMAP_ROWS_35 = [
@@ -7811,6 +7845,17 @@ class TestReadmeSection35:
     def test_embedded_table_row(self) -> None:
         """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
         assert_embedded_rows([_EMBEDDED_TABLE_DDL_ROW])
+
+    def test_v070_row_states_the_list_item_exception(self) -> None:
+        """The v0.7.0 row on the same writes carries the list-item exception in the words of the v0.34.0 row, all four
+        cells, in its place between the namespace row and the ``upsert()`` row; widths kept."""
+        assert_server_table()
+        rows = _server_rows()
+        assert rows.count(_SCHEMAFULL_WRITE_ROW_07) == 1, [row for row in rows if row[0] == _SCHEMAFULL_WRITE_FIRST_07]
+        firsts = [row[0] for row in rows]
+        index = rows.index(_SCHEMAFULL_WRITE_ROW_07)
+        neighbours = firsts[index - 1 : index + 2 : 2]
+        assert neighbours[0].startswith("Namespace/db selection") and neighbours[1].startswith("`upsert()`"), neighbours
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]
