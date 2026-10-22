@@ -5,7 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.35.2] - 2026-10-22
+
+An auth model whose signup field is declared `Field(exclude=True)` is refused whatever its schema
+mode (#299): v0.34.1 refused it only for a `SCHEMAFULL` table, and on any other table its
+`update()` or `upsert()` dropped the stored password hash. No new public API.
+
+### Changed
+
+- **An auth model with an excluded signup field raises `TypeError` whatever its schema mode and
+  `with_table`** (#299). For a model built on `AuthenticatedUserMixin` with a field SIGNUP writes
+  that `Field(exclude=True)` keeps out of `model_dump()` (`password: str = Field(exclude=True)`),
+  `table_ddl()`, `define_table()`, `access_ddl()` and `define_access()` (with or without the
+  table) now raise `TypeError` before any request on a `SCHEMALESS` table, with no declared schema
+  mode and with `with_table=False`, as v0.34.1 did for a `SCHEMAFULL` table. `signup()` and
+  `signin()` raise the same error before any request, so an access defined by hand cannot leave
+  such a record either. The message names the model and the fields in declaration order and keeps
+  the advice: remove `exclude=True` and leave the field out where you serialise the model instead
+  (`model_dump(exclude={"password"})`). A model that relied on `exclude=True` now fails at
+  start-up instead of losing data later. Auth models without `exclude=True`, and models that are
+  not auth models, render and apply as before.
+
+### Fixed
+
+- **An auth model no longer loses its stored password hash at `update()` or `upsert()`** (#299).
+  Both replace the record with what `model_dump()` writes, so an auth model whose signup field was
+  declared `Field(exclude=True)` lost the stored value at its first `update()` or `upsert()`, with
+  no error, on a `SCHEMALESS` table (a model with neither `table_type` nor `schema_mode`) or with
+  `define_access(with_table=False)` over an optional column defined by hand
+  (`TYPE option<string>`): the hash became `NONE` and every later signin failed. With a required
+  column (`TYPE string`), the write was refused instead. Such a model is now refused before it
+  writes a record (see Changed). README section 19, "User models" and a row of "ORM behaviour:
+  SurrealDB 2.x vs 3.x" describe it; the behaviour is the same on both lines.
 
 ### Notes
 
@@ -19,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts only the keys defined for it, so do not rely on 3.x keeping such a key. README section
   35, the v0.7.0 and v0.34.0 rows of "ORM behaviour: SurrealDB 2.x vs 3.x" and the embedded
   engine's "Model table DDL (v0.34.0)" row now state the exception. No ORM behaviour changes.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
 
 ## [0.35.0] - 2026-10-22
 

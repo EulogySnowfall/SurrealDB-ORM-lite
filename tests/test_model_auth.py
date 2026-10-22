@@ -27,6 +27,7 @@ from surreal_orm_lite import (
     AuthResult,
     AuthTokens,
     BaseSurrealModel,
+    SchemaMode,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
     SurrealDbConnectionError,
@@ -34,6 +35,7 @@ from surreal_orm_lite import (
     SurrealDbError,
 )
 from surreal_orm_lite._sdk import SurrealError
+from surreal_orm_lite.schema import signup_excluded_refused
 
 HOST = os.getenv("SURREALDB_HOST", "localhost")
 PORT = os.getenv("SURREALDB_PORT", "8000")
@@ -540,6 +542,54 @@ class TestAuthValidation:
         }
         with pytest.raises(ValueError, match="Connection not been set"):
             await calls[method]()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("schema_mode", [None, SchemaMode.SCHEMALESS, SchemaMode.SCHEMAFULL], ids=str)
+    @pytest.mark.parametrize("method", ["signup", "signin"])
+    async def test_an_excluded_signup_field_is_refused_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch, schema_mode: SchemaMode | None, method: str
+    ) -> None:
+        """#299: ``update()`` and ``upsert()`` replace the record with what ``model_dump()`` writes, which leaves out a
+        ``Field(exclude=True)`` field SIGNUP wrote, whatever the schema mode: the stored hash would be lost and every
+        later signin fail. Over an access defined by hand (no ORM DDL call), ``signup()`` and ``signin()`` refuse the
+        model with the DDL methods' ``TypeError``, before any request — even before an unknown field."""
+
+        class HiddenUser(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="hidden_user", schema_mode=schema_mode, connection="sg1")
+
+            id: str | None = None
+            email: str
+            password: str = Field(exclude=True)
+            nickname: str | None = Field(default=None, exclude=True)
+
+        requests: list[str] = []
+
+        def no_request(name: str) -> Any:
+            def refuse(*args: Any, **kwargs: Any) -> Any:
+                requests.append(name)
+                raise AssertionError(f"{name}() was called")
+
+            return refuse
+
+        for name in ("ephemeral_client", "get_client", "_exclusive_embedded_client"):
+            monkeypatch.setattr(SurrealDBConnectionManager, name, no_request(name))
+        # A server nobody listens on: a request that slipped through would fail with another error.
+        SurrealDBConnectionManager.add_connection(
+            "sg1", url="ws://127.0.0.1:9/rpc", user="root", password="root", namespace="ns", database="db"
+        )
+        calls = {
+            "signup": lambda: HiddenUser.signup(email="a@b.c", password=AUTH_PASSWORD, unknown=1),
+            "signin": lambda: HiddenUser.signin(email="a@b.c", password=AUTH_PASSWORD),
+        }
+        with pytest.raises(TypeError) as raised:
+            await calls[method]()
+        assert requests == []
+        assert str(raised.value) == signup_excluded_refused("HiddenUser", ["password", "nickname"])
+        for part in ("HiddenUser: SIGNUP writes 'password', 'nickname',", "Remove exclude=True", "signup() and signin()"):
+            assert part in str(raised.value)
+        with pytest.raises(TypeError) as ddl:
+            HiddenUser.access_ddl(with_table=False)
+        assert str(ddl.value) == str(raised.value)
 
     @pytest.mark.asyncio
     async def test_refresh_on_a_model_without_with_refresh_says_so(self) -> None:

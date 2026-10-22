@@ -85,8 +85,10 @@ table's field definitions with one ``INFO FOR TABLE``, keyed by path whichever r
 definition the parser cannot read. ``table_refused()`` gives the texts of the node models' table guard (TG1–TG4),
 ``relation_table_refused()`` names ``define_table()`` when it is the caller, and ``relation_schemafull_refused()``
 refuses ``define_relation()`` of an edge model declared ``SCHEMAFULL`` with data fields, which it would not define.
-``user_extra_refused()`` and ``signup_excluded_refused()`` give the texts of UX1 and SG1, the refusals of a
-``SCHEMAFULL`` table the model table DDL checks before any request.
+``user_extra_refused()`` gives the text of UX1, the refusal of a ``SCHEMAFULL`` table the model table DDL checks before
+any request, and ``signup_excluded_refused()`` that of SG1, an auth model with a field SIGNUP writes that
+``Field(exclude=True)`` keeps out of ``model_dump()``, refused whatever its schema mode by the model table DDL, the
+access DDL, ``signup()`` and ``signin()`` (#299).
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -1949,16 +1951,20 @@ def user_extra_refused(model: str) -> str:
 
 
 def signup_excluded_refused(model: str, fields: Sequence[str]) -> str:
-    """The refusal of an auth model whose ``SCHEMAFULL`` table would leave out *fields* (SG1, #296): SIGNUP writes
-    them, ``Field(exclude=True)`` keeps them out of ``model_dump()`` and so out of the columns the model table DDL
-    defines — in ``table_ddl()``, ``define_table()`` and ``define_access()`` alike. Pure."""
+    """The refusal of an auth model with *fields* (in declaration order) that SIGNUP writes and
+    ``Field(exclude=True)`` keeps out of ``model_dump()`` (SG1): ``update()`` and ``upsert()`` replace the stored record
+    with what ``model_dump()`` writes, whatever the table's schema mode, so they drop them or a required column refuses
+    them (#299), and a ``SCHEMAFULL`` table defined from the model has no column for them (#296). ``table_ddl()``,
+    ``define_table()``, ``access_ddl()``, ``define_access()``, ``signup()`` and ``signin()`` raise it before any
+    request. Pure."""
     names = ", ".join(repr(name) for name in fields)
     pronoun = "it" if len(fields) == 1 else "them"
     return (
-        f"{model}: SIGNUP writes {names}, but Field(exclude=True) keeps {pronoun} out of model_dump() and so out of the "
-        f"SCHEMAFULL table that table_ddl(), define_table() and define_access() define for the model; that table would "
-        f"refuse {pronoun} (SurrealDB 3.x) or drop {pronoun} (2.x), so no signup or signin would work. Remove "
-        f"exclude=True and leave {pronoun} out where you serialise the model instead (model_dump(exclude={{{names}}})): "
-        f"update() and upsert() replace the record with what model_dump() writes, so even over a table defined by "
-        f"hand they would be refused or drop {pronoun}."
+        f"{model}: SIGNUP writes {names}, but Field(exclude=True) keeps {pronoun} out of model_dump(), and update() and "
+        f"upsert() replace the stored record with what model_dump() writes, whatever the table's schema mode: they "
+        f"would drop {pronoun} (a password hash: every later signin fails) or be refused by a required column. A "
+        f"SCHEMAFULL table defined from the model has no column for {pronoun} either (SurrealDB 3.x refuses the signup, "
+        f"2.x drops {pronoun}). Remove exclude=True and leave {pronoun} out where you serialise the model instead "
+        f"(model_dump(exclude={{{names}}})); until then table_ddl(), define_table(), access_ddl(), define_access(), "
+        f"signup() and signin() refuse {model}."
     )

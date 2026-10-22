@@ -47,7 +47,6 @@ from .schema import (
     read_table_fields,
     remove_event_statement,
     remove_view_statement,
-    signup_excluded_refused,
     table_holds_records,
     table_kind,
     table_permissions_text,
@@ -1761,9 +1760,9 @@ class BaseSurrealModel(BaseModel):
         ``FLEXIBLE`` following *clauses*' schema mode. Pure.
 
         Raises:
-            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"`` (UX1); then, when
-                *clauses* are ``SCHEMAFULL``, an auth model (``AuthenticatedUserMixin``) with a field SIGNUP writes that
-                ``Field(exclude=True)`` keeps out of the columns (SG1, #296).
+            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"`` (UX1); then,
+                whatever *clauses*' schema mode, an auth model (``AuthenticatedUserMixin``) with a field SIGNUP writes
+                that ``Field(exclude=True)`` keeps out of ``model_dump()`` (SG1, #296, #299).
             ValueError: see :meth:`_table_columns`.
         """
         if cls._is_view():
@@ -1774,16 +1773,15 @@ class BaseSurrealModel(BaseModel):
             raise TypeError(user_extra_refused(cls.__name__))
         schemafull = clauses.schema_mode == SchemaMode.SCHEMAFULL.value
         fields = [field_statement(table, column, overwrite=overwrite, schemafull=schemafull) for column in cls._table_columns()]
-        if schemafull:
-            # Imported here, only for a SCHEMAFULL table: model_auth sits above this module.
-            from .model_auth import AuthenticatedUserMixin
+        # Imported here: model_auth sits above this module.
+        from .model_auth import AuthenticatedUserMixin
 
-            # SG1 (#296), after the other refusals: SIGNUP writes a field the columns leave out, which the SCHEMAFULL
-            # table would refuse (3.x) or drop (2.x) — checked here, as UX1 is, so that table_ddl(), define_table(),
-            # access_ddl() and define_access() refuse the same model.
-            excluded: list[str] = cls._signup_fields_excluded() if issubclass(cls, AuthenticatedUserMixin) else []
-            if excluded:
-                raise TypeError(signup_excluded_refused(cls.__name__, excluded))
+        if issubclass(cls, AuthenticatedUserMixin):
+            # SG1 (#296, #299), after the other refusals, whatever the schema mode: SIGNUP writes a field model_dump()
+            # leaves out, which update() and upsert() would drop and a SCHEMAFULL table would refuse (3.x) or drop
+            # (2.x) — checked here, as UX1 is, so that table_ddl() and define_table() refuse the model access_ddl(),
+            # define_access(), signup() and signin() refuse.
+            cls._refuse_signup_fields_excluded()
         return [statement, *fields]
 
     @classmethod
@@ -1827,11 +1825,13 @@ class BaseSurrealModel(BaseModel):
         Raises:
             TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"`` (its table is
                 ``SCHEMAFULL``, which refuses or drops the fields the model does not declare); an auth model
-                (``AuthenticatedUserMixin``) whose declared schema mode is ``SCHEMAFULL`` with a field SIGNUP writes
-                that ``Field(exclude=True)`` keeps out of the columns (``password: str = Field(exclude=True)``), which
-                the table would refuse or drop, failing every signup or signin — ``define_access()`` refuses it too;
-                remove ``exclude=True`` (a table defined by hand would not help: ``update()`` and ``upsert()`` replace
-                the record with what ``model_dump()`` writes).
+                (``AuthenticatedUserMixin``), whatever its schema mode, with a field SIGNUP writes that
+                ``Field(exclude=True)`` keeps out of ``model_dump()`` (``password: str = Field(exclude=True)``):
+                ``update()`` and ``upsert()`` replace the record with what ``model_dump()`` writes, so they would drop
+                the password hash, failing every later signin, or be refused by a required column, and a
+                ``SCHEMAFULL`` table would not define the field — ``access_ddl()``, ``define_access()``, ``signup()``
+                and ``signin()`` refuse the model too; remove ``exclude=True`` and pass ``exclude=`` to
+                ``model_dump()`` where you serialise the model.
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
                 SurrealQL the ORM can embed.
 
@@ -2008,8 +2008,8 @@ class BaseSurrealModel(BaseModel):
 
         Raises:
             TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"``; an auth model
-                whose declared schema mode is ``SCHEMAFULL`` with a field SIGNUP writes that ``Field(exclude=True)``
-                keeps out of the columns (see :meth:`table_ddl`) — before any request.
+                with a field SIGNUP writes that ``Field(exclude=True)`` keeps out of ``model_dump()``, whatever its
+                schema mode (see :meth:`table_ddl`) — before any request.
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
                 SurrealQL the ORM can embed — before any request.
             SurrealDbError: *tx* belongs to another connection — before any request; the table is a materialized view

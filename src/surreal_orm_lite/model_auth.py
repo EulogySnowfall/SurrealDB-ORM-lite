@@ -38,7 +38,7 @@ from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_manager import SurrealDBConnectionManager
 from .embedded import model_auth_unsupported
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError
-from .schema import TableClauses, declared_clauses
+from .schema import TableClauses, declared_clauses, signup_excluded_refused
 from .transaction import Transaction
 from .types import SchemaMode
 from .utils import apply_ddl_statements, validate_alias_name, validate_field_name
@@ -268,16 +268,32 @@ class AuthenticatedUserMixin:
     @classmethod
     def _signup_fields_excluded(cls) -> list[str]:
         """The fields SIGNUP writes that ``Field(exclude=True)`` keeps out of ``model_dump()``, in declaration order
-        (#296).
+        (#296, #299).
 
-        The model table DDL defines the columns ``model_dump()`` writes (``model_ddl.model_columns()`` skips the same
-        fields), while SIGNUP writes every field of :meth:`_signup_fields` — so on a ``SCHEMAFULL`` table these have no
-        column: SurrealDB 3.x refuses the signup, 2.x drops their values (a password hash, and every signin fails).
-        ``BaseSurrealModel._table_ddl()`` refuses such a table (SG1), behind ``table_ddl()``, ``define_table()``,
-        :meth:`access_ddl` and :meth:`define_access`.
+        SIGNUP writes every field of :meth:`_signup_fields`, while ``update()`` and ``upsert()`` replace the stored
+        record with what ``model_dump()`` writes, whatever the table's schema mode — so they drop these values (a
+        password hash, and every later signin fails), or a required column refuses them —, and the model table DDL
+        defines the columns ``model_dump()`` writes (``model_ddl.model_columns()`` skips the same fields), so on a
+        ``SCHEMAFULL`` table these have no column: SurrealDB 3.x refuses the signup, 2.x drops their values.
+        :meth:`_refuse_signup_fields_excluded` refuses such a model (SG1).
         """
         fields = getattr(cls, "model_fields", {}) or {}
         return [name for name in cls._signup_fields() if fields[name].exclude is True]
+
+    @classmethod
+    def _refuse_signup_fields_excluded(cls) -> None:
+        """SG1 (#296, #299): refuse a model with a field SIGNUP writes that ``Field(exclude=True)`` keeps out of
+        ``model_dump()`` (:meth:`_signup_fields_excluded`), whatever its schema mode. Pure:
+        ``BaseSurrealModel._table_ddl()`` (behind ``table_ddl()`` and ``define_table()``), :meth:`access_ddl` (behind
+        :meth:`define_access`, with or without the table) and :meth:`_auth_variables` (behind :meth:`signup` and
+        :meth:`signin`) call it before any request.
+
+        Raises:
+            TypeError: naming the model and those fields, in declaration order (``schema.signup_excluded_refused()``).
+        """
+        excluded = cls._signup_fields_excluded()
+        if excluded:
+            raise TypeError(signup_excluded_refused(cls.__name__, excluded))
 
     @classmethod
     def _signup_primary_key(cls) -> str | None:
@@ -383,15 +399,17 @@ class AuthenticatedUserMixin:
             TypeError: with ``with_table=True``, a ``TableType.USER`` model with
                 ``extra="allow"`` (its ``SCHEMAFULL`` table refuses or drops the fields the
                 model does not declare), or, for a model whose schema mode is ``SCHEMAFULL``,
-                an *overwrite* that is not a ``bool``, or a field SIGNUP writes that
-                ``Field(exclude=True)`` keeps out of ``model_dump()`` and so out of the table
-                (SurrealDB 3.x would refuse every signup, 2.x drop the value — a password hash,
-                failing every signin); the message names the model and the fields, in
-                declaration order. ``table_ddl()`` and ``define_table()`` refuse that model too.
+                an *overwrite* that is not a ``bool``; then, whatever the schema mode and
+                *with_table*, a field SIGNUP writes that ``Field(exclude=True)`` keeps out of
+                ``model_dump()``: ``update()`` and ``upsert()`` replace the record with what
+                ``model_dump()`` writes, so on any table (``SCHEMALESS``, or defined by hand)
+                they would drop the value — a password hash, failing every later signin — or
+                be refused by a required column, and a ``SCHEMAFULL`` table would not define
+                the field (SurrealDB 3.x would refuse every signup, 2.x drop the value). The
+                message names the model and the fields, in declaration order; ``table_ddl()``,
+                ``define_table()``, :meth:`signup` and :meth:`signin` refuse that model too.
                 Remove ``exclude=True`` and pass ``exclude=`` to ``model_dump()`` where you
-                serialise the model: ``update()`` and ``upsert()`` replace the record with what
-                ``model_dump()`` writes, so a table defined by hand would refuse them or drop the
-                value.
+                serialise the model.
             ValueError: an auth key naming no field of the model, an unknown hashing family or
                 duration, a primary key SIGNUP cannot bind; with ``with_table=True`` and a
                 ``SCHEMAFULL`` schema mode, a ``FLEXIBLE`` request on a kind without an object
@@ -416,11 +434,13 @@ class AuthenticatedUserMixin:
 
         statements: list[str] = []
         if with_table and cls._schemafull_access():
-            # The model table DDL's refusals, SG1 (#296) included: a column SIGNUP writes that the table would not define.
+            # The model table DDL's refusals, UX1 then SG1 included.
             table_ddl: list[str] = cls._table_ddl(overwrite, cls._access_table_clauses())  # type: ignore[attr-defined]
             statements.extend(table_ddl)
         elif with_table:
             statements.append(cls._access_table_statement(table, clause))
+        # SG1 whatever the schema mode and with_table (#299): update() and upsert() would drop what SIGNUP wrote.
+        cls._refuse_signup_fields_excluded()
 
         # The record id follows the model's primary key, because the rest of the ORM does: a
         # random id here would leave User.objects().get(email=…) addressing a record the
@@ -516,8 +536,8 @@ class AuthenticatedUserMixin:
 
         Raises:
             TypeError: see :meth:`access_ddl` — before any request, a field SIGNUP writes that
-                ``Field(exclude=True)`` keeps out of a ``SCHEMAFULL`` table included, which
-                ``define_table()`` refuses too.
+                ``Field(exclude=True)`` keeps out of ``model_dump()`` included, whatever the
+                schema mode and *with_table*.
             ValueError: see :meth:`access_ddl` — before any request.
             SurrealDbError: if the server rejects a statement. The most likely cause on
                 **SurrealDB 2.6.x** is ``with_refresh=True``: that line cannot parse
@@ -574,7 +594,12 @@ class AuthenticatedUserMixin:
         Every field named in the SIGNUP clause must be bound, or the server has no value for a
         ``$variable`` it references — so absent optional fields are sent as ``None`` explicitly
         rather than omitted.
+
+        First of all, SG1 (#299): a model with a field SIGNUP writes that ``Field(exclude=True)``
+        keeps out of ``model_dump()`` is refused, so an access defined by hand cannot leave a
+        stored record that ``update()`` or ``upsert()`` would strip of its hash.
         """
+        cls._refuse_signup_fields_excluded()
         known = set(cls._signup_fields())
         unknown = sorted(set(values) - known)
         if unknown:
@@ -926,6 +951,10 @@ class AuthenticatedUserMixin:
             instance's password field holds the **hash**, since that is what the server stores.
 
         Raises:
+            TypeError: the model has a field SIGNUP writes that ``Field(exclude=True)`` keeps
+                out of ``model_dump()`` (see :meth:`access_ddl`) — before any request, so an
+                access defined by hand cannot leave a record that ``update()`` or ``upsert()``
+                would strip of its password hash.
             ValueError: for an unknown field or a missing required one — before any request.
             SurrealDbAuthenticationError: if the server refuses the signup, or returns no
                 record for the new session (the message says how to grant the permission).
@@ -948,6 +977,7 @@ class AuthenticatedUserMixin:
         Isolation and ``bind=`` behave exactly as in :meth:`signup`, on the embedded engine too.
 
         Raises:
+            TypeError: as in :meth:`signup` — before any request.
             ValueError: for an unknown or missing field — before any request.
             SurrealDbAuthenticationError: if the credentials are refused. Both DB lines are
                 normalised here: the same wrong password surfaces as ``NotFoundError`` on 3.x
