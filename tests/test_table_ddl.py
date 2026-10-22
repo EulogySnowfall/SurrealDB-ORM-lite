@@ -164,7 +164,7 @@ The README (``TestReadmeSection35``): section 35 — its place, its subsections,
 written, each printed line equal to its comment), the sentences each subsection says, its kinds and source-rule tables
 and its "Coming from the full SurrealDB-ORM" bullets —, the sentences sections 16, 19, 31, 33 and 34 change, the four
 rows of the 2.x/3.x table and its intro sentence, the embedded engine's row, and the features, roadmap and comparison
-rows. ``TestReadmeSg1``: what v0.35.1 says of SG1 whatever the schema mode (#299) — section 19's paragraph, the row of
+rows. ``TestReadmeSg1``: what v0.35.2 says of SG1 whatever the schema mode (#299) — section 19's paragraph, the row of
 the 2.x/3.x table and its intro sentence.
 """
 
@@ -8027,15 +8027,15 @@ class TestReadmeSection35:
             namespace.clear()
 
 
-#: The row v0.35.1 adds to the 2.x/3.x table (#299), cell by cell, within the table's column widths.
+#: The row v0.35.2 adds to the 2.x/3.x table (#299), cell by cell, within the table's column widths.
 _SG1_ROW = [
     "An auth model with a `Field(exclude=True)` field SIGNUP writes (`password: str = Field(exclude=True)`)",
     "`TypeError` before any request, whatever the schema mode and `with_table`: the four DDL methods, `signup()` and "
     "`signin()`",
     "same on both lines (a check of the model, no request)",
-    "v0.35.1",
+    "v0.35.2",
 ]
-_HEADER_SENTENCE_351 = "The row added in v0.35.1 was measured on 2.7.0 and 3.3.4, identical on 3.1.5."
+_HEADER_SENTENCE_352 = "The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5."
 #: The paragraph section 19 gives SG1 (#299), whitespace normalised.
 _SECTION_19_SG1 = (
     "**Keep the password field in `model_dump()`.** SIGNUP writes every field, while `update()` and `upsert()` replace "
@@ -8049,7 +8049,7 @@ _SECTION_19_SG1 = (
 
 
 class TestReadmeSg1:
-    """What v0.35.1 says of SG1 whatever the schema mode (#299): section 19's paragraph, after the note on the hash;
+    """What v0.35.2 says of SG1 whatever the schema mode (#299): section 19's paragraph, after the note on the hash;
     section 35's "User models" bullet (:data:`_SENTENCES_35`); the row and the sentence of the 2.x/3.x table."""
 
     def test_section_19_paragraph(self) -> None:
@@ -8068,4 +8068,4 @@ class TestReadmeSg1:
         assert_server_rows([_SG1_ROW])
 
     def test_server_behaviour_header_sentence(self) -> None:
-        assert_server_header_sentence(_HEADER_SENTENCE_351)
+        assert_server_header_sentence(_HEADER_SENTENCE_352)
