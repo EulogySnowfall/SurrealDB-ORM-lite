@@ -31,6 +31,7 @@ from .geo import GeoDistance, GeometryPoint
 from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error
 from .model_base import _snapshot_moment
 from .q import Q
+from .search import SearchAnnotation, SearchHighlight, SearchOffsets, SearchScore
 from .subquery import SubqueryCompiler
 from .surql_literal import inline_variables
 from .types import Duration
@@ -112,9 +113,12 @@ class QuerySet:
         # checked against the model's connection before a statement is sent.
         self._link_heads: set[str] = set()
         self._group_by_fields: list[str] = []
-        self._annotations: dict[str, Aggregation | GeoDistance] = {}
+        # Every annotation, by alias: the aggregations and the per-record ones (GeoDistance, the search annotations).
+        self._annotations: dict[str, Aggregation | GeoDistance | SearchAnnotation] = {}
         # GeoDistance annotations (v0.24.0), as annotate() checked them: alias -> column, reference point.
         self._geo_annotations: dict[str, tuple[str, GeometryPoint]] = {}
+        # Search annotations (v0.35.0), in annotate() order: alias -> SearchScore, SearchHighlight or SearchOffsets.
+        self._search_annotations: dict[str, SearchAnnotation] = {}
         # nearby() conditions (v0.24.0): column, reference point, distance in metres.
         self._nearby: list[tuple[str, GeometryPoint, float]] = []
         # search() conditions (v0.35.0): field as given, column, text; the match reference is the position.
@@ -1047,7 +1051,10 @@ class QuerySet:
         Raises:
             RuntimeError: under ``as_of()`` without a moment (an internal error).
             ValueError, SurrealDbError: a subquery the ORM cannot compile (README section 28).
+            ValueError: a search annotation whose match reference ``search()`` did not give this queryset
+                (v0.35.0, :meth:`_check_search_references`).
         """
+        self._check_search_references()
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
         compiler.moment = moment
@@ -1061,6 +1068,8 @@ class QuerySet:
             variable = f"_gd{index}"
             projection.append(f"IF {column}.is_point() THEN geo::distance({column}, ${variable}) END AS {alias}")
             distance_vars[variable] = point
+        search_projection, search_vars = self._search_projection()
+        projection += search_projection
         query = f"SELECT {', '.join(projection)} FROM {self._model_table}"
 
         query += where_clause
@@ -1077,8 +1086,49 @@ class QuerySet:
         if self._fetch_fields:
             query += f" FETCH {', '.join(self._fetch_fields)}"
 
-        query, variables = self._terminate(query, {**compiler.variables, **where_vars, **distance_vars}, moment)
+        query, variables = self._terminate(query, {**compiler.variables, **where_vars, **distance_vars, **search_vars}, moment)
         return compiler.wrap(query), variables
+
+    def _search_projection(self) -> tuple[list[str], dict[str, Any]]:
+        """The projections of the search annotations, in ``annotate()`` order, and the highlight tags they bind
+        (v0.35.0).
+
+        ``search::score(<ref>) AS <alias>``, ``search::highlight($_sh<2k>, $_sh<2k+1>, <ref>) AS <alias>`` (*k* the
+        highlight's position among the highlights, its tags bound, never written into the statement) and
+        ``search::offsets(<ref>) AS <alias>``; the reference is an ``int`` checked 0..255 when the annotation was
+        built, the alias checked by ``annotate()``.
+        """
+        projection: list[str] = []
+        tags: dict[str, str] = {}
+        for alias, annotation in self._search_annotations.items():
+            if isinstance(annotation, SearchHighlight):
+                opening, closing = f"_sh{len(tags)}", f"_sh{len(tags) + 1}"
+                projection.append(f"search::highlight(${opening}, ${closing}, {annotation.ref}) AS {alias}")
+                tags = {**tags, opening: annotation.open_tag, closing: annotation.close_tag}
+            elif isinstance(annotation, SearchScore):
+                projection.append(f"search::score({annotation.ref}) AS {alias}")
+            else:
+                projection.append(f"search::offsets({annotation.ref}) AS {alias}")
+        return projection, tags
+
+    def _check_search_references(self) -> None:
+        """Refuse a search annotation whose match reference ``search()`` did not give this queryset (v0.35.0).
+
+        Checked when the queryset runs — ``annotate()`` may come before ``search()`` —, before any request: first by
+        ``exec()`` (hence ``first()`` and ``get()`` without an id) and ``exists()``, ahead of an ``as_of()``
+        moment's resolution, then by :meth:`_compile_query`. ``count()`` and the aggregations ignore every
+        annotation, as they ignore ``GeoDistance``.
+
+        Raises:
+            ValueError: a search annotation on a queryset without ``search()``, or naming a reference beyond the
+                fields ``search()`` gave it (``0`` to ``n - 1``, in call order).
+        """
+        given = len(self._search)
+        for annotation in self._search_annotations.values():
+            if not given:
+                raise ValueError(_search.no_search_refused(annotation))
+            if annotation.ref >= given:
+                raise ValueError(_search.reference_refused(annotation, given))
 
     def _compile_aggregation_query(
         self,
@@ -1136,12 +1186,14 @@ class QuerySet:
             A tuple of (query_string, variables_dict).
 
         Raises:
-            ValueError: a ``GeoDistance`` annotation is present: it is computed per record.
+            ValueError: a per-record annotation is present — a ``GeoDistance``, or a search annotation (v0.35.0) —,
+                named by the first of them.
             RuntimeError: under ``as_of()`` without a moment (an internal error).
             ValueError, SurrealDbError: a subquery the ORM cannot compile, as for :meth:`_compile_query`.
         """
-        if self._geo_annotations:
-            raise ValueError(_GEO_DISTANCE_PER_RECORD)
+        if self._geo_annotations or self._search_annotations:
+            per_record = [value for value in self._annotations.values() if isinstance(value, _PER_RECORD)]
+            raise ValueError(_per_record_refused(per_record[0]))
         self._reject_annotation_collisions()
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
@@ -1459,18 +1511,25 @@ class QuerySet:
         Execute the compiled query and return the results.
 
         When ``values()`` and ``annotate()`` are used, returns a list of dictionaries with
-        the grouped fields and aggregation results. With ``GeoDistance`` annotations, returns the
-        model instances, each carrying its distances as attributes (see :meth:`annotate`).
+        the grouped fields and aggregation results. With ``GeoDistance`` annotations, or the search
+        annotations (``SearchScore``, ``SearchHighlight``, ``SearchOffsets``, v0.35.0), returns the
+        model instances, each carrying its values as attributes (see :meth:`annotate`).
         Served from the query cache with ``cache()`` (v0.28.0), as new instances.
 
         Returns:
             list[BaseSurrealModel] | list[dict]: Model instances or dictionaries for GROUP BY queries.
             Under ``as_of()`` the instances are snapshots (v0.26.0).
+
+        Raises:
+            ValueError: a search annotation whose match reference ``search()`` did not give this queryset, before
+                any request (v0.35.0).
         """
+        self._check_search_references()
+        per_record = bool(self._geo_annotations or self._search_annotations)
         # The values()+annotate() branch compiles no FETCH: only the other two return fetched records.
-        moment = await self._time_travel_moment(fetches=bool(self._geo_annotations) or not self._annotations)
-        if self._geo_annotations:
-            return await self._exec_with_distances(moment)
+        moment = await self._time_travel_moment(fetches=per_record or not self._annotations)
+        if per_record:
+            return await self._exec_with_annotations(moment)
 
         if self._annotations:
             results = await self._run_compiled(lambda c: self._compile_group_by_query(moment, subqueries=c))
@@ -1488,8 +1547,9 @@ class QuerySet:
             logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
             return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
 
-    async def _exec_with_distances(self, moment: datetime | None = None) -> Any:
-        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0).
+    async def _exec_with_annotations(self, moment: datetime | None = None) -> Any:
+        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0) and of the search annotations
+        (v0.35.0).
 
         The alias keys are taken out of each row before validation, so they never reach a field, an
         ``extra="allow"`` model's extras or a later write, then set on the instance with
@@ -1497,21 +1557,22 @@ class QuerySet:
         field…) come back as dicts, alias keys included, as ``exec()`` returns them today. Under
         ``as_of()``, *moment* is the read's resolved moment and the instances are snapshots (v0.26.0).
         """
-        self._reject_geo_distance_mixing(self._annotations, grouped=bool(self._group_by_fields))
+        self._reject_per_record_mixing(self._annotations, grouped=bool(self._group_by_fields))
         results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
         rows = results if isinstance(results, list) else []
+        aliases = [*self._geo_annotations, *self._search_annotations]
         stripped: list[dict[str, Any]] = []
-        distances: list[dict[str, Any]] = []
+        annotated: list[dict[str, Any]] = []
         for row in rows:
             record = dict(row)
-            distances.append({alias: record.pop(alias, None) for alias in self._geo_annotations})
+            annotated.append({alias: record.pop(alias, None) for alias in aliases})
             stripped.append(record)
         try:
             instances = cast(list[Any], self.model.from_db(stripped))
         except ValidationError as e:
             logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
             return [self._py_keyed(row) for row in rows]
-        for instance, values in zip(instances, distances, strict=True):
+        for instance, values in zip(instances, annotated, strict=True):
             for alias, value in values.items():
                 object.__setattr__(instance, alias, value)
         return self._mark_snapshots(instances, moment)
@@ -1704,18 +1765,19 @@ class QuerySet:
             Self: The current QuerySet instance for method chaining.
 
         Raises:
-            ValueError: a field name is invalid, or a ``GeoDistance`` annotation is present (it is
-                computed per record, not per group).
+            ValueError: a field name is invalid, or a per-record annotation is present — a ``GeoDistance``, or a
+                search annotation (v0.35.0) — (it is computed per record, not per group).
         """
         for field in fields:
             validate_field_name(field, "GROUP BY field")
-        self._reject_geo_distance_mixing(self._annotations, grouped=bool(fields))
+        self._reject_per_record_mixing(self._annotations, grouped=bool(fields))
         self._group_by_fields = [self._column(field) for field in fields]
         return self
 
-    def annotate(self, **annotations: "Aggregation | GeoDistance") -> Self:
+    def annotate(self, **annotations: "Aggregation | GeoDistance | SearchScore | SearchHighlight | SearchOffsets") -> Self:
         """
-        Add aggregation annotations, or per-record distances, to the query.
+        Add aggregation annotations, or per-record values — distances, search scores, highlights and offsets —, to
+        the query.
 
         An ``Aggregation`` (``Count``, ``Sum``, ``Avg``, ``Min``, ``Max``) groups the records with
         ``values()``, and ``exec()`` returns one dict per group.
@@ -1731,6 +1793,29 @@ class QuerySet:
             )
             near[0].dist  # metres, a float; None for a record whose field is not a point
 
+        So are the search annotations (v0.35.0, the full SurrealDB-ORM's ``SearchScore`` and ``SearchHighlight``,
+        plus ``SearchOffsets``), each naming the match reference a :meth:`search` field was given (``@0@``,
+        ``@1@`` …, in call order)::
+
+            articles = await (
+                Article.objects()
+                .search(title="physics")
+                .annotate(relevance=SearchScore(0), snippet=SearchHighlight("<b>", "</b>", 0))
+                .order_by("-relevance")
+                .exec()
+            )
+            articles[0].relevance  # BM25, a float
+            articles[0].snippet    # 'Cooking with <b>physics</b>'
+
+        ``SearchScore`` gives the field's BM25 score, ``SearchHighlight`` its text with each matched term wrapped in
+        the tags (a list of texts for an array field; the text unchanged when the index has no ``HIGHLIGHTS``),
+        ``SearchOffsets`` where the matched terms sit (``{"0": [{"s": 13, "e": 20}]}``). The tags are bound query
+        variables. The references are checked when the queryset runs (``annotate()`` may come before ``search()``):
+        a reference ``search()`` did not give, or a search annotation without ``search()``, raises before any
+        request. The scores depend on the line: SurrealDB 3.x gives a term found in more than half the documents no
+        weight, while 2.x and the embedded engine score it below zero, count an index's records again each time it
+        is rebuilt and keep counting deleted records (README section 36): compare scores within one query.
+
         ``exec()``, ``first()`` and ``get()`` return model instances carrying the value as an
         attribute named after the alias; it is never written back (``model_dump()``, ``update()``,
         ``upsert()`` leave it out). Rows that do not validate (a ``select()`` that omits a required
@@ -1740,39 +1825,48 @@ class QuerySet:
         ``nearby()``. On an ``extra="allow"`` model, a stored undeclared column with the alias's
         name is replaced by the distance in the results, and a later ``update()`` removes it: choose
         an alias no record stores. The field and the point are checked and copied here: changing
-        the ``GeoDistance`` afterwards does not change this queryset.
+        the ``GeoDistance`` afterwards does not change this queryset. ``count()`` and the aggregations
+        ignore every annotation; ``live()``, ``watch()``, ``changes()`` and a ``Subquery`` refuse a queryset
+        holding one.
 
         Args:
-            **annotations: The alias of each value, and an ``Aggregation`` or a ``GeoDistance``.
+            **annotations: The alias of each value, and an ``Aggregation``, a ``GeoDistance``, a ``SearchScore``,
+                a ``SearchHighlight`` or a ``SearchOffsets``.
 
         Returns:
             Self: The current QuerySet instance for method chaining.
 
         Raises:
-            TypeError: a value is neither an ``Aggregation`` nor a ``GeoDistance``.
-            ValueError: an invalid alias; for a ``GeoDistance``, an alias that names a declared field
+            TypeError: a value is none of those.
+            ValueError: an invalid alias; for a per-record annotation, an alias that names a declared field
                 or its column, ``id``, ``in``, ``out``, a name starting with ``_`` or ``model_`` or an
-                attribute of the model (``save``, ``objects``…), an invalid field name or a field
-                declared as a geometry that holds no point; a ``GeoDistance`` combined with an
+                attribute of the model (``save``, ``objects``…); for a ``GeoDistance``, an invalid field name or
+                a field declared as a geometry that holds no point; a per-record annotation combined with an
                 ``Aggregation`` or with ``values()``.
         """
         from .aggregations import Aggregation as AggregationClass
 
         distances: dict[str, tuple[str, GeometryPoint]] = {}
+        searches: dict[str, SearchAnnotation] = {}
         for alias, value in annotations.items():
             validate_alias_name(alias)
             if isinstance(value, GeoDistance):
                 distances[alias] = self._geo_distance_snapshot(alias, value)
+            elif isinstance(value, SearchScore | SearchHighlight | SearchOffsets):
+                self._check_annotation_alias(alias, type(value).__name__, _search.annotation_noun(value))
+                searches[alias] = value
             elif not isinstance(value, AggregationClass):
                 raise TypeError(
-                    f"annotate() argument '{alias}' must be an Aggregation instance or a GeoDistance, "
-                    f"got {type(value).__name__}"
+                    f"annotate() argument {alias!r} must be an Aggregation instance, a GeoDistance, a SearchScore, "
+                    f"a SearchHighlight or a SearchOffsets, got {type(value).__name__}"
                 )
-        self._reject_geo_distance_mixing({**self._annotations, **annotations}, grouped=bool(self._group_by_fields))
+        self._reject_per_record_mixing({**self._annotations, **annotations}, grouped=bool(self._group_by_fields))
         self._annotations.update(annotations)
-        # An alias given again is replaced, an Aggregation included: keep the snapshots of the others.
+        # An alias given again is replaced, whatever its kind: each per-record dict keeps only the others.
         kept = {alias: snapshot for alias, snapshot in self._geo_annotations.items() if alias not in annotations}
         self._geo_annotations = {**kept, **distances}
+        kept_searches = {alias: value for alias, value in self._search_annotations.items() if alias not in annotations}
+        self._search_annotations = {**kept_searches, **searches}
         return self
 
     def _geo_distance_snapshot(self, alias: str, distance: GeoDistance) -> tuple[str, GeometryPoint]:
@@ -1782,36 +1876,43 @@ class QuerySet:
         <alias>`` replaces a stored column of that name in the result (``AS id`` replaces the id),
         and the value is set on the instance as an attribute.
         """
-        reason = self._reserved_distance_alias(alias)
-        if reason is not None:
-            raise ValueError(f"annotate() alias {alias!r} {reason}; choose another alias for the GeoDistance")
+        self._check_annotation_alias(alias, "GeoDistance", "distance")
         field = _geo._distance_field(distance.field)
         validate_field_name(field, "GeoDistance field")
         self._check_point_field(field, "GeoDistance")
         return self._column(field), _geo._as_point(distance.point)
 
-    def _reserved_distance_alias(self, alias: str) -> str | None:
-        """Why ``alias`` cannot name a ``GeoDistance`` on this model, or ``None`` when it can."""
+    def _check_annotation_alias(self, alias: str, kind: str, noun: str) -> None:
+        """Refuse *alias* for a per-record annotation of class *kind*, whose value is a *noun* (``distance``,
+        ``score``, ``highlight``, ``offsets``), when it would shadow what a record or an instance already has."""
+        reason = self._reserved_annotation_alias(alias, noun)
+        if reason is not None:
+            raise ValueError(f"annotate() alias {alias!r} {reason}; choose another alias for the {kind}")
+
+    def _reserved_annotation_alias(self, alias: str, noun: str) -> str | None:
+        """Why ``alias`` cannot name a per-record annotation whose value is a *noun* on this model, or ``None`` when
+        it can (v0.24.0's rule for ``GeoDistance``, v0.35.0's for the search annotations)."""
         if alias in ("id", "in", "out"):
             return "is reserved: it names the record's id or an edge endpoint"
         if alias.startswith(("_", "model_")):
             return "is reserved: names starting with '_' or 'model_' belong to Pydantic"
         model = self.model
         if alias in model.model_fields:
-            return f"is a field of {model.__name__}: the distance would replace its value in the results"
+            return f"is a field of {model.__name__}: the {noun} would replace its value in the results"
         for name in model.model_fields:
             if model.to_db_field(name) == alias:
-                return f"is the column of field {name!r}: the distance would replace its value in the results"
+                return f"is the column of field {name!r}: the {noun} would replace its value in the results"
         if hasattr(model, alias):
-            return f"is an attribute of {model.__name__}: the distance would shadow it on the instances"
+            return f"is an attribute of {model.__name__}: the {noun} would shadow it on the instances"
         return None
 
     @staticmethod
-    def _reject_geo_distance_mixing(annotations: Mapping[str, Any], *, grouped: bool) -> None:
-        """Refuse a ``GeoDistance`` next to an ``Aggregation`` or a ``values()`` grouping."""
-        kinds = {isinstance(value, GeoDistance) for value in annotations.values()}
-        if True in kinds and (False in kinds or grouped):
-            raise ValueError(_GEO_DISTANCE_PER_RECORD)
+    def _reject_per_record_mixing(annotations: Mapping[str, Any], *, grouped: bool) -> None:
+        """Refuse a per-record annotation — a ``GeoDistance``, or a search annotation (v0.35.0) — next to an
+        ``Aggregation`` or a ``values()`` grouping, naming the first per-record one in alias order."""
+        per_record = [value for value in annotations.values() if isinstance(value, _PER_RECORD)]
+        if per_record and (grouped or len(per_record) < len(annotations)):
+            raise ValueError(_per_record_refused(per_record[0]))
 
     async def count(self) -> int:
         """
@@ -1942,9 +2043,16 @@ class QuerySet:
         """
         Check if any records match the current query.
 
+        It compiles the full projection, as ``exec()`` does: a search annotation (v0.35.0) is sent with its
+        ``LIMIT 1`` and its match reference checked first, before any request.
+
         Returns:
             True if at least one record matches, False otherwise.
+
+        Raises:
+            ValueError: a search annotation whose match reference ``search()`` did not give this queryset.
         """
+        self._check_search_references()
         moment = await self._time_travel_moment()
         original_limit = self._limit
         try:
@@ -2927,10 +3035,16 @@ class QuerySet:
         return self.model.from_db(data.get("result", []))
 
 
-#: The refusal of a ``GeoDistance`` combined with ``values()`` or an ``Aggregation``.
-_GEO_DISTANCE_PER_RECORD = (
-    "annotate(): a GeoDistance is computed per record; it cannot be combined with GROUP BY aggregations or values()"
-)
+#: The annotations computed per record: ``GeoDistance`` (v0.24.0) and the search annotations (v0.35.0).
+_PER_RECORD = (GeoDistance, SearchScore, SearchHighlight, SearchOffsets)
+
+
+def _per_record_refused(annotation: object) -> str:
+    """The refusal of *annotation*, computed per record, combined with ``values()`` or an ``Aggregation``."""
+    return (
+        f"annotate(): a {type(annotation).__name__} is computed per record; it cannot be combined with GROUP BY "
+        "aggregations or values()"
+    )
 
 
 def _metres(value: Any) -> float:

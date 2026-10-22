@@ -27,6 +27,7 @@ from surreal_orm_lite import (
     BoundIncluded,
     Computed,
     ConnectionConfig,
+    Count,
     DatabaseIntrospector,
     Duration,
     Event,
@@ -669,6 +670,19 @@ def search_forms() -> None:
     assert_type(QuerySet(IndexedPost).search(title="physics"), QuerySet)
     assert_type(QuerySet(IndexedPost).search(title="quantum", slug="a1").search(**{"meta.headline": "rust"}), QuerySet)
     assert_type(QuerySet(IndexedPost).filter(id__in=Subquery(QuerySet(IndexedPost).search(title="x"))), QuerySet)
+
+
+def search_annotation_forms() -> None:
+    """v0.35.0: ``annotate()`` takes ``SearchScore``, ``SearchHighlight`` and ``SearchOffsets`` and returns the
+    queryset."""
+    annotated = (
+        QuerySet(IndexedPost)
+        .search(title="physics")
+        .annotate(relevance=SearchScore(0), snippet=SearchHighlight("<b>", "</b>", 0), spans=SearchOffsets(0))
+        .order_by("-relevance")
+    )
+    assert_type(annotated, QuerySet)
+    assert_type(QuerySet(IndexedPost).annotate(n=Count(), s=SearchScore()), QuerySet)
 
 
 async def analyzer_appliers(tx: Transaction) -> None:

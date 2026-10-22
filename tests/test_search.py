@@ -94,6 +94,22 @@ starts: without the index SurrealDB 3.x would accept the live query and never no
 ``filter()``, ``Q``, ``order_by()``, ``limit()``/``offset()``, ``select()``, ``fetch()``, ``first()`` and ``get()``.
 Pinned (README rows "``search()`` on a field without a full-text index" and "``live()`` with a ``Subquery`` that
 searches a field without a full-text index"): SurrealDB 3.1 answers no record, and starts the live query.
+
+The search annotations in ``annotate()`` (``TestAnnotateCompile``): ``SearchScore``, ``SearchHighlight`` and
+``SearchOffsets`` compile ``search::score(<ref>)``, ``search::highlight($_sh<2k>, $_sh<2k+1>, <ref>)`` (the tags bound)
+and ``search::offsets(<ref>)``, after the ``GeoDistance`` projections, in ``annotate()`` order; an alias that would
+shadow a field, its column or an attribute, a search annotation with an aggregation or ``values()``, a value of another
+type, a reference ``search()`` did not give and a search annotation without ``search()`` are each refused with an
+exact text, before any request — the references when the queryset runs, since ``annotate()`` may come before
+``search()``. ``count()`` ignores them; ``live()``, ``watch()``, ``changes()`` and a ``Subquery`` refuse them; an alias
+given again replaces the earlier value whatever its kind. On every engine (``TestAnnotateE2E``) the instances carry the
+corpus's scores — equal across engines on an index built once —, highlights (a list for an array field, the text
+unchanged without ``HIGHLIGHTS``), offsets and tags exactly as given, never written back; rows that do not validate are
+dicts holding the aliases. Pinned (``TestSearchLinesE2E``, README rows "Two ``search()`` fields AND-ed", "BM25 score
+of a term in more than half the documents" and "BM25 statistics after a rebuild, a redefinition or a deletion"): each
+field of an AND scored as if searched alone, SurrealDB 3.1 also returning records that match one field only; a common
+term scored ``0.0`` on 3.x and below zero on 2.x and the embedded engine; after a rebuild or a deleted record, 3.x
+keeps the scores of the freshly built index while 2.x and the embedded engine count the records again.
 """
 
 import ast
@@ -124,6 +140,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     Count,
     DatabaseIntrospector,
+    GeoDistance,
     Index,
     IndexState,
     Q,
@@ -2103,6 +2120,258 @@ class TestTransactionReason:
         assert str(parsed.value.__context__) == excerpt
 
 
+# --- the search annotations in annotate() ---------------------------------------------------------------------------
+
+_Q3 = (
+    "SELECT *, search::score(0) AS relevance, search::highlight($_sh0, $_sh1, 0) AS snippet, search::offsets(0) AS spans "
+    "FROM fts_article WHERE title @0@ $_f0 ORDER BY relevance DESC;"
+)
+_PR1 = "annotate(): a {} is computed per record; it cannot be combined with GROUP BY aggregations or values()"
+_AT1 = (
+    "annotate() argument {!r} must be an Aggregation instance, a GeoDistance, a SearchScore, a SearchHighlight or a "
+    "SearchOffsets, got {}"
+)
+_SR1 = "annotate(): {} names match reference {}, but search() gave this queryset {}."
+_SR2 = "annotate(): {} needs search(): SurrealDB scores, highlights and locates the fields search() matches."
+_LIVE_ANNOTATE = (
+    "A live query cannot honour annotate(): SurrealDB's LIVE SELECT has no ORDER BY, LIMIT or START, streams whole "
+    "records, and runs outside any transaction. Drop the clause — filter(), variables() and fetch() are supported."
+)
+_SUBQUERY_ANNOTATE = (
+    "A subquery cannot honour annotate(): it gives the outer filter one list of values, SELECT VALUE <one field>. Drop "
+    "the clause; filter(), Q, nearby(), select() of one field, order_by(), limit(), offset() and variables() are "
+    "supported."
+)
+
+#: A search annotation of each kind, with the noun its alias refusals use.
+_SEARCH_ANNOTATIONS = [(SearchScore(0), "score"), (SearchHighlight(), "highlight"), (SearchOffsets(0), "offsets")]
+
+
+def _q3(text: str = "quantum") -> Any:
+    """Q3's queryset: the articles whose title matches *text*, with their score, highlight and offsets, best first."""
+    return (
+        FtsArticle.objects()
+        .search(title=text)
+        .annotate(relevance=SearchScore(0), snippet=SearchHighlight("<b>", "</b>", 0), spans=SearchOffsets(0))
+        .order_by("-relevance")
+    )
+
+
+class TestAnnotateCompile:
+    """``SearchScore``, ``SearchHighlight`` and ``SearchOffsets`` in ``annotate()``: one projection each, after the
+    ``GeoDistance`` ones, the highlight tags bound; their aliases, their mixing with groups and their references
+    refused before any request, with exact texts."""
+
+    def test_q3(self) -> None:
+        assert _q3()._compile_query() == (_Q3, {"_f0": "quantum", "_sh0": "<b>", "_sh1": "</b>"})
+
+    def test_q9_a_reference_of_a_later_call(self) -> None:
+        queryset = FtsArticle.objects().search(title="a").search(body="b").annotate(s=SearchScore(1))
+        assert queryset._compile_query() == (
+            "SELECT *, search::score(1) AS s FROM fts_article WHERE title @0@ $_f0 AND body @1@ $_f1;",
+            {"_f0": "a", "_f1": "b"},
+        )
+
+    def test_after_the_geo_distances_unchanged(self) -> None:
+        queryset = (
+            FtsArticle.objects()
+            .search(title="a")
+            .annotate(s=SearchScore(0), dist=GeoDistance("meta.at", (1.0, 2.0)), h=SearchHighlight("[", "]"))
+        )
+        query, variables = queryset._compile_query()
+        assert query == (
+            "SELECT *, IF meta.at.is_point() THEN geo::distance(meta.at, $_gd0) END AS dist, search::score(0) AS s, "
+            "search::highlight($_sh0, $_sh1, 0) AS h FROM fts_article WHERE title @0@ $_f0;"
+        )
+        assert sorted(variables) == ["_f0", "_gd0", "_sh0", "_sh1"]
+        assert (variables["_sh0"], variables["_sh1"]) == ("[", "]")
+
+    def test_two_highlights_bind_four_tags(self) -> None:
+        queryset = (
+            FtsArticle.objects()
+            .search(title="a", tags="b")
+            .annotate(a=SearchHighlight("<i>", "</i>", 0), b=SearchScore(1), c=SearchHighlight("<em class='x'>", "\\", 1))
+        )
+        assert queryset._compile_query() == (
+            "SELECT *, search::highlight($_sh0, $_sh1, 0) AS a, search::score(1) AS b, search::highlight($_sh2, $_sh3, 1) "
+            "AS c FROM fts_article WHERE title @0@ $_f0 AND tags @1@ $_f1;",
+            {"_f0": "a", "_f1": "b", "_sh0": "<i>", "_sh1": "</i>", "_sh2": "<em class='x'>", "_sh3": "\\"},
+        )
+
+    def test_kept_in_annotations_and_in_the_search_annotations(self) -> None:
+        queryset = FtsArticle.objects().annotate(s=SearchScore(0), h=SearchHighlight(ref=1), n=SearchOffsets(2))
+        assert queryset._annotations == {"s": SearchScore(0), "h": SearchHighlight(ref=1), "n": SearchOffsets(2)}
+        assert queryset._search_annotations == queryset._annotations
+        assert queryset._geo_annotations == {}
+
+    @pytest.mark.parametrize("value", ["relevance", 3, None, SearchScore], ids=["str", "int", "none", "class"])
+    def test_at1_another_type(self, value: object) -> None:
+        queryset = FtsArticle.objects().search(title="a")
+        assert _raised(TypeError, queryset.annotate, x=value) == _AT1.format("x", type(value).__name__)
+        assert queryset._annotations == {}
+
+    @pytest.mark.parametrize(("annotation", "noun"), _SEARCH_ANNOTATIONS, ids=["score", "highlight", "offsets"])
+    def test_al1_an_alias_that_would_shadow(self, annotation: Any, noun: str) -> None:
+        kind = type(annotation).__name__
+        reasons = {
+            "title": f"is a field of FtsArticle: the {noun} would replace its value in the results",
+            "head_text": f"is the column of field 'heading': the {noun} would replace its value in the results",
+            "heading": f"is a field of FtsArticle: the {noun} would replace its value in the results",
+            "save": f"is an attribute of FtsArticle: the {noun} would shadow it on the instances",
+            "objects": f"is an attribute of FtsArticle: the {noun} would shadow it on the instances",
+            "id": "is reserved: it names the record's id or an edge endpoint",
+            "_score": "is reserved: names starting with '_' or 'model_' belong to Pydantic",
+            "model_score": "is reserved: names starting with '_' or 'model_' belong to Pydantic",
+        }
+        for alias, reason in reasons.items():
+            queryset = FtsArticle.objects().search(title="a")
+            text = _raised(ValueError, queryset.annotate, **{alias: annotation})
+            assert text == f"annotate() alias {alias!r} {reason}; choose another alias for the {kind}"
+            assert queryset._annotations == {} and queryset._search_annotations == {}
+
+    def test_al1_an_edge_reserves_its_endpoints(self) -> None:
+        for alias in ("in", "out"):
+            assert _raised(ValueError, FtsCites.objects().annotate, **{alias: SearchScore(0)}) == (
+                f"annotate() alias {alias!r} is reserved: it names the record's id or an edge endpoint; choose another "
+                "alias for the SearchScore"
+            )
+
+    def test_the_geo_distance_texts_are_unchanged(self) -> None:
+        assert _raised(ValueError, FtsArticle.objects().annotate, title=GeoDistance("meta.at", (1.0, 2.0))) == (
+            "annotate() alias 'title' is a field of FtsArticle: the distance would replace its value in the results; "
+            "choose another alias for the GeoDistance"
+        )
+        mixed = FtsArticle.objects().annotate(dist=GeoDistance("meta.at", (1.0, 2.0)), s=SearchScore(0))
+        assert _raised(ValueError, mixed.annotate, n=Count()) == _PR1.format("GeoDistance")
+
+    @pytest.mark.parametrize(("annotation", "noun"), _SEARCH_ANNOTATIONS, ids=["score", "highlight", "offsets"])
+    def test_pr1_with_an_aggregation_or_values(self, annotation: Any, noun: str) -> None:
+        kind = type(annotation).__name__
+        refused = _PR1.format(kind)
+        assert _raised(ValueError, FtsArticle.objects().annotate, n=Count(), s=annotation) == refused
+        counted = FtsArticle.objects().annotate(n=Count())
+        assert _raised(ValueError, counted.annotate, s=annotation) == refused
+        assert list(counted._annotations) == ["n"] and counted._search_annotations == {}
+        grouped = FtsArticle.objects().search(title="a").values("views")
+        assert _raised(ValueError, grouped.annotate, s=annotation) == refused
+        assert grouped._annotations == {} and grouped._search_annotations == {}
+        annotated = FtsArticle.objects().search(title="a").annotate(s=annotation)
+        assert _raised(ValueError, annotated.values, "views") == refused
+        assert annotated._group_by_fields == []
+        assert _raised(ValueError, annotated.annotate, n=Count()) == refused
+        assert list(annotated._annotations) == ["s"]
+
+    def test_pr1_names_the_first_per_record_annotation(self) -> None:
+        point = GeoDistance("meta.at", (1.0, 2.0))
+        assert _raised(ValueError, FtsArticle.objects().annotate, h=SearchHighlight(), d=point, n=Count()) == (
+            _PR1.format("SearchHighlight")
+        )
+        assert _raised(ValueError, FtsArticle.objects().annotate, d=point, h=SearchHighlight(), n=Count()) == (
+            _PR1.format("GeoDistance")
+        )
+
+    def test_pr1_in_the_group_by_compiler(self) -> None:
+        queryset = FtsArticle.objects().annotate(o=SearchOffsets(0))
+        assert _raised(ValueError, queryset._compile_group_by_query) == _PR1.format("SearchOffsets")
+
+    @pytest.mark.usefixtures("_no_client")
+    async def test_pr1_from_exec_of_a_grouped_queryset(self) -> None:
+        queryset = FtsArticle.objects().search(title="a").annotate(s=SearchScore(0))
+        queryset._group_by_fields = ["views"]
+        with pytest.raises(ValueError) as raised:
+            await queryset.exec()
+        assert str(raised.value) == _PR1.format("SearchScore")
+
+    def test_sr1_a_reference_search_did_not_give(self) -> None:
+        one = FtsArticle.objects().search(title="a").annotate(h=SearchHighlight("<b>", "</b>", 1))
+        assert _raised(ValueError, one._compile_query) == _SR1.format("SearchHighlight('<b>', '</b>', 1)", 1, "reference 0")
+        two = FtsArticle.objects().search(title="a", body="b").annotate(s=SearchScore(2))
+        assert _raised(ValueError, two._compile_query) == _SR1.format("SearchScore(2)", 2, "references 0 and 1")
+        three = FtsArticle.objects().search(title="a", body="b").search(tags="c").annotate(o=SearchOffsets(5))
+        assert _raised(ValueError, three._compile_query) == _SR1.format("SearchOffsets(5)", 5, "references 0, 1 and 2")
+
+    def test_sr1_is_checked_when_the_queryset_runs(self) -> None:
+        """``annotate()`` may come before ``search()``: the references are checked against the searches of the
+        queryset as it runs."""
+        queryset = FtsArticle.objects().annotate(s=SearchScore(1)).search(title="a")
+        assert _raised(ValueError, queryset._compile_query) == _SR1.format("SearchScore(1)", 1, "reference 0")
+        queryset.search(body="b")
+        assert queryset._compile_query()[0] == (
+            "SELECT *, search::score(1) AS s FROM fts_article WHERE title @0@ $_f0 AND body @1@ $_f1;"
+        )
+
+    @pytest.mark.parametrize(("annotation", "noun"), _SEARCH_ANNOTATIONS, ids=["score", "highlight", "offsets"])
+    def test_sr2_without_search(self, annotation: Any, noun: str) -> None:
+        queryset = FtsArticle.objects().filter(views__gt=1).annotate(x=annotation)
+        assert _raised(ValueError, queryset._compile_query) == _SR2.format(repr(annotation))
+
+    @pytest.mark.usefixtures("_no_client")
+    @pytest.mark.parametrize("method", ["exec", "exists", "first", "get"])
+    async def test_sr1_and_sr2_before_any_request(self, method: str) -> None:
+        unsearched = FtsArticle.objects().annotate(s=SearchScore(0))
+        with pytest.raises(ValueError) as raised:
+            await getattr(unsearched, method)()
+        assert str(raised.value) == _SR2.format("SearchScore(0)")
+        unknown = FtsArticle.objects().search(title="a").annotate(s=SearchScore(1))
+        with pytest.raises(ValueError) as raised:
+            await getattr(unknown, method)()
+        assert str(raised.value) == _SR1.format("SearchScore(1)", 1, "reference 0")
+
+    @pytest.mark.usefixtures("_no_client")
+    @pytest.mark.parametrize("method", ["exec", "exists"])
+    async def test_sr2_before_the_moment_of_as_of_is_resolved(self, method: str) -> None:
+        """Under ``as_of(<duration>)`` the read resolves its moment with a ``RETURN`` request first: the refusal
+        comes before it."""
+        queryset = FtsArticle.objects().as_of(timedelta(hours=1)).annotate(h=SearchHighlight())
+        with pytest.raises(ValueError) as raised:
+            await getattr(queryset, method)()
+        assert str(raised.value) == _SR2.format("SearchHighlight('<b>', '</b>', 0)")
+
+    async def test_count_ignores_the_annotations(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``count()`` and the aggregations ignore every annotation, as they ignore ``GeoDistance``: no reference
+        check, no projection."""
+        sent: list[tuple[str, dict[str, Any]]] = []
+
+        async def execute(self: Any, query: str, variables: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+            sent.append((query, dict(variables or {})))
+            return [{"count": 3}]
+
+        monkeypatch.setattr(type(FtsArticle.objects()), "_execute_query", execute)
+        assert await FtsArticle.objects().annotate(s=SearchScore(0)).count() == 3
+        assert await FtsArticle.objects().search(title="a").annotate(s=SearchScore(4)).count() == 3
+        assert sent == [
+            ("SELECT count() FROM fts_article GROUP ALL;", {}),
+            ("SELECT count() FROM fts_article WHERE title @0@ $_f0 GROUP ALL;", {"_f0": "a"}),
+        ]
+
+    @pytest.mark.usefixtures("_no_client")
+    def test_refused_by_a_live_query_a_change_feed_and_a_subquery(self) -> None:
+        for annotation, _ in _SEARCH_ANNOTATIONS:
+            annotated = FtsArticle.objects().annotate(x=annotation)
+            assert _raised(SurrealDbError, annotated.live) == _LIVE_ANNOTATE
+            assert _raised(SurrealDbError, annotated.watch) == _LIVE_ANNOTATE
+            assert _raised(SurrealDbError, annotated.changes) == _CH1.format("annotate()")
+            inner = FtsArticle.objects().search(title="a").annotate(x=annotation)
+            outer = FtsArticle.objects().filter(id__in=Subquery(inner))
+            assert _raised(ValueError, outer._compile_query) == _SUBQUERY_ANNOTATE
+
+    def test_an_alias_given_again_replaces_the_earlier_value(self) -> None:
+        point = GeoDistance("meta.at", (1.0, 2.0))
+        aggregated = FtsArticle.objects().annotate(x=SearchScore(0)).annotate(x=Count())
+        assert aggregated._search_annotations == {} and aggregated._geo_annotations == {}
+        assert isinstance(aggregated._annotations["x"], Count)
+        assert aggregated._compile_group_by_query()[0] == "SELECT count() AS x FROM fts_article GROUP ALL;"
+        scored = FtsArticle.objects().annotate(x=Count()).annotate(x=SearchScore(0))
+        assert scored._annotations == {"x": SearchScore(0)} and scored._search_annotations == {"x": SearchScore(0)}
+        moved = FtsArticle.objects().annotate(x=point).annotate(x=SearchOffsets(0))
+        assert moved._geo_annotations == {} and moved._search_annotations == {"x": SearchOffsets(0)}
+        back = FtsArticle.objects().annotate(x=SearchOffsets(0)).annotate(x=point)
+        assert back._search_annotations == {} and list(back._geo_annotations) == ["x"]
+        assert back.search(title="a")._compile_query()[0] == (
+            "SELECT *, IF meta.at.is_point() THEN geo::distance(meta.at, $_gd0) END AS x FROM fts_article WHERE title @0@ $_f0;"
+        )
+
+
 # === E2E: the connection "fts" on the database fts_db, over WebSocket and HTTP, and mem:// =========================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -3647,3 +3916,230 @@ class TestLiveIndexCheckE2E:
         assert str(raised.value) == _si1("slug")
         assert _shown(raised.value, _SECRET) == []
         assert started == [check]
+
+
+# --- the search annotations on the engines --------------------------------------------------------------------------
+
+#: The BM25 scores of ``search(title="physics")`` on the corpus, its index built once in a fresh database: the same on
+#: every engine.
+_PHYSICS_SCORES = {"a1": 0.543332, "a2": 0.612858}
+
+#: The README rows the line pins back.
+_ROW_AND = "README row 'Two search() fields AND-ed'"
+_ROW_COMMON = "README row 'BM25 score of a term in more than half the documents (SearchScore)'"
+_ROW_STATISTICS = "README row 'BM25 statistics after a rebuild, a redefinition or a deletion (SearchScore)'"
+
+#: A rebuild of the title index, sent raw.
+_REBUILD_TITLE = "REBUILD INDEX `fts_article_title` ON `fts_article`;"
+
+
+def _approx(value: float) -> Any:
+    """*value* to the relative precision scores agree to across engines."""
+    return pytest.approx(value, rel=1e-5)
+
+
+async def _scores(**field_queries: str) -> dict[str, float]:
+    """The ``SearchScore(0)`` of each article ``search(**field_queries)`` matches, by id."""
+    rows = await FtsArticle.objects().search(**field_queries).annotate(relevance=SearchScore(0)).exec()
+    return {row.id: row.relevance for row in rows}
+
+
+class TestAnnotateE2E:
+    """The search annotations on every engine (SurrealDB 3.x and 2.x over WebSocket and HTTP, and the embedded
+    engine): scores ordered and equal across engines on an index built once, highlights and offsets exact, tags given
+    back exactly, the values carried by the instances and never written back."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_q3_score_highlight_and_offsets(self, kind: str) -> None:
+        async with _corpus(kind):
+            articles = await _q3("physics").exec()
+        assert [article.id for article in articles] == ["a2", "a1"]
+        assert all(isinstance(article, FtsArticle) for article in articles)
+        assert [article.relevance for article in articles] == [_approx(0.612858), _approx(0.543332)]
+        assert articles[0].relevance > articles[1].relevance > 0
+        assert [article.snippet for article in articles] == [
+            "Cooking with <b>physics</b>",
+            "Quantum <b>physics</b> for beginners",
+        ]
+        assert [article.spans for article in articles] == [{"0": [{"s": 13, "e": 20}]}, {"0": [{"s": 8, "e": 15}]}]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_tags_are_given_back_exactly(self, kind: str) -> None:
+        """The tags are bound query variables: a quote and a trailing backslash come back as they were given."""
+        async with _corpus(kind):
+            articles = await (
+                FtsArticle.objects()
+                .search(title="physics")
+                .annotate(relevance=SearchScore(0), snippet=SearchHighlight("<em class='hit'>", "</em>\\", 0))
+                .order_by("-relevance")
+                .exec()
+            )
+        assert [article.snippet for article in articles] == [
+            "Cooking with <em class='hit'>physics</em>\\",
+            "Quantum <em class='hit'>physics</em>\\ for beginners",
+        ]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_array_field_and_an_index_without_highlights(self, kind: str) -> None:
+        async with _corpus(kind):
+            tagged = await FtsArticle.objects().search(tags="quantum").annotate(snippet=SearchHighlight()).exec()
+            body = await FtsArticle.objects().search(body="physics").annotate(snippet=SearchHighlight()).exec()
+        assert [article.id for article in tagged] == ["a1"]
+        assert isinstance(tagged[0].snippet, list)
+        assert "<b>quantum</b> world" in tagged[0].snippet
+        assert [article.snippet for article in body] == ["Heat and physics in the kitchen"], (
+            "an index without HIGHLIGHTS gives the text unchanged"
+        )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_reference_names_its_field(self, kind: str) -> None:
+        """Each annotation reads the field its reference names; offsets of an array field are keyed by the item's
+        position; an index without ``HIGHLIGHTS`` gives no offsets."""
+        async with _corpus(kind):
+            articles = await (
+                FtsArticle.objects()
+                .search(tags="quantum")
+                .search(heading="introduction")
+                .annotate(snippet=SearchHighlight("[", "]", 1), spans=SearchOffsets(0))
+                .exec()
+            )
+            body = await FtsArticle.objects().search(body="physics").annotate(spans=SearchOffsets(0)).exec()
+        assert [(article.id, article.snippet, article.spans) for article in articles] == [
+            ("a1", "[Introduction]", {"1": [{"s": 0, "e": 7}]})
+        ]
+        assert [(article.id, article.spans) for article in body] == [("a2", None)]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_values_are_never_written_back(self, kind: str) -> None:
+        async with _corpus(kind) as client:
+            article = await _q3("cooking").first()
+            read = (article.id, article.relevance)
+            dumped = article.model_dump()
+            article.views = 20
+            await article.update()
+            await article.upsert()
+            stored = await client.query("SELECT * FROM fts_article;", {})
+        assert read[0] == "a2" and read[1] > 0
+        assert not {"relevance", "snippet", "spans"} & set(dumped)
+        assert all(not {"relevance", "snippet", "spans"} & set(row) for row in stored)
+        assert sorted(row["views"] for row in stored) == [1, 3, 4, 5, 6, 20]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_rows_that_do_not_validate_are_dicts_holding_the_aliases(self, kind: str) -> None:
+        async with _corpus(kind):
+            rows = await (
+                FtsArticle.objects()
+                .search(title="physics")
+                .select("title")
+                .annotate(relevance=SearchScore(0))
+                .order_by("-relevance")
+                .exec()
+            )
+        assert [row["title"] for row in rows] == ["Cooking with physics", "Quantum physics for beginners"]
+        assert all(set(row) == {"title", "relevance"} and row["relevance"] > 0 for row in rows)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_first_and_get_without_an_id(self, kind: str) -> None:
+        async with _corpus(kind):
+            first = await _q3("physics").first()
+            got = (
+                await FtsArticle.objects()
+                .search(title="cooking")
+                .annotate(relevance=SearchScore(0), snippet=SearchHighlight())
+                .get()
+            )
+        assert (first.id, first.relevance, first.snippet) == ("a2", _approx(0.612858), "Cooking with <b>physics</b>")
+        assert first.spans == {"0": [{"s": 13, "e": 20}]}
+        assert (got.id, got.snippet) == ("a2", "<b>Cooking</b> with physics")
+        assert got.relevance > 0
+
+
+class TestSearchLinesE2E:
+    """Pinned line facts on the corpus, each backing a README row: two ``search()`` fields AND-ed, the BM25 score of a
+    term in more than half the documents, and the BM25 statistics after a rebuild or a deletion. Every score compared
+    with a recorded value or across queries is read from the index built once in the test's fresh database."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_two_fields_and_ed(self, kind: str) -> None:
+        """README row "Two ``search()`` fields AND-ed": only the records that match every field, each field scored as
+        if searched alone; SurrealDB 3.1 can also return records that match only one of the fields, scored ``0.0`` on
+        the other (here ``title`` alone)."""
+        async with _corpus(kind) as client:
+            line = await _line(client)
+            rows = await (
+                FtsArticle.objects().search(title="physics", body="kitchen").annotate(t=SearchScore(0), b=SearchScore(1)).exec()
+            )
+            title = await _scores(title="physics")
+            body = await _scores(body="kitchen")
+        found = {row.id: (row.t, row.b) for row in rows}
+        if _is_31(line):
+            assert sorted(found) == ["a1", "a2"], f"{_ROW_AND}: 3.1 also returns a record that matches one field only"
+            assert found["a1"][1] == 0.0, f"{_ROW_AND}: 3.1 scores 0.0 the field that record does not match"
+        else:
+            assert sorted(found) == ["a2"], _ROW_AND
+        assert found["a2"] == (_approx(title["a2"]), _approx(body["a2"])), f"{_ROW_AND}: each field scored alone"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_term_in_more_than_half_the_documents(self, kind: str) -> None:
+        """README row "BM25 score of a term in more than half the documents (``SearchScore``)": SurrealDB 3.x gives
+        it no weight (``0.0``); 2.x and the embedded engine score it below zero, so a text holding it scores lower
+        than without it. The records matched are the same."""
+        async with _corpus(kind) as client:
+            major = await _major(client)
+            common = await _scores(body="and")
+            mixed = await _scores(body="and physics")
+            alone = await _scores(body="physics")
+        assert sorted(common) == ["a2", "a3", "a4", "a6"]
+        assert sorted(mixed) == sorted(alone) == ["a2"]
+        if major >= 3:
+            assert all(score == 0.0 for score in common.values()), f"{_ROW_COMMON}: 3.x scores 0.0"
+            assert mixed["a2"] == _approx(alone["a2"]), f"{_ROW_COMMON}: on 3.x the term adds nothing"
+        else:
+            assert all(score < 0 for score in common.values()), f"{_ROW_COMMON}: 2.x scores below zero"
+            assert mixed["a2"] < alone["a2"], f"{_ROW_COMMON}: on 2.x a text holding the term scores lower"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_bm25_statistics_after_a_rebuild(self, kind: str) -> None:
+        """README row "BM25 statistics after a rebuild, a redefinition or a deletion (``SearchScore``)": after a
+        ``REBUILD INDEX``, SurrealDB 3.x gives the scores of the freshly built index; 2.x and the embedded engine count
+        the records again, so the scores grow. The matches are unaffected."""
+        async with _corpus(kind) as client:
+            major = await _major(client)
+            fresh = await _scores(title="physics")
+            await _apply_ddl(client, _REBUILD_TITLE)
+            rebuilt = await _scores(title="physics")
+        assert fresh == {key: _approx(value) for key, value in _PHYSICS_SCORES.items()}, "an index built once"
+        assert sorted(rebuilt) == ["a1", "a2"], f"{_ROW_STATISTICS}: the matches are unaffected"
+        if major >= 3:
+            assert rebuilt == {key: _approx(value) for key, value in fresh.items()}, (
+                f"{_ROW_STATISTICS}: 3.x keeps its statistics in step with the records"
+            )
+        else:
+            assert all(rebuilt[key] > fresh[key] for key in fresh), (
+                f"{_ROW_STATISTICS}: 2.x and the embedded engine count the records again at a rebuild"
+            )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_bm25_statistics_after_a_deletion(self, kind: str) -> None:
+        """README row "BM25 statistics after a rebuild, a redefinition or a deletion (``SearchScore``)": after a
+        record is created then deleted, SurrealDB 3.x gives the scores of the freshly built index; 2.x and the embedded
+        engine keep counting the deleted record, so the scores change. The matches are unaffected."""
+        async with _corpus(kind) as client:
+            major = await _major(client)
+            fresh = await _scores(title="physics")
+            knitting = FtsArticle(id="a7", title="Knitting basics", slug="a7")
+            await knitting.save()
+            await knitting.delete()
+            after = await _scores(title="physics")
+            stored = _ids(await FtsArticle.objects().all())
+        assert fresh == {key: _approx(value) for key, value in _PHYSICS_SCORES.items()}, "an index built once"
+        assert stored == ["a1", "a2", "a3", "a4", "a5", "a6"]
+        assert sorted(after) == ["a1", "a2"], f"{_ROW_STATISTICS}: the matches are unaffected"
+        if major >= 3:
+            assert after == {key: _approx(value) for key, value in fresh.items()}, (
+                f"{_ROW_STATISTICS}: 3.x keeps its statistics in step with the records"
+            )
+        else:
+            assert all(after[key] > fresh[key] for key in fresh), (
+                f"{_ROW_STATISTICS}: 2.x and the embedded engine keep counting a deleted record"
+            )

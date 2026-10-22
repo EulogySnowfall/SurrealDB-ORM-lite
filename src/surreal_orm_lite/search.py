@@ -58,7 +58,10 @@ refusals with ``text_refused()``, ``field_refused()``, ``too_many_fields()``, ``
 full-text index with an error that names the column and, on 3.x, quotes the bound search text:
 ``is_missing_index_error()`` recognises it, ``missing_index_column()`` reads the column, and
 ``missing_index_refusal()`` builds the ORM's error naming the field, never the server's text. ``live_index_probe()``
-is the empty search a live query's start check sends for each column its subqueries search.
+is the empty search a live query's start check sends for each column its subqueries search. ``QuerySet.annotate()``
+names a search annotation's value with ``annotation_noun()`` in its alias refusals; a queryset that runs with an
+annotation whose match reference ``search()`` did not give it is refused with ``reference_refused()``, one without
+``search()`` with ``no_search_refused()``.
 
 The module sits low in the package: it imports neither ``model_base``, ``query_set`` nor ``connection_manager``, so
 each of them can import it.
@@ -231,8 +234,9 @@ class SearchOffsets:
         articles[0].spans  # {'0': [{'s': 13, 'e': 20}]}
 
     The value is SurrealDB's: a ``dict`` keyed by the position of the matched item as a string (``"0"`` for a
-    string field), each holding the start (``s``) and end (``e``) of every matched term. ``ref`` is the match
-    reference of the searched field, as for ``SearchScore``. Frozen, hashable and equal by value.
+    string field), each holding the start (``s``) and end (``e``) of every matched term. The field's index needs
+    ``highlights=True``, without which SurrealDB returns ``None``. ``ref`` is the match reference of the searched
+    field, as for ``SearchScore``. Frozen, hashable and equal by value.
 
     Raises:
         TypeError: ``ref`` is not an ``int`` (a ``bool`` included).
@@ -1356,3 +1360,31 @@ def live_index_probe(table: str, column: str) -> str:
     the text is the constant ``''``, never a caller's.
     """
     return f"(SELECT VALUE id FROM {table} WHERE {column} @0@ '' LIMIT 1)"
+
+
+# --- the query side: the search annotations in annotate() -----------------------------------------------------------
+
+#: What each search annotation gives a record, as an ``annotate()`` alias refusal names it.
+_ANNOTATION_NOUNS: dict[type, str] = {SearchScore: "score", SearchHighlight: "highlight", SearchOffsets: "offsets"}
+
+
+def annotation_noun(annotation: SearchAnnotation) -> str:
+    """What *annotation* gives each record, as an ``annotate()`` alias refusal names it: ``score``, ``highlight`` or
+    ``offsets``."""
+    return _ANNOTATION_NOUNS[type(annotation)]
+
+
+def reference_refused(annotation: SearchAnnotation, given: int) -> str:
+    """The refusal of *annotation*, whose match reference is not one of the *given* (at least one) that ``search()``
+    gave the queryset: ``0`` to ``given - 1``, in call order."""
+    if given == 1:
+        references = "reference 0"
+    else:
+        references = f"references {', '.join(str(ref) for ref in range(given - 1))} and {given - 1}"
+    return f"annotate(): {annotation!r} names match reference {annotation.ref}, but search() gave this queryset {references}."
+
+
+def no_search_refused(annotation: SearchAnnotation) -> str:
+    """The refusal of *annotation* on a queryset without ``search()``: there is no match to score, highlight or
+    locate."""
+    return f"annotate(): {annotation!r} needs search(): SurrealDB scores, highlights and locates the fields search() matches."
