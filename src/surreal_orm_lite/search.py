@@ -815,8 +815,16 @@ def remove_analyzer_statement(name: str, missing_ok: bool) -> str:
 # --- the model's indexes --------------------------------------------------------------------------------------------
 
 
-def check_indexes_config(model: type, value: object, *, view: bool, column: Callable[[str], str]) -> None:
-    """The ``indexes`` key of a model's ``SurrealConfigDict``, checked when the class is defined (v0.35.0).
+def check_indexes_config(
+    model: type,
+    value: object,
+    *,
+    view: bool,
+    column: Callable[[str], str],
+    vectors: Mapping[str, tuple[int, str]],
+) -> None:
+    """The ``indexes`` key of a model's ``SurrealConfigDict``, checked when the class is defined (v0.35.0; the vector
+    indexes v0.36.0).
 
     ``None`` (no indexes) is not passed here. The first fault raises, in this order: *value* is not a ``list`` or a
     ``tuple``; an item is not an ``Index``; two indexes share a name (the second definition would replace the first);
@@ -824,11 +832,17 @@ def check_indexes_config(model: type, value: object, *, view: bool, column: Call
     the view changes, and ``define_view()`` drops them); two full-text indexes cover one column, each field translated
     by *column* — the model's ``to_db_field`` — so an aliased field counts under its column (SurrealDB would use either
     for ``search()``, with different scores); two different ``Analyzer`` objects share a name (an analyzer belongs to
-    the database: one definition per name). Each ``Index`` was checked when it was built. The messages name *model*.
+    the database: one definition per name); two vector indexes cover one column, counted the same way (SurrealDB would
+    use either for ``similar_to()``); a vector index on a vector field — *vectors* maps the column of each, either
+    spelling, to its ``(dimension, storage type)`` — whose dimension or storage type differs from the field's, the
+    index's effective type compared (``F32`` when it declares none, ``Index._hnsw_options()``). A vector index on a
+    column that is not a vector field is not checked against it. Each ``Index`` was checked when it was built. The
+    messages name *model*.
 
     :raises TypeError: *value* is not a ``list`` or a ``tuple``, or holds something other than an ``Index``.
     :raises ValueError: two indexes share a name; a view declares an index; two full-text indexes cover one column;
-        two different analyzers share a name.
+        two different analyzers share a name; two vector indexes cover one column; a vector index's dimension or
+        storage type differs from its vector field's.
     """
     owner = model.__name__
     key = f"{owner}: model_config['indexes']"
@@ -868,6 +882,27 @@ def check_indexes_config(model: type, value: object, *, view: bool, column: Call
             raise ValueError(
                 f"{key} holds two definitions of analyzer {analyzer.name!r}; declare one Analyzer object and reference "
                 "it from every index."
+            )
+    vector_indexes = [index for index in indexes if index.hnsw]
+    nearest: dict[str, str] = {}
+    for index in vector_indexes:
+        # A vector index covers one field (Index checked it).
+        target = column(index.fields[0])
+        if target in nearest:
+            raise ValueError(
+                f"{owner}: two vector indexes cover column {target!r} ({nearest[target]!r}, {index.name!r}); "
+                "similar_to() would use either. Keep one."
+            )
+        nearest[target] = index.name
+    for index in vector_indexes:
+        field = vectors.get(column(index.fields[0]))
+        if field is None:
+            continue
+        dimension, _, vector_type, _, _ = index._hnsw_options()
+        if (dimension, vector_type) != field:
+            raise ValueError(
+                f"{owner}: vector index {index.name!r} has dimension {dimension} and type {vector_type}, but field "
+                f"{index.fields[0]!r} is VectorField[{field[0]}, {field[1]!r}]. Make them equal."
             )
 
 

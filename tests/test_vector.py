@@ -38,6 +38,17 @@ one spelling out the defaults both match the same stored index, and any other di
 with its exact text, and no out-of-range option is ever applied. ``TestIndexVectorE2E`` applies the statements on the
 line under test over WebSocket and HTTP and on the embedded engine: what ``INFO FOR TABLE`` returns matches each
 declaration, and the introspector reads the options the ORM wrote.
+
+The model's vector indexes (``TestClassChecks``): at the ``class`` statement, after v0.35.0's checks, two vector
+indexes on one column (an aliased field counted under its column) are refused, then a vector index on a vector field
+whose dimension or storage type differs from the field's — the index's effective type compared, ``F32`` when it
+declares none —, each with its exact text, the first fault raising; a vector index on a field that is not a vector
+field is accepted, and an inherited index is checked again against the subclass's field.
+
+The table's vector columns (``TestFieldKind``, ``TestDefineTableE2E``): a vector field of either spelling is written
+``option<array<float, d>>`` by ``table_ddl()`` and ``define_table()``, whatever its storage type; on every engine the
+column reads back as written, so a second ``define_table()`` changes nothing, integers are stored as floats, and a
+vector of another length is refused.
 """
 
 import ast
@@ -46,7 +57,7 @@ import copy
 import os
 import pickle
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -60,6 +71,7 @@ from surreal_orm_lite import (
     Analyzer,
     BaseSurrealModel,
     DatabaseIntrospector,
+    FieldState,
     Index,
     IndexState,
     PointField,
@@ -67,10 +79,11 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     Vector,
     VectorField,
+    model_ddl,
     search,
     vector,
 )
-from surreal_orm_lite.define_parser import parse_define_index
+from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_index, render_kind
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
 
 _EXPORTS = ["VectorField", "Vector"]
@@ -1026,6 +1039,230 @@ class TestIndexVector:
         assert not search.index_matches(Index("i", "e"), ["e"], parse_define_index(_STORED_BARE))
 
 
+# === The indexes key: the vector checks at the class statement ======================================================
+
+#: ``VectorField[3, "F64"]`` and ``VectorField[4]`` as names (a string in an annotation reads as a forward reference).
+_WIDE: Any = VectorField[3, "F64"]
+_FOUR: Any = VectorField[4]
+
+_IC4 = (
+    "VecBad: two full-text indexes cover column {!r} ({!r}, {!r}); SurrealDB would use either for search(), with "
+    "different scores. Keep one."
+)
+_IC5 = (
+    "VecBad: model_config['indexes'] holds two definitions of analyzer {!r}; declare one Analyzer object and reference "
+    "it from every index."
+)
+_IC7 = "{}: two vector indexes cover column {!r} ({!r}, {!r}); similar_to() would use either. Keep one."
+_IC8 = "{}: vector index {!r} has dimension {} and type {}, but field {!r} is VectorField[{}, {!r}]. Make them equal."
+
+
+def _vec_bad(indexes: object) -> type[BaseSurrealModel]:
+    """A model ``VecBad`` with ``indexes=`` *indexes*, built by its ``class`` statement: a vector field of each spelling
+    and storage type (one aliased), a list of floats and an ``Any`` field, and two text fields."""
+
+    class VecBad(BaseSurrealModel):
+        model_config = SurrealConfigDict(table_name="vec_bad", indexes=indexes)  # type: ignore[typeddict-item]
+
+        id: str | None = None
+        title: str = ""
+        body: str = ""
+        embedding: VectorField[3]
+        wide: _WIDE
+        typed: Annotated[list[float] | None, Vector(3, "F64")] = None
+        aliased: Annotated[list[float] | None, Vector(3)] = Field(default=None, alias="aliased_vec")
+        plain: list[float] | None = None
+        loose: Any = None
+
+    return VecBad
+
+
+def _hnsw(name: str, field: str, dimension: int = 3, **options: Any) -> Index:
+    """A vector index *name* on *field*."""
+    return Index(name, field, hnsw=True, dimension=dimension, **options)
+
+
+class TestClassChecks:
+    """``SurrealConfigDict(indexes=[...])`` with vector indexes, checked at the ``class`` statement after v0.35.0's
+    checks: one vector index per column (an aliased field counted under its column), and a vector index on a vector
+    field of the same dimension and effective storage type (``F32`` when the index declares none). A vector index on a
+    field that is not a vector field is the application's choice."""
+
+    def test_the_golden_model_is_accepted(self) -> None:
+        assert [index.name for index in VecDoc.get_indexes()] == ["vec_doc_embedding", "vec_doc_summary", "vec_doc_title"]
+
+    @pytest.mark.parametrize(
+        ("indexes", "text"),
+        [
+            (
+                [_hnsw("vec_a", "embedding"), _hnsw("vec_b", "embedding", dist="cosine")],
+                _IC7.format("VecBad", "embedding", "vec_a", "vec_b"),
+            ),
+            (
+                [_hnsw("vec_a", "aliased"), _hnsw("vec_b", "aliased_vec", dist="cosine")],
+                _IC7.format("VecBad", "aliased_vec", "vec_a", "vec_b"),
+            ),
+            (
+                [_hnsw("vec_a", "plain"), Index("vec_s", "plain"), _hnsw("vec_b", "plain", m=8)],
+                _IC7.format("VecBad", "plain", "vec_a", "vec_b"),
+            ),
+            (
+                [_hnsw("vec_a", "embedding", dimension=4)],
+                _IC8.format("VecBad", "vec_a", 4, "F32", "embedding", 3, "F32"),
+            ),
+            (
+                [_hnsw("vec_a", "embedding", vector_type="f64")],
+                _IC8.format("VecBad", "vec_a", 3, "F64", "embedding", 3, "F32"),
+            ),
+            (
+                [_hnsw("vec_a", "typed", vector_type="F32")],
+                _IC8.format("VecBad", "vec_a", 3, "F32", "typed", 3, "F64"),
+            ),
+            (
+                [_hnsw("vec_a", "wide")],
+                _IC8.format("VecBad", "vec_a", 3, "F32", "wide", 3, "F64"),
+            ),
+            (
+                [_hnsw("vec_a", "aliased_vec", dimension=2)],
+                _IC8.format("VecBad", "vec_a", 2, "F32", "aliased_vec", 3, "F32"),
+            ),
+            (
+                [_hnsw("vec_a", "aliased", vector_type="i16")],
+                _IC8.format("VecBad", "vec_a", 3, "I16", "aliased", 3, "F32"),
+            ),
+        ],
+        ids=[
+            "ic7",
+            "ic7-alias",
+            "ic7-not-a-vector-field",
+            "ic8-dimension",
+            "ic8-type",
+            "ic8-typed-form",
+            "ic8-effective-type",
+            "ic8-alias-column",
+            "ic8-alias-name",
+        ],
+    )
+    def test_refused_at_the_class_statement(self, indexes: list[Index], text: str) -> None:
+        assert _raised(ValueError, _vec_bad, indexes) == text
+
+    @pytest.mark.parametrize(
+        ("indexes", "text"),
+        [
+            # IC4 before IC7: two vector indexes on one column, then two full-text indexes on another.
+            (
+                [
+                    _hnsw("vec_a", "embedding"),
+                    _hnsw("vec_b", "embedding"),
+                    Index("vec_t1", "title", search_analyzer=VEC_PLAIN),
+                    Index("vec_t2", "title", search_analyzer=VEC_PLAIN),
+                ],
+                _IC4.format("title", "vec_t1", "vec_t2"),
+            ),
+            # IC5 before IC7: two vector indexes on one column, then two definitions of one analyzer name.
+            (
+                [
+                    _hnsw("vec_a", "embedding"),
+                    _hnsw("vec_b", "embedding"),
+                    Index("vec_t", "title", search_analyzer=Analyzer("vec_plain", ["blank"])),
+                    Index("vec_u", "body", search_analyzer=Analyzer("vec_plain", ["punct"])),
+                ],
+                _IC5.format("vec_plain"),
+            ),
+            # IC7 before IC8: the second vector index on the column is also of another dimension.
+            (
+                [_hnsw("vec_a", "embedding", dimension=4), _hnsw("vec_b", "embedding", dimension=5)],
+                _IC7.format("VecBad", "embedding", "vec_a", "vec_b"),
+            ),
+            # IC7 on one column before IC8 on an earlier one.
+            (
+                [_hnsw("vec_a", "typed"), _hnsw("vec_b", "plain"), _hnsw("vec_c", "plain")],
+                _IC7.format("VecBad", "plain", "vec_b", "vec_c"),
+            ),
+            # IC8: the first faulty index in declaration order.
+            (
+                [_hnsw("vec_a", "embedding"), _hnsw("vec_b", "typed", dimension=2), _hnsw("vec_c", "wide", dimension=4)],
+                _IC8.format("VecBad", "vec_b", 2, "F32", "typed", 3, "F64"),
+            ),
+        ],
+        ids=["ic4-before-ic7", "ic5-before-ic7", "ic7-before-ic8", "ic7-before-ic8-elsewhere", "ic8-first-index"],
+    )
+    def test_the_first_fault_raises(self, indexes: list[Index], text: str) -> None:
+        assert _raised(ValueError, _vec_bad, indexes) == text
+
+    def test_matching_vector_indexes_accepted(self) -> None:
+        indexes = [
+            _hnsw("vec_a", "embedding", dist="cosine"),
+            _hnsw("vec_b", "wide", vector_type="f64"),
+            _hnsw("vec_c", "typed", vector_type="F64", efc=100, m=8),
+            _hnsw("vec_d", "aliased_vec", vector_type="f32"),
+            Index("vec_e", "embedding"),
+            Index("vec_t", "title", search_analyzer=VEC_PLAIN),
+        ]
+        assert _vec_bad(indexes).get_indexes() == tuple(indexes)
+
+    def test_a_vector_index_on_a_field_that_is_not_a_vector_field_accepted(self) -> None:
+        indexes = [_hnsw("vec_a", "plain", dimension=8, vector_type="i64"), _hnsw("vec_b", "loose", dimension=2)]
+        assert _vec_bad(indexes).get_indexes() == tuple(indexes)
+
+    def test_an_inherited_index_is_checked_again_naming_the_subclass(self) -> None:
+        with pytest.raises(ValueError) as raised:
+
+            class VecDocWide(VecDoc):
+                model_config = SurrealConfigDict(table_name="vec_doc_wide")
+
+                embedding: _FOUR
+
+        assert str(raised.value) == _IC8.format("VecDocWide", "vec_doc_embedding", 3, "F32", "embedding", 4, "F32")
+
+
+# === define_table(): the vector columns =============================================================================
+
+#: ``VecDoc.table_ddl()``: the two vector columns (the typed one under its alias) written ``option<array<float, 3>>``.
+_D1 = [
+    "DEFINE TABLE OVERWRITE `vec_doc` TYPE NORMAL;",
+    "DEFINE FIELD OVERWRITE `title` ON `vec_doc` TYPE string;",
+    "DEFINE FIELD OVERWRITE `category` ON `vec_doc` TYPE string DEFAULT '';",
+    "DEFINE FIELD OVERWRITE `n` ON `vec_doc` TYPE int DEFAULT 0;",
+    "DEFINE FIELD OVERWRITE `embedding` ON `vec_doc` TYPE option<array<float, 3>>;",
+    "DEFINE FIELD OVERWRITE `summary` ON `vec_doc` TYPE option<array<float, 3>>;",
+    "DEFINE FIELD OVERWRITE `loc` ON `vec_doc` TYPE option<geometry<point>>;",
+]
+
+
+class TestFieldKind:
+    """``model_ddl.field_kind()``: a vector field, either spelling, is ``option<array<float, d>>`` — the marker accepts
+    ``None`` —, whatever its storage type; ``table_ddl()`` writes it."""
+
+    @pytest.mark.parametrize(
+        ("annotation", "text"),
+        [
+            (VectorField[3], "option<array<float, 3>>"),
+            (VectorField[384, "i16"], "option<array<float, 384>>"),
+            (Annotated[list[float] | None, Vector(3)], "option<array<float, 3>>"),
+            (Annotated[list[float] | None, Vector(65535, "F64")], "option<array<float, 65535>>"),
+            (Annotated[list[float], Vector(2)], "option<array<float, 2>>"),
+            (list[VectorField[3]], "array<option<array<float, 3>>>"),
+            (list[float] | None, "option<array<float>>"),
+        ],
+        ids=["vector-field", "vector-field-i16", "typed", "typed-f64", "typed-not-optional", "list-of-vectors", "plain"],
+    )
+    def test_the_kind_of_an_annotation(self, annotation: Any, text: str) -> None:
+        assert render_kind(model_ddl.field_kind(annotation)) == text
+
+    @pytest.mark.parametrize("name", ["embedding", "typed", "aliased"])
+    def test_the_kind_of_a_model_field(self, name: str) -> None:
+        info = VecField.model_fields[name]
+        assert render_kind(model_ddl.field_kind(info.annotation, info.metadata)) == "option<array<float, 3>>"
+
+    def test_the_table_statements(self) -> None:
+        assert VecDoc.table_ddl() == _D1
+        assert VecField.table_ddl()[1:] == [
+            f"DEFINE FIELD OVERWRITE `{column}` ON `vec_t` TYPE option<array<float, 3>>;"
+            for column in ("embedding", "typed", "aliased_vec")
+        ]
+
+
 # === E2E: the connection "vec" on the database vec_db, over WebSocket and HTTP, and mem:// =========================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -1097,6 +1334,61 @@ async def _table_info(client: Any, table: str) -> dict[str, Any]:
     return info
 
 
+@contextlib.asynccontextmanager
+async def _vec_models(kind: str) -> AsyncIterator[Any]:
+    """:func:`_vec`, the models routed to the connection ``"vec"`` for the block (``using("vec")``)."""
+    async with _vec(kind) as client, SurrealDBConnectionManager.using("vec"):
+        yield client
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
+    through) — v0.31.0's spy."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+def _calls(calls: list[tuple[str, tuple[object, ...]]]) -> list[tuple[str, object]]:
+    """What *calls* (:func:`_spy`'s) sent: each method with its first argument (``None`` for ``version()``)."""
+    return [(method, args[0] if args else None) for method, args in calls]
+
+
+def _query(statement: str) -> list[tuple[str, object]]:
+    """The calls of one ``client.query(statement, {})``: the SDK's ``query()`` sends it through ``query_raw()``."""
+    return [("query", statement), ("query_raw", statement)]
+
+
+def _sent(statements: Sequence[str]) -> list[tuple[str, object]]:
+    """The calls of ``client.query(statement, {})`` for each of *statements*, in order."""
+    return [call for statement in statements for call in _query(statement)]
+
+
+def _field_states(info: Mapping[str, Any]) -> dict[tuple[str, ...], FieldState]:
+    """The fields of an ``INFO FOR TABLE`` answer, each parsed, keyed by path (an item field ``e.*`` or ``e[*]`` under
+    ``("e", "*")``)."""
+    states = [parse_define_field(text).state for text in info["fields"].values()]
+    return {tuple(state.path): state for state in states}
+
+
+async def _refused(client: Any, statement: str) -> bool:
+    """Whether the engine refuses *statement* (one statement, a constant of these tests)."""
+    response = await client.query_raw(statement, {})
+    assert "error" not in response, response["error"]
+    return [result["status"] for result in response["result"]] != ["OK"]
+
+
 class TestIndexVectorE2E:
     """The vector indexes' statements applied on every engine: what ``INFO FOR TABLE`` returns matches each
     declaration — the embedded engine stores the ``TYPE`` written, as the servers do —, and the introspector reads the
@@ -1144,3 +1436,62 @@ class TestIndexVectorE2E:
                 *index._hnsw_options(),
             ), index.name
             assert (read.mtree, read.unique, read.comment) == (False, False, index.comment), index.name
+
+
+_INFO_DB = "INFO FOR DB;"
+_INFO_DOC = "INFO FOR TABLE `vec_doc`;"
+
+
+class TestDefineTableE2E:
+    """``define_table()`` on every engine: the vector columns — both spellings, the typed one under its alias — are
+    defined ``option<array<float, 3>>`` and read back as written (SurrealDB 3.x renders ``none | array<float, 3>`` with
+    an item field ``e.*``, 2.x and the embedded engine ``option<array<float, 3>>`` with ``e[*]``), so a second call
+    sends the same statements and changes nothing. A record's integers are stored as floats; a vector longer than the
+    dimension is refused by the field, and one of another length once the vector indexes are applied."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_vector_columns_read_back_unchanged(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            calls = _spy(monkeypatch, client)
+            result = await VecDoc.define_table()
+            assert result == "\n".join(_D1)
+            assert _calls(calls) == _sent([_INFO_DB, *_D1])
+            info = await _table_info(client, "vec_doc")
+            stored = _field_states(info)
+            changed = [
+                column.path
+                for column in VecDoc._table_columns()
+                if (stored[column.path].field_type, stored[column.path].nullable) != normalise_kind(render_kind(column.kind))
+            ]
+            assert changed == []
+            for column in ("embedding", "summary"):
+                vector_field = stored[(column,)]
+                assert (vector_field.field_type, vector_field.nullable) == ("array<float, 3>", True), column
+                item = stored[(column, "*")]
+                assert (item.field_type, item.nullable) == ("float", False), column
+
+            calls.clear()
+            assert await VecDoc.define_table() == result
+            assert _calls(calls) == _sent([_INFO_DB, _INFO_DOC, *_D1])
+            assert await _table_info(client, "vec_doc") == info
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_values_stored_as_floats_and_a_wrong_length_refused(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await VecDoc.define_table()
+            await _apply_ddl(
+                client, "CREATE vec_doc:d1 SET title = 'Cats and dogs', embedding = [1, 0, 0], summary = [0, 1, 0];"
+            )
+            rows = await client.query("SELECT embedding, summary FROM vec_doc:d1;", {})
+            assert rows == [{"embedding": [1.0, 0.0, 0.0], "summary": [0.0, 1.0, 0.0]}]
+            assert {type(item) for row in rows for value in row.values() for item in value} == {float}
+            doc = await VecDoc.objects().get("d1")
+            assert (doc.embedding, doc.summary_vec) == ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+
+            assert await _refused(client, "CREATE vec_doc:d2 SET title = 'Long', embedding = [1.0, 0.0, 0.0, 0.0];")
+            assert await _refused(client, "CREATE vec_doc:d3 SET title = 'Long', summary = [1.0, 0.0, 0.0, 0.0];")
+            for statement in VecDoc.index_ddl(line=await _keyword_line(client)):
+                await _apply_ddl(client, statement)
+            assert await _refused(client, "CREATE vec_doc:d4 SET title = 'Short', embedding = [1.0, 0.0];")
+            assert await _refused(client, "CREATE vec_doc:d5 SET title = 'Short', summary = [1.0, 0.0];")
+            assert await client.query("SELECT VALUE record::id(id) FROM vec_doc;", {}) == ["d1"]
