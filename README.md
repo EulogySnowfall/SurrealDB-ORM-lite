@@ -218,6 +218,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Materialized views (`view_query`, `define_view()`, read-only)                 | ✅     |
 | Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)    | ✅     |
 | Model table DDL (`define_table()`, `schema_mode`, `permissions`)              | ✅     |
+| Full-text search (`search()`, BM25 score and highlights)                      | ✅     |
 
 ### Supported Filter Lookups
 
@@ -270,7 +271,8 @@ await User.objects().filter(name__regex=r"^\d{3}").exec()          # SurrealDB's
 - **`match` and `regex`.** Both take a regular expression in SurrealDB's syntax (the Rust
   `regex` crate) and match anywhere in the value unless it is anchored (`^…$`). Prefix it
   with `(?i)` to ignore case. Here `match` is a regex lookup, not the full SurrealDB-ORM's
-  full-text `@@` operator: full-text search is planned for v0.35.0, as a separate API.
+  full-text `@@` operator: full-text search is the separate `search()` API
+  ([section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)).
 - **Values.** The value must be a `str`, otherwise `ValueError`. A string starting with `$`
   is data, as for every lookup ([String filter values and `Var()`](#string-filter-values-and-var)).
   `startswith`, `endswith`, `match` and `regex` also take a `Var`. `like` and `ilike` do not:
@@ -5782,6 +5784,298 @@ Applying needs a privileged session: run `define_table()` at start-up or deploym
   (or `TYPE ANY`) for any model with `table_type`; generated models carry the keys
   ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)).
 
+### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)
+
+Since v0.35.0 a queryset searches text with the full SurrealDB-ORM's API — `search()`, with `SearchScore` and
+`SearchHighlight` in `annotate()` — plus `SearchOffsets`, over the full-text indexes a model declares with `Analyzer`
+and `Index` and applies with `define_indexes()`. SurrealDB tokenises, matches, scores (BM25) and highlights on the
+server; the ORM binds every search text and highlight tag as a query variable. The same code runs on SurrealDB 2.x,
+3.x and the embedded engine, except where the [2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The
+examples assume a configured connection: they run as written, in order, on the embedded engine (`mem://`).
+
+#### Declare and apply
+
+An `Analyzer` is SurrealDB's `DEFINE ANALYZER`, with the full ORM's `DefineAnalyzer` arguments: a name, tokenizers
+(`blank`, `camel`, `class`, `punct`), filters (`ascii`, `lowercase`, `uppercase`, `ngram(min,max)`,
+`edgengram(min,max)`, `snowball(language)`, `mapper('path')`), and optionally `function=` and `comment=`. An `Index`
+is `DEFINE INDEX`, with `CreateIndex`'s arguments: a plain index, a `UNIQUE` one (`unique=True`), or a full-text one
+(`search_analyzer=`, an `Analyzer` or the name of an analyzer the database defines), which covers one field and takes
+`bm25=` (`True`, or a `(k1, b)` pair) and `highlights=True`. Each argument is checked when the object is built. A
+model lists its indexes in `SurrealConfigDict(indexes=[...])`, checked when the class is defined (a list or a tuple of
+`Index`, distinct names, one full-text index per column, one `Analyzer` per analyzer name); `get_indexes()` returns
+them in declaration order.
+
+```python
+from surreal_orm_lite import (
+    Analyzer,
+    BaseSurrealModel,
+    Count,
+    Index,
+    SearchHighlight,
+    SearchOffsets,
+    SearchScore,
+    Subquery,
+    SurrealConfigDict,
+    SurrealDbError,
+)
+
+ENGLISH = Analyzer("english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"])
+
+
+class Article(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="article",
+        indexes=[
+            Index("article_title", "title", search_analyzer=ENGLISH, bm25=True, highlights=True),
+            Index("article_body", "body", search_analyzer=ENGLISH),
+            Index("article_slug", "slug", unique=True),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    body: str = ""
+    slug: str
+    topic: str = ""
+
+
+print(*Article.index_ddl(), sep="\n")
+# DEFINE ANALYZER OVERWRITE `english` TOKENIZERS class,blank FILTERS lowercase,ascii,snowball(english);
+# DEFINE INDEX OVERWRITE `article_title` ON `article` FIELDS `title` FULLTEXT ANALYZER `english` BM25 HIGHLIGHTS;
+# DEFINE INDEX OVERWRITE `article_body` ON `article` FIELDS `body` FULLTEXT ANALYZER `english`;
+# DEFINE INDEX OVERWRITE `article_slug` ON `article` FIELDS `slug` UNIQUE;
+await Article.define_table()  # the table first
+applied = await Article.define_indexes()
+print(applied == Article.index_ddl(line=2))  # the embedded engine is a SurrealDB 2.x core: SEARCH
+# True
+print(await Article.define_indexes())  # nothing changed, nothing applied
+# []
+```
+
+`define_indexes()` runs on the model's connection. It reads what the database holds (`INFO FOR DB`, `INFO FOR TABLE`)
+and the line (`client.version()`, when a full-text index is declared), then applies only what is missing or changed,
+one statement per request, and returns the statements applied: on an unchanged database it sends the reads alone and
+returns `[]`, so it is safe at start-up. It writes the line's keyword: `FULLTEXT` on SurrealDB 3.x, `SEARCH` on 2.x and
+the embedded engine, each of which refuses the other's. `overwrite=False` defines what is missing (`IF NOT EXISTS`) and
+leaves a changed index as it is. `index_ddl()` renders the statements without a database, for SurrealDB 3.x, or for 2.x
+with `index_ddl(line=2)` (a script for a 2.x server). Nothing is removed: `remove_index()` removes an index by name
+(`Article.remove_index("article_body")` sends `REMOVE INDEX IF EXISTS`; with `missing_ok=False`, a missing index
+raises `SurrealDbNotFoundError`). An analyzer an index names by `str` must exist, or `define_indexes()` raises
+`SurrealDbError` before any DDL: `SurrealDBConnectionManager.define_analyzer()` defines one on the current connection
+(redefining it only when it changed, and returning the statements applied), and `remove_analyzer()` removes one by
+name, refusing it while an index uses it. `define_indexes()` and `define_analyzer()` drop every cached read
+([section 29](#29-query-cache-cache-querycache)), `remove_index()` the model's.
+
+Call `define_table()` (or `define_relation()` for an edge model) before `define_indexes()`: on a table that does not
+exist yet, SurrealDB's `DEFINE INDEX` creates it `TYPE ANY SCHEMALESS PERMISSIONS NONE`, which `define_table()`
+replaces but `define_table(overwrite=False)` leaves as it is.
+
+#### Search, score, highlight
+
+`search(**field_queries)` keeps the records whose fields match: each keyword names a field — a Python field name (an
+aliased field searches its column) or a dotted path (`**{"meta.headline": "rust"}`) — and the text to match, which is
+bound, never written into the statement, and is data whatever it holds. Each field gets the next match reference, in
+call order and across calls (`search(title="a").search(body="b")`: references 0 and 1), which `SearchScore(ref)`,
+`SearchHighlight(open_tag, close_tag, ref)` and `SearchOffsets(ref)` name in `annotate()`: the BM25 score, a `float`;
+the text with each matched term between the tags, a `str` (a list of strings for an array field); where the terms sit,
+SurrealDB's `{"<item>": [{"s": <start>, "e": <end>}]}`. `exec()`, `first()` and `get()` without an id set each value
+as an attribute named after its alias, never written back (`model_dump()`, `save()` and `update()` leave it out); rows
+that do not validate (a `select()` leaving out a required field) come back as dicts holding the aliases.
+`order_by("-relevance")` sorts on an alias. An alias that would shadow a field, its column or an attribute of the
+model raises `ValueError`, as does a reference no `search()` gave, before any request.
+
+```python
+corpus = [
+    ("a1", "Quantum physics for beginners", "An introduction to quantum mechanics", "science"),
+    ("a2", "Cooking with physics", "Heat and physics in the kitchen", "food"),
+    ("a3", "Gardening in spring", "Plants and soil", "garden"),
+    ("a4", "Quantum computing explained", "Qubits and gates", "science"),
+    ("a5", "Baking bread at home", "Flour water salt", "food"),
+    ("a6", "Sewing for beginners", "Needles and thread", "craft"),
+]
+for key, title, body, topic in corpus:
+    await Article(id=key, title=title, body=body, slug=key, topic=topic).save()
+
+articles = await (
+    Article.objects()
+    .search(title="physics")
+    .annotate(relevance=SearchScore(0), snippet=SearchHighlight("<b>", "</b>", 0), spans=SearchOffsets(0))
+    .order_by("-relevance")
+    .exec()
+)
+for article in articles:
+    print(article.id, round(article.relevance, 3), article.snippet, article.spans)
+# a2 0.613 Cooking with <b>physics</b> {'0': [{'e': 20, 's': 13}]}
+# a1 0.543 Quantum <b>physics</b> for beginners {'0': [{'e': 15, 's': 8}]}
+```
+
+`search()` applies wherever `filter()` does, AND-ed after `filter()`, `Q` and `nearby()`: `count()`, `exists()`, the
+aggregations, `values()` groups, `bulk_update()`, `bulk_delete()`, `patch()`, and a `Subquery` of the queryset
+([section 28](#28-subqueries-subquery)), whose references start again at 0. `get(<id>)` and `all()` ignore it, as they
+ignore `filter()`.
+
+```python
+quantum_qubits = Article.objects().search(title="quantum", body="qubits")
+both = await quantum_qubits.annotate(t=SearchScore(0), b=SearchScore(1)).exec()
+print([(article.id, article.t > 0, article.b > 0) for article in both])
+# [('a4', True, True)]
+print(await Article.objects().search(title="quantum").count())
+# 2
+print(await Article.objects().filter(topic="food").search(title="physics").exists())
+# True
+print(await Article.objects().search(title="beginners").values("topic").annotate(n=Count()).exec())
+# [{'n': 1, 'topic': 'craft'}, {'n': 1, 'topic': 'science'}]
+beginners = Subquery(Article.objects().search(title="beginners"))
+print(await Article.objects().filter(id__in=beginners).search(body="thread").count())
+# 1
+print(await Article.objects().search(body="kitchen").bulk_update(topic="cooking"))
+# 1
+```
+
+#### What SurrealDB decides
+
+- The analyzer decides what matches: its tokenizers split the text and its filters normalise each token — case,
+  accents, stems (`snowball`), prefixes (`edgengram`) — and the search text goes through the same analyzer.
+- Within a field, the terms of one text are AND-ed: `search(title="quantum physics")` keeps the records whose title
+  holds both; an empty text matches nothing, and so does a field that holds no text (`None`, a number).
+- BM25 scores depend on the line: SurrealDB 3.x gives a term found in more than half the documents no weight (a score
+  of `0.0`) and keeps its statistics in step with the records, while 2.x and the embedded engine score such a term
+  below zero, count an index's records again each time it is rebuilt, and keep counting deleted records. Compare
+  scores within one query, and upgrade to SurrealDB 3.x where scores must not depend on the index's history.
+- `SearchHighlight` and `SearchOffsets` need the index's `highlights=True` (`HIGHLIGHTS`): without it SurrealDB returns
+  the text unhighlighted, and no offsets (`None`).
+- A search on a field without a full-text index raises `SurrealDbError` naming the field. The server's own error,
+  which on SurrealDB 3.x quotes the search text, is never shown.
+
+```python
+print([article.id for article in await Article.objects().search(title="quantum physics").exec()])
+# ['a1']
+print(await Article.objects().search(title="").count())
+# 0
+try:
+    await Article.objects().search(slug="a1").exec()
+except SurrealDbError as error:
+    print(error)
+# search(): no full-text index on field 'slug'. SurrealDB matches only a field with a FULLTEXT (3.x) or SEARCH (2.x) index: declare Index(..., search_analyzer=...) on the model and apply define_indexes().
+```
+
+#### Changing an analyzer
+
+SurrealDB keeps the tokens of the records an index holds when their analyzer changes: a search tokenised the new way
+misses them — the records written afterwards use the new analyzer — until the index is rebuilt. So when
+`define_indexes()`, or `SurrealDBConnectionManager.define_analyzer()`, redefines an analyzer, it rebuilds every index of
+the database that uses it (`REBUILD INDEX`, sorted by table then index; `define_indexes()` rebuilds the model's table's
+last), and logs one warning naming them (logger `surreal_orm_lite.search`). A rebuild re-reads the table: seconds
+per thousands of records on SurrealDB 2.x and the embedded engine. An analyzer belongs to the database, not to a table:
+declare one `Analyzer` per name (a module constant) and reference it from every index that uses it — two definitions
+under one name would redefine it in turn, each time rebuilding its indexes. An unchanged index is never redefined, so
+start-up never rebuilds (and, on SurrealDB 2.x, never inflates its scores).
+
+```python
+PLAIN = Analyzer("plain", ["blank"], ["ascii"])
+
+
+class Note(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="note", indexes=[Index("note_text", "text", search_analyzer=PLAIN)])
+
+    id: str | None = None
+    text: str
+
+
+await Note.define_table()
+await Note.define_indexes()
+await Note(id="n1", text="Physics Rocks").save()
+print(await Note.objects().search(text="physics").count())  # ascii keeps the case: "Physics" is not "physics"
+# 0
+
+LOWERED = Analyzer("plain", ["blank"], ["lowercase", "ascii"])  # the same analyzer, changed in a later release
+
+
+class NoteV2(Note):
+    model_config = SurrealConfigDict(table_name="note", indexes=[Index("note_text", "text", search_analyzer=LOWERED)])
+
+
+print(*await NoteV2.define_indexes(), sep="\n")  # logs: Analyzer 'plain' redefined; 1 index(es) rebuilt: note.note_text
+# DEFINE ANALYZER OVERWRITE `plain` TOKENIZERS blank FILTERS lowercase,ascii;
+# REBUILD INDEX `note_text` ON `note`;
+print(await NoteV2.objects().search(text="physics").count())
+# 1
+```
+
+#### Transactions
+
+- `define_indexes(tx=…)` reads first — committed state, outside the transaction — then its index statements join it
+  ([section 11](#11-transactions-atomic-all-or-nothing)): applied at once in an interactive transaction (WebSocket,
+  SurrealDB 3.x), at the commit in a buffered one (HTTP, SurrealDB 2.x, the embedded engine), where a refusal comes
+  back as the transaction's own `SurrealDbError`. A block that raises applies nothing. `remove_index(tx=…)` joins it
+  the same way.
+- The analyzers must be in place: SurrealDB builds an index with the analyzers committed before the transaction began.
+  So `define_indexes(tx=…)` raises `SurrealDbError` before any DDL when an analyzer must be defined or redefined, and
+  `define_analyzer(tx=…)` when a redefinition has indexes to rebuild (a new analyzer, or a redefinition no index uses,
+  joins the transaction): call `define_analyzer()` without `tx=` first.
+- Prefer `define_indexes()` outside the block: in a transaction that also writes to the model's table, SurrealDB may
+  leave out of the index a record the block wrote before the index was defined, and may fail the block on a write
+  after it.
+- `remove_analyzer(tx=…)` reads committed state to find the indexes that use the analyzer: an index queued earlier in
+  a buffered block is not seen.
+- A search in an interactive transaction sees the transaction's writes; in a buffered one, a read raises, as every
+  read does there.
+- In a transaction, a search on a field without a full-text index raises the same `SurrealDbError`, which the
+  transaction records: the block's commit then fails with it as its cause, and neither error quotes the search text.
+
+#### Live queries
+
+- `live()` and `watch()` refuse `search()` — and a search annotation — before any request (`SurrealDbError`):
+  SurrealDB accepts a live query whose condition holds a full-text match, but never notifies it
+  ([section 21](#21-live-queries-real-time-notifications)).
+- Search in a subquery instead:
+  `Article.objects().filter(id__in=Subquery(Article.objects().search(title="physics"))).live()` notifies the records
+  created or updated to match — not a deletion, nor an update that makes a record stop matching.
+- Before a live query whose subquery searches, the ORM checks that each searched field has a full-text index and
+  raises `SurrealDbError` naming the field otherwise, before the live query starts: without the index, SurrealDB 3.x
+  would accept the live query and never notify. Do not remove that index while the live query runs.
+
+#### Not supported
+
+- `as_of()` ([section 27](#27-time-travel-as_of)): `search()` with `as_of()` raises `SurrealDbError` before any
+  request, in either order and in a subquery under it. The index holds the records' current text, so a time-travel
+  read would select records by their text now.
+- `changes()` ([section 22](#22-change-feeds-changes)): a change feed refuses `search()` and the search annotations
+  (`SurrealDbError`), and a `Subquery` refuses the search annotations.
+- Indexes on materialized views ([section 33](#33-materialized-views-view_query-define_view)), refused with
+  `ValueError` when the class is defined. A materialized view model cannot declare `indexes=`: SurrealDB 3.x does not
+  index the records a view gains after the index is defined, and `define_view()` drops the indexes of the view's table.
+- `@AND@`/`@OR@`: SurrealDB 3.x's boolean match operators are not exposed. The terms of one text, and the fields of
+  `search()`, are AND-ed; there is no OR of two matches.
+
+#### Coming from the full SurrealDB-ORM
+
+- **Declared on the model**: `Analyzer` and `Index` take the argument names of the full ORM's `DefineAnalyzer` and
+  `CreateIndex`, a model lists its indexes in `SurrealConfigDict(indexes=[...])` and `define_indexes()` applies them;
+  the full ORM declares analyzers and indexes in migrations, which this library adds in v0.38.0.
+- **`search()` applies wherever `filter()` applies**: `count()`, the aggregations, `values()` groups, `exists()`,
+  `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery`; the full ORM applies it to `exec()` only.
+- **Refused where SurrealDB cannot honour it**: `search()` with `live()`/`watch()`, `as_of()` or `changes()` raises
+  before any request; the full ORM's `live()` ignores it.
+- **The highlight tags are bound query variables**, and `SearchScore`, `SearchHighlight` and `SearchOffsets` have no
+  public `to_surql()` (the full ORM writes the tags into the statement, escaping quotes only).
+- **`SearchOffsets` is an addition** of this library: SurrealDB's `search::offsets()`, where the matched terms sit in
+  the field.
+- **A field without a full-text index raises `SurrealDbError` naming the field**, instead of the server's error,
+  which on SurrealDB 3.x quotes the search text.
+- **Checked before any request**: the text to match must be a `str`, every match reference an annotation names must
+  come from `search()`, and `Index`/`Analyzer` arguments are checked at construction, more strictly than the server
+  where its answer would be silently wrong (BM25 parameters out of range, an n-gram whose minimum exceeds its maximum,
+  `UNIQUE` on a full-text index).
+- **The index keyword follows the server line**: `FULLTEXT` on SurrealDB 3.x, `SEARCH` on 2.x and the embedded engine;
+  the full ORM writes `FULLTEXT` only, which 2.x refuses.
+- **A `COMMENT` is escaped with a backslash**; the full ORM's doubled quote is a parse error on both lines.
+- **`Index` has no `concurrently` argument and no vector arguments yet**: it covers plain, `UNIQUE` and full-text
+  indexes; vector indexes come in v0.36.0.
+- **`filter(x__match=...)` stays a regular expression**: this library's `match` lookup, not SurrealDB's `@@`;
+  `search()` is the full-text path.
+- **`hybrid_search()` comes in v0.37.0.**
+
 ---
 
 ## Configuration Options
@@ -5904,7 +6198,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -6047,6 +6341,13 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | An `Any` or untyped `list`/`set` field of a `SCHEMAFULL` model                                                                         | `define_table()` adds `FLEXIBLE` (read from `client.version()`): without it these engines empty such values, optional or not; the item definitions as on 3.x                  | kept without `FLEXIBLE` (refused there); an untyped `list` gets an item definition `TYPE any`, without which 3.x refuses an object item of a required one (`no such field exists`)  | v0.34.0                              |
 | A `list` of sub-models (`list[M]`, at any depth) holding a `dict`, an `Any` or an untyped `list`, in a `SCHEMAFULL` model              | `define_table()` also writes the `list` `FLEXIBLE`: without it these engines drop such a value from every item, then refuse the record's next write (`Found NONE for field`)  | kept without `FLEXIBLE` on the `list`, which `define_table()` does not write there                                                                                                  | v0.34.0                              |
 | A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records predating `SCHEMAFULL`) | the field is dropped, silently; kept in the items of a list `define_table()` writes `FLEXIBLE` (a 2.x limitation)                                                             | the write is refused (`no such field exists`), except in the items of a list of objects, which keep it                                                                              | v0.34.0                              |
+| Full-text index (`define_indexes()`, `index_ddl(line=)`)                                                                               | `SEARCH ANALYZER` (`FULLTEXT` is a parse error), read from `client.version()`; several fields accepted, the ORM writes one                                                    | `FULLTEXT ANALYZER` (`SEARCH` is a parse error); one field per index                                                                                                                | v0.35.0                              |
+| Removing an analyzer an index uses (`remove_analyzer()`)                                                                               | the server would accept it, then refuse every write to the table: the ORM refuses it first, with 3.x's message                                                                | refused by the server                                                                                                                                                               | v0.35.0                              |
+| BM25 score of a term in more than half the documents (`SearchScore`)                                                                   | below zero: a text holding such a term scores lower than without it, and ranks differently than on 3.x                                                                        | `0.0`: the term adds nothing to the score                                                                                                                                           | v0.35.0                              |
+| BM25 statistics after a rebuild, a redefinition or a deletion (`SearchScore`)                                                          | not reset: a `REBUILD INDEX`, an `OVERWRITE` or a new index of the same name counts the records again, and deleted records stay counted; the matches are unaffected           | kept in step with the records: the scores of a freshly built index                                                                                                                  | v0.35.0                              |
+| Two `search()` fields AND-ed                                                                                                           | only the records matching every field, each field scored as if searched alone                                                                                                 | the same on 3.3; 3.1 can also return records that match only one of the fields, scored `0.0` on the other                                                                           | v0.35.0                              |
+| `search()` on a field without a full-text index                                                                                        | `SurrealDbError` naming the field                                                                                                                                             | the same; 3.1 answers no record                                                                                                                                                     | v0.35.0                              |
+| `live()` with a `Subquery` that searches a field without a full-text index                                                             | `SurrealDbError` naming the field, before the live query starts                                                                                                               | the same (the live query would never notify); 3.1 starts it                                                                                                                         | v0.35.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -6083,6 +6384,7 @@ Capabilities not listed behave as on a 2.x server.
 | Materialized views (v0.32.0)                                        | as on a 2.x server: `int` sums and `Decimal` means; in a grouped view, `math::stddev()`/`math::variance()`, an expression around an aggregate, a field outside `GROUP BY` and a `GROUP BY` on an alias raise `SurrealDbError` before any DDL; writes to a view refused by the ORM (the engine would accept them); no live queries                     | `float` sums and means on 3.x                                                                                   | v0.32.0 |
 | TYPE RELATION constraints (v0.33.0)                                 | as on a 2.x server: a raw `ALTER TABLE … TYPE` of a table already written to is not enforced (`define_relation()` sends `DEFINE TABLE OVERWRITE`); an endpoint outside `IN`/`OUT` whose record does not exist raises `SurrealDbNotFoundError`                                                                                                         | `SurrealDbError` for that endpoint on 3.x                                                                       | v0.33.0 |
 | Model table DDL (v0.34.0)                                           | as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops that field                                                                                                           | 3.x keeps those values without `FLEXIBLE` and refuses that write                                                | v0.34.0 |
+| Full-text search (v0.35.0)                                          | as on a 2.x server: `SEARCH ANALYZER`, a term in more than half the documents scores below zero, BM25 statistics grow with each rebuild and keep deleted records, `remove_analyzer()` refuses an analyzer an index uses; an index defined in the transaction that defines its analyzer sees it, which `define_indexes(tx=…)` refuses all the same     | 3.x writes `FULLTEXT ANALYZER`, scores such a term `0.0`, keeps BM25 statistics exact and refuses that removal  | v0.35.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -6101,40 +6403,41 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-| Version           | Theme                                                | Status      |
-| ----------------- | ---------------------------------------------------- | ----------- |
-| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration         | ✅ Released |
-| v0.8.0            | Transactions ORM (`tx=`)                             | ✅ Released |
-| v0.9.0            | Transactions — QuerySet & interactive (3.x)          | ✅ Released |
-| v0.10.0           | upsert / update_or_create / get_or_create            | ✅ Released |
-| v0.11.0           | patch / atomic field & array ops                     | ✅ Released |
-| v0.12.0           | retry_on_conflict & optimistic concurrency           | ✅ Released |
-| v0.13.0           | SurrealFunc & server-side values                     | ✅ Released |
-| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)             | ✅ Released |
-| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops    | ✅ Released |
-| v0.15.0           | `call_function()` — custom `fn::` stored functions   | ✅ Released |
-| v0.16.0           | Connection auth (`signin`/`signup`/`info`)           | ✅ Released |
-| v0.17.0           | Model auth (`AuthenticatedUserMixin`)                | ✅ Released |
-| v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`    | ✅ Released |
-| v0.19.0           | Live queries (base): `live()` / `kill()`, raw notifs | ✅ Released |
-| v0.20.0           | Typed live queries: `LiveModelStream`, diff, filters | ✅ Released |
-| v0.21.0           | Auto-resubscribe & change feeds (`changes()`)        | ✅ Released |
-| v0.22.0           | Tier 1 — Native typed relations                      | ✅ Released |
-| v0.23.0           | Rich field types                                     | ✅ Released |
-| v0.24.0           | Geospatial fields                                    | ✅ Released |
-| v0.25.0           | Embedded test engine                                 | ✅ Released |
-| v0.26.0           | Time travel (versioned storage)                      | ✅ Released |
-| v0.27.0           | Subqueries                                           | ✅ Released |
-| v0.28.0           | Query cache                                          | ✅ Released |
-| v0.29.0           | Tier 2 — Multi-database                              | ✅ Released |
-| v0.30.0           | Tier 3 — Schema introspection                        | ✅ Released |
-| v0.31.0           | Tier 3 — Server-side events and DDL helpers          | ✅ Released |
-| v0.32.0           | Tier 3 — Materialized views                          | ✅ Released |
-| v0.33.0           | Tier 3 — `TYPE RELATION` constraints                 | ✅ Released |
-| v0.34.0           | Tier 3 — Model table DDL                             | ✅ Released |
-| v0.35.0 – v0.40.0 | Tier 3 — Advanced (search, migrations, CLI)          | 📋 Planned  |
-| v0.41.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
+| Version           | Theme                                                         | Status      |
+| ----------------- | ------------------------------------------------------------- | ----------- |
+| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration                  | ✅ Released |
+| v0.8.0            | Transactions ORM (`tx=`)                                      | ✅ Released |
+| v0.9.0            | Transactions — QuerySet & interactive (3.x)                   | ✅ Released |
+| v0.10.0           | upsert / update_or_create / get_or_create                     | ✅ Released |
+| v0.11.0           | patch / atomic field & array ops                              | ✅ Released |
+| v0.12.0           | retry_on_conflict & optimistic concurrency                    | ✅ Released |
+| v0.13.0           | SurrealFunc & server-side values                              | ✅ Released |
+| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)                      | ✅ Released |
+| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops             | ✅ Released |
+| v0.15.0           | `call_function()` — custom `fn::` stored functions            | ✅ Released |
+| v0.16.0           | Connection auth (`signin`/`signup`/`info`)                    | ✅ Released |
+| v0.17.0           | Model auth (`AuthenticatedUserMixin`)                         | ✅ Released |
+| v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`             | ✅ Released |
+| v0.19.0           | Live queries (base): `live()` / `kill()`, raw notifs          | ✅ Released |
+| v0.20.0           | Typed live queries: `LiveModelStream`, diff, filters          | ✅ Released |
+| v0.21.0           | Auto-resubscribe & change feeds (`changes()`)                 | ✅ Released |
+| v0.22.0           | Tier 1 — Native typed relations                               | ✅ Released |
+| v0.23.0           | Rich field types                                              | ✅ Released |
+| v0.24.0           | Geospatial fields                                             | ✅ Released |
+| v0.25.0           | Embedded test engine                                          | ✅ Released |
+| v0.26.0           | Time travel (versioned storage)                               | ✅ Released |
+| v0.27.0           | Subqueries                                                    | ✅ Released |
+| v0.28.0           | Query cache                                                   | ✅ Released |
+| v0.29.0           | Tier 2 — Multi-database                                       | ✅ Released |
+| v0.30.0           | Tier 3 — Schema introspection                                 | ✅ Released |
+| v0.31.0           | Tier 3 — Server-side events and DDL helpers                   | ✅ Released |
+| v0.32.0           | Tier 3 — Materialized views                                   | ✅ Released |
+| v0.33.0           | Tier 3 — `TYPE RELATION` constraints                          | ✅ Released |
+| v0.34.0           | Tier 3 — Model table DDL                                      | ✅ Released |
+| v0.35.0           | Tier 3 — Full-text search                                     | ✅ Released |
+| v0.36.0 – v0.40.0 | Tier 3 — Advanced (vector and hybrid search, migrations, CLI) | 📋 Planned  |
+| v0.41.0           | Beta Phase (API freeze, hardening)                            | 📋 Planned  |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)                        | 📋 Planned  |
 
 > Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
 > `query()` SurrealQL) — no custom SDK. GA is numbered **v2.0.0** to mirror SDK 2.0; the `1.x`
@@ -6191,7 +6494,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Materialized views            | ✅ v0.32.0 (`view_query`, `define_view()`)                            | ✅                                        |
 | TYPE RELATION enforcement     | ✅ v0.33.0 (`relation_in`, `define_relation()`)                       | ✅ DDL (`TableType.RELATION`, migrations) |
 | Model table DDL               | ✅ v0.34.0 (`define_table()`)                                         | ✅                                        |
-| Full-Text Search              | v0.35.0                                                               | ✅                                        |
+| Full-Text Search              | ✅ v0.35.0 (`search()`)                                               | ✅                                        |
 | Vector Search (KNN/HNSW)      | v0.36.0                                                               | ✅                                        |
 | Hybrid Search (RRF)           | v0.37.0                                                               | ✅                                        |
 | Migrations & CLI              | v0.38 – v0.39                                                         | ✅                                        |

@@ -2583,7 +2583,8 @@ class TestReadmeSection31:
 
     def test_section_31_follows_section_30(self) -> None:
         """Right after section 30 (after its "Coming from" bullets), then section 32 (v0.31.0), section 33
-        (v0.32.0), section 34 (v0.33.0) and section 35 (v0.34.0), and before the ``---`` of "Configuration Options"."""
+        (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0) and section 36 (v0.35.0), and before the ``---`` of
+        "Configuration Options"."""
         readme = _readme()
         start_30 = readme.index(f"\n{_SECTION_30}\n")
         start_31 = readme.index(f"\n{_SECTION_31}\n")
@@ -2596,6 +2597,7 @@ class TestReadmeSection31:
             "### 33. Materialized views (`view_query`, `define_view()`)",
             "### 34. Relation constraints (`relation_in`, `define_relation()`)",
             "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

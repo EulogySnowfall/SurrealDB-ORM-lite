@@ -15,6 +15,7 @@ from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
 from . import routing as _routing
+from . import search as _search
 from . import subquery as _subquery
 from . import time_travel as _time_travel
 from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
@@ -30,6 +31,7 @@ from .geo import GeoDistance, GeometryPoint
 from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error
 from .model_base import _snapshot_moment
 from .q import Q
+from .search import SearchAnnotation, SearchHighlight, SearchOffsets, SearchScore
 from .subquery import SubqueryCompiler
 from .surql_literal import inline_variables
 from .types import Duration
@@ -111,11 +113,16 @@ class QuerySet:
         # checked against the model's connection before a statement is sent.
         self._link_heads: set[str] = set()
         self._group_by_fields: list[str] = []
-        self._annotations: dict[str, Aggregation | GeoDistance] = {}
+        # Every annotation, by alias: the aggregations and the per-record ones (GeoDistance, the search annotations).
+        self._annotations: dict[str, Aggregation | GeoDistance | SearchAnnotation] = {}
         # GeoDistance annotations (v0.24.0), as annotate() checked them: alias -> column, reference point.
         self._geo_annotations: dict[str, tuple[str, GeometryPoint]] = {}
+        # Search annotations (v0.35.0), in annotate() order: alias -> SearchScore, SearchHighlight or SearchOffsets.
+        self._search_annotations: dict[str, SearchAnnotation] = {}
         # nearby() conditions (v0.24.0): column, reference point, distance in metres.
         self._nearby: list[tuple[str, GeometryPoint, float]] = []
+        # search() conditions (v0.35.0): field as given, column, text; the match reference is the position.
+        self._search: list[tuple[str, str, str]] = []
         self._tx: Any = None
         # as_of() (v0.26.0): the moment a time-travel read is made at, normalised; None reads the current state.
         self._as_of: _time_travel.AsOf | None = None
@@ -318,8 +325,8 @@ class QuerySet:
         ``containsall`` and ``containsany`` (compared with all its values) and of ``exact``, ``gt``, ``gte``,
         ``lt``, ``lte``, ``contains`` and ``not_contains`` (compared with its first value; no record when it is
         empty), here and in ``Q``. The inner queryset selects its record ids, or the one field given to its
-        ``select()``; its ``filter()``, ``Q``, ``nearby()``, ``order_by()``, ``limit()``, ``offset()`` and
-        ``variables()`` apply, its ``fetch()`` is ignored. It is read when this queryset runs, in the same
+        ``select()``; its ``filter()``, ``Q``, ``nearby()``, ``search()``, ``order_by()``, ``limit()``, ``offset()``
+        and ``variables()`` apply, its ``fetch()`` is ignored. It is read when this queryset runs, in the same
         statement: one request. A clause it cannot honour raises when this queryset compiles, before any request
         (see ``Subquery``). A subquery reading a table that does not exist reads as empty, as any missing table
         (SurrealDB 3.x raises: once the server confirms the table does not exist, the statement is sent once more
@@ -530,6 +537,65 @@ class QuerySet:
         if kinds is not None and "point" not in kinds:
             raise ValueError(f"{caller} measures distances between points; field {field!r} is declared as {_geo._info(kinds)}")
 
+    def search(self, **field_queries: str) -> Self:
+        """Keep the records whose fields match full-text queries (v0.35.0) — the full SurrealDB-ORM's method.
+
+        ::
+
+            physics = await Article.objects().search(title="quantum physics").exec()
+            recent = await Article.objects().filter(views__gt=10).search(title="quantum", body="physics").exec()
+            rust = await Article.objects().search(**{"meta.headline": "rust"}).count()
+
+        Each keyword maps a field — a Python field name (an aliased field compiles its column) or a dotted path — to
+        the text to match. The text is bound as a query variable, never written into the statement, and is data
+        whatever it holds (``"$title"`` is the text ``$title``). Each field gets the next match reference, in call
+        order and across calls (``search(title="a").search(body="b")``: ``title @0@ $_f0 AND body @1@ $_f1``), the
+        reference ``SearchScore(ref)`` and ``SearchHighlight(…, ref)`` name; the same field may be searched twice; at
+        most 256 fields per queryset (SurrealDB's match references are 0 to 255). Without a keyword nothing changes.
+
+        The conditions are AND-ed with each other and after ``filter()``, ``Q`` and ``nearby()``, wherever those
+        apply: ``exec()``, ``first()``, ``get()`` without an id, ``count()`` and the other aggregations, ``exists()``,
+        ``values()``/``annotate()`` groups, ``bulk_update()``, ``bulk_delete()``, ``patch()``, and a ``Subquery`` of
+        this queryset. ``get(<id>)`` and ``all()`` ignore it, as they ignore ``filter()``. SurrealDB's analyzer decides
+        what matches (case, stemming, prefixes); the terms of one text are AND-ed; an empty text matches nothing. The
+        records matched are the same on every line; the scores are not always (see ``SearchScore``).
+
+        The field needs a full-text index — ``Index(..., search_analyzer=...)`` declared on the model and applied by
+        ``define_indexes()``: without one, the read raises ``SurrealDbError`` naming the field, never the server's
+        text (SurrealDB 3.x quotes the search text in it). In a transaction the commit then fails with that error as
+        its cause. ``live()``/``watch()`` refuse ``search()`` — search in a ``Subquery`` of the live query instead —,
+        as ``as_of()`` and ``changes()`` do.
+
+        Args:
+            **field_queries: Each field to search, and the text to match in it.
+
+        Returns:
+            Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: a text is not a ``str``.
+            ValueError: a field is not a field name or a dotted path; it is the record id (``id``) or, on an edge
+                model, an endpoint (``in``/``out``); the queryset would search more than 256 fields.
+            SurrealDbError: the queryset reads ``as_of()``.
+            Each raised before any request, the queryset left unchanged.
+        """
+        endpoint_columns = self.model._endpoint_columns()
+        conditions: list[tuple[str, str]] = []
+        for field, text in field_queries.items():
+            _search.checked_search_field(field)
+            column = self.model.to_db_field(field)
+            if column == RECORD_ID_COLUMN or column in endpoint_columns:
+                raise ValueError(_search.field_refused(field, endpoint=column in endpoint_columns))
+            if not isinstance(text, str):
+                raise TypeError(_search.text_refused(field, text))
+            conditions.append((field, text))
+        if len(self._search) + len(conditions) > _search.MAX_SEARCH_FIELDS:
+            raise ValueError(_search.too_many_fields())
+        if conditions and self._as_of is not None:
+            raise SurrealDbError(_search.time_travel_refused())
+        self._search.extend((field, self._column(field), text) for field, text in conditions)
+        return self
+
     def as_of(self, at: datetime | str | timedelta | Duration | SurrealFunc | None) -> Self:
         """Read the records as they were at a moment: SurrealQL's ``VERSION`` (v0.26.0).
 
@@ -581,6 +647,10 @@ class QuerySet:
         link in ``filter()``, ``select()``, ``order_by()`` or ``values()`` reads the linked record as it was on
         3.x and as it is now on 2.x (see the README).
 
+        ``search()`` (v0.35.0) is refused with a moment, whichever comes first: a full-text match reads the index,
+        which holds the records' current text, so the read would select records by their text now. A ``Subquery``
+        holding ``search()`` is refused under an outer ``as_of()`` when the statement compiles, before any request.
+
         A time-travel queryset is read-only: ``bulk_create()``, ``bulk_update()``, ``bulk_delete()``,
         ``patch()``, ``update_or_create()``, ``get_or_create()``, ``delete_table()``, ``query()``, ``live()``,
         ``watch()`` and ``changes()`` raise ``SurrealDbError`` on it, before any request. ``_as_of`` is a
@@ -594,12 +664,15 @@ class QuerySet:
             ValueError: a string that is not ISO-8601; a negative duration; a moment outside
                 1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z.
             SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``); a moment on a queryset
-                with ``cache()`` (v0.28.0: a time-travel read is never cached). ``as_of(None)`` is accepted.
+                with ``cache()`` (v0.28.0: a time-travel read is never cached) or with ``search()`` (v0.35.0).
+                ``as_of(None)`` is accepted.
         """
         if self._tx is not None:
             raise SurrealDbError(_time_travel.transaction_refused())
         if at is not None and self._cache is not None:
             raise SurrealDbError(_CACHE_AS_OF)
+        if at is not None and self._search:
+            raise SurrealDbError(_search.time_travel_refused())
         self._as_of = _time_travel.normalise_as_of(at)
         return self
 
@@ -774,11 +847,14 @@ class QuerySet:
     ) -> tuple[list[str], dict[str, Any], int]:
         """The AND-ed conditions of the WHERE clause, their bound values and the next ``$_f<N>`` number.
 
-        Filters, ``Q`` objects and ``nearby()`` conditions, in that order, numbered from *counter* on: the outer
-        statement starts at 0, a subquery (v0.27.0) continues the numbering of the statement it goes into. With
-        ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check ``time_travel.GUARD`` is the last
-        condition, after the ``nearby()`` ones: every other part is a single comparison or a parenthesised group,
-        so the check applies to every row they keep.
+        Filters, ``Q`` objects, ``nearby()`` and ``search()`` conditions (v0.35.0), in that order, numbered from
+        *counter* on: the outer statement starts at 0, a subquery (v0.27.0) continues the numbering of the statement
+        it goes into. A ``search()`` condition is ``<column> @<ref>@ $_f<N>``, its text bound; the match reference
+        is the condition's position in this queryset, so a subquery's references start again at 0 while its texts
+        continue the statement's numbering. With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record
+        check ``time_travel.GUARD`` is the last condition, after the ``nearby()`` ones (``search()`` never reads at a
+        moment): every other part is a single comparison or a parenthesised group, so the check applies to every row
+        they keep.
 
         Args:
             counter: the first ``$_f<N>`` number.
@@ -825,6 +901,13 @@ class QuerySet:
             variables[distance_var] = distance
             counter += 2
 
+        # search() conditions (v0.35.0): the text is bound, never written into the statement.
+        for reference, (_, column, text) in enumerate(self._search):
+            variable = f"_f{counter}"
+            parts.append(f"{column} @{reference}@ ${variable}")
+            variables[variable] = text
+            counter += 1
+
         if as_of:
             parts.append(_time_travel.GUARD)
 
@@ -867,7 +950,8 @@ class QuerySet:
         values are bound from *counter* on, its ``variables()`` merged into the statement's, its own subqueries
         rendered first (their ``LET`` s precede its own). Under the outer ``as_of()`` (``compiler.moment``) it
         carries the per-record guard and ``VERSION $_as_of``: the server never applies the outer ``VERSION`` to a
-        ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. ``fetch()`` is ignored, as in the full
+        ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. Each of its ``search()`` conditions is
+        recorded in ``compiler.searched`` (v0.35.0). ``fetch()`` is ignored, as in the full
         SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
 
         Called by :meth:`SubqueryCompiler.reference`, which first refuses a queryset that is its own subquery.
@@ -877,7 +961,8 @@ class QuerySet:
                 invalid selected column; ``_sqv`` ordered on where the ordered form selects its alias; its
                 ``variables()`` binding a name of the statement to another value; and its filters' own refusals.
                 Its ``limit()`` and ``offset()`` were checked when they were called (a non-negative integer).
-            SurrealDbError: an ``as_of()`` of its own; a transaction that is not the outer queryset's.
+            SurrealDbError: an ``as_of()`` of its own; a transaction that is not the outer queryset's; ``search()``
+                under the outer ``as_of()`` (v0.35.0).
         """
         offenders = {
             "annotate()": bool(self._annotations),
@@ -891,6 +976,8 @@ class QuerySet:
             raise SurrealDbError(_subquery.moment_refused())
         if self._tx is not None and self._tx is not compiler.outer_tx:
             raise SurrealDbError(_subquery.transaction_refused())
+        if self._search and compiler.moment is not None:
+            raise SurrealDbError(_search.time_travel_refused())
         column = self.select_item[0] if self.select_item else "id"
         validate_field_name(column, "subquery select field")
         order_columns: list[str] = []
@@ -909,6 +996,8 @@ class QuerySet:
         compiler.merge_variables(self._variables)
         if table in compiler.empty_tables:
             return "[]", {}, counter
+        for field, search_column, _ in self._search:
+            compiler.searched[(table, search_column)] = field
         parts, values, counter = self._where_parts(counter, as_of=compiler.moment is not None, subqueries=compiler)
         where = " WHERE " + " AND ".join(parts) if parts else ""
         tail = ""
@@ -962,7 +1051,10 @@ class QuerySet:
         Raises:
             RuntimeError: under ``as_of()`` without a moment (an internal error).
             ValueError, SurrealDbError: a subquery the ORM cannot compile (README section 28).
+            ValueError: a search annotation whose match reference ``search()`` did not give this queryset
+                (v0.35.0, :meth:`_check_search_references`).
         """
+        self._check_search_references()
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
         compiler.moment = moment
@@ -976,6 +1068,8 @@ class QuerySet:
             variable = f"_gd{index}"
             projection.append(f"IF {column}.is_point() THEN geo::distance({column}, ${variable}) END AS {alias}")
             distance_vars[variable] = point
+        search_projection, search_vars = self._search_projection()
+        projection += search_projection
         query = f"SELECT {', '.join(projection)} FROM {self._model_table}"
 
         query += where_clause
@@ -992,8 +1086,49 @@ class QuerySet:
         if self._fetch_fields:
             query += f" FETCH {', '.join(self._fetch_fields)}"
 
-        query, variables = self._terminate(query, {**compiler.variables, **where_vars, **distance_vars}, moment)
+        query, variables = self._terminate(query, {**compiler.variables, **where_vars, **distance_vars, **search_vars}, moment)
         return compiler.wrap(query), variables
+
+    def _search_projection(self) -> tuple[list[str], dict[str, Any]]:
+        """The projections of the search annotations, in ``annotate()`` order, and the highlight tags they bind
+        (v0.35.0).
+
+        ``search::score(<ref>) AS <alias>``, ``search::highlight($_sh<2k>, $_sh<2k+1>, <ref>) AS <alias>`` (*k* the
+        highlight's position among the highlights, its tags bound, never written into the statement) and
+        ``search::offsets(<ref>) AS <alias>``; the reference is an ``int`` checked 0..255 when the annotation was
+        built, the alias checked by ``annotate()``.
+        """
+        projection: list[str] = []
+        tags: dict[str, str] = {}
+        for alias, annotation in self._search_annotations.items():
+            if isinstance(annotation, SearchHighlight):
+                opening, closing = f"_sh{len(tags)}", f"_sh{len(tags) + 1}"
+                projection.append(f"search::highlight(${opening}, ${closing}, {annotation.ref}) AS {alias}")
+                tags = {**tags, opening: annotation.open_tag, closing: annotation.close_tag}
+            elif isinstance(annotation, SearchScore):
+                projection.append(f"search::score({annotation.ref}) AS {alias}")
+            else:
+                projection.append(f"search::offsets({annotation.ref}) AS {alias}")
+        return projection, tags
+
+    def _check_search_references(self) -> None:
+        """Refuse a search annotation whose match reference ``search()`` did not give this queryset (v0.35.0).
+
+        Checked when the queryset runs — ``annotate()`` may come before ``search()`` —, before any request: first by
+        ``exec()`` (hence ``first()`` and ``get()`` without an id) and ``exists()``, ahead of an ``as_of()``
+        moment's resolution, then by :meth:`_compile_query`. ``count()`` and the aggregations ignore every
+        annotation, as they ignore ``GeoDistance``.
+
+        Raises:
+            ValueError: a search annotation on a queryset without ``search()``, or naming a reference beyond the
+                fields ``search()`` gave it (``0`` to ``n - 1``, in call order).
+        """
+        given = len(self._search)
+        for annotation in self._search_annotations.values():
+            if not given:
+                raise ValueError(_search.no_search_refused(annotation))
+            if annotation.ref >= given:
+                raise ValueError(_search.reference_refused(annotation, given))
 
     def _compile_aggregation_query(
         self,
@@ -1051,12 +1186,14 @@ class QuerySet:
             A tuple of (query_string, variables_dict).
 
         Raises:
-            ValueError: a ``GeoDistance`` annotation is present: it is computed per record.
+            ValueError: a per-record annotation is present — a ``GeoDistance``, or a search annotation (v0.35.0) —,
+                named by the first of them.
             RuntimeError: under ``as_of()`` without a moment (an internal error).
             ValueError, SurrealDbError: a subquery the ORM cannot compile, as for :meth:`_compile_query`.
         """
-        if self._geo_annotations:
-            raise ValueError(_GEO_DISTANCE_PER_RECORD)
+        if self._geo_annotations or self._search_annotations:
+            per_record = [value for value in self._annotations.values() if isinstance(value, _PER_RECORD)]
+            raise ValueError(_per_record_refused(per_record[0]))
         self._reject_annotation_collisions()
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
@@ -1090,7 +1227,12 @@ class QuerySet:
     # ==================== Query execution ====================
 
     async def _execute_query(
-        self, query: str, variables: dict[str, Any] | None = None, *, subquery_tables: frozenset[str] = frozenset()
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        subquery_tables: frozenset[str] = frozenset(),
+        searched: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Execute a read query. Routes through the transaction when one is attached
@@ -1105,6 +1247,11 @@ class QuerySet:
         to the SDK's error. Keyed on ``as_of()``, never on the variables: without it, every error is
         relayed unchanged.
 
+        A search on a field without a full-text index (v0.35.0) raises ``SurrealDbError`` naming the field, from
+        ``None``: the server's text, which on SurrealDB 3.x quotes the search text, stays its suppressed
+        ``__context__`` (``search.missing_index_refusal()``). In a transaction that error replaces the SDK's in the
+        transaction's failures, so the commit that fails afterwards chains it, never the server's text.
+
         Args:
             query: the statement.
             variables: its bound values (the queryset's ``variables()`` when ``None``).
@@ -1113,12 +1260,16 @@ class QuerySet:
                 anything but itself (:meth:`_reads_as_empty`): naming one of these tables, and confirmed by the
                 server, it asks :meth:`_run_compiled` to send the statement again with that subquery empty;
                 naming another table, it is the outer table's and reads as no rows. Every other error is relayed.
+            searched: the columns the statement searches, each mapped to its field as given — this queryset's and
+                its subqueries' (:meth:`_searched_columns`); ``None``: this queryset's own.
 
         Raises:
             _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist (caught by
                 :meth:`_run_compiled`).
+            SurrealDbError: a searched field has no full-text index.
         """
         vars_ = variables if variables is not None else self._variables
+        columns = searched if searched is not None else self._searched_columns()
         if self._tx is not None:
             try:
                 return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
@@ -1133,6 +1284,12 @@ class QuerySet:
                 if empty:
                     self._tx._absorb_failure(exc)
                     return []
+                refusal = _search.missing_index_refusal(exc, columns)
+                if refusal is not None:
+                    # The transaction still fails as a whole, with the ORM's error as its cause, never the server's.
+                    self._tx._absorb_failure(exc)
+                    self._tx._note_failure(refusal)
+                    raise refusal from None
                 raise
         client = await self._manager().get_client()
         try:
@@ -1140,9 +1297,18 @@ class QuerySet:
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
+            refusal = _search.missing_index_refusal(exc, columns)
+            if refusal is not None:
+                raise refusal from None
             if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
                 raise SurrealDbError(_time_travel.server_refused(exc)) from exc
             raise
+
+    def _searched_columns(self, compiler: SubqueryCompiler | None = None) -> dict[str, str]:
+        """The columns a statement of this queryset searches, each mapped to its field as given (v0.35.0): those of
+        its subqueries (``compiler.searched``), then this queryset's own ``search()`` conditions."""
+        columns = {} if compiler is None else {column: field for (_, column), field in compiler.searched.items()}
+        return {**columns, **{column: field for field, column, _ in self._search}}
 
     async def _reads_as_empty(self, exc: ServerError, subquery_tables: frozenset[str]) -> bool:
         """Whether the server's error *exc* reads as no rows; ``False`` relays it.
@@ -1239,7 +1405,8 @@ class QuerySet:
         table compile again with that subquery bound to ``[]`` and send again.
 
         The filter values' warnings are given by the first compilation only, and only with *warn* (v0.28.1):
-        ``False`` when :meth:`_run_cached` compiled the statement for this read already."""
+        ``False`` when :meth:`_run_cached` compiled the statement for this read already. The fields the statement's
+        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them."""
         empty: frozenset[str] = frozenset()
         while True:
             compiler = self._subquery_compiler(empty, warn=warn)
@@ -1251,8 +1418,11 @@ class QuerySet:
             read = frozenset(compiler.tables) - empty
             if not read:
                 return await self._execute_query(query, variables)
+            # The fields the subqueries search (v0.35.0), which a missing-index error names; _execute_query() maps
+            # this queryset's own. Only a subquery that searches adds the argument: the call is otherwise v0.27.0's.
+            searched: dict[str, Any] = {"searched": self._searched_columns(compiler)} if compiler.searched else {}
             try:
-                return await self._execute_query(query, variables, subquery_tables=read)
+                return await self._execute_query(query, variables, subquery_tables=read, **searched)
             except _subquery._MissingSubqueryTable as missing:
                 empty |= {missing.table}
 
@@ -1341,18 +1511,25 @@ class QuerySet:
         Execute the compiled query and return the results.
 
         When ``values()`` and ``annotate()`` are used, returns a list of dictionaries with
-        the grouped fields and aggregation results. With ``GeoDistance`` annotations, returns the
-        model instances, each carrying its distances as attributes (see :meth:`annotate`).
+        the grouped fields and aggregation results. With ``GeoDistance`` annotations, or the search
+        annotations (``SearchScore``, ``SearchHighlight``, ``SearchOffsets``, v0.35.0), returns the
+        model instances, each carrying its values as attributes (see :meth:`annotate`).
         Served from the query cache with ``cache()`` (v0.28.0), as new instances.
 
         Returns:
             list[BaseSurrealModel] | list[dict]: Model instances or dictionaries for GROUP BY queries.
             Under ``as_of()`` the instances are snapshots (v0.26.0).
+
+        Raises:
+            ValueError: a search annotation whose match reference ``search()`` did not give this queryset, before
+                any request (v0.35.0).
         """
+        self._check_search_references()
+        per_record = bool(self._geo_annotations or self._search_annotations)
         # The values()+annotate() branch compiles no FETCH: only the other two return fetched records.
-        moment = await self._time_travel_moment(fetches=bool(self._geo_annotations) or not self._annotations)
-        if self._geo_annotations:
-            return await self._exec_with_distances(moment)
+        moment = await self._time_travel_moment(fetches=per_record or not self._annotations)
+        if per_record:
+            return await self._exec_with_annotations(moment)
 
         if self._annotations:
             results = await self._run_compiled(lambda c: self._compile_group_by_query(moment, subqueries=c))
@@ -1370,8 +1547,9 @@ class QuerySet:
             logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
             return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
 
-    async def _exec_with_distances(self, moment: datetime | None = None) -> Any:
-        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0).
+    async def _exec_with_annotations(self, moment: datetime | None = None) -> Any:
+        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0) and of the search annotations
+        (v0.35.0).
 
         The alias keys are taken out of each row before validation, so they never reach a field, an
         ``extra="allow"`` model's extras or a later write, then set on the instance with
@@ -1379,21 +1557,22 @@ class QuerySet:
         field…) come back as dicts, alias keys included, as ``exec()`` returns them today. Under
         ``as_of()``, *moment* is the read's resolved moment and the instances are snapshots (v0.26.0).
         """
-        self._reject_geo_distance_mixing(self._annotations, grouped=bool(self._group_by_fields))
+        self._reject_per_record_mixing(self._annotations, grouped=bool(self._group_by_fields))
         results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
         rows = results if isinstance(results, list) else []
+        aliases = [*self._geo_annotations, *self._search_annotations]
         stripped: list[dict[str, Any]] = []
-        distances: list[dict[str, Any]] = []
+        annotated: list[dict[str, Any]] = []
         for row in rows:
             record = dict(row)
-            distances.append({alias: record.pop(alias, None) for alias in self._geo_annotations})
+            annotated.append({alias: record.pop(alias, None) for alias in aliases})
             stripped.append(record)
         try:
             instances = cast(list[Any], self.model.from_db(stripped))
         except ValidationError as e:
             logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
             return [self._py_keyed(row) for row in rows]
-        for instance, values in zip(instances, distances, strict=True):
+        for instance, values in zip(instances, annotated, strict=True):
             for alias, value in values.items():
                 object.__setattr__(instance, alias, value)
         return self._mark_snapshots(instances, moment)
@@ -1586,18 +1765,19 @@ class QuerySet:
             Self: The current QuerySet instance for method chaining.
 
         Raises:
-            ValueError: a field name is invalid, or a ``GeoDistance`` annotation is present (it is
-                computed per record, not per group).
+            ValueError: a field name is invalid, or a per-record annotation is present — a ``GeoDistance``, or a
+                search annotation (v0.35.0) — (it is computed per record, not per group).
         """
         for field in fields:
             validate_field_name(field, "GROUP BY field")
-        self._reject_geo_distance_mixing(self._annotations, grouped=bool(fields))
+        self._reject_per_record_mixing(self._annotations, grouped=bool(fields))
         self._group_by_fields = [self._column(field) for field in fields]
         return self
 
-    def annotate(self, **annotations: "Aggregation | GeoDistance") -> Self:
+    def annotate(self, **annotations: "Aggregation | GeoDistance | SearchScore | SearchHighlight | SearchOffsets") -> Self:
         """
-        Add aggregation annotations, or per-record distances, to the query.
+        Add aggregation annotations, or per-record values — distances, search scores, highlights and offsets —, to
+        the query.
 
         An ``Aggregation`` (``Count``, ``Sum``, ``Avg``, ``Min``, ``Max``) groups the records with
         ``values()``, and ``exec()`` returns one dict per group.
@@ -1613,6 +1793,29 @@ class QuerySet:
             )
             near[0].dist  # metres, a float; None for a record whose field is not a point
 
+        So are the search annotations (v0.35.0, the full SurrealDB-ORM's ``SearchScore`` and ``SearchHighlight``,
+        plus ``SearchOffsets``), each naming the match reference a :meth:`search` field was given (``@0@``,
+        ``@1@`` …, in call order)::
+
+            articles = await (
+                Article.objects()
+                .search(title="physics")
+                .annotate(relevance=SearchScore(0), snippet=SearchHighlight("<b>", "</b>", 0))
+                .order_by("-relevance")
+                .exec()
+            )
+            articles[0].relevance  # BM25, a float
+            articles[0].snippet    # 'Cooking with <b>physics</b>'
+
+        ``SearchScore`` gives the field's BM25 score, ``SearchHighlight`` its text with each matched term wrapped in
+        the tags (a list of texts for an array field; the text unchanged when the index has no ``HIGHLIGHTS``),
+        ``SearchOffsets`` where the matched terms sit (``{"0": [{"s": 13, "e": 20}]}``). The tags are bound query
+        variables. The references are checked when the queryset runs (``annotate()`` may come before ``search()``):
+        a reference ``search()`` did not give, or a search annotation without ``search()``, raises before any
+        request. The scores depend on the line: SurrealDB 3.x gives a term found in more than half the documents no
+        weight, while 2.x and the embedded engine score it below zero, count an index's records again each time it
+        is rebuilt and keep counting deleted records (README section 36): compare scores within one query.
+
         ``exec()``, ``first()`` and ``get()`` return model instances carrying the value as an
         attribute named after the alias; it is never written back (``model_dump()``, ``update()``,
         ``upsert()`` leave it out). Rows that do not validate (a ``select()`` that omits a required
@@ -1622,39 +1825,48 @@ class QuerySet:
         ``nearby()``. On an ``extra="allow"`` model, a stored undeclared column with the alias's
         name is replaced by the distance in the results, and a later ``update()`` removes it: choose
         an alias no record stores. The field and the point are checked and copied here: changing
-        the ``GeoDistance`` afterwards does not change this queryset.
+        the ``GeoDistance`` afterwards does not change this queryset. ``count()`` and the aggregations
+        ignore every annotation; ``live()``, ``watch()``, ``changes()`` and a ``Subquery`` refuse a queryset
+        holding one.
 
         Args:
-            **annotations: The alias of each value, and an ``Aggregation`` or a ``GeoDistance``.
+            **annotations: The alias of each value, and an ``Aggregation``, a ``GeoDistance``, a ``SearchScore``,
+                a ``SearchHighlight`` or a ``SearchOffsets``.
 
         Returns:
             Self: The current QuerySet instance for method chaining.
 
         Raises:
-            TypeError: a value is neither an ``Aggregation`` nor a ``GeoDistance``.
-            ValueError: an invalid alias; for a ``GeoDistance``, an alias that names a declared field
+            TypeError: a value is none of those.
+            ValueError: an invalid alias; for a per-record annotation, an alias that names a declared field
                 or its column, ``id``, ``in``, ``out``, a name starting with ``_`` or ``model_`` or an
-                attribute of the model (``save``, ``objects``…), an invalid field name or a field
-                declared as a geometry that holds no point; a ``GeoDistance`` combined with an
+                attribute of the model (``save``, ``objects``…); for a ``GeoDistance``, an invalid field name or
+                a field declared as a geometry that holds no point; a per-record annotation combined with an
                 ``Aggregation`` or with ``values()``.
         """
         from .aggregations import Aggregation as AggregationClass
 
         distances: dict[str, tuple[str, GeometryPoint]] = {}
+        searches: dict[str, SearchAnnotation] = {}
         for alias, value in annotations.items():
             validate_alias_name(alias)
             if isinstance(value, GeoDistance):
                 distances[alias] = self._geo_distance_snapshot(alias, value)
+            elif isinstance(value, SearchScore | SearchHighlight | SearchOffsets):
+                self._check_annotation_alias(alias, type(value).__name__, _search.annotation_noun(value))
+                searches[alias] = value
             elif not isinstance(value, AggregationClass):
                 raise TypeError(
-                    f"annotate() argument '{alias}' must be an Aggregation instance or a GeoDistance, "
-                    f"got {type(value).__name__}"
+                    f"annotate() argument {alias!r} must be an Aggregation instance, a GeoDistance, a SearchScore, "
+                    f"a SearchHighlight or a SearchOffsets, got {type(value).__name__}"
                 )
-        self._reject_geo_distance_mixing({**self._annotations, **annotations}, grouped=bool(self._group_by_fields))
+        self._reject_per_record_mixing({**self._annotations, **annotations}, grouped=bool(self._group_by_fields))
         self._annotations.update(annotations)
-        # An alias given again is replaced, an Aggregation included: keep the snapshots of the others.
+        # An alias given again is replaced, whatever its kind: each per-record dict keeps only the others.
         kept = {alias: snapshot for alias, snapshot in self._geo_annotations.items() if alias not in annotations}
         self._geo_annotations = {**kept, **distances}
+        kept_searches = {alias: value for alias, value in self._search_annotations.items() if alias not in annotations}
+        self._search_annotations = {**kept_searches, **searches}
         return self
 
     def _geo_distance_snapshot(self, alias: str, distance: GeoDistance) -> tuple[str, GeometryPoint]:
@@ -1664,36 +1876,43 @@ class QuerySet:
         <alias>`` replaces a stored column of that name in the result (``AS id`` replaces the id),
         and the value is set on the instance as an attribute.
         """
-        reason = self._reserved_distance_alias(alias)
-        if reason is not None:
-            raise ValueError(f"annotate() alias {alias!r} {reason}; choose another alias for the GeoDistance")
+        self._check_annotation_alias(alias, "GeoDistance", "distance")
         field = _geo._distance_field(distance.field)
         validate_field_name(field, "GeoDistance field")
         self._check_point_field(field, "GeoDistance")
         return self._column(field), _geo._as_point(distance.point)
 
-    def _reserved_distance_alias(self, alias: str) -> str | None:
-        """Why ``alias`` cannot name a ``GeoDistance`` on this model, or ``None`` when it can."""
+    def _check_annotation_alias(self, alias: str, kind: str, noun: str) -> None:
+        """Refuse *alias* for a per-record annotation of class *kind*, whose value is a *noun* (``distance``,
+        ``score``, ``highlight``, ``offsets``), when it would shadow what a record or an instance already has."""
+        reason = self._reserved_annotation_alias(alias, noun)
+        if reason is not None:
+            raise ValueError(f"annotate() alias {alias!r} {reason}; choose another alias for the {kind}")
+
+    def _reserved_annotation_alias(self, alias: str, noun: str) -> str | None:
+        """Why ``alias`` cannot name a per-record annotation whose value is a *noun* on this model, or ``None`` when
+        it can (v0.24.0's rule for ``GeoDistance``, v0.35.0's for the search annotations)."""
         if alias in ("id", "in", "out"):
             return "is reserved: it names the record's id or an edge endpoint"
         if alias.startswith(("_", "model_")):
             return "is reserved: names starting with '_' or 'model_' belong to Pydantic"
         model = self.model
         if alias in model.model_fields:
-            return f"is a field of {model.__name__}: the distance would replace its value in the results"
+            return f"is a field of {model.__name__}: the {noun} would replace its value in the results"
         for name in model.model_fields:
             if model.to_db_field(name) == alias:
-                return f"is the column of field {name!r}: the distance would replace its value in the results"
+                return f"is the column of field {name!r}: the {noun} would replace its value in the results"
         if hasattr(model, alias):
-            return f"is an attribute of {model.__name__}: the distance would shadow it on the instances"
+            return f"is an attribute of {model.__name__}: the {noun} would shadow it on the instances"
         return None
 
     @staticmethod
-    def _reject_geo_distance_mixing(annotations: Mapping[str, Any], *, grouped: bool) -> None:
-        """Refuse a ``GeoDistance`` next to an ``Aggregation`` or a ``values()`` grouping."""
-        kinds = {isinstance(value, GeoDistance) for value in annotations.values()}
-        if True in kinds and (False in kinds or grouped):
-            raise ValueError(_GEO_DISTANCE_PER_RECORD)
+    def _reject_per_record_mixing(annotations: Mapping[str, Any], *, grouped: bool) -> None:
+        """Refuse a per-record annotation — a ``GeoDistance``, or a search annotation (v0.35.0) — next to an
+        ``Aggregation`` or a ``values()`` grouping, naming the first per-record one in alias order."""
+        per_record = [value for value in annotations.values() if isinstance(value, _PER_RECORD)]
+        if per_record and (grouped or len(per_record) < len(annotations)):
+            raise ValueError(_per_record_refused(per_record[0]))
 
     async def count(self) -> int:
         """
@@ -1824,9 +2043,16 @@ class QuerySet:
         """
         Check if any records match the current query.
 
+        It compiles the full projection, as ``exec()`` does: a search annotation (v0.35.0) is sent with its
+        ``LIMIT 1`` and its match reference checked first, before any request.
+
         Returns:
             True if at least one record matches, False otherwise.
+
+        Raises:
+            ValueError: a search annotation whose match reference ``search()`` did not give this queryset.
         """
+        self._check_search_references()
         moment = await self._time_travel_moment()
         original_limit = self._limit
         try:
@@ -2489,7 +2715,12 @@ class QuerySet:
         them at parse time), a typed stream needs whole records, and a live query is a
         connection-level subscription with no transaction to join. Each offender is named so
         the caller fixes them all at once.
+
+        ``search()`` (v0.35.0) is refused first, on its own: SurrealDB accepts a live query whose condition holds a
+        full-text match and never notifies it; the refusal names the subquery form, which notifies.
         """
+        if self._search:
+            raise SurrealDbError(_search.live_refused())
         unsupported = {
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -2554,6 +2785,11 @@ class QuerySet:
         answers it (the table reads as empty) and the live query starts. A resubscribe runs the
         check again, on the new connection.
 
+        The same request checks (v0.35.0) that each column a subquery searches has a full-text index — one empty
+        search per column, ``(SELECT VALUE id FROM <table> WHERE <column> @0@ '' LIMIT 1)``, after the tables, the
+        pairs sorted — and raises ``SurrealDbError`` naming the field otherwise, before the live query starts:
+        without the index, SurrealDB 3.x would accept the live query and never notify.
+
         The coroutine runs on the client it is given (v0.29.0): the stream passes its connection's — at start, the
         client it opened; at a resubscribe, the one it is about to move onto — so the live query runs on that very
         connection, and the stream has already checked the transport.
@@ -2561,14 +2797,20 @@ class QuerySet:
         compiler = self._subquery_compiler(inline=True)
         query = self._compile_live(diff, compiler)
         table = self._model_table
+        items = [f"(SELECT VALUE id FROM {name} LIMIT 1)" for name in sorted(compiler.tables)]
+        items += [_search.live_index_probe(name, column) for name, column in sorted(compiler.searched)]
         tables = tuple(sorted(compiler.tables))
-        check = "RETURN [" + ", ".join(f"(SELECT VALUE id FROM {name} LIMIT 1)" for name in tables) + "];"
+        fields = {column: field for (_, column), field in compiler.searched.items()}
+        check = "RETURN [" + ", ".join(items) + "];"
 
         async def start(client: Any) -> UUID:
-            if tables:
+            if items:
                 try:
                     await client.query(check)
                 except ServerError as exc:
+                    refusal = _search.missing_index_refusal(exc, fields)
+                    if refusal is not None:
+                        raise refusal from None
                     missing = _subquery.missing_table(exc)
                     if missing is None or missing not in tables:
                         raise
@@ -2611,6 +2853,14 @@ class QuerySet:
         exists — again on each resubscribe — because SurrealDB 3.x would accept the live query on a
         missing one and never notify; 2.x reads a missing table as empty, as everywhere else.
 
+        **Full-text search (v0.35.0).** ``search()`` is refused: SurrealDB accepts a live query whose condition holds
+        a full-text match and never notifies it. Search in a subquery instead —
+        ``filter(id__in=Subquery(Model.objects().search(title="physics")))`` —, which notifies the records created
+        or updated to match, not their deletion. Before such a live query starts, and again on each resubscribe, the
+        ORM checks in the same request that each field a subquery searches has a full-text index, and raises
+        ``SurrealDbError`` naming the field otherwise: without the index, SurrealDB 3.x would accept the live query
+        and never notify. Do not remove that index while the live query runs.
+
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
         deprecated, and never resubscribes: the caller owns that uuid.
 
@@ -2623,10 +2873,10 @@ class QuerySet:
         ``close_connection()``…) ends the stream either way.
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
-            ``offset``/``objects(tx=)``/``cache()`` (v0.28.0: a stream is never cached), and on a
-            queryset read ``as_of()`` (a live query streams the current changes, v0.26.0), here; for a
-            non-WebSocket connection (the embedded engine included: read its change feed with
-            :meth:`changes`), on start.
+            ``offset``/``objects(tx=)``/``cache()`` (v0.28.0: a stream is never cached), for ``search()``
+            (v0.35.0), and on a queryset read ``as_of()`` (a live query streams the current changes, v0.26.0),
+            here; for a non-WebSocket connection (the embedded engine included: read its change feed with
+            :meth:`changes`), or a field a subquery searches without a full-text index (v0.35.0), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile, here.
         :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist, or a
@@ -2661,9 +2911,9 @@ class QuerySet:
         ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
-        :meth:`live`, and so do its refusals (``as_of()`` and ``cache()`` included, here) and its subqueries (inline,
-        the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
-        missing one).
+        :meth:`live`, and so do its refusals (``as_of()``, ``cache()`` and ``search()`` included, here) and its
+        subqueries (inline, the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
+        missing one; the fields they search checked for a full-text index: ``SurrealDbError`` naming one without).
         """
         self._reject_time_travel("watch()")
         return LiveStream(
@@ -2683,6 +2933,7 @@ class QuerySet:
         unsupported = {
             "filter()": bool(self._filters or self._q_filters),
             "nearby()": bool(self._nearby),
+            "search()": bool(self._search),
             "variables()": bool(self._variables),
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -2728,8 +2979,8 @@ class QuerySet:
             keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
-        :raises SurrealDbError: for any queryset clause (``as_of()`` and ``cache()`` included), here; on start, for a
-            table that does not exist or has no change feed (on the table or on its database), or for a
+        :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()`` and ``search()`` included), here; on
+            start, for a table that does not exist or has no change feed (on the table or on its database), or for a
             datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
@@ -2784,10 +3035,16 @@ class QuerySet:
         return self.model.from_db(data.get("result", []))
 
 
-#: The refusal of a ``GeoDistance`` combined with ``values()`` or an ``Aggregation``.
-_GEO_DISTANCE_PER_RECORD = (
-    "annotate(): a GeoDistance is computed per record; it cannot be combined with GROUP BY aggregations or values()"
-)
+#: The annotations computed per record: ``GeoDistance`` (v0.24.0) and the search annotations (v0.35.0).
+_PER_RECORD = (GeoDistance, SearchScore, SearchHighlight, SearchOffsets)
+
+
+def _per_record_refused(annotation: object) -> str:
+    """The refusal of *annotation*, computed per record, combined with ``values()`` or an ``Aggregation``."""
+    return (
+        f"annotate(): a {type(annotation).__name__} is computed per record; it cannot be combined with GROUP BY "
+        "aggregations or values()"
+    )
 
 
 def _metres(value: Any) -> float:

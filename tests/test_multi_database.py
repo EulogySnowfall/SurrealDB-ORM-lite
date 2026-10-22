@@ -2811,6 +2811,7 @@ _TX_CALLS: dict[str, Callable[[Any, Any], Any]] = {
     "define_access": lambda m, tx: type(m).define_access(tx=tx),
     "define_computed_fields": lambda m, tx: type(m).define_computed_fields(tx=tx),
     "define_events": lambda m, tx: type(m).define_events(tx=tx),
+    "define_indexes": lambda m, tx: type(m).define_indexes(tx=tx),
     "define_relation": lambda m, tx: type(m).define_relation(tx=tx),
     "define_table": lambda m, tx: type(m).define_table(tx=tx),
     "define_view": lambda m, tx: type(m).define_view(tx=tx),
@@ -2822,6 +2823,7 @@ _TX_CALLS: dict[str, Callable[[Any, Any], Any]] = {
     "relate": lambda m, tx: m.relate("md_follows", MdEvent(id="b"), tx=tx),
     "remove_all_relations": lambda m, tx: m.remove_all_relations("md_follows", tx=tx),
     "remove_event": lambda m, tx: type(m).remove_event("md_audit", tx=tx),
+    "remove_index": lambda m, tx: type(m).remove_index("md_title", tx=tx),
     "remove_view": lambda m, tx: type(m).remove_view(tx=tx),
     "remove_relation": lambda m, tx: m.remove_relation("md_follows", MdEvent(id="b"), tx=tx),
     "save": lambda m, tx: m.save(tx=tx),
@@ -5156,8 +5158,8 @@ class TestMultiDatabaseDocs:
 
     def test_section_30_follows_section_29(self) -> None:
         """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), section 32
-        (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0) and section 35 (v0.34.0), and before the ``---`` of
-        "Configuration Options"."""
+        (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0) and section 36 (v0.35.0), and
+        before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_29 = readme.index(f"\n{_SECTION_29}\n")
         start_30 = readme.index(f"\n{_SECTION_30}\n")
@@ -5171,6 +5173,7 @@ class TestMultiDatabaseDocs:
             "### 33. Materialized views (`view_query`, `define_view()`)",
             "### 34. Relation constraints (`relation_in`, `define_relation()`)",
             "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
 

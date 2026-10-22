@@ -58,6 +58,12 @@ _CANCELLED_AFTER_FAILURE = "The transaction was cancelled: a statement in it fai
 #: a line of its own, followed by an excerpt of the query.
 _QUERY_EXCERPT = re.compile(r"\n\s*--> \[(\d+):(\d+)\]")
 
+#: A search on a field without a full-text index (v0.35.0): SurrealDB names the expression, ``<column> @<N>@``, then
+#: its value — on 3.x the bound search text, quoted.
+_MISSING_INDEX = "no suitable index supporting the expression"
+#: That expression up to its operator, the end of what the reason keeps.
+_MISSING_INDEX_EXPRESSION = re.compile(r"no suitable index supporting the expression: \S+ @\d*@")
+
 #: Maps a position of a buffered batch's query (line, column) to the queued statement it falls in (issue #278):
 #: ``(number, count, line, column)``, the line and column in the text the caller queued; ``None`` outside every
 #: statement (:meth:`BufferedTransaction._locate`).
@@ -95,9 +101,15 @@ def _server_reason(message: str) -> tuple[str, list[tuple[int, int]]]:
 
     A message that quotes the query — a parse error, from `` --> [line:column]`` on, and on some errors in the lines
     before it too (a regex's) — is cut to its first line, and every line and column it gives is returned, in order
-    (an unclosed delimiter gives where the parser stopped, then where the delimiter opens). Any other message is the
-    reason as it is, with no position.
+    (an unclosed delimiter gives where the parser stopped, then where the delimiter opens). A missing full-text index's
+    expression is cut after its operator (``… the expression: slug @0@``): 3.x quotes the bound search text there
+    (v0.35.0); no position. Any other message is the reason as it is, with no position.
     """
+    if f"{_MISSING_INDEX}: " in message:
+        expression = _MISSING_INDEX_EXPRESSION.search(message)
+        if expression is not None:
+            return message[: expression.end()], []
+        return message[: message.index(_MISSING_INDEX) + len(_MISSING_INDEX)], []
     positions = [(int(found[1]), int(found[2])) for found in _QUERY_EXCERPT.finditer(message)]
     if not positions:
         return message, []
@@ -179,11 +191,11 @@ def _raise_for_status(raw: Any, locate: _Locate | None = None) -> None:
         or errors[0]
     )
     message = str(root.get("result") or "transaction failed")
-    reason, positions = _server_reason(message)
+    reason, _ = _server_reason(message)
     # Type retryable conflicts so callers / retry_on_conflict can catch them, from the reason alone (#278): a real
     # conflict has no excerpt, and an excerpt may quote conflict words.
     error = _error_type(reason)(f"Transaction failed and rolled back: {reason}")
-    if not positions:
+    if reason == message:
         raise error
     _raise_hiding(error, message)
 
@@ -303,7 +315,8 @@ class Transaction(ABC):
         refused as a whole (an ``error`` envelope, e.g. a statement it cannot parse) raises
         ``Transaction failed: the server refused …`` with the server's reason and the position it
         gives (:func:`_refusal`); a failed statement raises ``Transaction failed and rolled back:
-        <the server's reason>``, a reason that quotes the query cut to its first line. Whenever the
+        <the server's reason>``, a reason that quotes the query cut to its first line, a missing full-text
+        index's expression cut after its operator (v0.35.0: 3.x quotes the search text after it). Whenever the
         message leaves part of the server's text out, that text is kept as the error's suppressed
         ``__context__``. ``SurrealDbConflictError`` for a retryable conflict.
         """

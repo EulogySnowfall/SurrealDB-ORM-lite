@@ -5,6 +5,150 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-10-22
+
+Full-text search: a queryset searches text with the full SurrealDB-ORM's `search()`, and scores and
+highlights the matches with `SearchScore` and `SearchHighlight` (plus `SearchOffsets`), over the
+analyzers and full-text indexes a model declares with `Analyzer` and `Index` and applies with
+`define_indexes()`. SurrealDB tokenises, matches, scores (BM25) and highlights on the server; the
+ORM binds every search text and highlight tag as a query variable. The same code runs on SurrealDB
+2.x, 3.x and the embedded engine, each line getting its own index keyword. The first minor of Tier
+3's search phase.
+
+### Added
+
+- **`QuerySet.search(**field_queries)`**, the full SurrealDB-ORM's method: keeps the records whose
+  fields match. Each keyword names a field — a Python field name (an aliased field searches its
+  column) or a dotted path — and the text to match, bound, never written into the statement. The
+  terms of one text are AND-ed, and so are the fields; each field gets the next match reference, in
+  call order and across calls. `search()` applies wherever `filter()` does, AND-ed after
+  `filter()`, `Q` and `nearby()`: `exec()`, `first()`, `get()` without an id, `count()`,
+  `exists()`, the aggregations, `values()` groups, `bulk_update()`, `bulk_delete()`, `patch()` and a
+  `Subquery`, whose references start again at 0 (the full ORM applies it to `exec()` only).
+  `get(<id>)` and `all()` ignore it, as they ignore `filter()`.
+- **`SearchScore(ref)` and `SearchHighlight(open_tag, close_tag, ref)`**, the full ORM's search
+  annotations, **and `SearchOffsets(ref)`**, an addition (SurrealDB's `search::offsets()`), in
+  `annotate()`: the BM25 score (a `float`), the text with each matched term between the tags (bound
+  as query variables), and where the matched terms sit. `exec()`, `first()` and `get()` without an
+  id set each value as an attribute named after its alias, never written back (`model_dump()`,
+  `save()` and `update()` leave it out); `order_by("-relevance")` sorts on an alias. A reference no
+  `search()` gave, or an alias that would shadow a field, its column or an attribute of the model,
+  raises `ValueError` before any request.
+- **`Analyzer` and `Index`**, with the argument names of the full ORM's `DefineAnalyzer` and
+  `CreateIndex`: an analyzer's name, tokenizers (`blank`, `camel`, `class`, `punct`), filters
+  (`ascii`, `lowercase`, `uppercase`, `ngram`, `edgengram`, `snowball`, `mapper`), `function=` and
+  `comment=`; a plain index, a `UNIQUE` one (`unique=True`) or a full-text one (`search_analyzer=`,
+  an `Analyzer` or the name of an analyzer the database defines), which covers one field and takes
+  `bm25=` (`True`, or a `(k1, b)` pair) and `highlights=True`. Every argument is checked at
+  construction, more strictly than the server where its answer would be silently wrong.
+- **`SurrealConfigDict(indexes=[Index(...)])`** declares a model's indexes, checked when the class
+  is defined (distinct names, one full-text index per column, one `Analyzer` per analyzer name);
+  `get_indexes()` returns them in declaration order, and `Model.index_ddl()` renders their
+  `DEFINE ANALYZER` and `DEFINE INDEX` statements without a connection, for SurrealDB 3.x or, with
+  `line=2`, for 2.x.
+- **`await Model.define_indexes()`** applies them on the model's connection: it reads what the
+  database holds (`INFO FOR DB`, `INFO FOR TABLE`) and, when a full-text index is declared, the
+  server line (`client.version()`), then defines what is missing and redefines what changed, one
+  statement per request, and returns the statements applied — `[]` on an unchanged database, so it
+  is safe at start-up. `overwrite=False` defines only what is missing (`IF NOT EXISTS`); `tx=` joins
+  a transaction. Nothing is removed: **`await Model.remove_index(name)`** removes an index by name
+  (`REMOVE INDEX IF EXISTS`; `missing_ok=False` raises `SurrealDbNotFoundError` for a missing one).
+- **`SurrealDBConnectionManager.define_analyzer(analyzer)` and `remove_analyzer(analyzer)`**, for
+  the analyzers, which belong to the database rather than to a table: `define_analyzer()` defines
+  one on the current connection, redefining it only when it changed, and returns the statements
+  applied; `remove_analyzer()` removes one by name and refuses one an index uses.
+- README section 36, "Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`,
+  `Index`)" (declaring and applying, searching, scoring and highlighting, what SurrealDB decides,
+  changing an analyzer, transactions, live queries, what is not supported, a note for users of the
+  full SurrealDB-ORM), seven rows of the "ORM behaviour: SurrealDB 2.x vs 3.x" table and one of the
+  embedded engine's, and the example notebook `examples/v0.35.0_full_text_search.ipynb`.
+
+  ```python
+  ENGLISH = Analyzer("english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"])
+
+
+  class Article(BaseSurrealModel):
+      model_config = SurrealConfigDict(
+          table_name="article",
+          indexes=[Index("article_title", "title", search_analyzer=ENGLISH, bm25=True, highlights=True)],
+      )
+
+      id: str | None = None
+      title: str
+
+
+  await Article.define_table()
+  await Article.define_indexes()  # FULLTEXT on SurrealDB 3.x, SEARCH on 2.x; [] when nothing changed
+  articles = await (
+      Article.objects()
+      .search(title="physics")
+      .annotate(relevance=SearchScore(0), snippet=SearchHighlight("<b>", "</b>", 0))
+      .order_by("-relevance")
+      .exec()
+  )
+  # each article carries .relevance (a float) and .snippet (its title, "<b>physics</b>" highlighted)
+  ```
+
+### Fixed
+
+- **A transaction error no longer quotes a bound search text**: a failed statement whose reason
+  reports a missing full-text index ("no suitable index supporting the expression") is cut after
+  the expression's operator (`… the expression: slug @0@`), since SurrealDB 3.x quotes the bound
+  value after it. The server's text stays reachable as the error's suppressed `__context__`, as
+  for a reason that quotes the query.
+
+### Notes
+
+- **The index keyword follows the server line**, read from `client.version()`: `FULLTEXT` on
+  SurrealDB 3.x, `SEARCH` on 2.x and the embedded engine, each of which refuses the other's. The ORM
+  writes one field per full-text index on both lines.
+- **Only what changed is redefined**: an unchanged index is never redefined, so start-up never
+  rebuilds. A rebuild re-reads the table: seconds per thousands of records on SurrealDB 2.x and the
+  embedded engine.
+- **A changed analyzer rebuilds its indexes**: SurrealDB keeps the tokens of the records an index
+  holds when their analyzer changes, so a search would miss them. When `define_indexes()` or
+  `define_analyzer()` redefines an analyzer, it rebuilds every index of the database that uses it
+  (`REBUILD INDEX`) and logs one warning naming them (logger `surreal_orm_lite.search`). In a
+  transaction, `define_indexes(tx=…)` refuses an analyzer to define or redefine, and
+  `define_analyzer(tx=…)` a redefinition with indexes to rebuild, before any DDL: call
+  `define_analyzer()` without `tx=` first.
+- **`remove_analyzer()` is safe on SurrealDB 2.x**: 2.x and the embedded engine accept removing an
+  analyzer an index uses, then refuse every write to the table; the ORM refuses it first on every
+  line, with SurrealDB 3.x's own message.
+- **A live query's searched subquery is checked**: before a live query whose `Subquery` searches,
+  the ORM checks that each searched field has a full-text index and raises `SurrealDbError` naming
+  the field otherwise, before the live query starts.
+- **BM25 scores depend on the line**: a term found in more than half the documents scores `0.0` on
+  SurrealDB 3.x and below zero on 2.x and the embedded engine, where a text holding such a term
+  therefore scores lower than without it. On 2.x and the embedded engine, BM25 statistics count an
+  index's records again at each rebuild or redefinition and keep counting deleted records, so the
+  scores depend on the index's history (the matches do not): a documented 2.x limitation. SurrealDB
+  3.x keeps them exact; compare scores within one query, and upgrade to 3.x where scores must not
+  depend on the index's history.
+- **Refused before any request** (`SurrealDbError`): `search()` with `as_of()`, in either order and
+  in a subquery under it (the index holds the records' current text); with `live()` and `watch()`,
+  since SurrealDB accepts a live query whose condition holds a full-text match but never notifies
+  it — search in a `Subquery` instead, which notifies the records created or updated to match; and
+  with `changes()`. A search on a field without a full-text index raises `SurrealDbError` naming the
+  field instead of the server's error, which on SurrealDB 3.x quotes the search text, in a
+  transaction too. **Indexes on materialized views** are refused (`ValueError` when the class is
+  defined): SurrealDB 3.x does not index the records a view gains after the index is defined.
+- **Call `define_table()` before `define_indexes()`**: on a table that does not exist yet,
+  SurrealDB's `DEFINE INDEX` creates it `TYPE ANY SCHEMALESS PERMISSIONS NONE`, which
+  `define_table()` replaces but `define_table(overwrite=False)` leaves as it is.
+- **SurrealDB 3.1** (tested with 3.1.5 for backward compatibility): two `search()` fields AND-ed
+  can also return records that match only one of them, scored `0.0` on the other; a field without a
+  full-text index answers no record instead of an error; and a live query whose subquery searches
+  such a field starts.
+- **Deferred**: `search()` with `as_of()` on a versioned SurrealDB 3.x server; indexes on
+  materialized views once SurrealDB indexes the records a view gains; 3.x's boolean match operators
+  (`@AND@`/`@OR@`) and `highlight_all`; `indexes=[Index(...)]` in generated models;
+  `define_index()`/`remove_index()` on the connection manager for tables without a model;
+  `Index(concurrently=True)`. Vector indexes come in v0.36.0, `hybrid_search()` in v0.37.0, and
+  analyzers and indexes in migrations in v0.38.0.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.34.1] - 2026-10-22
 
 Follow-ups to the review of v0.34.0's model table DDL (#296): `define_access()` and

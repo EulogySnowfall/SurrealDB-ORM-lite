@@ -7554,8 +7554,9 @@ _FEATURES_ROW_35 = ["Model table DDL (`define_table()`, `schema_mode`, `permissi
 _ROADMAP_ROWS_35 = [
     ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
     ["v0.34.0", "Tier 3 — Model table DDL", "✅ Released"],
-    ["v0.35.0 – v0.40.0", "Tier 3 — Advanced (search, migrations, CLI)", "📋 Planned"],
-    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    # v0.35.0 ships full-text search; the planned range starts at v0.36.0.
+    ["v0.35.0", "Tier 3 — Full-text search", "✅ Released"],
+    ["v0.36.0 – v0.40.0", "Tier 3 — Advanced (vector and hybrid search, migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROW_35 = ["Model table DDL", "✅ v0.34.0 (`define_table()`)", "✅"]
 
@@ -7598,7 +7599,8 @@ class TestReadmeSection35:
     sections 16, 19, 31, 33 and 34; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_35_follows_section_34(self) -> None:
-        """Right after section 34 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 34 (after its "Coming from" bullets), then section 36 (v0.35.0), and before the ``---`` of
+        "Configuration Options"."""
         text = _readme()
         start_34 = text.index(f"\n{_SECTION_34}\n")
         start_35 = text.index(f"\n{_SECTION_35}\n")
@@ -7607,8 +7609,9 @@ class TestReadmeSection35:
         assert re.findall(r"^#{2,3} .*$", text[start_34 + 1 : configuration], re.MULTILINE) == [
             _SECTION_34,
             _SECTION_35,
+            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
         ]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 35 ends before the --- of the next part"
+        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         assert re.findall(r"^#### (.*)$", _section_35(), re.MULTILINE) == _SUBSECTIONS_35
