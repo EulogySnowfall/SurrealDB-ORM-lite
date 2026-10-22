@@ -75,6 +75,25 @@ cached read dropped; ``remove_analyzer()`` takes ``analyzer`` (never ``name``, w
 name), removes by name with ``missing_ok``, and refuses an analyzer an index uses with SurrealDB 3.x's own text on every
 engine — the server's on 3.x, the ORM's before any DDL on 2.x and the embedded engine. Pinned (README row "Removing an
 analyzer an index uses"): 2.x and the embedded engine accept that removal, then refuse the next write to the table.
+
+``search()`` (``TestSearchCompile``, ``TestSearchRefusals``): each field compiles ``<column> @<ref>@ $_f<N>``, AND-ed
+after the filters, ``Q`` and ``nearby()``, its text bound (data, whatever it holds), the references in call order
+across calls, a subquery's starting again at 0 while its texts continue the statement's numbering; an aliased field
+compiles its column; each refusal — a text that is not a ``str``, a field that is not a name or a dotted path, the
+record id or an edge endpoint, more than 256 fields — comes before any request and leaves the queryset unchanged.
+``search()`` with ``as_of()`` (either way round, and in a subquery under the outer one), in a live query or a change
+feed is refused before any request. A search on a field without a full-text index (``TestMissingIndexTexts``,
+``TestMissingIndexE2E``) raises ``SurrealDbError`` naming the field — the one whose column SurrealDB names, a
+subquery's included —, never the server's text, which on SurrealDB 3.x quotes the search text: in a read, a count, a
+write by filter, and in a transaction, whose commit then fails with that error as its cause; a write by filter in a
+transaction gets the transaction's own error, cut after the expression's operator (``TestTransactionReason``). Before a
+live query whose subquery searches (``TestLiveIndexCheck``, ``TestLiveIndexCheckE2E``), the ORM checks that each
+searched field has a full-text index and raises ``SurrealDbError`` naming the field otherwise, before the live query
+starts: without the index SurrealDB 3.x would accept the live query and never notify. On every engine
+(``TestSearchE2E``) the corpus's matches, the terms of one text AND-ed, an empty text matching nothing, with
+``filter()``, ``Q``, ``order_by()``, ``limit()``/``offset()``, ``select()``, ``fetch()``, ``first()`` and ``get()``.
+Pinned (README rows "``search()`` on a field without a full-text index" and "``live()`` with a ``Subquery`` that
+searches a field without a full-text index"): SurrealDB 3.1 answers no record, and starts the live query.
 """
 
 import ast
@@ -88,12 +107,14 @@ import pickle
 import re
 import traceback
 from collections.abc import AsyncIterator, Iterator, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from uuid import UUID
 
 import pytest
 from pydantic import Field
-from surrealdb import InternalError, NotAllowedError
+from surrealdb import InternalError, NotAllowedError, NotFoundError
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -101,13 +122,16 @@ from surreal_orm_lite import (
     AnalyzerState,
     BaseSurrealEdge,
     BaseSurrealModel,
+    Count,
     DatabaseIntrospector,
     Index,
     IndexState,
+    Q,
     QueryCache,
     SearchHighlight,
     SearchOffsets,
     SearchScore,
+    Subquery,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
@@ -119,6 +143,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyzer, parse_define_index
 from surreal_orm_lite.functions import normalize_function_name
+from surreal_orm_lite.utils import validate_field_name
 
 FTS_ENGLISH = Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"], comment="English text")
 
@@ -1643,15 +1668,383 @@ class TestAnalyzerManagerApi:
         assert not hasattr(vars(SurrealDBConnectionManager)["remove_analyzer"].__func__, "__surreal_cache_writes__")
 
 
-# --- a missing full-text index in a transaction's reason ------------------------------------------------------------
+# --- search(): its statements and its refusals ----------------------------------------------------------------------
 
 #: A search text no error the ORM raises may show: 3.x quotes the bound search text in its missing-index error.
 _SECRET = "secret words"
 
-#: SurrealDB 3.3's missing-index error for a ``LET`` subquery's search of ``slug``, which has no full-text index.
+#: SurrealDB 3.3's missing-index error for a search of ``slug``, which has no full-text index.
 _NO_INDEX_3X = f"There was no suitable index supporting the expression: slug @0@ '{_SECRET}'"
 
-#: What the transaction layer keeps of it: the expression cut after its operator.
+_S2 = (
+    "Invalid search field name '{}': must contain only alphanumeric characters, underscores, and dots (for nested "
+    "fields), and start with a letter or underscore"
+)
+_S4 = "search() takes at most 256 fields per queryset (SurrealDB's match references are 0 to 255)."
+_TT1 = (
+    "search() cannot be combined with as_of(): a full-text match reads the index, which holds the records' current "
+    "text, so a time-travel read would select records by their text now. Run the search without as_of()."
+)
+_LV1 = (
+    "A live query cannot honour search(): SurrealDB accepts a LIVE SELECT whose condition holds a full-text match but "
+    "never notifies it. Search in a subquery instead — filter(id__in=Subquery(Model.objects().search(...))) — which "
+    "notifies the records created or updated to match, not their deletion."
+)
+_CH1 = (
+    "A change feed cannot honour {}: SurrealDB's SHOW CHANGES reads the whole table's log, with no WHERE, projection, "
+    "ordering or paging, outside any transaction. Call changes() on Model.objects() and filter the events."
+)
+_SI1_ADVICE = (
+    "SurrealDB matches only a field with a FULLTEXT (3.x) or SEARCH (2.x) index: declare Index(..., search_analyzer=...) "
+    "on the model and apply define_indexes()."
+)
+
+
+def _si1(field: str) -> str:
+    """The refusal of a search on *field*, which has no full-text index."""
+    return f"search(): no full-text index on field {field!r}. {_SI1_ADVICE}"
+
+
+#: Q7's queryset: the record ids of the articles whose title matches "quantum", as a subquery.
+def _q7() -> Any:
+    return FtsArticle.objects().filter(id__in=Subquery(FtsArticle.objects().search(title="quantum")))
+
+
+_Q7 = "{ LET $_sq0 = (SELECT VALUE id FROM fts_article WHERE title @0@ $_f0); (SELECT * FROM fts_article WHERE id IN $_sq0) };"
+_Q8 = "LIVE SELECT * FROM fts_article WHERE id IN (SELECT VALUE id FROM fts_article WHERE title @0@ 'quantum');"
+_Q10 = "RETURN [(SELECT VALUE id FROM fts_article LIMIT 1), (SELECT VALUE id FROM fts_article WHERE title @0@ '' LIMIT 1)];"
+
+#: A moment for ``as_of()``.
+_MOMENT = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+async def _forbidden_client(*args: Any, **kwargs: Any) -> Any:
+    pytest.fail("a client was acquired")
+
+
+@pytest.fixture
+def _no_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No client may be acquired: a refusal comes before any request."""
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+
+
+class TestSearchCompile:
+    """``search()`` compiles one ``<column> @<ref>@ $_f<N>`` condition per field, AND-ed after the filters, its text
+    bound; each refusal comes before any request and leaves the queryset unchanged."""
+
+    def test_q1(self) -> None:
+        assert FtsArticle.objects().search(title="quantum physics")._compile_query() == (
+            "SELECT * FROM fts_article WHERE title @0@ $_f0;",
+            {"_f0": "quantum physics"},
+        )
+
+    def test_q2_after_the_filters(self) -> None:
+        compiled = FtsArticle.objects().filter(views__gt=10).search(title="quantum", body="physics")._compile_query()
+        assert compiled == (
+            "SELECT * FROM fts_article WHERE views > $_f0 AND title @0@ $_f1 AND body @1@ $_f2;",
+            {"_f0": 10, "_f1": "quantum", "_f2": "physics"},
+        )
+
+    def test_q4_an_aliased_field_compiles_its_column(self) -> None:
+        assert FtsArticle.objects().search(heading="intro")._compile_query()[0] == (
+            "SELECT * FROM fts_article WHERE head_text @0@ $_f0;"
+        )
+
+    def test_q5_values_and_annotate(self) -> None:
+        queryset = FtsArticle.objects().search(title="quantum").values("views").annotate(n=Count())
+        assert queryset._compile_group_by_query() == (
+            "SELECT views, count() AS n FROM fts_article WHERE title @0@ $_f0 GROUP BY views;",
+            {"_f0": "quantum"},
+        )
+
+    def test_q6_an_aggregation(self) -> None:
+        assert FtsArticle.objects().search(title="quantum")._compile_aggregation_query("count()") == (
+            "SELECT count() FROM fts_article WHERE title @0@ $_f0 GROUP ALL;",
+            {"_f0": "quantum"},
+        )
+
+    def test_q7_a_subquery(self) -> None:
+        assert _q7()._compile_query() == (_Q7, {"_f0": "quantum"})
+
+    def test_q8_a_live_query_inlines_the_text(self) -> None:
+        assert _q7()._compile_live(False) == _Q8
+
+    def test_after_q_and_nearby(self) -> None:
+        queryset = FtsArticle.objects().search(title="x").filter(Q(views=1) | Q(views=2)).nearby("meta.at", (1.0, 2.0), 10)
+        query, variables = queryset._compile_query()
+        assert query == (
+            "SELECT * FROM fts_article WHERE (views = $_f0 OR views = $_f1) AND (meta.at.is_point() AND "
+            "geo::distance(meta.at, $_f2) <= $_f3) AND title @0@ $_f4;"
+        )
+        assert variables["_f4"] == "x"
+
+    def test_the_references_follow_the_calls(self) -> None:
+        queryset = FtsArticle.objects().search(title="a").search(body="b")
+        assert queryset._compile_query() == (
+            "SELECT * FROM fts_article WHERE title @0@ $_f0 AND body @1@ $_f1;",
+            {"_f0": "a", "_f1": "b"},
+        )
+
+    def test_the_same_field_twice(self) -> None:
+        assert FtsArticle.objects().search(title="a").search(title="b")._compile_query()[0] == (
+            "SELECT * FROM fts_article WHERE title @0@ $_f0 AND title @1@ $_f1;"
+        )
+
+    def test_a_dotted_path_and_an_array_field(self) -> None:
+        assert FtsArticle.objects().search(**{"meta.headline": "rust"}, tags="quantum")._compile_query()[0] == (
+            "SELECT * FROM fts_article WHERE meta.headline @0@ $_f0 AND tags @1@ $_f1;"
+        )
+
+    def test_a_subquerys_references_start_at_0_and_its_texts_continue_the_numbering(self) -> None:
+        queryset = (
+            FtsArticle.objects()
+            .search(body="kitchen")
+            .filter(id__in=Subquery(FtsArticle.objects().search(title="physics", slug="a2")))
+        )
+        assert queryset._compile_query() == (
+            "{ LET $_sq0 = (SELECT VALUE id FROM fts_article WHERE title @0@ $_f0 AND slug @1@ $_f1); "
+            "(SELECT * FROM fts_article WHERE id IN $_sq0 AND body @0@ $_f2) };",
+            {"_f0": "physics", "_f1": "a2", "_f2": "kitchen"},
+        )
+
+    def test_no_keyword_changes_nothing(self) -> None:
+        queryset = FtsArticle.objects().filter(views__gt=1)
+        before = queryset._compile_query()
+        assert queryset.search() is queryset
+        assert queryset._compile_query() == before
+
+    def test_a_text_is_data(self, recwarn: pytest.WarningsRecorder) -> None:
+        queryset = FtsArticle.objects().variables(title="x").search(title="$title")
+        assert queryset._compile_query() == (
+            "SELECT * FROM fts_article WHERE title @0@ $_f0;",
+            {"title": "x", "_f0": "$title"},
+        )
+        assert len(recwarn) == 0
+
+    def test_a_subquery_records_the_fields_it_searches(self) -> None:
+        inner = FtsArticle.objects().search(title="quantum", heading="intro")
+        queryset = FtsArticle.objects().filter(id__in=Subquery(inner))
+        compiler = queryset._subquery_compiler()
+        queryset._compile_query(subqueries=compiler)
+        assert compiler.searched == {("fts_article", "title"): "title", ("fts_article", "head_text"): "heading"}
+        plain = FtsArticle.objects().filter(id__in=Subquery(FtsArticle.objects().filter(views=1)))
+        compiler = plain._subquery_compiler()
+        plain._compile_query(subqueries=compiler)
+        assert compiler.searched == {}
+
+    @pytest.mark.parametrize(("text", "kind"), [(3, "int"), (None, "NoneType"), (b"x", "bytes")])
+    def test_s1_a_text_that_is_not_a_str(self, text: object, kind: str) -> None:
+        queryset = FtsArticle.objects().search(body="x")
+        before = queryset._compile_query()
+        assert _raised(TypeError, queryset.search, title=text) == f"search() takes a str to match in 'title', got {kind}."
+        assert queryset._compile_query() == before
+
+    @pytest.mark.parametrize("field", ["a b", "title\n", "meta..headline", "1title", "title;"])
+    def test_s2_a_field_that_is_not_a_name(self, field: str) -> None:
+        queryset = FtsArticle.objects().search(body="x")
+        before = queryset._compile_query()
+        assert _raised(ValueError, queryset.search, **{field: "x"}) == _S2.format(field)
+        assert queryset._compile_query() == before
+
+    def test_s2_is_validate_field_names_text(self) -> None:
+        assert _raised(ValueError, FtsArticle.objects().search, **{"a b": "x"}) == _raised(
+            ValueError, validate_field_name, "a b", "search field"
+        )
+        assert _raised(ValueError, FtsArticle.objects().search, **{"": "x"}) == "search field name cannot be empty"
+
+    def test_s3_the_record_id(self) -> None:
+        queryset = FtsArticle.objects()
+        assert _raised(ValueError, queryset.search, id="a1") == (
+            "search() matches text: 'id' is the record id, not a text field."
+        )
+        assert queryset._search == []
+
+    @pytest.mark.parametrize("field", ["in_", "in", "out"])
+    def test_s3_an_edge_endpoint(self, field: str) -> None:
+        assert _raised(ValueError, FtsCites.objects().search, **{field: "x"}) == (
+            f"search() matches text: {field!r} is an edge endpoint, not a text field."
+        )
+        assert FtsCites.objects().search(note="x")._compile_query()[0] == "SELECT * FROM fts_cites WHERE note @0@ $_f0;"
+
+    def test_s4_at_most_256_fields_across_calls(self) -> None:
+        queryset = FtsArticle.objects().search(**{f"f{i}": "x" for i in range(200)})
+        before = queryset._compile_query()
+        assert _raised(ValueError, queryset.search, **{f"g{i}": "x" for i in range(57)}) == _S4
+        assert queryset._compile_query() == before
+        queryset.search(**{f"g{i}": "x" for i in range(56)})
+        query, variables = queryset._compile_query()
+        assert re.findall(r"@(\d+)@", query) == [str(reference) for reference in range(256)]
+        assert len(variables) == 256
+        assert _raised(ValueError, queryset.search, title="x") == _S4
+
+    def test_a_refusal_records_no_link(self) -> None:
+        queryset = FtsArticle.objects()
+        _raised(TypeError, queryset.search, **{"meta.headline": 3})
+        assert queryset._link_heads == set()
+        queryset.search(**{"meta.headline": "rust"})
+        assert queryset._link_heads == {"meta"}
+
+
+@pytest.mark.usefixtures("_no_client")
+class TestSearchRefusals:
+    """``search()`` with ``as_of()`` (either way round, and in a subquery under the outer one), in a live query or a
+    change feed: each refused before any request."""
+
+    def test_tt1_search_after_as_of(self) -> None:
+        queryset = FtsArticle.objects().as_of(_MOMENT)
+        assert _raised(SurrealDbError, queryset.search, title="x") == _TT1
+        assert queryset._search == []
+        assert queryset.search() is queryset
+
+    @pytest.mark.parametrize("moment", [_MOMENT, timedelta(days=1), "2026-01-01T00:00:00Z"])
+    def test_tt1_as_of_after_search(self, moment: Any) -> None:
+        queryset = FtsArticle.objects().search(title="x")
+        assert _raised(SurrealDbError, queryset.as_of, moment) == _TT1
+        assert queryset._as_of is None
+        assert queryset.as_of(None) is queryset
+        assert queryset._compile_query() == ("SELECT * FROM fts_article WHERE title @0@ $_f0;", {"_f0": "x"})
+
+    def test_tt1_a_subquery_under_the_outer_as_of(self) -> None:
+        queryset = FtsArticle.objects().as_of(_MOMENT).filter(id__in=Subquery(FtsArticle.objects().search(title="x")))
+        assert _raised(SurrealDbError, queryset._compile_query, _MOMENT) == _TT1
+        assert _raised(SurrealDbError, queryset._compile_aggregation_query, "count()", moment=_MOMENT) == _TT1
+
+    @pytest.mark.parametrize("method", ["live", "watch"])
+    def test_lv1(self, method: str) -> None:
+        assert _raised(SurrealDbError, getattr(FtsArticle.objects().search(title="x"), method)) == _LV1
+
+    def test_lv1_comes_before_the_other_clauses(self) -> None:
+        queryset = FtsArticle.objects().search(title="x").order_by("views").limit(3)
+        assert _raised(SurrealDbError, queryset.live) == _LV1
+
+    def test_a_subquery_that_searches_is_allowed_in_a_live_query(self) -> None:
+        assert _q7()._compile_live(True).startswith("LIVE SELECT DIFF FROM fts_article WHERE id IN (SELECT VALUE id ")
+
+    def test_ch1(self) -> None:
+        assert _raised(SurrealDbError, FtsArticle.objects().search(title="x").changes) == _CH1.format("search()")
+        both = FtsArticle.objects().filter(views=1).search(title="x").nearby("meta", (0.0, 0.0), 1.0)
+        assert _raised(SurrealDbError, both.changes) == _CH1.format("filter(), nearby(), search()")
+
+
+class TestMissingIndexTexts:
+    """The ORM's error for SurrealDB's refusal of a search on a field without a full-text index: the field named,
+    never the server's text."""
+
+    def test_the_column_the_server_names(self) -> None:
+        def column(message: str) -> str | None:
+            return search.missing_index_column(InternalError("Internal", message))
+
+        assert column(_NO_INDEX_3X) == "slug"
+        assert column("There was no suitable index supporting the expression: meta.headline @1@ $_f0") == "meta.headline"
+        assert column("There was no suitable index supporting the expression: `meta`.`headline` @1@ $_f0") == ("meta.headline")
+        assert column("There was no suitable index supporting the expression: ⟨meta⟩.headline @0@ $_f0") == ("meta.headline")
+        assert column(f"There was no suitable index supporting the expression: slug '{_SECRET}'") is None
+
+    def test_the_refusal_names_the_field(self) -> None:
+        refusal = search.missing_index_refusal(InternalError("Internal", _NO_INDEX_3X), {"slug": "slug"})
+        assert type(refusal) is SurrealDbError
+        assert str(refusal) == _si1("slug")
+        aliased = InternalError("Internal", "There was no suitable index supporting the expression: head_text @0@ $_f0")
+        assert str(search.missing_index_refusal(aliased, {"head_text": "heading"})) == _si1("heading")
+        assert str(search.missing_index_refusal(aliased, {})) == _si1("head_text")
+
+    def test_an_unreadable_column_names_every_searched_field(self) -> None:
+        error = InternalError("Internal", f"There was no suitable index supporting the expression: slug '{_SECRET}'")
+        both = search.missing_index_refusal(error, {"title": "title", "head_text": "heading"})
+        assert str(both) == f"search(): no full-text index on one of the fields 'title', 'heading'. {_SI1_ADVICE}"
+        assert str(search.missing_index_refusal(error, {"slug": "slug"})) == _si1("slug")
+        assert search.missing_index_refusal(error, {}) is None
+
+    def test_any_other_error_is_not_translated(self) -> None:
+        assert search.missing_index_refusal(InternalError("Internal", "There was a problem"), {"slug": "slug"}) is None
+        assert search.missing_index_refusal(RuntimeError(_NO_INDEX_3X), {"slug": "slug"}) is None
+        assert search.is_missing_index_error(InternalError("Internal", _NO_INDEX_3X)) is True
+        assert search.is_missing_index_error(SurrealDbError(_NO_INDEX_3X)) is False
+
+    def test_the_live_probe(self) -> None:
+        assert search.live_index_probe("fts_article", "meta.headline") == (
+            "(SELECT VALUE id FROM fts_article WHERE meta.headline @0@ '' LIMIT 1)"
+        )
+
+
+_LIVE_ID = UUID("00000000-0000-4000-8000-000000000035")
+
+
+class _LiveClient:
+    """A client that records every statement, answers the start check (``RETURN …``) with *check* — raised when it
+    is an exception — and a ``LIVE SELECT`` with :data:`_LIVE_ID`."""
+
+    def __init__(self, check: Any = None) -> None:
+        self.check = check
+        self.calls: list[str] = []
+
+    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+        self.calls.append(query)
+        if not query.startswith("RETURN "):
+            return _LIVE_ID
+        if isinstance(self.check, BaseException):
+            raise self.check
+        return self.check
+
+
+class TestLiveIndexCheck:
+    """Before a live query whose subquery searches, the ORM checks, in the request that checks the subquery tables,
+    that each searched field has a full-text index, and raises ``SurrealDbError`` naming the field otherwise, before
+    the live query starts: without the index, SurrealDB 3.x would accept the live query and never notify."""
+
+    async def test_q10_the_check_comes_before_the_live_select(self) -> None:
+        client = _LiveClient([[], []])
+        assert await _q7()._live_starter(False)(client) == _LIVE_ID
+        assert client.calls == [_Q10, _Q8]
+
+    async def test_the_searched_columns_sorted_after_the_tables(self) -> None:
+        inner = FtsArticle.objects().search(title="a", heading="b", **{"meta.headline": "c"})
+        queryset = FtsArticle.objects().filter(id__in=Subquery(inner), slug__in=Subquery(FtsPlain.objects().select("title")))
+        client = _LiveClient([[], [], [], [], []])
+        await queryset._live_starter(False)(client)
+        assert client.calls[0] == (
+            "RETURN [(SELECT VALUE id FROM fts_article LIMIT 1), (SELECT VALUE id FROM fts_plain LIMIT 1), "
+            "(SELECT VALUE id FROM fts_article WHERE head_text @0@ '' LIMIT 1), "
+            "(SELECT VALUE id FROM fts_article WHERE meta.headline @0@ '' LIMIT 1), "
+            "(SELECT VALUE id FROM fts_article WHERE title @0@ '' LIMIT 1)];"
+        )
+
+    async def test_a_field_without_an_index_raises_and_starts_nothing(self) -> None:
+        error = InternalError("Internal", "There was no suitable index supporting the expression: head_text @0@ ''")
+        client = _LiveClient(error)
+        queryset = FtsArticle.objects().filter(id__in=Subquery(FtsArticle.objects().search(heading=_SECRET)))
+        with pytest.raises(SurrealDbError) as raised:
+            await queryset._live_starter(False)(client)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _si1("heading")
+        assert raised.value.__cause__ is None
+        assert raised.value.__suppress_context__
+        assert client.calls == [_Q10.replace("title", "head_text")]
+
+    async def test_a_missing_table_is_still_reported(self) -> None:
+        details = {"kind": "Table", "details": {"name": "fts_article"}}
+        error = NotFoundError("NotFound", "The table 'fts_article' does not exist", details=details)
+        with pytest.raises(SurrealDbNotFoundError):
+            await _q7()._live_starter(False)(_LiveClient(error))
+
+    async def test_any_other_error_is_relayed(self) -> None:
+        error = InternalError("Internal", "There was a problem")
+        with pytest.raises(InternalError) as raised:
+            await _q7()._live_starter(False)(_LiveClient(error))
+        assert raised.value is error
+
+    async def test_every_start_checks_again(self) -> None:
+        """A resubscribe runs the starter again on the new connection, the check included."""
+        start = _q7()._live_starter(False)
+        first, second = _LiveClient([[], []]), _LiveClient([[], []])
+        await start(first)
+        await start(second)
+        assert first.calls == second.calls == [_Q10, _Q8]
+
+
+# --- a missing full-text index in a transaction's reason ------------------------------------------------------------
+
+#: What the transaction layer keeps of :data:`_NO_INDEX_3X`: the expression cut after its operator.
 _NO_INDEX_REASON = "There was no suitable index supporting the expression: slug @0@"
 
 
@@ -2943,3 +3336,314 @@ class TestRemoveAnalyzerE2E:
             assert len(created) == 1 and "The analyzer 'fts_english' does not exist" in created[0], (
                 f"README row 'Removing an analyzer an index uses': the next write fails, got {created}"
             )
+
+
+# --- search() on the engines ----------------------------------------------------------------------------------------
+
+#: The corpus: six articles — id, title, body, tags, meta.headline, heading — each searched term in fewer than half of
+#: them. ``slug`` is the id, ``views`` its number (1 … 6).
+_CORPUS = [
+    ("a1", "Quantum physics for beginners", "An introduction to quantum mechanics", ["science", "quantum world"],
+     "Rust web programming", "Introduction"),
+    ("a2", "Cooking with physics", "Heat and physics in the kitchen", ["food"], "Kitchen tips", "Recipes"),
+    ("a3", "Gardening in spring", "Plants and soil", ["garden"], "Soil care", "Seasons"),
+    ("a4", "Quantum computing explained", "Qubits and gates", ["tech"], "Qubits", "Hardware"),
+    ("a5", "Baking bread at home", "Flour water salt", ["food"], "Bread", "Recipes at home"),
+    ("a6", "Sewing for beginners", "Needles and thread", ["craft"], "Thread", "Crafts"),
+]  # fmt: skip
+
+
+async def _seed() -> None:
+    """Save the corpus."""
+    for views, (key, title, body, tags, headline, heading) in enumerate(_CORPUS, start=1):
+        article = FtsArticle(
+            id=key, title=title, body=body, slug=key, meta={"headline": headline}, tags=tags, heading=heading, views=views
+        )
+        await article.save()
+
+
+@contextlib.asynccontextmanager
+async def _corpus(kind: str) -> AsyncIterator[Any]:
+    """:func:`_fts_models`, ``FtsArticle``'s indexes defined in the fresh database, then the corpus saved."""
+    async with _fts_models(kind) as client:
+        await FtsArticle.define_indexes()
+        await _seed()
+        yield client
+
+
+def _ids(rows: Sequence[Any]) -> list[str]:
+    """The ids of *rows*, sorted."""
+    return sorted(row.id for row in rows)
+
+
+class TestSearchE2E:
+    """``search()`` on every engine (SurrealDB 3.x and 2.x over WebSocket and HTTP, and the embedded engine): the
+    corpus's matches, the terms of one text AND-ed, an empty text matching nothing, with the other clauses."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_corpus_matches(self, kind: str) -> None:
+        async with _corpus(kind):
+            title = await FtsArticle.objects().search(title="physics").exec()
+            quantum = await FtsArticle.objects().search(title="quantum").exec()
+            body = await FtsArticle.objects().search(body="physics").exec()
+            headline = await FtsArticle.objects().search(**{"meta.headline": "rust"}).exec()
+            tags = await FtsArticle.objects().search(tags="quantum").exec()
+            heading = await FtsArticle.objects().search(heading="recipes").exec()
+        assert _ids(title) == ["a1", "a2"]
+        assert _ids(quantum) == ["a1", "a4"]
+        assert _ids(body) == ["a2"]
+        assert _ids(headline) == ["a1"]
+        assert _ids(tags) == ["a1"]
+        assert _ids(heading) == ["a2", "a5"]
+        assert all(isinstance(article, FtsArticle) for article in title)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_terms_of_a_text_are_and_ed(self, kind: str) -> None:
+        async with _corpus(kind):
+            both = await FtsArticle.objects().search(title="quantum physics").exec()
+            empty = await FtsArticle.objects().search(title="").exec()
+            none = await FtsArticle.objects().search(title="knitting").exec()
+        assert _ids(both) == ["a1"]
+        assert empty == []
+        assert none == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_with_filter_and_q(self, kind: str) -> None:
+        async with _corpus(kind):
+            filtered = await FtsArticle.objects().filter(views__gt=1).search(title="physics").exec()
+            either = await FtsArticle.objects().filter(Q(views=4) | Q(views=5)).search(title="quantum").exec()
+            text = await FtsArticle.objects().search(title="$title").variables(title="physics").exec()
+        assert _ids(filtered) == ["a2"]
+        assert _ids(either) == ["a4"]
+        assert text == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_order_limit_and_offset(self, kind: str) -> None:
+        async with _corpus(kind):
+            first = await FtsArticle.objects().search(title="quantum").order_by("views").limit(1).exec()
+            second = await FtsArticle.objects().search(title="quantum").order_by("views").limit(1).offset(1).exec()
+            descending = await FtsArticle.objects().search(title="quantum").order_by("-views").exec()
+        assert [article.id for article in first] == ["a1"]
+        assert [article.id for article in second] == ["a4"]
+        assert [article.id for article in descending] == ["a4", "a1"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_select_and_fetch(self, kind: str) -> None:
+        async with _corpus(kind):
+            titles = await FtsArticle.objects().search(title="physics").select("title").order_by("title").exec()
+            fetched = await FtsArticle.objects().search(title="physics").fetch("tags").exec()
+        assert titles == [{"title": "Cooking with physics"}, {"title": "Quantum physics for beginners"}]
+        assert _ids(fetched) == ["a1", "a2"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_first_and_get_without_an_id(self, kind: str) -> None:
+        async with _corpus(kind):
+            first = await FtsArticle.objects().search(title="quantum").order_by("views").first()
+            got = await FtsArticle.objects().search(title="cooking").get()
+            with pytest.raises(SurrealDbError, match="More than one result found"):
+                await FtsArticle.objects().search(title="quantum").get()
+            with pytest.raises(SurrealDbNotFoundError):
+                await FtsArticle.objects().search(title="knitting").first()
+            by_id = await FtsArticle.objects().search(title="knitting").get("a3")
+        assert first.id == "a1"
+        assert got.id == "a2"
+        assert by_id.id == "a3", "get(<id>) ignores search(), as it ignores filter()"
+
+
+def _is_31(line: tuple[int, int]) -> bool:
+    """Whether *line* is SurrealDB 3.1, whose answers to a search on a field without a full-text index differ."""
+    return line == (3, 1)
+
+
+async def _native_transactions(kind: str, client: Any) -> bool:
+    """Whether ``transaction()`` on *kind* is interactive: WebSocket on SurrealDB 3.x."""
+    return kind == "ws" and await _major(client) >= 3
+
+
+class TestMissingIndexE2E:
+    """A search on a field without a full-text index raises ``SurrealDbError`` naming the field, never the server's
+    text — which on SurrealDB 3.x quotes the search text — on every engine, in a read, a count, a write by filter and a
+    subquery; in a transaction, the commit fails with that error as its cause. Pinned (README row "``search()`` on a
+    field without a full-text index"): SurrealDB 3.1 answers no record instead."""
+
+    @pytest.mark.parametrize("field", ["slug", "views"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_read(self, kind: str, field: str) -> None:
+        async with _corpus(kind) as client:
+            line = await _line(client)
+            if _is_31(line):
+                rows = await FtsArticle.objects().search(**{field: _SECRET}).exec()
+                assert rows == [], "README row 'search() on a field without a full-text index': 3.1 answers no record"
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await FtsArticle.objects().search(**{field: _SECRET}).exec()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _si1(field)
+        assert _shown(raised.value, _SECRET) == []
+        assert raised.value.__cause__ is None
+        assert raised.value.__suppress_context__
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_count_an_exists_and_a_write_by_filter(self, kind: str) -> None:
+        async with _corpus(kind) as client:
+            line = await _line(client)
+            searched = FtsArticle.objects().search(slug=_SECRET)
+            errors: list[BaseException] = []
+            answers: list[Any] = []
+            for call in (searched.count, searched.exists, lambda: searched.bulk_update(views=9)):
+                try:
+                    answers.append(await call())
+                except SurrealDbError as error:
+                    errors.append(error)
+            views = sorted(article.views for article in await FtsArticle.objects().all())
+        if _is_31(line):
+            assert answers == [0, False], "README row 'search() on a field without a full-text index': 3.1 answers no record"
+            assert [str(error) for error in errors] == [_si1("slug")]
+        else:
+            assert answers == []
+            assert [str(error) for error in errors] == [_si1("slug")] * 3
+        assert all(_shown(error, _SECRET) == [] for error in errors)
+        assert views == [1, 2, 3, 4, 5, 6]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_subquery_names_its_field(self, kind: str) -> None:
+        async with _corpus(kind) as client:
+            line = await _line(client)
+            inner = FtsArticle.objects().search(views=_SECRET)
+            queryset = FtsArticle.objects().search(title="physics").filter(id__in=Subquery(inner))
+            if _is_31(line):
+                assert await queryset.exec() == []
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await queryset.exec()
+        assert str(raised.value) == _si1("views")
+        assert _shown(raised.value, _SECRET) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_read_in_an_interactive_transaction(self, kind: str) -> None:
+        """The read raises the ORM's error; the block that catches it and ends normally gets the commit's error,
+        caused by that very error: no trace of the search text."""
+        async with _corpus(kind) as client:
+            if not await _native_transactions(kind, client):
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            if _is_31(await _line(client)):
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    assert await FtsArticle.objects(tx=tx).search(slug=_SECRET).exec() == []
+                return
+            read: pytest.ExceptionInfo[SurrealDbError] | None = None
+            with pytest.raises(SurrealDbError) as commit:
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    with pytest.raises(SurrealDbError) as read:
+                        await FtsArticle.objects(tx=tx).search(slug=_SECRET).exec()
+                    await FtsArticle(id="a7", title="Knitting basics", slug="a7").save(tx=tx)
+            stored = _ids(await FtsArticle.objects().all())
+        assert read is not None
+        assert str(read.value) == _si1("slug")
+        assert str(commit.value) == (
+            "The transaction was cancelled: a statement in it failed; nothing was committed (SurrealDbError)"
+        )
+        assert commit.value.__cause__ is read.value
+        assert _shown(commit.value, _SECRET) == []
+        assert stored == ["a1", "a2", "a3", "a4", "a5", "a6"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_by_filter_in_a_transaction(self, kind: str) -> None:
+        """A write by filter whose subquery searches a field without a full-text index, in a transaction (interactive:
+        3.x over WebSocket; buffered: HTTP, 2.x, the embedded engine): the transaction's own error names the column and
+        the operator, never the search text — in the write's error and in the commit's."""
+        async with _corpus(kind) as client:
+            line = await _line(client)
+            interactive = await _native_transactions(kind, client)
+            matched = FtsArticle.objects().search(slug=_SECRET)
+            errors: list[BaseException] = []
+            try:
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    try:
+                        await FtsArticle.objects(tx=tx).filter(id__in=Subquery(matched)).bulk_update(views=9)
+                    except SurrealDbError as error:
+                        errors.append(error)
+            except SurrealDbError as error:
+                errors.append(error)
+            views = sorted(article.views for article in await FtsArticle.objects().all())
+        assert views == [1, 2, 3, 4, 5, 6]
+        if _is_31(line):
+            assert errors == [], "README row 'search() on a field without a full-text index': 3.1 answers no record"
+            return
+        failed = f"Transaction failed and rolled back: {_NO_INDEX_REASON}"
+        if interactive:
+            assert [str(error) for error in errors] == [
+                failed,
+                "The transaction was cancelled: a statement in it failed; nothing was committed (SurrealDbError)",
+            ]
+            assert errors[1].__cause__ is errors[0]
+        else:
+            assert [str(error) for error in errors] == [failed]
+        assert all(_shown(error, _SECRET) == [] for error in errors)
+
+
+@pytest.fixture
+def _live_registry() -> Iterator[None]:
+    """The live module's per-loop registries emptied after the test, as ``tests/test_live_queryset.py`` does."""
+    from surreal_orm_lite import live
+
+    yield
+    live._SUBSCRIBERS.clear()
+    live._RECENTLY_KILLED.clear()
+
+
+def _live_selects(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
+    """The statements *calls* (:func:`_spy`'s) sent through ``query()``."""
+    return [statement for method, statement in _calls(calls) if method == "query"]
+
+
+@pytest.mark.usefixtures("_live_registry")
+class TestLiveIndexCheckE2E:
+    """Before a live query whose subquery searches, the ORM checks that each searched field has a full-text index and
+    raises ``SurrealDbError`` naming the field otherwise, before the live query starts — without the index SurrealDB
+    3.x would accept the live query and never notify. Over WebSocket, on every server line. Pinned (README row
+    "``live()`` with a ``Subquery`` that searches a field without a full-text index"): SurrealDB 3.1 starts it."""
+
+    async def test_q10_the_check_comes_before_the_live_select(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _corpus("ws") as client:
+            calls = _spy(monkeypatch, client)
+            async with _q7().live():
+                sent = _live_selects(calls)
+            monkeypatch.undo()
+        assert sent == [_Q10, _Q8]
+
+    @pytest.mark.parametrize("method", ["live", "watch"])
+    async def test_a_field_without_an_index_is_refused_before_the_live_query(
+        self, method: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The check raises the ORM's error naming the field and no live query is sent; a write to the table then
+        succeeds. On SurrealDB 3.1, which answers the check, the live query starts (and ends with the block)."""
+        async with _corpus("ws") as client:
+            line = await _line(client)
+            queryset = FtsArticle.objects().filter(id__in=Subquery(FtsArticle.objects().search(slug=_SECRET)))
+            calls = _spy(monkeypatch, client)
+            raised: pytest.ExceptionInfo[SurrealDbError] | None = None
+            if _is_31(line):
+                async with getattr(queryset, method)():
+                    started = _live_selects(calls)
+            else:
+                with pytest.raises(SurrealDbError) as raised:
+                    async with getattr(queryset, method)():
+                        pass
+                started = _live_selects(calls)
+            monkeypatch.undo()
+            await FtsArticle(id="a7", title="Knitting basics", slug="a7").save()
+            stored = _ids(await FtsArticle.objects().all())
+        check = _Q10.replace("title @0@", "slug @0@")
+        assert stored == ["a1", "a2", "a3", "a4", "a5", "a6", "a7"]
+        if _is_31(line):
+            assert raised is None
+            assert started[0] == check
+            assert len(started) == 2 and str(started[1]).startswith("LIVE SELECT "), (
+                "README row 'live() with a Subquery that searches a field without a full-text index': 3.1 starts it"
+            )
+            return
+        assert raised is not None
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _si1("slug")
+        assert _shown(raised.value, _SECRET) == []
+        assert started == [check]

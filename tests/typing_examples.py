@@ -664,6 +664,13 @@ async def index_appliers(tx: Transaction) -> None:
     assert_type(await IndexedPost.remove_index("indexed_post_slug", missing_ok=False, tx=tx), str)
 
 
+def search_forms() -> None:
+    """v0.35.0: ``search()`` takes ``str`` texts by field and returns the queryset, a dotted path given through ``**``."""
+    assert_type(QuerySet(IndexedPost).search(title="physics"), QuerySet)
+    assert_type(QuerySet(IndexedPost).search(title="quantum", slug="a1").search(**{"meta.headline": "rust"}), QuerySet)
+    assert_type(QuerySet(IndexedPost).filter(id__in=Subquery(QuerySet(IndexedPost).search(title="x"))), QuerySet)
+
+
 async def analyzer_appliers(tx: Transaction) -> None:
     """v0.35.0: the manager's ``define_analyzer()`` returns the statements applied (a ``list[str]``),
     ``remove_analyzer()`` the one statement (a ``str``)."""

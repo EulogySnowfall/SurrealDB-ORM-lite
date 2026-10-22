@@ -221,6 +221,9 @@ class SubqueryCompiler:
         edge_tables: the tables of edge models the subqueries read: the query cache tags such a read (v0.28.0).
         view_tables: the tables of view models the subqueries read: the query cache tags such a read "any table"
             (v0.32.0).
+        searched: (table, column) → the field as given, for each ``search()`` condition of the statement's subqueries
+            (v0.35.0): the missing-index error names the field, and a live query checks each column's full-text index
+            before it starts.
         warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
             ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
             re-send for a missing subquery table), so each read warns once (v0.28.1).
@@ -241,6 +244,7 @@ class SubqueryCompiler:
     tables: set[str] = field(default_factory=set)
     edge_tables: set[str] = field(default_factory=set)
     view_tables: set[str] = field(default_factory=set)
+    searched: dict[tuple[str, str], str] = field(default_factory=dict)
     warn: bool = True
     variable_like: list[str] = field(default_factory=list)
     _stack: list[int] = field(default_factory=list)

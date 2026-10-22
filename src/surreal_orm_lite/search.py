@@ -52,6 +52,14 @@ manager's ``define_analyzer()`` and ``remove_analyzer()``; the latter refuses, b
 engine, which would remove it and then refuse every write to the table), an analyzer an index uses, with 3.x's own
 reason.
 
+**The query side.** ``QuerySet.search()`` checks its fields and texts with ``checked_search_field()`` and words its
+refusals with ``text_refused()``, ``field_refused()``, ``too_many_fields()``, ``time_travel_refused()`` (with
+``as_of()``) and ``live_refused()`` (in a live query's own condition). SurrealDB refuses a match on a field without a
+full-text index with an error that names the column and, on 3.x, quotes the bound search text:
+``is_missing_index_error()`` recognises it, ``missing_index_column()`` reads the column, and
+``missing_index_refusal()`` builds the ORM's error naming the field, never the server's text. ``live_index_probe()``
+is the empty search a live query's start check sends for each column its subqueries search.
+
 The module sits low in the package: it imports neither ``model_base``, ``query_set`` nor ``connection_manager``, so
 each of them can import it.
 """
@@ -72,7 +80,7 @@ from .schema import _comment_text, _identifier_name, _missing_clause, _overwrite
 from .schema_state import AnalyzerState, IndexState
 from .surql_literal import _identifier, _quoted
 from .time_travel import line_major
-from .utils import VALID_FIELD_PATTERN, _ddl_refusal_class, apply_ddl_statements
+from .utils import VALID_FIELD_PATTERN, _ddl_refusal_class, apply_ddl_statements, validate_field_name
 
 __all__ = ["SearchScore", "SearchHighlight", "SearchOffsets", "Analyzer", "Index"]
 
@@ -1218,3 +1226,133 @@ async def apply_analyzer_removal(client: Any, name: str, statement: str, *, tx: 
         [statement], client=client, tx=tx, what="analyzer", kind="removal", classify=True, subjects=[repr(name)]
     )
     return statement
+
+
+# --- the query side: search(), its refusals, a missing full-text index ----------------------------------------------
+
+#: The most fields one queryset may search: one match reference each, ``@0@`` … ``@255@``.
+MAX_SEARCH_FIELDS = MAX_MATCH_REFERENCE + 1
+
+#: The words of SurrealDB's error for a match on a field without a full-text index, on every engine.
+_MISSING_INDEX_MARKER = "no suitable index supporting the expression"
+
+#: The column that error names: ``… the expression: <column> @<N>@ <value>`` — bare on every engine measured.
+_MISSING_INDEX_COLUMN = re.compile(r"expression: (\S+) @\d*@")
+
+#: The pairs of delimiters a server could put around one segment of that column.
+_SEGMENT_QUOTES = (("`", "`"), ("⟨", "⟩"))
+
+
+def checked_search_field(field: str) -> None:
+    """*field*, a keyword of ``search()``, checked as ``validate_field_name()`` checks a field name, matched in full.
+
+    :raises ValueError: ``validate_field_name()``'s text, for a field that is not a field name or a dotted path —
+        a trailing newline included, which its pattern's ``$`` accepts.
+    """
+    validate_field_name(field, "search field")
+    if VALID_FIELD_PATTERN.fullmatch(field) is None:
+        raise ValueError(
+            f"Invalid search field name '{field}': must contain only alphanumeric characters, underscores, and dots "
+            "(for nested fields), and start with a letter or underscore"
+        )
+
+
+def text_refused(field: str, text: object) -> str:
+    """The refusal of a ``search()`` text that is not a ``str``: *text* given for *field*."""
+    return f"search() takes a str to match in {field!r}, got {type(text).__name__}."
+
+
+def field_refused(field: str, *, endpoint: bool) -> str:
+    """The refusal of ``search()`` on *field*, the record id — or an edge endpoint when *endpoint*."""
+    what = "an edge endpoint" if endpoint else "the record id"
+    return f"search() matches text: {field!r} is {what}, not a text field."
+
+
+def too_many_fields() -> str:
+    """The refusal of a queryset searching more fields than SurrealDB has match references."""
+    return (
+        f"search() takes at most {MAX_SEARCH_FIELDS} fields per queryset (SurrealDB's match references are 0 to "
+        f"{MAX_MATCH_REFERENCE})."
+    )
+
+
+def time_travel_refused() -> str:
+    """The refusal of ``search()`` with ``as_of()``: the index holds the records' current text."""
+    return (
+        "search() cannot be combined with as_of(): a full-text match reads the index, which holds the records' current "
+        "text, so a time-travel read would select records by their text now. Run the search without as_of()."
+    )
+
+
+def live_refused() -> str:
+    """The refusal of ``search()`` in a live query's own condition, naming the subquery form that notifies."""
+    return (
+        "A live query cannot honour search(): SurrealDB accepts a LIVE SELECT whose condition holds a full-text match "
+        "but never notifies it. Search in a subquery instead — filter(id__in=Subquery(Model.objects().search(...))) — "
+        "which notifies the records created or updated to match, not their deletion."
+    )
+
+
+def search_index_refused(fields: Sequence[str]) -> str:
+    """The refusal of a search on a field without a full-text index. *fields*: the field whose column the server named
+    — or, when that column cannot be read, every field the statement searches; one is named alone, several as "one of
+    the fields"."""
+    advice = (
+        "SurrealDB matches only a field with a FULLTEXT (3.x) or SEARCH (2.x) index: declare "
+        "Index(..., search_analyzer=...) on the model and apply define_indexes()."
+    )
+    if len(fields) == 1:
+        return f"search(): no full-text index on field {fields[0]!r}. {advice}"
+    return f"search(): no full-text index on one of the fields {', '.join(repr(field) for field in fields)}. {advice}"
+
+
+def is_missing_index_error(error: BaseException) -> bool:
+    """Whether *error* is SurrealDB's refusal of a match on a field without a full-text index (a ``ServerError``)."""
+    return isinstance(error, ServerError) and _MISSING_INDEX_MARKER in str(error)
+
+
+def _unquoted_segment(segment: str) -> str:
+    """*segment* without one pair of surrounding backticks or ``⟨⟩``."""
+    for opening, closing in _SEGMENT_QUOTES:
+        if len(segment) >= 2 and segment.startswith(opening) and segment.endswith(closing):
+            return segment[1:-1]
+    return segment
+
+
+def missing_index_column(error: BaseException) -> str | None:
+    """The column SurrealDB's missing-index *error* names (``… the expression: meta.headline @1@ …`` →
+    ``meta.headline``), each dotted segment without its backticks or ``⟨⟩`` should a server escape one; ``None`` when
+    the expression cannot be read."""
+    found = _MISSING_INDEX_COLUMN.search(str(error))
+    if found is None:
+        return None
+    return ".".join(_unquoted_segment(segment) for segment in found[1].split("."))
+
+
+def missing_index_refusal(error: BaseException, searched: Mapping[str, str]) -> SurrealDbError | None:
+    """The ORM's error for SurrealDB's missing-index *error*, not raised; ``None`` for any other error.
+
+    *searched* maps each column the statement searches to its field as given (the queryset's and its subqueries'). The
+    error names the field whose column the server names, else that column; when the column cannot be read, every
+    field of *searched*. Never the server's text, which on SurrealDB 3.x quotes the search text: the caller raises it
+    ``from None``.
+    """
+    if not is_missing_index_error(error):
+        return None
+    column = missing_index_column(error)
+    if column is not None:
+        return SurrealDbError(search_index_refused([searched.get(column, column)]))
+    fields = list(dict.fromkeys(searched.values()))
+    if not fields:
+        return None
+    return SurrealDbError(search_index_refused(fields))
+
+
+def live_index_probe(table: str, column: str) -> str:
+    """One item of a live query's start check: an empty search of *column* of *table*, which answers ``[]`` when the
+    column has a full-text index and raises SurrealDB's missing-index error when it has none.
+
+    *table* and *column* are written as the live query writes them (the model's table, a column the queryset checked);
+    the text is the constant ``''``, never a caller's.
+    """
+    return f"(SELECT VALUE id FROM {table} WHERE {column} @0@ '' LIMIT 1)"

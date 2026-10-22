@@ -15,6 +15,7 @@ from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
 from . import routing as _routing
+from . import search as _search
 from . import subquery as _subquery
 from . import time_travel as _time_travel
 from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
@@ -116,6 +117,8 @@ class QuerySet:
         self._geo_annotations: dict[str, tuple[str, GeometryPoint]] = {}
         # nearby() conditions (v0.24.0): column, reference point, distance in metres.
         self._nearby: list[tuple[str, GeometryPoint, float]] = []
+        # search() conditions (v0.35.0): field as given, column, text; the match reference is the position.
+        self._search: list[tuple[str, str, str]] = []
         self._tx: Any = None
         # as_of() (v0.26.0): the moment a time-travel read is made at, normalised; None reads the current state.
         self._as_of: _time_travel.AsOf | None = None
@@ -318,8 +321,8 @@ class QuerySet:
         ``containsall`` and ``containsany`` (compared with all its values) and of ``exact``, ``gt``, ``gte``,
         ``lt``, ``lte``, ``contains`` and ``not_contains`` (compared with its first value; no record when it is
         empty), here and in ``Q``. The inner queryset selects its record ids, or the one field given to its
-        ``select()``; its ``filter()``, ``Q``, ``nearby()``, ``order_by()``, ``limit()``, ``offset()`` and
-        ``variables()`` apply, its ``fetch()`` is ignored. It is read when this queryset runs, in the same
+        ``select()``; its ``filter()``, ``Q``, ``nearby()``, ``search()``, ``order_by()``, ``limit()``, ``offset()``
+        and ``variables()`` apply, its ``fetch()`` is ignored. It is read when this queryset runs, in the same
         statement: one request. A clause it cannot honour raises when this queryset compiles, before any request
         (see ``Subquery``). A subquery reading a table that does not exist reads as empty, as any missing table
         (SurrealDB 3.x raises: once the server confirms the table does not exist, the statement is sent once more
@@ -530,6 +533,65 @@ class QuerySet:
         if kinds is not None and "point" not in kinds:
             raise ValueError(f"{caller} measures distances between points; field {field!r} is declared as {_geo._info(kinds)}")
 
+    def search(self, **field_queries: str) -> Self:
+        """Keep the records whose fields match full-text queries (v0.35.0) — the full SurrealDB-ORM's method.
+
+        ::
+
+            physics = await Article.objects().search(title="quantum physics").exec()
+            recent = await Article.objects().filter(views__gt=10).search(title="quantum", body="physics").exec()
+            rust = await Article.objects().search(**{"meta.headline": "rust"}).count()
+
+        Each keyword maps a field — a Python field name (an aliased field compiles its column) or a dotted path — to
+        the text to match. The text is bound as a query variable, never written into the statement, and is data
+        whatever it holds (``"$title"`` is the text ``$title``). Each field gets the next match reference, in call
+        order and across calls (``search(title="a").search(body="b")``: ``title @0@ $_f0 AND body @1@ $_f1``), the
+        reference ``SearchScore(ref)`` and ``SearchHighlight(…, ref)`` name; the same field may be searched twice; at
+        most 256 fields per queryset (SurrealDB's match references are 0 to 255). Without a keyword nothing changes.
+
+        The conditions are AND-ed with each other and after ``filter()``, ``Q`` and ``nearby()``, wherever those
+        apply: ``exec()``, ``first()``, ``get()`` without an id, ``count()`` and the other aggregations, ``exists()``,
+        ``values()``/``annotate()`` groups, ``bulk_update()``, ``bulk_delete()``, ``patch()``, and a ``Subquery`` of
+        this queryset. ``get(<id>)`` and ``all()`` ignore it, as they ignore ``filter()``. SurrealDB's analyzer decides
+        what matches (case, stemming, prefixes); the terms of one text are AND-ed; an empty text matches nothing. The
+        records matched are the same on every line; the scores are not always (see ``SearchScore``).
+
+        The field needs a full-text index — ``Index(..., search_analyzer=...)`` declared on the model and applied by
+        ``define_indexes()``: without one, the read raises ``SurrealDbError`` naming the field, never the server's
+        text (SurrealDB 3.x quotes the search text in it). In a transaction the commit then fails with that error as
+        its cause. ``live()``/``watch()`` refuse ``search()`` — search in a ``Subquery`` of the live query instead —,
+        as ``as_of()`` and ``changes()`` do.
+
+        Args:
+            **field_queries: Each field to search, and the text to match in it.
+
+        Returns:
+            Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: a text is not a ``str``.
+            ValueError: a field is not a field name or a dotted path; it is the record id (``id``) or, on an edge
+                model, an endpoint (``in``/``out``); the queryset would search more than 256 fields.
+            SurrealDbError: the queryset reads ``as_of()``.
+            Each raised before any request, the queryset left unchanged.
+        """
+        endpoint_columns = self.model._endpoint_columns()
+        conditions: list[tuple[str, str]] = []
+        for field, text in field_queries.items():
+            _search.checked_search_field(field)
+            column = self.model.to_db_field(field)
+            if column == RECORD_ID_COLUMN or column in endpoint_columns:
+                raise ValueError(_search.field_refused(field, endpoint=column in endpoint_columns))
+            if not isinstance(text, str):
+                raise TypeError(_search.text_refused(field, text))
+            conditions.append((field, text))
+        if len(self._search) + len(conditions) > _search.MAX_SEARCH_FIELDS:
+            raise ValueError(_search.too_many_fields())
+        if conditions and self._as_of is not None:
+            raise SurrealDbError(_search.time_travel_refused())
+        self._search.extend((field, self._column(field), text) for field, text in conditions)
+        return self
+
     def as_of(self, at: datetime | str | timedelta | Duration | SurrealFunc | None) -> Self:
         """Read the records as they were at a moment: SurrealQL's ``VERSION`` (v0.26.0).
 
@@ -581,6 +643,10 @@ class QuerySet:
         link in ``filter()``, ``select()``, ``order_by()`` or ``values()`` reads the linked record as it was on
         3.x and as it is now on 2.x (see the README).
 
+        ``search()`` (v0.35.0) is refused with a moment, whichever comes first: a full-text match reads the index,
+        which holds the records' current text, so the read would select records by their text now. A ``Subquery``
+        holding ``search()`` is refused under an outer ``as_of()`` when the statement compiles, before any request.
+
         A time-travel queryset is read-only: ``bulk_create()``, ``bulk_update()``, ``bulk_delete()``,
         ``patch()``, ``update_or_create()``, ``get_or_create()``, ``delete_table()``, ``query()``, ``live()``,
         ``watch()`` and ``changes()`` raise ``SurrealDbError`` on it, before any request. ``_as_of`` is a
@@ -594,12 +660,15 @@ class QuerySet:
             ValueError: a string that is not ISO-8601; a negative duration; a moment outside
                 1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z.
             SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``); a moment on a queryset
-                with ``cache()`` (v0.28.0: a time-travel read is never cached). ``as_of(None)`` is accepted.
+                with ``cache()`` (v0.28.0: a time-travel read is never cached) or with ``search()`` (v0.35.0).
+                ``as_of(None)`` is accepted.
         """
         if self._tx is not None:
             raise SurrealDbError(_time_travel.transaction_refused())
         if at is not None and self._cache is not None:
             raise SurrealDbError(_CACHE_AS_OF)
+        if at is not None and self._search:
+            raise SurrealDbError(_search.time_travel_refused())
         self._as_of = _time_travel.normalise_as_of(at)
         return self
 
@@ -774,11 +843,14 @@ class QuerySet:
     ) -> tuple[list[str], dict[str, Any], int]:
         """The AND-ed conditions of the WHERE clause, their bound values and the next ``$_f<N>`` number.
 
-        Filters, ``Q`` objects and ``nearby()`` conditions, in that order, numbered from *counter* on: the outer
-        statement starts at 0, a subquery (v0.27.0) continues the numbering of the statement it goes into. With
-        ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check ``time_travel.GUARD`` is the last
-        condition, after the ``nearby()`` ones: every other part is a single comparison or a parenthesised group,
-        so the check applies to every row they keep.
+        Filters, ``Q`` objects, ``nearby()`` and ``search()`` conditions (v0.35.0), in that order, numbered from
+        *counter* on: the outer statement starts at 0, a subquery (v0.27.0) continues the numbering of the statement
+        it goes into. A ``search()`` condition is ``<column> @<ref>@ $_f<N>``, its text bound; the match reference
+        is the condition's position in this queryset, so a subquery's references start again at 0 while its texts
+        continue the statement's numbering. With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record
+        check ``time_travel.GUARD`` is the last condition, after the ``nearby()`` ones (``search()`` never reads at a
+        moment): every other part is a single comparison or a parenthesised group, so the check applies to every row
+        they keep.
 
         Args:
             counter: the first ``$_f<N>`` number.
@@ -825,6 +897,13 @@ class QuerySet:
             variables[distance_var] = distance
             counter += 2
 
+        # search() conditions (v0.35.0): the text is bound, never written into the statement.
+        for reference, (_, column, text) in enumerate(self._search):
+            variable = f"_f{counter}"
+            parts.append(f"{column} @{reference}@ ${variable}")
+            variables[variable] = text
+            counter += 1
+
         if as_of:
             parts.append(_time_travel.GUARD)
 
@@ -867,7 +946,8 @@ class QuerySet:
         values are bound from *counter* on, its ``variables()`` merged into the statement's, its own subqueries
         rendered first (their ``LET`` s precede its own). Under the outer ``as_of()`` (``compiler.moment``) it
         carries the per-record guard and ``VERSION $_as_of``: the server never applies the outer ``VERSION`` to a
-        ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. ``fetch()`` is ignored, as in the full
+        ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. Each of its ``search()`` conditions is
+        recorded in ``compiler.searched`` (v0.35.0). ``fetch()`` is ignored, as in the full
         SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
 
         Called by :meth:`SubqueryCompiler.reference`, which first refuses a queryset that is its own subquery.
@@ -877,7 +957,8 @@ class QuerySet:
                 invalid selected column; ``_sqv`` ordered on where the ordered form selects its alias; its
                 ``variables()`` binding a name of the statement to another value; and its filters' own refusals.
                 Its ``limit()`` and ``offset()`` were checked when they were called (a non-negative integer).
-            SurrealDbError: an ``as_of()`` of its own; a transaction that is not the outer queryset's.
+            SurrealDbError: an ``as_of()`` of its own; a transaction that is not the outer queryset's; ``search()``
+                under the outer ``as_of()`` (v0.35.0).
         """
         offenders = {
             "annotate()": bool(self._annotations),
@@ -891,6 +972,8 @@ class QuerySet:
             raise SurrealDbError(_subquery.moment_refused())
         if self._tx is not None and self._tx is not compiler.outer_tx:
             raise SurrealDbError(_subquery.transaction_refused())
+        if self._search and compiler.moment is not None:
+            raise SurrealDbError(_search.time_travel_refused())
         column = self.select_item[0] if self.select_item else "id"
         validate_field_name(column, "subquery select field")
         order_columns: list[str] = []
@@ -909,6 +992,8 @@ class QuerySet:
         compiler.merge_variables(self._variables)
         if table in compiler.empty_tables:
             return "[]", {}, counter
+        for field, search_column, _ in self._search:
+            compiler.searched[(table, search_column)] = field
         parts, values, counter = self._where_parts(counter, as_of=compiler.moment is not None, subqueries=compiler)
         where = " WHERE " + " AND ".join(parts) if parts else ""
         tail = ""
@@ -1090,7 +1175,12 @@ class QuerySet:
     # ==================== Query execution ====================
 
     async def _execute_query(
-        self, query: str, variables: dict[str, Any] | None = None, *, subquery_tables: frozenset[str] = frozenset()
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        subquery_tables: frozenset[str] = frozenset(),
+        searched: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Execute a read query. Routes through the transaction when one is attached
@@ -1105,6 +1195,11 @@ class QuerySet:
         to the SDK's error. Keyed on ``as_of()``, never on the variables: without it, every error is
         relayed unchanged.
 
+        A search on a field without a full-text index (v0.35.0) raises ``SurrealDbError`` naming the field, from
+        ``None``: the server's text, which on SurrealDB 3.x quotes the search text, stays its suppressed
+        ``__context__`` (``search.missing_index_refusal()``). In a transaction that error replaces the SDK's in the
+        transaction's failures, so the commit that fails afterwards chains it, never the server's text.
+
         Args:
             query: the statement.
             variables: its bound values (the queryset's ``variables()`` when ``None``).
@@ -1113,12 +1208,16 @@ class QuerySet:
                 anything but itself (:meth:`_reads_as_empty`): naming one of these tables, and confirmed by the
                 server, it asks :meth:`_run_compiled` to send the statement again with that subquery empty;
                 naming another table, it is the outer table's and reads as no rows. Every other error is relayed.
+            searched: the columns the statement searches, each mapped to its field as given — this queryset's and
+                its subqueries' (:meth:`_searched_columns`); ``None``: this queryset's own.
 
         Raises:
             _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist (caught by
                 :meth:`_run_compiled`).
+            SurrealDbError: a searched field has no full-text index.
         """
         vars_ = variables if variables is not None else self._variables
+        columns = searched if searched is not None else self._searched_columns()
         if self._tx is not None:
             try:
                 return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
@@ -1133,6 +1232,12 @@ class QuerySet:
                 if empty:
                     self._tx._absorb_failure(exc)
                     return []
+                refusal = _search.missing_index_refusal(exc, columns)
+                if refusal is not None:
+                    # The transaction still fails as a whole, with the ORM's error as its cause, never the server's.
+                    self._tx._absorb_failure(exc)
+                    self._tx._note_failure(refusal)
+                    raise refusal from None
                 raise
         client = await self._manager().get_client()
         try:
@@ -1140,9 +1245,18 @@ class QuerySet:
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
+            refusal = _search.missing_index_refusal(exc, columns)
+            if refusal is not None:
+                raise refusal from None
             if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
                 raise SurrealDbError(_time_travel.server_refused(exc)) from exc
             raise
+
+    def _searched_columns(self, compiler: SubqueryCompiler | None = None) -> dict[str, str]:
+        """The columns a statement of this queryset searches, each mapped to its field as given (v0.35.0): those of
+        its subqueries (``compiler.searched``), then this queryset's own ``search()`` conditions."""
+        columns = {} if compiler is None else {column: field for (_, column), field in compiler.searched.items()}
+        return {**columns, **{column: field for field, column, _ in self._search}}
 
     async def _reads_as_empty(self, exc: ServerError, subquery_tables: frozenset[str]) -> bool:
         """Whether the server's error *exc* reads as no rows; ``False`` relays it.
@@ -1239,7 +1353,8 @@ class QuerySet:
         table compile again with that subquery bound to ``[]`` and send again.
 
         The filter values' warnings are given by the first compilation only, and only with *warn* (v0.28.1):
-        ``False`` when :meth:`_run_cached` compiled the statement for this read already."""
+        ``False`` when :meth:`_run_cached` compiled the statement for this read already. The fields the statement's
+        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them."""
         empty: frozenset[str] = frozenset()
         while True:
             compiler = self._subquery_compiler(empty, warn=warn)
@@ -1251,8 +1366,11 @@ class QuerySet:
             read = frozenset(compiler.tables) - empty
             if not read:
                 return await self._execute_query(query, variables)
+            # The fields the subqueries search (v0.35.0), which a missing-index error names; _execute_query() maps
+            # this queryset's own. Only a subquery that searches adds the argument: the call is otherwise v0.27.0's.
+            searched: dict[str, Any] = {"searched": self._searched_columns(compiler)} if compiler.searched else {}
             try:
-                return await self._execute_query(query, variables, subquery_tables=read)
+                return await self._execute_query(query, variables, subquery_tables=read, **searched)
             except _subquery._MissingSubqueryTable as missing:
                 empty |= {missing.table}
 
@@ -2489,7 +2607,12 @@ class QuerySet:
         them at parse time), a typed stream needs whole records, and a live query is a
         connection-level subscription with no transaction to join. Each offender is named so
         the caller fixes them all at once.
+
+        ``search()`` (v0.35.0) is refused first, on its own: SurrealDB accepts a live query whose condition holds a
+        full-text match and never notifies it; the refusal names the subquery form, which notifies.
         """
+        if self._search:
+            raise SurrealDbError(_search.live_refused())
         unsupported = {
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -2554,6 +2677,11 @@ class QuerySet:
         answers it (the table reads as empty) and the live query starts. A resubscribe runs the
         check again, on the new connection.
 
+        The same request checks (v0.35.0) that each column a subquery searches has a full-text index — one empty
+        search per column, ``(SELECT VALUE id FROM <table> WHERE <column> @0@ '' LIMIT 1)``, after the tables, the
+        pairs sorted — and raises ``SurrealDbError`` naming the field otherwise, before the live query starts:
+        without the index, SurrealDB 3.x would accept the live query and never notify.
+
         The coroutine runs on the client it is given (v0.29.0): the stream passes its connection's — at start, the
         client it opened; at a resubscribe, the one it is about to move onto — so the live query runs on that very
         connection, and the stream has already checked the transport.
@@ -2561,14 +2689,20 @@ class QuerySet:
         compiler = self._subquery_compiler(inline=True)
         query = self._compile_live(diff, compiler)
         table = self._model_table
+        items = [f"(SELECT VALUE id FROM {name} LIMIT 1)" for name in sorted(compiler.tables)]
+        items += [_search.live_index_probe(name, column) for name, column in sorted(compiler.searched)]
         tables = tuple(sorted(compiler.tables))
-        check = "RETURN [" + ", ".join(f"(SELECT VALUE id FROM {name} LIMIT 1)" for name in tables) + "];"
+        fields = {column: field for (_, column), field in compiler.searched.items()}
+        check = "RETURN [" + ", ".join(items) + "];"
 
         async def start(client: Any) -> UUID:
-            if tables:
+            if items:
                 try:
                     await client.query(check)
                 except ServerError as exc:
+                    refusal = _search.missing_index_refusal(exc, fields)
+                    if refusal is not None:
+                        raise refusal from None
                     missing = _subquery.missing_table(exc)
                     if missing is None or missing not in tables:
                         raise
@@ -2611,6 +2745,14 @@ class QuerySet:
         exists — again on each resubscribe — because SurrealDB 3.x would accept the live query on a
         missing one and never notify; 2.x reads a missing table as empty, as everywhere else.
 
+        **Full-text search (v0.35.0).** ``search()`` is refused: SurrealDB accepts a live query whose condition holds
+        a full-text match and never notifies it. Search in a subquery instead —
+        ``filter(id__in=Subquery(Model.objects().search(title="physics")))`` —, which notifies the records created
+        or updated to match, not their deletion. Before such a live query starts, and again on each resubscribe, the
+        ORM checks in the same request that each field a subquery searches has a full-text index, and raises
+        ``SurrealDbError`` naming the field otherwise: without the index, SurrealDB 3.x would accept the live query
+        and never notify. Do not remove that index while the live query runs.
+
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
         deprecated, and never resubscribes: the caller owns that uuid.
 
@@ -2623,10 +2765,10 @@ class QuerySet:
         ``close_connection()``…) ends the stream either way.
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
-            ``offset``/``objects(tx=)``/``cache()`` (v0.28.0: a stream is never cached), and on a
-            queryset read ``as_of()`` (a live query streams the current changes, v0.26.0), here; for a
-            non-WebSocket connection (the embedded engine included: read its change feed with
-            :meth:`changes`), on start.
+            ``offset``/``objects(tx=)``/``cache()`` (v0.28.0: a stream is never cached), for ``search()``
+            (v0.35.0), and on a queryset read ``as_of()`` (a live query streams the current changes, v0.26.0),
+            here; for a non-WebSocket connection (the embedded engine included: read its change feed with
+            :meth:`changes`), or a field a subquery searches without a full-text index (v0.35.0), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile, here.
         :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist, or a
@@ -2661,9 +2803,9 @@ class QuerySet:
         ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
-        :meth:`live`, and so do its refusals (``as_of()`` and ``cache()`` included, here) and its subqueries (inline,
-        the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
-        missing one).
+        :meth:`live`, and so do its refusals (``as_of()``, ``cache()`` and ``search()`` included, here) and its
+        subqueries (inline, the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
+        missing one; the fields they search checked for a full-text index: ``SurrealDbError`` naming one without).
         """
         self._reject_time_travel("watch()")
         return LiveStream(
@@ -2683,6 +2825,7 @@ class QuerySet:
         unsupported = {
             "filter()": bool(self._filters or self._q_filters),
             "nearby()": bool(self._nearby),
+            "search()": bool(self._search),
             "variables()": bool(self._variables),
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -2728,8 +2871,8 @@ class QuerySet:
             keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
-        :raises SurrealDbError: for any queryset clause (``as_of()`` and ``cache()`` included), here; on start, for a
-            table that does not exist or has no change feed (on the table or on its database), or for a
+        :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()`` and ``search()`` included), here; on
+            start, for a table that does not exist or has no change feed (on the table or on its database), or for a
             datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
