@@ -30,11 +30,18 @@ list.
 rules raises rather than reaching a statement. ``KnnSearch`` is one ``similar_to()`` of a queryset once checked, and
 the texts of its refusals are here, each naming the field or the model, never the statement nor the vector.
 
+**The other conditions below SurrealDB 3.** SurrealDB 3.x applies the conditions AND-ed with the KNN during the index
+search. SurrealDB 2.x and the embedded engine answer wrong records for many of them — a condition on an indexed
+column, a function call, a negation, a group, a dotted path, a full-text match —, so below 3 the queryset selects the
+records matching them first, in a ``LET`` of the statement, and the KNN searches those ids. ``id_subquery_part()``
+tells the only parts that stay next to the KNN on every line: the ORM's own id subqueries.
+
 The module sits low in the package: it imports neither ``search``, ``model_base``, ``query_set`` nor
 ``connection_manager``, so each of them can import it.
 """
 
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -87,6 +94,10 @@ DEFAULTS: _HnswDefaults = {"dist": "EUCLIDEAN", "vector_type": "F32", "efc": 150
 
 #: The attribute that carries each record's distance from the query vector.
 DISTANCE_ALIAS = "_knn_distance"
+
+#: The two forms the ORM writes for a ``Subquery`` given to ``id__in``: ``id IN $_sq<N>``, and ``$_sq<N> CONTAINS id``
+#: on a view model (v0.32.0) — the only parts of a KNN statement's ``WHERE`` kept next to the KNN on every line.
+_ID_SUBQUERY_PART = re.compile(r"id IN \$_sq[0-9]+|\$_sq[0-9]+ CONTAINS id")
 
 _DISTANCE_LIST = "EUCLIDEAN, COSINE, MANHATTAN, CHEBYSHEV and HAMMING"
 _VECTOR_TYPE_LIST = "F64, F32, I64, I32 and I16"
@@ -450,6 +461,20 @@ def knn_condition(column: str, k: int, ef: int | None, dist: str | None, variabl
     return f"{column} <|{limit},{checked_distance(dist, subject='similar_to()')}|> ${variable}"
 
 
+def id_subquery_part(part: str) -> bool:
+    """Whether *part*, one AND-ed condition the queryset wrote for a KNN statement's ``WHERE``, is exactly one of the
+    ORM's id subqueries — ``id IN $_sq<N>`` (``filter(id__in=Subquery(...))``) or ``$_sq<N> CONTAINS id`` (its form on a
+    view model, v0.32.0). Pure.
+
+    Such a part stays next to the KNN on every line: SurrealDB 2.x answers right with id subqueries AND-ed with a KNN,
+    two of them included. Below SurrealDB 3 every other part of the statement's ``WHERE`` goes into the ``LET`` that
+    selects the records first: a comparison may be on an indexed column, which SurrealDB 2.x answers wrongly next to a
+    KNN, and the ORM cannot know a column's indexes. Anything that is not exactly one of the two forms — ``(id IN
+    $_sq0)`` inside a ``Q``, a literal ``id IN $_f0`` — goes there too, which is always right, only slower.
+    """
+    return _ID_SUBQUERY_PART.fullmatch(part) is not None
+
+
 # --- the query side -------------------------------------------------------------------------------------------------
 
 
@@ -501,6 +526,17 @@ def dimension_refused(field: str, n: int, d: int, source: str) -> str:
 def zero_vector_refused() -> str:
     """The refusal of a zero query vector for a ``COSINE`` search, which has no distance to rank by."""
     return "similar_to(): a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance."
+
+
+def search_annotation_refused(annotation: str) -> str:
+    """The refusal of a search annotation (its class name, *annotation*) on a ``similar_to()`` queryset read below
+    SurrealDB 3: there the full-text matches are selected first, in a ``LET``, so the statement that searches the
+    vectors holds no match its score, highlight or offsets could read (SurrealDB 2.x answers ``NONE`` for each)."""
+    return (
+        f"similar_to() cannot be combined with {annotation} on SurrealDB 2.x or the embedded engine: there the ORM "
+        "selects the full-text matches first, so the vector search holds no match to score, highlight or locate. Keep "
+        "search() as a condition, or use SurrealDB 3.x."
+    )
 
 
 def time_travel_refused() -> str:

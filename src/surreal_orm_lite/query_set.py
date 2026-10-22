@@ -942,7 +942,12 @@ class QuerySet:
     # ==================== Internal query building ====================
 
     def _subquery_compiler(
-        self, empty_tables: frozenset[str] = frozenset(), *, inline: bool = False, warn: bool = True
+        self,
+        empty_tables: frozenset[str] = frozenset(),
+        *,
+        inline: bool = False,
+        warn: bool = True,
+        knn_prefilter: bool = False,
     ) -> SubqueryCompiler:
         """A compiler for the subqueries of one statement of this queryset (v0.27.0).
 
@@ -956,6 +961,8 @@ class QuerySet:
             empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
             inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
             warn: emit the warnings of the filter values (v0.28.1); ``False`` for a statement this read compiled once.
+            knn_prefilter: compile the form below SurrealDB 3 (v0.36.0): the conditions next to a KNN selected first,
+                in a ``LET`` (:meth:`_where_parts`).
         """
         return SubqueryCompiler(
             inline=inline,
@@ -964,6 +971,7 @@ class QuerySet:
             outer_model=self.model,
             variables=dict(self._variables),
             warn=warn,
+            knn_prefilter=knn_prefilter,
             _stack=[id(self)],
         )
 
@@ -978,7 +986,19 @@ class QuerySet:
         ``<column> @<ref>@ $_f<N>``, its text bound; the match reference is the condition's position in this queryset,
         so a subquery's references start again at 0 while its texts continue the statement's numbering. The KNN
         condition is ``<column> <|K,EF|> $_f<N>`` or ``<column> <|K,DIST|> $_f<N>``, the query vector bound as a
-        ``list[float]``; it comes last, AND-ed at the top level of the ``WHERE``, where SurrealDB requires it. With
+        ``list[float]``; it comes last, AND-ed at the top level of the ``WHERE``, where SurrealDB requires it.
+
+        With a statement's compiler, the parts next to the KNN that are not one of the ORM's id subqueries
+        (``vector.id_subquery_part()``: ``id IN $_sq<N>``, ``$_sq<N> CONTAINS id`` on a view) — a comparison, a ``Q``,
+        a ``nearby()`` or ``search()`` condition — set ``subqueries.knn_conditions``: the caller reads the line. In the
+        form for SurrealDB 3.x they stay inline. In the form below 3 (``subqueries.knn_prefilter``: SurrealDB 2.x, the
+        embedded engine) they go into ``LET $_sq<N> = (SELECT VALUE id FROM <table> WHERE <parts AND-ed>);`` and the
+        ``WHERE`` keeps the id subqueries, then ``id IN $_sq<N>`` (``$_sq<N> CONTAINS id`` on a view model, as
+        ``id__in`` writes it), then the KNN: SurrealDB 2.x answers wrong records for a KNN next to a condition on an
+        indexed column, a function call, a negation, a group, a dotted path or a full-text match, while it answers
+        right through ids selected first — and the ORM cannot know a column's indexes. The ``LET`` reads the
+        statement's own table and follows the ``LET`` s of the parts' own subqueries; inside a ``Subquery``, it
+        precedes the subquery's own. Without a compiler the KNN is written inline. With
         ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check ``time_travel.GUARD`` is the last
         condition, after the ``nearby()`` ones (``search()`` never reads at a moment): every other part is a single
         comparison or a parenthesised group, so the check applies to every row they keep.
@@ -1038,9 +1058,25 @@ class QuerySet:
         # similar_to() (v0.36.0): the query vector is bound; K and EF are checked integers the ORM writes itself.
         if self._similar is not None:
             variable = f"_f{counter}"
-            parts.append(self._similar.condition(variable))
+            knn = self._similar.condition(variable)
             variables[variable] = list(self._similar.vector)
             counter += 1
+            others = [part for part in parts if not _vector.id_subquery_part(part)]
+            if subqueries is None or not others:
+                parts.append(knn)
+            elif not subqueries.knn_prefilter:
+                # The form for SurrealDB 3.x, which applies every condition during the index search.
+                subqueries.knn_conditions = True
+                parts.append(knn)
+            else:
+                # Below SurrealDB 3: the records matching the other conditions selected first, by their ids.
+                subqueries.knn_conditions = True
+                name = f"{_subquery.LET_PREFIX}{len(subqueries.lets)}"
+                subqueries.lets.append(
+                    f"LET ${name} = (SELECT VALUE id FROM {self._model_table} WHERE {' AND '.join(others)});"
+                )
+                kept = [part for part in parts if _vector.id_subquery_part(part)]
+                parts = [*kept, f"${name} CONTAINS id" if view else f"id IN ${name}", knn]
 
         if as_of:
             parts.append(_time_travel.GUARD)
@@ -1174,7 +1210,11 @@ class QuerySet:
         return f"{query}{_time_travel.VERSION_CLAUSE};", {**variables, _time_travel.MOMENT_VARIABLE: moment}
 
     def _compile_query(
-        self, moment: datetime | None = None, *, subqueries: SubqueryCompiler | None = None
+        self,
+        moment: datetime | None = None,
+        *,
+        subqueries: SubqueryCompiler | None = None,
+        for_exists: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """
         Compile the QuerySet parameters into a parameterized SQL query.
@@ -1185,10 +1225,15 @@ class QuerySet:
             subqueries: The compiler of the statement's subqueries (v0.27.0); a new one by default. With
                 subqueries the statement is a block, ``{ LET $_sq0 = (…); (SELECT …) };``; without, the text
                 and variables of v0.26.0.
+            for_exists: private, ``exists()`` only (v0.36.0): below SurrealDB 3 the search annotations are left out of
+                a ``similar_to()`` statement instead of refused — a boolean answer needs none. Elsewhere it changes
+                nothing.
 
         With ``similar_to()`` (v0.36.0) the distance is projected as ``vector::distance::knn() AS _knn_distance``,
         after the ``GeoDistance`` and search annotations, and without ``order_by()`` the statement ends
-        ``ORDER BY _knn_distance`` (nearest first).
+        ``ORDER BY _knn_distance`` (nearest first). Its search annotations are projected in the form for SurrealDB
+        3.x only: the form below 3 (``subqueries.knn_prefilter``) selects the full-text matches in a ``LET``, so its
+        outer statement holds no match to score, highlight or locate, and SurrealDB 2.x would answer ``NONE`` for each.
 
         Returns:
             A tuple of (query_string, variables_dict).
@@ -1198,8 +1243,16 @@ class QuerySet:
             ValueError, SurrealDbError: a subquery the ORM cannot compile (README section 28).
             ValueError: a search annotation whose match reference ``search()`` did not give this queryset
                 (v0.35.0, :meth:`_check_search_references`).
+            SurrealDbError: this queryset's own ``similar_to()`` with a search annotation, compiled in the form below
+                SurrealDB 3 (v0.36.0), never with ``for_exists``; raised before any ``LET`` is written.
         """
         self._check_search_references()
+        drop_search = False
+        if subqueries is not None and subqueries.knn_prefilter and self._similar is not None and self._search_annotations:
+            if not for_exists:
+                first = next(iter(self._search_annotations.values()))
+                raise SurrealDbError(_vector.search_annotation_refused(type(first).__name__))
+            drop_search = True
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
         compiler.moment = moment
@@ -1213,7 +1266,7 @@ class QuerySet:
             variable = f"_gd{index}"
             projection.append(f"IF {column}.is_point() THEN geo::distance({column}, ${variable}) END AS {alias}")
             distance_vars[variable] = point
-        search_projection, search_vars = self._search_projection()
+        search_projection, search_vars = ([], {}) if drop_search else self._search_projection()
         projection += search_projection
         # similar_to() (v0.36.0): the distance of the KNN, after every other per-record value.
         if self._similar is not None:
@@ -1550,18 +1603,29 @@ class QuerySet:
         *,
         write: bool = False,
         warn: bool = True,
+        knn_prefilter: bool | None = None,
     ) -> Any:
         """The loop of :meth:`_run_compiled`, as in v0.27.0: compile, send, and on a confirmed missing subquery
         table compile again with that subquery bound to ``[]`` and send again.
 
         The filter values' warnings are given by the first compilation only, and only with *warn* (v0.28.1):
         ``False`` when :meth:`_run_cached` compiled the statement for this read already. The fields the statement's
-        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them."""
+        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them.
+
+        A KNN next to other conditions (v0.36.0, ``compiler.knn_conditions``) is compiled for the line: *knn_prefilter*
+        ``None`` decides it once, right after the first compilation — the line read once per client
+        (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is checked,
+        queued or sent — and every later compilation of this read or write (a re-send for a missing subquery table
+        included) uses that decision; :meth:`_run_cached` passes the one it took."""
         empty: frozenset[str] = frozenset()
         while True:
-            compiler = self._subquery_compiler(empty, warn=warn)
+            compiler = self._subquery_compiler(empty, warn=warn, knn_prefilter=bool(knn_prefilter))
             warn = False
             query, variables = compile_statement(compiler)
+            if knn_prefilter is None:
+                knn_prefilter = await self._below_3(compiler)
+                if knn_prefilter:
+                    continue
             self._check_links()
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
@@ -1587,9 +1651,17 @@ class QuerySet:
         the view from tables the ORM does not track. On a miss :meth:`_run_uncached` sends it, compiling it again
         (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
         compilation gives the filter values' warnings, once per read.
+
+        A KNN next to other conditions (v0.36.0) is keyed in its line's form: the line is read after the first
+        compilation and, below SurrealDB 3, the statement compiled again for the key; the decision is passed on to
+        :meth:`_run_uncached`, so a read the compilation refuses stores nothing.
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
+        knn_prefilter = await self._below_3(compiler)
+        if knn_prefilter:
+            compiler = self._subquery_compiler(warn=False, knn_prefilter=True)
+            query, variables = compile_statement(compiler)
         self._check_links()
         tables = {self._model_table, *compiler.tables}
         if self.model.__surreal_edge__ or compiler.edge_tables:
@@ -1607,8 +1679,17 @@ class QuerySet:
             variables,
             frozenset(tables),
             any_table,
-            lambda: self._run_uncached(compile_statement, warn=False),
+            lambda: self._run_uncached(compile_statement, warn=False, knn_prefilter=knn_prefilter),
         )
+
+    async def _below_3(self, compiler: SubqueryCompiler) -> bool:
+        """Whether the statement *compiler* compiled is for a line below SurrealDB 3 and needs the form with the
+        conditions next to its KNN selected first (v0.36.0): only when it has such conditions
+        (``compiler.knn_conditions``) is the line read, once per client (``time_travel.cached_major()``) — on the
+        connection's client, an interactive transaction's included. A version that cannot be read counts as 3."""
+        if not compiler.knn_conditions:
+            return False
+        return await _time_travel.cached_major(await self._manager().get_client()) < 3
 
     async def _cached_read(
         self,
@@ -1675,6 +1756,8 @@ class QuerySet:
         Raises:
             ValueError: a search annotation whose match reference ``search()`` did not give this queryset, before
                 any request (v0.35.0).
+            SurrealDbError: a search annotation with ``similar_to()`` on SurrealDB 2.x or the embedded engine
+                (v0.36.0), once the line is read and before the statement is sent.
         """
         self._check_search_references()
         # A similar_to() statement projects the distance: without an aggregation (values() alone compiles no GROUP BY)
@@ -2202,7 +2285,9 @@ class QuerySet:
         Check if any records match the current query.
 
         It compiles the full projection, as ``exec()`` does: a search annotation (v0.35.0) is sent with its
-        ``LIMIT 1`` and its match reference checked first, before any request.
+        ``LIMIT 1`` and its match reference checked first, before any request; with ``similar_to()`` on SurrealDB 2.x
+        or the embedded engine, where ``exec()`` refuses search annotations, they are left out (v0.36.0): the answer
+        needs none.
 
         Returns:
             True if at least one record matches, False otherwise.
@@ -2215,7 +2300,7 @@ class QuerySet:
         original_limit = self._limit
         try:
             self._limit = 1
-            results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
+            results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c, for_exists=True))
 
             if isinstance(results, list):
                 return len(results) > 0

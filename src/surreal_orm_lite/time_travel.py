@@ -22,6 +22,9 @@ and a ``SurrealFunc`` expression are resolved by :func:`resolve`, once per read,
 clock (``RETURN time::now() - $_as_of_ago;`` / ``RETURN <expression>;``), then checked against the same
 bounds before the read is sent.
 
+:func:`line_major` reads the server line from a ``client.version()`` answer; :func:`cached_major` keeps it per client,
+for the reads that depend on it (v0.36.0: a vector search next to other conditions below SurrealDB 3).
+
 The texts of the errors the ORM raises for time travel are built here, so each lives in one place (the
 embedded engine's own refusal is ``embedded.history_unsupported()``).
 
@@ -32,6 +35,7 @@ library only.
 from __future__ import annotations
 
 import re
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -63,6 +67,8 @@ UNSUPPORTED_MARKER: Final = "does not support versioned queries"
 
 _RESOLVE_AGO: Final = f"RETURN time::now() - ${AGO_VARIABLE};"
 _VERSION: Final = re.compile(r"(\d+)\.\d+")
+#: The line of each SDK client read so far (:func:`cached_major`), dropped with the client.
+_MAJORS: Final[weakref.WeakKeyDictionary[Any, int]] = weakref.WeakKeyDictionary()
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +193,24 @@ def line_major(version: object) -> int:
     """The major of a ``client.version()`` answer (``"surrealdb-3.3.4"`` → 3); 3 when none can be read."""
     match = _VERSION.search(str(version))
     return int(match.group(1)) if match else 3
+
+
+async def cached_major(client: Any) -> int:
+    """The major of the server line *client* talks to (:func:`line_major` of ``client.version()``), read once per client.
+
+    For v0.36.0's vector search: below SurrealDB 3 (2.x, the embedded engine) a KNN next to other conditions is
+    compiled with those conditions selected first, in a ``LET``. The answer is kept per SDK client object, so a client
+    is asked once, and forgotten with it: a reconnected WebSocket is a new client, read again. A client that cannot be
+    weakly referenced is read every time. A version that cannot be read counts as 3 (:func:`line_major`).
+    """
+    try:
+        major = _MAJORS.get(client)
+    except TypeError:
+        return line_major(await client.version())
+    if major is None:
+        major = line_major(await client.version())
+        _MAJORS[client] = major
+    return major
 
 
 # --- message builders (one place per text) --------------------------------------------------------------

@@ -89,6 +89,24 @@ accepted in either order, nothing sent. ``TestCombinationsE2E`` reads, on every 
 the other aggregations and a ``values()`` group restricted to the ``limit`` nearest; a ``Subquery`` holding
 ``similar_to()`` in another queryset's filter; ``cache()`` hits, misses and ``define_indexes()``'s invalidation; a
 model of a named connection and a model inside ``using()`` of another one.
+
+The other conditions next to the vector search (``TestPrefilter``): the statements are pinned in the form for
+SurrealDB 3.x — every condition inline — and in the form below 3 — every condition but an id subquery selected first in
+a ``LET``, the KNN searching those ids (``$_sq<N> CONTAINS id`` on a view model), a ``Subquery``'s ``LET`` before its
+own —; the parts kept next to the KNN on every line are exactly the ORM's id subqueries; a statement without such a
+condition is the same on every line and needs no line. The line is read once per client and decided once per read, a
+re-send for a missing subquery table keeping it. ``TestPrefilterE2E`` reads, on every engine, a comparison, a function
+lookup, a ``Q`` group, a negation, ``nearby()``, ``search()``, a condition on an indexed column and one through a
+record link next to ``similar_to()`` (an index search and an exact scan): the same records everywhere, the form sent
+being the line's, the line read once and only for such a condition; ``exists()``, ``count()`` and a ``values()`` group
+through the ``LET``.
+
+The search annotations next to the vector search (``TestSearchAnnotationsWithKnn``): projected before the distance in
+the form for SurrealDB 3.x; below 3, ``exec()``, ``first()`` and ``get()`` without an id refuse them with an exact
+text after the line is read and before anything is sent, queued in a transaction or cached, while ``exists()`` leaves
+them out of its statement and answers; a queryset without its own ``similar_to()`` compiles as before.
+``TestSearchAnnotationsWithKnnE2E``: on SurrealDB 3.x each of the nearest matches carries the score, highlight and
+offsets the plain search gives it; below 3 the refusals, ``exists()`` and ``count()`` on every engine.
 """
 
 import ast
@@ -107,6 +125,7 @@ from typing import Annotated, Any, Literal
 
 import pytest
 from pydantic import Field, ValidationError
+from surrealdb import RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -120,6 +139,7 @@ from surreal_orm_lite import (
     Index,
     IndexState,
     PointField,
+    Q,
     QueryCache,
     SearchHighlight,
     SearchOffsets,
@@ -132,9 +152,11 @@ from surreal_orm_lite import (
     VectorField,
     model_ddl,
     search,
+    time_travel,
     vector,
 )
 from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_index, render_kind
+from surreal_orm_lite.subquery import SubqueryCompiler, _MissingSubqueryTable
 from surreal_orm_lite.utils import validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
 
@@ -2546,10 +2568,12 @@ def _euclidean(record_id: str, query: Sequence[float] = _Q) -> float:
     return math.dist(_EMBEDDINGS[record_id], query)
 
 
-def _seed_statements(table: str, *, doc: bool = False, nested: bool = False, only: Sequence[str] | None = None) -> str:
+def _seed_statements(
+    table: str, *, doc: bool = False, nested: bool = False, numbered: bool = False, only: Sequence[str] | None = None
+) -> str:
     """The ``CREATE`` of the six records in *table* (constants of these tests) — or of those *only* names —:
     ``VecDoc``'s every column with *doc*, the embedding under ``meta.vec`` with *nested*, else the title, the category
-    and the embedding."""
+    and the embedding, and the number ``n`` (1 to 6) with *numbered*."""
     statements = []
     for number, (record_id, title, category, embedding, (lon, lat)) in enumerate(_CORPUS, start=1):
         if only is not None and record_id not in only:
@@ -2560,6 +2584,8 @@ def _seed_statements(table: str, *, doc: bool = False, nested: bool = False, onl
             columns = f"title = '{title}', category = '{category}', embedding = {embedding}"
         if doc:
             columns += f", n = {number}, summary = {embedding}, loc = ({lon}, {lat})"
+        elif numbered:
+            columns += f", n = {number}"
         statements.append(f"CREATE {table}:{record_id} SET {columns};")
     return " ".join(statements)
 
@@ -2883,3 +2909,830 @@ class TestCombinationsE2E:
         assert _ids(nearest) == ["d6", "d4"]
         assert count == 3
         assert sent == [], "the reads inside using() never reach the connection 'vec'"
+
+
+# === Below SurrealDB 3: every condition next to a KNN selected first in a LET; the search annotations ================
+
+#: K9: an id subquery only next to the KNN — the same statement on every line.
+_K9 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); (SELECT *, vector::distance::knn() AS "
+    "_knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f1 ORDER BY _knn_distance) };"
+)
+#: K10: a comparison and a function lookup next to the KNN, in the form for SurrealDB 3.x.
+_K10 = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE category = $_f0 AND ((title).is_string() AND "
+    "string::starts_with(title, $_f1)) AND embedding <|2,100|> $_f2 ORDER BY _knn_distance;"
+)
+#: K11: K10's queryset in the form below SurrealDB 3, both conditions in the LET.
+_K11 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0 AND ((title).is_string() AND "
+    "string::starts_with(title, $_f1))); (SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN "
+    "$_sq0 AND embedding <|2,100|> $_f2 ORDER BY _knn_distance) };"
+)
+#: K11b: K2's queryset (a plain comparison) in the form below SurrealDB 3.
+_K11B = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, vector::distance::knn() AS "
+    "_knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|3,40|> $_f1 ORDER BY _knn_distance) };"
+)
+#: K14: a Q OR group and an exact scan, in the form below SurrealDB 3.
+_K14 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE (category = $_f0 OR category = $_f1)); (SELECT *, "
+    "vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,COSINE|> $_f2 ORDER BY "
+    "_knn_distance) };"
+)
+#: K17: search() next to the KNN (K16, ``_SEARCH_KNN``) in the form below SurrealDB 3.
+_K17 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); (SELECT *, vector::distance::knn() AS "
+    "_knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f1 ORDER BY _knn_distance) };"
+)
+#: K18: a search score next to the KNN, in the form for SurrealDB 3.x.
+_K18 = (
+    "SELECT *, search::score(0) AS s, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE title @0@ $_f0 AND "
+    "embedding <|2,100|> $_f1 ORDER BY _knn_distance;"
+)
+#: K18b: K18's queryset as exists() compiles it — below SurrealDB 3 without the search projection, and on 3.x.
+_K18B = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); (SELECT *, vector::distance::knn() AS "
+    "_knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f1 ORDER BY _knn_distance LIMIT 1) };"
+)
+_K18B_3X = (
+    "SELECT *, search::score(0) AS s, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE title @0@ $_f0 AND "
+    "embedding <|2,100|> $_f1 ORDER BY _knn_distance LIMIT 1;"
+)
+#: A Subquery holding similar_to() and a condition (K8 with filter(category="tech") inside), in either form.
+_K8_TECH = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0 AND embedding <|2,100|> $_f1); (SELECT * FROM "
+    "vec_doc WHERE id IN $_sq0) };"
+)
+_K8_TECH_PREFILTERED = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE "
+    "id IN $_sq0 AND embedding <|2,100|> $_f1); (SELECT * FROM vec_doc WHERE id IN $_sq1) };"
+)
+#: An outer queryset scoring its own search() while a Subquery filter holds the KNN, in the form below SurrealDB 3.
+_SCORED_OUTER_PREFILTERED = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE "
+    "id IN $_sq0 AND embedding <|2,100|> $_f1); (SELECT *, search::score(0) AS s FROM vec_doc WHERE id IN $_sq1 AND "
+    "title @0@ $_f2) };"
+)
+#: A view model's form below SurrealDB 3: the LET's ids are matched as id__in matches them on a view (v0.32.0).
+_VIEW_PREFILTERED = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_view WHERE category = $_f0); (SELECT *, vector::distance::knn() AS "
+    "_knn_distance FROM vec_view WHERE $_sq0 CONTAINS id AND embedding <|2,100|> $_f1 ORDER BY _knn_distance) };"
+)
+_VIEW_BY_IDS = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, vector::distance::knn() AS "
+    "_knn_distance FROM vec_view WHERE $_sq0 CONTAINS id AND embedding <|2,100|> $_f1 ORDER BY _knn_distance) };"
+)
+#: The read the missing-table test sends first, then again with the subquery's table bound to [].
+_MISSING_FIRST = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f1); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE "
+    "category = $_f0); (SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND id IN "
+    "$_sq1 AND embedding <|2,100|> $_f2 ORDER BY _knn_distance) };"
+)
+_MISSING_AGAIN = (
+    "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, "
+    "vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND id IN $_sq1 AND embedding <|2,100|> "
+    "$_f1 ORDER BY _knn_distance) };"
+)
+
+_VS1 = (
+    "similar_to() cannot be combined with {} on SurrealDB 2.x or the embedded engine: there the ORM selects the "
+    "full-text matches first, so the vector search holds no match to score, highlight or locate. Keep search() as a "
+    "condition, or use SurrealDB 3.x."
+)
+_SR2 = "annotate(): {} needs search(): SurrealDB scores, highlights and locates the fields search() matches."
+
+
+class VecRanked(BaseSurrealModel):
+    """The six records with indexed columns next to the vector index: SurrealDB 2.x answers a KNN next to a condition
+    on an indexed column wrongly, so the ORM selects those records first."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_ranked",
+        indexes=[
+            Index("vec_ranked_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("vec_ranked_n", "n", unique=True),
+            Index("vec_ranked_category", "category"),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    hit: bool = False
+    embedding: VectorField[3]
+
+
+class VecOwner(BaseSurrealModel):
+    """The owner of a ``VecOwned`` record: a condition through a record link."""
+
+    model_config = SurrealConfigDict(table_name="vec_owner")
+
+    id: str | None = None
+    team: str = ""
+
+
+class VecOwned(BaseSurrealModel):
+    """Six vectors, each linked to its owner."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_owned",
+        indexes=[Index("vec_owned_embedding", "embedding", hnsw=True, dimension=3, dist="cosine")],
+    )
+
+    id: str | None = None
+    embedding: VectorField[3]
+    owner: VecOwner | RecordID | None = None
+
+
+class VecView(BaseSurrealModel):
+    """A materialized view over ``vec_doc``, searched with ``similar_to()``."""
+
+    model_config = SurrealConfigDict(table_name="vec_view", view_query="SELECT title, category, embedding FROM vec_doc")
+
+    id: RecordID | None = None
+    title: str = ""
+    category: str = ""
+    embedding: list[float] | None = None
+
+
+#: The owner of each ``vec_owned`` record, d1 to d6.
+_OWNERS = {"d1": "a", "d2": "a", "d3": "a", "d4": "b", "d5": "a", "d6": "b"}
+
+
+async def _seed_ranked(client: Any) -> None:
+    """``VecRanked``'s indexes applied (``define_indexes()``), then its six records (``n`` 1 to 6)."""
+    await VecRanked.define_indexes()
+    await _apply_ddl(client, _seed_statements("vec_ranked", numbered=True))
+
+
+async def _seed_owned(client: Any) -> None:
+    """``VecOwned``'s index applied, then the owners ``a`` (team ``x``) and ``b`` (``y``) and the six records."""
+    await VecOwned.define_indexes()
+    owned = [f"CREATE vec_owned:{i} SET embedding = {_EMBEDDINGS[i]}, owner = vec_owner:{o};" for i, o in _OWNERS.items()]
+    await _apply_ddl(client, " ".join(["CREATE vec_owner:a SET team = 'x';", "CREATE vec_owner:b SET team = 'y';", *owned]))
+
+
+def _compiled(queryset: Any, *, knn_prefilter: bool = False, **kwargs: Any) -> tuple[tuple[str, dict[str, Any]], Any]:
+    """*queryset*'s statement compiled with a new compiler (``knn_prefilter`` given), and that compiler."""
+    compiler = queryset._subquery_compiler(knn_prefilter=knn_prefilter)
+    return queryset._compile_query(subqueries=compiler, **kwargs), compiler
+
+
+def _k10() -> Any:
+    """K10's queryset: a comparison and a function lookup next to the KNN."""
+    return VecDoc.objects().filter(category="pets", title__startswith="Cats").similar_to("embedding", _Q, 2)
+
+
+def _k9() -> Any:
+    """K9's queryset: an id subquery only next to the KNN."""
+    return VecDoc.objects().filter(id__in=Subquery(VecDoc.objects().search(title="cats"))).similar_to("embedding", _Q, 2)
+
+
+def _k8_tech() -> Any:
+    """K8's queryset, its ``Subquery`` holding ``similar_to()`` next to ``filter(category="tech")``."""
+    inner = VecDoc.objects().filter(category="tech").similar_to("embedding", _Q, 2)
+    return VecDoc.objects().filter(id__in=Subquery(inner))
+
+
+class _LineClient:
+    """The client a unit test's read acquires: nothing may be sent through it."""
+
+    async def query(self, *args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a statement reached the client")
+
+    async def query_raw(self, *args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a statement reached the client")
+
+    async def version(self) -> str:
+        pytest.fail("the line was read past time_travel.cached_major()")
+
+
+def _line_answers(monkeypatch: pytest.MonkeyPatch, major: int) -> list[Any]:
+    """Every read acquires one ``_LineClient``, and ``time_travel.cached_major()`` answers *major*: returns the clients
+    it was awaited for, in order."""
+    client = _LineClient()
+    reads: list[Any] = []
+
+    async def get_client(*args: Any, **kwargs: Any) -> Any:
+        return client
+
+    async def cached_major(line_client: Any) -> int:
+        reads.append(line_client)
+        return major
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+    monkeypatch.setattr(time_travel, "cached_major", cached_major)
+    return reads
+
+
+def _executed(monkeypatch: pytest.MonkeyPatch, queryset: Any, rows: Any = None) -> list[tuple[str, dict[str, Any]]]:
+    """Replace *queryset*'s ``_execute_query`` with a fake recording each ``(query, variables)``: it raises
+    ``_MissingSubqueryTable`` for the greatest table of a non-empty ``subquery_tables``, else returns *rows*
+    (``[]`` by default)."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def execute(query: str, variables: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        calls.append((query, dict(variables or {})))
+        tables = kwargs.get("subquery_tables", frozenset())
+        if tables:
+            raise _MissingSubqueryTable(max(tables))
+        return [] if rows is None else rows
+
+    monkeypatch.setattr(queryset, "_execute_query", execute)
+    return calls
+
+
+class _VersionClient:
+    """A client whose ``version()`` answers *version* and counts its calls."""
+
+    def __init__(self, version: str) -> None:
+        self.answer = version
+        self.calls = 0
+
+    async def version(self) -> str:
+        self.calls += 1
+        return self.answer
+
+
+class _SlottedClient:
+    """A client that cannot be weakly referenced."""
+
+    __slots__ = ("calls",)
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def version(self) -> str:
+        self.calls += 1
+        return "surrealdb-2.7.0"
+
+
+class TestPrefilter:
+    """Below SurrealDB 3 every condition AND-ed with the KNN but an id subquery is selected first, in a ``LET`` of the
+    statement, and the KNN searches the ids it holds; SurrealDB 3.x gets the conditions inline. The compiler records
+    whether the statement needs the line (``knn_conditions``) and compiles the form below 3 on ``knn_prefilter``. The
+    line is read once per client (``time_travel.cached_major()``), and decided once per read."""
+
+    @pytest.mark.parametrize("part", ["id IN $_sq0", "id IN $_sq12", "$_sq1 CONTAINS id"])
+    def test_an_id_subquery_part(self, part: str) -> None:
+        assert vector.id_subquery_part(part) is True
+
+    @pytest.mark.parametrize(
+        "part",
+        [
+            "id IN $_f0",
+            "(id IN $_sq0)",
+            "category = $_f0",
+            "id IN $_sq0 OR n = $_f1",
+            "title @0@ $_f0",
+            "owner.id IN $_sq0",
+            "ID IN $_sq0",
+            "",
+        ],
+    )
+    def test_not_an_id_subquery_part(self, part: str) -> None:
+        assert vector.id_subquery_part(part) is False
+
+    def test_k10_the_3x_form(self) -> None:
+        statement, compiler = _compiled(_k10())
+        assert statement == (_K10, {"_f0": "pets", "_f1": "Cats", "_f2": [1.0, 0.0, 0.0]})
+        assert compiler.knn_conditions is True
+        assert compiler.knn_prefilter is False
+
+    def test_k11_every_condition_in_the_let(self) -> None:
+        statement, compiler = _compiled(_k10(), knn_prefilter=True)
+        assert statement == (_K11, {"_f0": "pets", "_f1": "Cats", "_f2": [1.0, 0.0, 0.0]})
+        assert compiler.knn_prefilter is True
+        assert compiler.tables == set()
+
+    def test_k11b_a_plain_comparison(self) -> None:
+        def k2() -> Any:
+            return VecDoc.objects().filter(category="news").similar_to("embedding", [1, 0, 0], 3, ef=40)
+
+        variables = {"_f0": "news", "_f1": [1.0, 0.0, 0.0]}
+        inline, compiler = _compiled(k2())
+        assert inline == (_K2, variables)
+        assert compiler.knn_conditions is True
+        assert _compiled(k2(), knn_prefilter=True)[0] == (_K11B, variables)
+
+    @pytest.mark.parametrize("knn_prefilter", [False, True])
+    def test_k11c_an_id_subquery_only(self, knn_prefilter: bool) -> None:
+        statement, compiler = _compiled(_k9(), knn_prefilter=knn_prefilter)
+        assert statement == (_K9, {"_f0": "cats", "_f1": [1.0, 0.0, 0.0]})
+        assert compiler.knn_conditions is False
+
+    @pytest.mark.parametrize("knn_prefilter", [False, True])
+    def test_similar_to_alone_needs_no_line(self, knn_prefilter: bool) -> None:
+        statement, compiler = _compiled(VecDoc.objects().similar_to("embedding", _Q, 2), knn_prefilter=knn_prefilter)
+        assert statement == (_K1, {"_f0": [1.0, 0.0, 0.0]})
+        assert compiler.knn_conditions is False
+
+    def test_k13_nearby_needs_the_line(self) -> None:
+        statement, compiler = _compiled(VecDoc.objects().nearby("loc", (0.0, 0.0), 1000).similar_to("embedding", _Q, 2))
+        assert statement[0] == _K13
+        assert compiler.knn_conditions is True
+
+    def test_k14_a_q_or_group(self) -> None:
+        queryset = (
+            VecDoc.objects().filter(Q(category="tech") | Q(category="news")).similar_to("embedding", _Q, 2, dist="cosine")
+        )
+        assert _compiled(queryset, knn_prefilter=True)[0] == (
+            _K14,
+            {"_f0": "tech", "_f1": "news", "_f2": [1.0, 0.0, 0.0]},
+        )
+
+    @pytest.mark.parametrize("knn_first", [False, True], ids=["search-then-similar_to", "similar_to-then-search"])
+    def test_k16_and_k17_search(self, knn_first: bool) -> None:
+        def k16() -> Any:
+            if knn_first:
+                return VecDoc.objects().similar_to("embedding", _Q2, 2).search(title="cats")
+            return VecDoc.objects().search(title="cats").similar_to("embedding", _Q2, 2)
+
+        variables = {"_f0": "cats", "_f1": [0.0, 1.0, 0.0]}
+        inline, compiler = _compiled(k16())
+        assert inline == (_SEARCH_KNN, variables)
+        assert compiler.knn_conditions is True
+        assert _compiled(k16(), knn_prefilter=True)[0] == (_K17, variables)
+
+    def test_a_view_model(self) -> None:
+        variables = {"_f0": "tech", "_f1": [1.0, 0.0, 0.0]}
+        compared = VecView.objects().filter(category="tech").similar_to("embedding", _Q, 2)
+        assert _compiled(compared, knn_prefilter=True)[0] == (_VIEW_PREFILTERED, variables)
+        by_ids = VecView.objects().filter(id__in=Subquery(VecDoc.objects().filter(category="tech")))
+        for knn_prefilter in (False, True):
+            statement, compiler = _compiled(by_ids.similar_to("embedding", _Q, 2), knn_prefilter=knn_prefilter)
+            assert statement == (_VIEW_BY_IDS, variables)
+            assert compiler.knn_conditions is False
+
+    def test_a_subquery_holding_similar_to_and_a_condition(self) -> None:
+        variables = {"_f0": "tech", "_f1": [1.0, 0.0, 0.0]}
+        inline, compiler = _compiled(_k8_tech())
+        assert inline == (_K8_TECH, variables)
+        assert compiler.knn_conditions is True
+        assert compiler.tables == {"vec_doc"}
+        assert _compiled(_k8_tech(), knn_prefilter=True)[0] == (_K8_TECH_PREFILTERED, variables)
+
+    def test_without_a_compiler_the_knn_is_inline(self) -> None:
+        parts, variables, counter = _k10()._where_parts()
+        assert parts == [
+            "category = $_f0",
+            "((title).is_string() AND string::starts_with(title, $_f1))",
+            "embedding <|2,100|> $_f2",
+        ]
+        assert (variables, counter) == ({"_f0": "pets", "_f1": "Cats", "_f2": [1.0, 0.0, 0.0]}, 3)
+        assert _k10()._build_where()[0] == " WHERE " + " AND ".join(parts)
+
+    def test_the_compiler_defaults(self) -> None:
+        compiler = SubqueryCompiler()
+        assert (compiler.knn_prefilter, compiler.knn_conditions) == (False, False)
+        assert VecDoc.objects()._subquery_compiler().knn_prefilter is False
+
+    async def test_cached_major_reads_each_client_once(self) -> None:
+        newer, older = _VersionClient("surrealdb-3.3.4"), _VersionClient("surrealdb-2.7.0")
+        assert [await time_travel.cached_major(newer) for _ in range(3)] == [3, 3, 3]
+        assert [await time_travel.cached_major(older) for _ in range(2)] == [2, 2]
+        assert (newer.calls, older.calls) == (1, 1)
+
+    async def test_cached_major_reads_a_client_without_weak_references_every_time(self) -> None:
+        client = _SlottedClient()
+        assert [await time_travel.cached_major(client) for _ in range(2)] == [2, 2]
+        assert client.calls == 2
+
+    async def test_cached_major_of_an_unreadable_version(self) -> None:
+        assert await time_travel.cached_major(_VersionClient("unknown")) == 3
+
+    async def test_the_line_is_decided_once_per_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        ranked = Subquery(VecRanked.objects().filter(n__gt=2))
+        queryset = VecDoc.objects().filter(category="tech", id__in=ranked).similar_to("embedding", _Q, 2)
+        executed = _executed(monkeypatch, queryset)
+        assert await queryset.exec() == []
+        assert executed == [
+            (_MISSING_FIRST, {"_f0": "tech", "_f1": 2, "_f2": [1.0, 0.0, 0.0]}),
+            (_MISSING_AGAIN, {"_f0": "tech", "_f1": [1.0, 0.0, 0.0]}),
+        ]
+        assert len(reads) == 1
+
+    async def test_the_3x_line_sends_the_inline_form(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 3)
+        queryset = _k10()
+        executed = _executed(monkeypatch, queryset)
+        assert await queryset.count() == 0
+        assert await queryset.exec() == []
+        assert [query for query, _ in executed] == [
+            "SELECT count() FROM vec_doc WHERE category = $_f0 AND ((title).is_string() AND string::starts_with(title, "
+            "$_f1)) AND embedding <|2,100|> $_f2 GROUP ALL;",
+            _K10,
+        ]
+        assert len(reads) == 2
+
+    async def test_no_line_without_a_condition(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        for queryset in (VecDoc.objects().similar_to("embedding", _Q, 2), _k9(), VecDoc.objects().filter(category="x")):
+            _executed(monkeypatch, queryset)
+            await queryset.exec()
+        assert reads == []
+
+
+def _scored(*annotations: tuple[str, Any], annotate_first: bool = False) -> Any:
+    """K18's queryset: ``search(title="cats")``, ``similar_to("embedding", _Q2, 2)`` and *annotations*
+    (``s=SearchScore(0)`` by default), ``annotate()`` called last or first."""
+    given = dict(annotations or [("s", SearchScore(0))])
+    searched = VecDoc.objects().search(title="cats")
+    if annotate_first:
+        return searched.annotate(**given).similar_to("embedding", _Q2, 2)
+    return searched.similar_to("embedding", _Q2, 2).annotate(**given)
+
+
+def _programming() -> Any:
+    """``search(title="programming").similar_to("embedding", _Q2, 2).annotate(s=SearchScore(0))``."""
+    return VecDoc.objects().search(title="programming").similar_to("embedding", _Q2, 2).annotate(s=SearchScore(0))
+
+
+#: The variables of ``_programming()``'s statements.
+_PROGRAMMING = {"_f0": "programming", "_f1": [0.0, 1.0, 0.0]}
+
+
+class _ReadTx:
+    """A transaction that records what reaches it and answers every read with one record."""
+
+    def __init__(self) -> None:
+        self.reads: list[tuple[str, dict[str, Any]]] = []
+        self.added: list[tuple[str, Any]] = []
+
+    @property
+    def is_interactive(self) -> bool:
+        return True
+
+    async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        self.reads.append((sql, dict(variables or {})))
+        return [{"id": "vec_doc:d3"}]
+
+    async def add(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        self.added.append((sql, variables))
+        return []
+
+
+class _RecordingClient:
+    """A client that records every call and answers each query with no rows."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    async def query(self, statement: str, variables: Any = None) -> Any:
+        self.calls.append(("query", (statement, variables)))
+        return []
+
+    async def version(self) -> str:
+        self.calls.append(("version", None))
+        return "surrealdb-2.7.0"
+
+
+class TestSearchAnnotationsWithKnn:
+    """The search annotations of a ``similar_to()`` queryset: projected next to the distance in the form for
+    SurrealDB 3.x; refused when the form below 3 compiles (``exec()``, ``first()`` and ``get()`` without an id), after
+    the line is read and before anything is sent, queued or cached; left out by ``exists()``, which answers on every
+    line. A queryset without its own ``similar_to()`` compiles as before."""
+
+    @pytest.mark.parametrize("annotate_first", [False, True])
+    def test_k18_the_3x_form(self, annotate_first: bool) -> None:
+        statement, compiler = _compiled(_scored(annotate_first=annotate_first))
+        assert statement == (_K18, {"_f0": "cats", "_f1": [0.0, 1.0, 0.0]})
+        assert compiler.knn_conditions is True
+
+    @pytest.mark.parametrize("annotation", _SEARCH_ANNOTATIONS, ids=lambda a: type(a).__name__)
+    @pytest.mark.parametrize("annotate_first", [False, True])
+    def test_k18_vs1_below_3(self, annotation: Any, annotate_first: bool) -> None:
+        queryset = _scored(("a", annotation), annotate_first=annotate_first)
+        compiler = queryset._subquery_compiler(knn_prefilter=True)
+        text = _raised(SurrealDbError, queryset._compile_query, subqueries=compiler)
+        assert text == _VS1.format(type(annotation).__name__)
+        assert compiler.lets == []
+
+    def test_vs1_names_the_first_annotation_in_alias_order(self) -> None:
+        queryset = _scored(("h", SearchHighlight("<b>", "</b>", 0)), ("s", SearchScore(0)))
+        compiler = queryset._subquery_compiler(knn_prefilter=True)
+        assert _raised(SurrealDbError, queryset._compile_query, subqueries=compiler) == _VS1.format("SearchHighlight")
+
+    def test_k18b_below_3(self) -> None:
+        variables = {"_f0": "cats", "_f1": [0.0, 1.0, 0.0]}
+        assert _compiled(_scored().limit(1), knn_prefilter=True, for_exists=True)[0] == (_K18B, variables)
+        highlighted = _scored(("h", SearchHighlight("<b>", "</b>", 0))).limit(1)
+        assert _compiled(highlighted, knn_prefilter=True, for_exists=True)[0] == (_K18B, variables)
+
+    def test_k18b_on_3x(self) -> None:
+        flagged = _compiled(_scored().limit(1), for_exists=True)[0]
+        assert flagged == (_K18B_3X, {"_f0": "cats", "_f1": [0.0, 1.0, 0.0]})
+        assert flagged == _compiled(_scored().limit(1))[0]
+
+    @pytest.mark.parametrize("knn_prefilter", [False, True])
+    def test_the_flag_changes_nothing_without_similar_to(self, knn_prefilter: bool) -> None:
+        def annotated() -> Any:
+            searched = VecDoc.objects().search(title="programming").limit(1)
+            return searched.annotate(s=SearchScore(0), h=SearchHighlight("<b>", "</b>", 0))
+
+        flagged = _compiled(annotated(), knn_prefilter=knn_prefilter, for_exists=True)[0]
+        assert flagged == _compiled(annotated(), knn_prefilter=knn_prefilter)[0]
+        assert flagged[0] == (
+            "SELECT *, search::score(0) AS s, search::highlight($_sh0, $_sh1, 0) AS h FROM vec_doc WHERE title @0@ $_f0 "
+            "LIMIT 1;"
+        )
+
+    def test_sr2_comes_first_with_the_flag(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q2, 2).annotate(s=SearchScore(0))
+        compiler = queryset._subquery_compiler(knn_prefilter=True)
+        text = _raised(ValueError, queryset._compile_query, subqueries=compiler, for_exists=True)
+        assert text == _SR2.format("SearchScore(0)")
+
+    def test_an_outer_search_next_to_a_subquery_knn(self) -> None:
+        outer = (
+            VecDoc.objects()
+            .search(title="programming")
+            .annotate(s=SearchScore(0))
+            .filter(id__in=Subquery(VecDoc.objects().filter(category="tech").similar_to("embedding", _Q, 2)))
+        )
+        assert _compiled(outer, knn_prefilter=True)[0] == (
+            _SCORED_OUTER_PREFILTERED,
+            {"_f0": "tech", "_f1": [1.0, 0.0, 0.0], "_f2": "programming"},
+        )
+
+    async def test_exists_without_similar_to_sends_v035s_statement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _RecordingClient()
+
+        async def get_client(*args: Any, **kwargs: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        assert await VecDoc.objects().search(title="programming").annotate(s=SearchScore(0)).exists() is False
+        assert client.calls == [
+            ("query", ("SELECT *, search::score(0) AS s FROM vec_doc WHERE title @0@ $_f0 LIMIT 1;", {"_f0": "programming"}))
+        ]
+
+    @pytest.mark.parametrize("method", ["exec", "first", "get"])
+    async def test_below_3_exec_first_and_get_raise_vs1(self, method: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        queryset = _programming()
+        executed = _executed(monkeypatch, queryset)
+        with pytest.raises(SurrealDbError) as raised:
+            await getattr(queryset, method)()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _VS1.format("SearchScore")
+        assert executed == []
+        assert len(reads) == 1
+        assert queryset._limit is None
+
+    async def test_below_3_exists_answers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        queryset = _programming()
+        executed = _executed(monkeypatch, queryset, [{"id": "vec_doc:d3"}])
+        assert await queryset.exists() is True
+        assert executed == [(_K18B, _PROGRAMMING)]
+        assert len(reads) == 1
+        assert queryset._limit is None
+
+    async def test_on_3x_exec_and_exists_send_the_inline_form(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 3)
+        queryset = _programming()
+        executed = _executed(monkeypatch, queryset, [])
+        assert await queryset.exec() == []
+        assert await queryset.exists() is False
+        assert executed == [(_K18, _PROGRAMMING), (_K18B_3X, _PROGRAMMING)]
+        assert len(reads) == 2
+
+    @pytest.mark.usefixtures("empty_cache")
+    async def test_below_3_with_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        queryset = _programming().cache(ttl=30)
+        executed = _executed(monkeypatch, queryset, [{"id": "vec_doc:d3"}])
+        keyed: list[str] = []
+
+        async def cached_read(kind: str, statement: str, variables: Any, tables: Any, any_table: bool, run: Any) -> Any:
+            keyed.append(statement)
+            return await run()
+
+        monkeypatch.setattr(queryset, "_cached_read", cached_read)
+        with pytest.raises(SurrealDbError) as raised:
+            await queryset.exec()
+        assert str(raised.value) == _VS1.format("SearchScore")
+        assert (keyed, executed, QueryCache.stats()["entries"]) == ([], [], 0)
+        assert await queryset.exists() is True
+        assert keyed == [_K18B]
+        assert executed == [(_K18B, _PROGRAMMING)]
+        assert len(reads) == 2
+
+    async def test_below_3_in_a_transaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        tx = _ReadTx()
+        queryset = VecDoc.objects(tx=tx).search(title="programming").similar_to("embedding", _Q2, 2)
+        queryset = queryset.annotate(s=SearchScore(0))
+        with pytest.raises(SurrealDbError) as raised:
+            await queryset.exec()
+        assert str(raised.value) == _VS1.format("SearchScore")
+        assert (tx.reads, tx.added) == ([], [])
+        assert await queryset.exists() is True
+        assert tx.reads == [(_K18B, _PROGRAMMING)]
+        assert tx.added == []
+        assert len(reads) == 2
+
+
+class TestPrefilterE2E:
+    """``similar_to()`` next to every kind of condition, on every engine: the same records on every line — SurrealDB
+    3.x gets the conditions inline, SurrealDB 2.x and the embedded engine the ``LET`` form (the spy shows each) —, the
+    line read once per client and only for a statement with such a condition."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(
+        ("condition", "expected"),
+        [
+            (lambda qs: qs.filter(category="tech"), ["d4", "d3"]),
+            (lambda qs: qs.filter(title__startswith="Cats"), ["d1", "d2"]),
+            (lambda qs: qs.filter(Q(category="tech") | Q(category="news")), ["d6", "d4"]),
+            (lambda qs: qs.filter(~Q(category="pets")), ["d6", "d4"]),
+            (lambda qs: qs.nearby("loc", (0.0, 0.0), 3000), ["d1", "d6"]),
+        ],
+        ids=["a-comparison", "a-function", "a-q-or-group", "a-negated-q", "nearby"],
+    )
+    async def test_a_condition(self, kind: str, condition: Any, expected: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            queryset = condition(VecDoc.objects()).similar_to("embedding", _Q, 2)
+            statement = _compiled(queryset, knn_prefilter=major < 3)[0][0]
+            calls = _spy(monkeypatch, client)
+            docs = await queryset.exec()
+            sent = _calls(calls)
+            exact = await condition(VecDoc.objects()).similar_to("embedding", _Q, 2, dist="cosine").exec()
+        assert sent == [("version", None), *_query(statement)]
+        assert statement.startswith("{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE ") == (major < 3)
+        assert _ids(docs) == expected
+        assert _distances(docs) == pytest.approx([_cosine(i) for i in expected], rel=1e-5)
+        assert _ids(exact) == expected
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_search(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            line = await _line(client)
+            calls = _spy(monkeypatch, client)
+            docs = await VecDoc.objects().search(title="cats").similar_to("embedding", _Q2, 2).exec()
+            sent = _calls(calls)
+            exact = await VecDoc.objects().search(title="cats").similar_to("embedding", _Q2, 2, dist="cosine").exec()
+            nearest = await VecDoc.objects().search(title="cats").similar_to("embedding", _Q2, 1, dist="cosine").exec()
+        assert sent == [("version", None), *_query(_K17 if line[0] < 3 else _SEARCH_KNN)]
+        if line == (3, 1):
+            # README row "similar_to() and search() in one queryset": 3.1 answers every match, with no distance.
+            assert sorted(_ids(docs)) == ["d1", "d2", "d6"]
+            assert _distances(docs) == [None, None, None]
+        else:
+            assert _ids(docs) == ["d6", "d2"]
+            assert _distances(docs) == pytest.approx([_cosine(i, _Q2) for i in ("d6", "d2")], rel=1e-5)
+        assert _ids(exact) == ["d6", "d2"]
+        assert _distances(exact) == pytest.approx([_cosine(i, _Q2) for i in ("d6", "d2")], rel=1e-9)
+        assert _ids(nearest) == ["d6"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_line_is_read_once_and_only_for_a_condition(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            calls = _spy(monkeypatch, client)
+            plain = await VecDoc.objects().filter(category="tech").exec()
+            alone = await VecDoc.objects().similar_to("embedding", _Q, 2).exec()
+            by_ids = await _k9().exec()
+            before = _calls(calls)
+            tech = await VecDoc.objects().filter(category="tech").similar_to("embedding", _Q, 2).exec()
+            count = await VecDoc.objects().filter(title__startswith="Cats").similar_to("embedding", _Q, 2).count()
+            versions = [call for call in _calls(calls) if call[0] == "version"]
+        assert before == [*_query("SELECT * FROM vec_doc WHERE category = $_f0;"), *_query(_K1), *_query(_K9)]
+        assert sorted(_ids(plain)) == ["d3", "d4"]
+        assert _ids(alone) == ["d1", "d2"]
+        assert _ids(by_ids) == ["d1", "d2"]
+        assert _ids(tech) == ["d4", "d3"]
+        assert count == 2
+        assert versions == [("version", None)]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("dist", [None, "cosine"])
+    @pytest.mark.parametrize(
+        ("condition", "expected"),
+        [({"n__gt": 2}, ["d6", "d4"]), ({"category": "tech"}, ["d4", "d3"])],
+        ids=["n__gt", "category"],
+    )
+    async def test_an_indexed_column(
+        self, kind: str, dist: str | None, condition: dict[str, Any], expected: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+            major = await _major(client)
+            queryset = VecRanked.objects().filter(**condition).similar_to("embedding", _Q, 2, dist=dist)
+            statement = _compiled(queryset, knn_prefilter=major < 3)[0][0]
+            calls = _spy(monkeypatch, client)
+            docs = await queryset.exec()
+            sent = _calls(calls)
+        assert sent == [("version", None), *_query(statement)]
+        assert statement.startswith("{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE ") == (major < 3)
+        assert _ids(docs) == expected
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_groups_exists_and_count_through_the_let(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+
+            def nearest() -> Any:
+                return VecRanked.objects().filter(n__gt=2).similar_to("embedding", _Q, 2)
+
+            groups = await nearest().values("category").annotate(c=Count()).exec()
+            exists = await nearest().exists()
+            count = await nearest().count()
+            exact = await VecRanked.objects().filter(n__gt=2).similar_to("embedding", _Q, 2, dist="cosine").count()
+        assert sorted(groups, key=lambda row: row["category"]) == [{"category": "news", "c": 1}, {"category": "tech", "c": 1}]
+        assert (exists, count, exact) == (True, 2, 2)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("dist", [None, "cosine"])
+    async def test_a_linked_record_s_field(self, kind: str, dist: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_owned(client)
+            major = await _major(client)
+            queryset = VecOwned.objects().filter(**{"owner.team": "x"}).similar_to("embedding", _Q, 2, dist=dist)
+            statement = _compiled(queryset, knn_prefilter=major < 3)[0][0]
+            calls = _spy(monkeypatch, client)
+            docs = await queryset.exec()
+            sent = _calls(calls)
+        assert sent == [("version", None), *_query(statement)]
+        assert statement.startswith("{ LET $_sq0 = (SELECT VALUE id FROM vec_owned WHERE owner.team = $_f0); ") == (major < 3)
+        assert _ids(docs) == ["d1", "d2"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_subquery_holding_similar_to_and_a_condition(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            docs = await _k8_tech().exec()
+            count = await _k8_tech().count()
+        assert sorted(_ids(docs)) == ["d3", "d4"]
+        assert count == 2
+
+
+#: The search annotations of the E2E case: the score, the highlight and the offsets of ``search()``'s first field.
+_ANN = {"s": SearchScore(0), "h": SearchHighlight("<b>", "</b>", 0), "o": SearchOffsets(0)}
+
+
+def _annotated_knn(dist: str | None = None) -> Any:
+    """``search(title="programming")`` with ``similar_to("embedding", _Q2, 2)`` and ``_ANN``: the matches d3, d4."""
+    return VecDoc.objects().search(title="programming").similar_to("embedding", _Q2, 2, dist=dist).annotate(**_ANN)
+
+
+class TestSearchAnnotationsWithKnnE2E:
+    """The search annotations next to ``similar_to()``, on every engine: on SurrealDB 3.x each of the nearest matches
+    carries the score, highlight and offsets the plain search gives it; below 3 ``exec()``, ``first()`` and a cached
+    read refuse them before any statement is sent, while ``exists()`` and ``count()`` answer."""
+
+    @pytest.mark.usefixtures("empty_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_annotations(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            line = await _line(client)
+            plain = {str(doc.id): doc for doc in await VecDoc.objects().search(title="programming").annotate(**_ANN).exec()}
+            if line[0] >= 3:
+                docs = await _annotated_knn().exec()
+                exact = await _annotated_knn("cosine").exec()
+                exists = await _annotated_knn().exists()
+                count = await _annotated_knn().count()
+            else:
+                calls = _spy(monkeypatch, client)
+                refused = []
+                for read in (lambda: _annotated_knn().exec(), lambda: _annotated_knn().first()):
+                    with pytest.raises(SurrealDbError) as raised:
+                        await read()
+                    refused.append(str(raised.value))
+                with pytest.raises(SurrealDbError) as raised:
+                    await _annotated_knn().cache(ttl=30).exec()
+                refused.append(str(raised.value))
+                before = _calls(calls)
+                entries = QueryCache.stats()["entries"]
+                exists = await _annotated_knn().exists()
+                sent = _calls(calls)[len(before) :]
+                count = await _annotated_knn().count()
+        assert sorted(plain) == ["d3", "d4"]
+        assert (exists, count) == (True, 2)
+        if line[0] < 3:
+            assert refused == [_VS1.format("SearchScore")] * 3
+            assert before == [("version", None)], "the line is read, then nothing is sent"
+            assert entries == 0
+            assert sent == _query(_K18B)
+            return
+        if line == (3, 1):
+            # README row "similar_to() and search() in one queryset": 3.1's index search gives no distance.
+            assert sorted(_ids(docs)) == ["d3", "d4"]
+            assert _distances(docs) == [None, None]
+        else:
+            assert _ids(docs) == ["d3", "d4"]
+            assert _distances(docs) == pytest.approx([0.0, _cosine("d4", _Q2)], rel=1e-5)
+        assert _ids(exact) == ["d3", "d4"]
+        assert _distances(exact) == pytest.approx([0.0, _cosine("d4", _Q2)], rel=1e-9)
+        for doc in [*docs, *exact]:
+            same = plain[str(doc.id)]
+            assert doc.s == pytest.approx(same.s)
+            assert (doc.h, doc.o) == (same.h, same.o)
