@@ -86,6 +86,7 @@ import math
 import os
 import pickle
 import re
+import traceback
 from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -114,6 +115,7 @@ from surreal_orm_lite import (
     SurrealDbNotFoundError,
     Transaction,
     search,
+    transaction,
 )
 from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyzer, parse_define_index
 from surreal_orm_lite.functions import normalize_function_name
@@ -1639,6 +1641,73 @@ class TestAnalyzerManagerApi:
         assert body.__surreal_cache_writes__ is True
         assert body.__surreal_routed__ == "current"
         assert not hasattr(vars(SurrealDBConnectionManager)["remove_analyzer"].__func__, "__surreal_cache_writes__")
+
+
+# --- a missing full-text index in a transaction's reason ------------------------------------------------------------
+
+#: A search text no error the ORM raises may show: 3.x quotes the bound search text in its missing-index error.
+_SECRET = "secret words"
+
+#: SurrealDB 3.3's missing-index error for a ``LET`` subquery's search of ``slug``, which has no full-text index.
+_NO_INDEX_3X = f"There was no suitable index supporting the expression: slug @0@ '{_SECRET}'"
+
+#: What the transaction layer keeps of it: the expression cut after its operator.
+_NO_INDEX_REASON = "There was no suitable index supporting the expression: slug @0@"
+
+
+def _shown(exc: BaseException, text: str) -> list[str]:
+    """Where *exc* shows *text*: its ``str()``, its ``repr()`` and its formatted traceback (chained errors included)."""
+    shown = {"str": str(exc), "repr": repr(exc), "traceback": "".join(traceback.format_exception(exc))}
+    return [where for where, value in shown.items() if text in value]
+
+
+class TestTransactionReason:
+    """A failed statement's reason in a transaction names the column a search lacks an index for and the operator,
+    never the search text SurrealDB 3.x quotes after them; every other reason is unchanged."""
+
+    def test_the_value_is_cut_after_the_operator(self) -> None:
+        assert transaction._server_reason(_NO_INDEX_3X) == (_NO_INDEX_REASON, [])
+        dotted = "There was no suitable index supporting the expression: meta.headline @1@ $_f0"
+        assert transaction._server_reason(dotted) == (
+            "There was no suitable index supporting the expression: meta.headline @1@",
+            [],
+        )
+
+    def test_an_expression_without_an_operator_is_cut_after_expression(self) -> None:
+        message = f"There was no suitable index supporting the expression: slug '{_SECRET}'"
+        assert transaction._server_reason(message) == ("There was no suitable index supporting the expression", [])
+
+    def test_a_failed_statement_hides_the_server_text(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            Transaction.raise_for_status({"result": [{"status": "ERR", "result": _NO_INDEX_3X}]})
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Transaction failed and rolled back: {_NO_INDEX_REASON}"
+        assert _shown(raised.value, _SECRET) == []
+        assert raised.value.__cause__ is None
+        assert raised.value.__suppress_context__
+        assert str(raised.value.__context__) == _NO_INDEX_3X
+
+    def test_a_refused_query_hides_the_server_text(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            Transaction.raise_for_status({"error": {"code": -32000, "message": _NO_INDEX_3X}})
+        assert str(raised.value) == f"Transaction failed: the server refused the query: {_NO_INDEX_REASON}"
+        assert _shown(raised.value, _SECRET) == []
+        assert str(raised.value.__context__) == _NO_INDEX_3X
+
+    def test_the_other_reasons_are_unchanged(self) -> None:
+        plain = "Database record `fts_article:a1` already exists"
+        assert transaction._server_reason(plain) == (plain, [])
+        with pytest.raises(SurrealDbError) as raised:
+            Transaction.raise_for_status({"result": [{"status": "ERR", "result": plain}]})
+        assert str(raised.value) == f"Transaction failed and rolled back: {plain}"
+        assert raised.value.__context__ is None
+        assert not raised.value.__suppress_context__
+        excerpt = "Parse error: Unexpected token `a strand`, expected Eof\n --> [1:7]\n  |\n1 | SELEC 'x' FRM t;\n"
+        assert transaction._server_reason(excerpt) == ("Parse error: Unexpected token `a strand`, expected Eof", [(1, 7)])
+        with pytest.raises(SurrealDbError) as parsed:
+            Transaction.raise_for_status({"result": [{"status": "ERR", "result": excerpt}]})
+        assert str(parsed.value) == "Transaction failed and rolled back: Parse error: Unexpected token `a strand`, expected Eof"
+        assert str(parsed.value.__context__) == excerpt
 
 
 # === E2E: the connection "fts" on the database fts_db, over WebSocket and HTTP, and mem:// =========================
