@@ -27,7 +27,8 @@ list.
   (``checked_count()``).
 
 ``hnsw_clause()`` and ``knn_condition()`` are pure renderers, and check what they write again: a value outside these
-rules raises rather than reaching a statement.
+rules raises rather than reaching a statement. ``KnnSearch`` is one ``similar_to()`` of a queryset once checked, and
+the texts of its refusals are here, each naming the field or the model, never the statement nor the vector.
 
 The module sits low in the package: it imports neither ``search``, ``model_base``, ``query_set`` nor
 ``connection_manager``, so each of them can import it.
@@ -35,6 +36,7 @@ The module sits low in the package: it imports neither ``search``, ``model_base`
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from numbers import Real
 from typing import Annotated, Any, NoReturn, Self, TypedDict, get_args, get_origin
@@ -43,6 +45,8 @@ from pydantic import Field, GetCoreSchemaHandler, GetJsonSchemaHandler
 from pydantic.fields import FieldInfo
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import core_schema
+
+from .utils import VALID_FIELD_PATTERN, validate_field_name
 
 __all__ = ["VectorField", "Vector", "get_vector_info", "is_vector_field"]
 
@@ -369,6 +373,23 @@ def checked_query_vector(value: object) -> list[float]:
     return floats
 
 
+def checked_knn_field(value: object) -> str:
+    """The ``field`` of ``similar_to()``: a field name or a dotted path, as ``validate_field_name()`` checks one,
+    matched in full (its pattern's ``$`` accepts a trailing newline, which this refuses with the same text).
+
+    A non-``str`` raises ``TypeError``; a ``str`` that is not a field name ``ValueError``.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"similar_to() takes a field name (str), not {type(value).__name__}.")
+    validate_field_name(value, "similar_to field")
+    if VALID_FIELD_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"Invalid similar_to field name '{value}': must contain only alphanumeric characters, underscores, and "
+            "dots (for nested fields), and start with a letter or underscore"
+        )
+    return value
+
+
 def checked_limit(value: object) -> int:
     """The ``limit`` of ``similar_to()`` — ``K``, the number of neighbours —, an ``int`` (not a ``bool``) from 1 to
     ``MAX_K``. Another type raises ``TypeError``, a value out of range ``ValueError``."""
@@ -427,3 +448,56 @@ def knn_condition(column: str, k: int, ef: int | None, dist: str | None, variabl
     if candidates is not None:
         raise ValueError("knn_condition() takes ef or dist, not both.")
     return f"{column} <|{limit},{checked_distance(dist, subject='similar_to()')}|> ${variable}"
+
+
+# --- the query side -------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class KnnSearch:
+    """One ``similar_to()`` of a queryset, its arguments checked: what its KNN condition writes and binds.
+
+    ``field`` is the field as the caller gave it (the refusals name it), ``column`` the column it is stored under, the
+    one the condition names; ``vector`` the query vector as floats (a ``tuple``, so the value is hashable; it is bound
+    as a ``list``); ``k`` the ``limit``; ``ef`` the HNSW search's candidate list as given (``None``: ``DEFAULT_EF``), or
+    ``dist`` the distance of an exact scan (one of ``DISTANCES``) — never both.
+    """
+
+    field: str
+    column: str
+    vector: tuple[float, ...]
+    k: int
+    ef: int | None
+    dist: str | None
+
+    def condition(self, variable: str) -> str:
+        """The KNN condition, the query vector bound as ``$<variable>`` (``knn_condition()``)."""
+        return knn_condition(self.column, self.k, self.ef, self.dist, variable)
+
+
+def field_refused(field: str, *, endpoint: bool) -> str:
+    """The refusal of ``similar_to()`` on *field*, the record id — or an edge endpoint when *endpoint*."""
+    what = "an edge endpoint" if endpoint else "the record id"
+    return f"similar_to() compares vectors: {field!r} is {what}, not a vector field."
+
+
+def distance_attribute_refused(model: str) -> str:
+    """The refusal of ``similar_to()`` on a model (named *model*) that defines ``_knn_distance`` itself: the distance
+    would replace it on the instances."""
+    return f"similar_to() sets each record's distance as {DISTANCE_ALIAS}, which {model} defines; rename that attribute."
+
+
+def ef_and_dist_refused() -> str:
+    """The refusal of ``similar_to()`` given both ``ef`` and ``dist``: an HNSW search or an exact scan, not both."""
+    return "similar_to() takes ef= (the HNSW index's search) or dist= (an exact scan without an index), not both."
+
+
+def dimension_refused(field: str, n: int, d: int, source: str) -> str:
+    """The refusal of a query vector of *n* numbers for *field*, which holds vectors of *d* as *source* declares
+    (``VectorField[d]``, or ``index 'name'``)."""
+    return f"similar_to(): the vector has {n} dimensions; field {field!r} holds vectors of {d} ({source})."
+
+
+def zero_vector_refused() -> str:
+    """The refusal of a zero query vector for a ``COSINE`` search, which has no distance to rank by."""
+    return "similar_to(): a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance."

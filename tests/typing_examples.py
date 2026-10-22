@@ -735,6 +735,13 @@ def vector_index_forms() -> None:
     assert_type(embedding.ddl("typed_vec_doc"), str)
 
 
+def vector_search_forms() -> None:
+    """v0.36.0: ``similar_to()`` returns the queryset, with ``ef=`` (the HNSW search) or ``dist=`` (an exact scan)."""
+    assert_type(QuerySet(TypedVecDoc).similar_to("embedding", [1.0, 0.0, 0.0], 3, ef=40), QuerySet)
+    assert_type(QuerySet(TypedVecDoc).similar_to("embedding", (1.0, 0.0, 0.0), dist="cosine"), QuerySet)
+    assert_type(QuerySet(TypedVecDoc).similar_to("embedding", [1, 0, 0]).filter(title="x"), QuerySet)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""

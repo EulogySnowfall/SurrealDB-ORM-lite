@@ -64,11 +64,27 @@ The engines' own vector DDL, pinned with raw statements (``TestVectorDdlPinsE2E`
 ``F64`` vectors on the embedded engine and ``F32`` on the servers, while the ORM's statement stores ``F32`` everywhere;
 SurrealDB 3.x refuses ``MTREE`` (a parse error), which 2.x and the embedded engine accept; ``HNSW … UNIQUE`` stores a
 plain ``UNIQUE`` index on every engine.
+
+The vector search (``TestSimilarTo``): ``similar_to(field, vector, limit=10, *, ef=None, dist=None)`` checks its
+arguments in a fixed order, each refusal with its exact text and class, before any request and leaving the queryset
+unchanged — the field (a name, not the record id nor an edge endpoint, its model not defining ``_knn_distance``), the
+vector (a list or tuple of finite real numbers, of the field's declared dimension, not a zero vector with ``COSINE``),
+``limit`` and ``ef`` (1 to 10000), ``ef`` or ``dist`` (one of the ORM's distances); a second call replaces the first.
+The statements are pinned: ``<column> <|K,EF|> $_f<N>`` (``EF`` at least ``K``, 100 by default) or
+``<column> <|K,DIST|> $_f<N>`` AND-ed after the other conditions, the vector bound as a ``list[float]``, the distance
+projected as ``_knn_distance`` after the other per-record values, ``ORDER BY _knn_distance`` unless ``order_by()`` is
+given; an aggregation and a ``Subquery`` carry the condition without the distance. ``TestSimilarToE2E`` reads the
+six-record corpus on every engine: the nearest records in order with their distances (the index's metric, or the exact
+scan of ``dist=``), on a field, an aliased field and a dotted path; the distance set on each instance and never
+written back, on an ``extra="allow"`` model too; dicts holding it when a row does not validate; ``first()``, ``get()``
+without an id, ``order_by()``, ``limit()``/``offset()`` over the ``limit`` nearest; an ``ef`` below ``limit`` and the
+largest ``limit``.
 """
 
 import ast
 import contextlib
 import copy
+import math
 import os
 import pickle
 import re
@@ -84,12 +100,16 @@ from pydantic import Field, ValidationError
 import surreal_orm_lite
 from surreal_orm_lite import (
     Analyzer,
+    BaseSurrealEdge,
     BaseSurrealModel,
+    Count,
     DatabaseIntrospector,
     FieldState,
+    GeoDistance,
     Index,
     IndexState,
     PointField,
+    Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     Vector,
@@ -99,6 +119,7 @@ from surreal_orm_lite import (
     vector,
 )
 from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_index, render_kind
+from surreal_orm_lite.utils import validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
 
 _EXPORTS = ["VectorField", "Vector"]
@@ -1894,3 +1915,639 @@ class TestVectorDdlPinsE2E:
         assert info["indexes"] == {"vec_pin_u": "DEFINE INDEX vec_pin_u ON vec_pin FIELDS embedding UNIQUE"}, message
         state = parse_define_index(info["indexes"]["vec_pin_u"])
         assert (state.unique, state.hnsw, state.dimension) == (True, False, None), message
+
+
+# === similar_to(): the KNN, the distance, the order =================================================================
+
+#: The query vector of the corpus's assertions.
+_Q = [1.0, 0.0, 0.0]
+
+
+class VecIndexed(BaseSurrealModel):
+    """A vector index without ``dist`` (its effective metric is ``EUCLIDEAN``) on a field that is not a vector field."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_indexed", indexes=[Index("vec_indexed_embedding", "embedding", hnsw=True, dimension=3)]
+    )
+
+    id: str | None = None
+    embedding: list[float] | None = None
+
+
+class VecShadow(BaseSurrealModel):
+    """A model that defines ``_knn_distance`` itself."""
+
+    model_config = SurrealConfigDict(table_name="vec_shadow")
+
+    id: str | None = None
+    embedding: VectorField[3]
+    _knn_distance: float = 0.0
+
+
+class VecLink(BaseSurrealEdge):
+    """An edge model: its endpoints are not vector fields."""
+
+    model_config = SurrealConfigDict(table_name="vec_link")
+
+    embedding: VectorField[3]
+
+
+#: K1 … K8 and K13, the statements of the read goldens.
+_K1 = "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|2,100|> $_f0 ORDER BY _knn_distance;"
+_K2 = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE category = $_f0 AND embedding <|3,40|> "
+    "$_f1 ORDER BY _knn_distance;"
+)
+_K3 = "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|50,50|> $_f0 ORDER BY _knn_distance;"
+_K4 = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|2,MANHATTAN|> $_f0 ORDER BY "
+    "_knn_distance;"
+)
+_K5 = "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|2,100|> $_f0 ORDER BY n DESC;"
+_K6 = (
+    "SELECT title, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE summary <|10,100|> $_f0 ORDER BY _knn_distance;"
+)
+_K7 = "SELECT count() FROM vec_doc WHERE embedding <|2,100|> $_f0 GROUP ALL;"
+_K8 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE embedding <|2,100|> $_f0); (SELECT * FROM vec_doc WHERE id IN $_sq0) };"
+)
+_K13 = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE (loc.is_point() AND geo::distance(loc, "
+    "$_f0) <= $_f1) AND embedding <|2,100|> $_f2 ORDER BY _knn_distance;"
+)
+
+#: K1's statement with another ``K`` and ``EF``, another order or a page.
+_K1_3 = "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|3,100|> $_f0 ORDER BY _knn_distance;"
+_K1_5_5 = "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|5,5|> $_f0 ORDER BY _knn_distance;"
+_K1_LARGEST_LIMIT = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|10000,10000|> $_f0 ORDER BY "
+    "_knn_distance;"
+)
+_K1_LARGEST_EF = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|1,10000|> $_f0 ORDER BY _knn_distance;"
+)
+_K1_FARTHEST = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|2,100|> $_f0 ORDER BY "
+    "_knn_distance DESC;"
+)
+_K1_PAGE = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE embedding <|3,100|> $_f0 ORDER BY "
+    "_knn_distance LIMIT 1 START 1;"
+)
+
+_V4_CONTAINER = "similar_to() takes the vector as a list or tuple of numbers, got {}; convert an array with .tolist()."
+_V7_RANGE = "similar_to() limit must be between 1 and 10000, got {!r}."
+_V8_RANGE = "similar_to() ef must be between 1 and 10000, got {!r}."
+_V9 = "similar_to() takes ef= (the HNSW index's search) or dist= (an exact scan without an index), not both."
+_V11 = "similar_to() sets each record's distance as _knn_distance, which VecShadow defines; rename that attribute."
+_V12 = "similar_to(): a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance."
+
+
+async def _forbidden_client(*args: Any, **kwargs: Any) -> Any:
+    pytest.fail("a client was acquired")
+
+
+@pytest.fixture
+def _no_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No client may be acquired: a refusal comes before any request."""
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+
+
+def _refused_unchanged(error: type[Exception], *args: Any, **kwargs: Any) -> str:
+    """The text of the *error* ``similar_to(*args, **kwargs)`` raises on a ``VecDoc`` queryset that already holds a
+    ``similar_to()``, its class checked exactly; the queryset is checked unchanged after it."""
+    queryset = VecDoc.objects().filter(category="news").similar_to("embedding", _Q, 2)
+    before = (queryset._similar, queryset._compile_query(), set(queryset._link_heads))
+    text = _raised(error, queryset.similar_to, *args, **kwargs)
+    assert (queryset._similar, queryset._compile_query(), set(queryset._link_heads)) == before
+    return text
+
+
+@pytest.mark.usefixtures("_no_client")
+class TestSimilarTo:
+    """``similar_to()`` checks every argument in a fixed order — the field (V1–V3), the model (V11), the vector (V4,
+    V5), ``limit`` (V7), ``ef`` (V8), ``ef`` with ``dist`` (V9), ``dist`` (V10), the declared dimension (V6), a zero
+    vector with ``COSINE`` (V12) — each refusal with its exact text and class, before any request, the queryset left
+    unchanged; a second call replaces the first. The statements it compiles (K1–K8, K13) are pinned exactly."""
+
+    @pytest.mark.parametrize(("field", "kind"), [(3, "int"), (None, "NoneType"), (b"embedding", "bytes")])
+    def test_v1_a_field_that_is_not_a_str(self, field: object, kind: str) -> None:
+        assert _refused_unchanged(TypeError, field, _Q) == f"similar_to() takes a field name (str), not {kind}."
+
+    @pytest.mark.parametrize("field", ["a b", "meta..vec", "1embedding", "embedding;", "", " "])
+    def test_v2_a_field_that_is_not_a_name(self, field: str) -> None:
+        assert _refused_unchanged(ValueError, field, _Q) == _raised(ValueError, validate_field_name, field, "similar_to field")
+
+    def test_v2_the_name_is_matched_in_full(self) -> None:
+        # validate_field_name()'s pattern accepts a trailing newline; similar_to() refuses it with the same text.
+        assert _refused_unchanged(ValueError, "embedding\n", _Q) == (
+            "Invalid similar_to field name 'embedding\n': must contain only alphanumeric characters, underscores, and "
+            "dots (for nested fields), and start with a letter or underscore"
+        )
+
+    def test_v3_the_record_id(self) -> None:
+        assert _refused_unchanged(ValueError, "id", _Q) == (
+            "similar_to() compares vectors: 'id' is the record id, not a vector field."
+        )
+
+    @pytest.mark.parametrize("field", ["in_", "in", "out"])
+    def test_v3_an_edge_endpoint(self, field: str) -> None:
+        queryset = VecLink.objects().similar_to("embedding", _Q, 2)
+        before = queryset._compile_query()
+        assert _raised(ValueError, queryset.similar_to, field, _Q) == (
+            f"similar_to() compares vectors: {field!r} is an edge endpoint, not a vector field."
+        )
+        assert queryset._compile_query() == before
+
+    def test_v11_a_model_defining_the_distance_attribute(self) -> None:
+        assert _raised(ValueError, VecShadow.objects().similar_to, "embedding", _Q) == _V11
+        # V11 comes before the vector's checks.
+        assert _raised(ValueError, VecShadow.objects().similar_to, "embedding", []) == _V11
+
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            ({"x": 1.0}, _V4_CONTAINER.format("dict")),
+            ("1,0,0", _V4_CONTAINER.format("str")),
+            (None, _V4_CONTAINER.format("NoneType")),
+            ([True, 0.0, 0.0], "similar_to(): vector item 0 is bool, not a number."),
+            ([1.0, "0", 0.0], "similar_to(): vector item 1 is str, not a number."),
+        ],
+    )
+    def test_v4_the_vector_and_its_items(self, value: object, text: str) -> None:
+        assert _refused_unchanged(TypeError, "embedding", value) == text
+
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            ([], "similar_to(): the vector is empty."),
+            ((), "similar_to(): the vector is empty."),
+            ([1.0, math.nan, 0.0], "similar_to(): vector item 1 is not finite (nan)."),
+            ([1.0, 0.0, math.inf], "similar_to(): vector item 2 is not finite (inf)."),
+        ],
+    )
+    def test_v5_an_empty_vector_or_an_item_not_finite(self, value: object, text: str) -> None:
+        assert _refused_unchanged(ValueError, "embedding", value) == text
+
+    @pytest.mark.parametrize(("limit", "kind"), [(True, "bool"), ("3", "str"), (2.0, "float"), (None, "NoneType")])
+    def test_v7_a_limit_that_is_not_an_int(self, limit: object, kind: str) -> None:
+        assert _refused_unchanged(TypeError, "embedding", _Q, limit) == f"similar_to() limit must be an int, got {kind}."
+
+    @pytest.mark.parametrize("limit", [0, -1, 10_001, 2**32])
+    def test_v7_a_limit_out_of_range(self, limit: int) -> None:
+        assert _refused_unchanged(ValueError, "embedding", _Q, limit) == _V7_RANGE.format(limit)
+
+    @pytest.mark.parametrize(("ef", "kind"), [(True, "bool"), ("40", "str"), (40.0, "float")])
+    def test_v8_an_ef_that_is_not_an_int(self, ef: object, kind: str) -> None:
+        assert (
+            _refused_unchanged(TypeError, "embedding", _Q, 2, ef=ef) == f"similar_to() ef must be an int or None, got {kind}."
+        )
+
+    @pytest.mark.parametrize("ef", [0, -1, 10_001, 2**32])
+    def test_v8_an_ef_out_of_range(self, ef: int) -> None:
+        assert _refused_unchanged(ValueError, "embedding", _Q, 2, ef=ef) == _V8_RANGE.format(ef)
+
+    def test_the_largest_limit_and_ef_are_accepted(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 10_000)
+        assert queryset._compile_query()[0] == _K1_LARGEST_LIMIT
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 1, ef=10_000)
+        assert queryset._compile_query()[0] == _K1_LARGEST_EF
+
+    def test_v9_ef_and_dist(self) -> None:
+        assert _refused_unchanged(ValueError, "embedding", _Q, 2, ef=40, dist="cosine") == _V9
+        # V8 comes first, V10 after.
+        assert _refused_unchanged(ValueError, "embedding", _Q, 2, ef=0, dist="cosine") == _V8_RANGE.format(0)
+        assert _refused_unchanged(ValueError, "embedding", _Q, 2, ef=40, dist="jaccard") == _V9
+
+    @pytest.mark.parametrize(
+        ("dist", "error", "text"),
+        [
+            (3, TypeError, "similar_to(): dist= must be a str, got int."),
+            (
+                "hamming2",
+                ValueError,
+                "similar_to(): unknown distance 'hamming2'; the ORM's are EUCLIDEAN, COSINE, MANHATTAN, CHEBYSHEV and HAMMING.",
+            ),
+            (
+                "minkowski",
+                ValueError,
+                "similar_to(): MINKOWSKI needs its order, which this version does not write; use EUCLIDEAN (order 2) or "
+                "MANHATTAN (order 1).",
+            ),
+            (
+                "Jaccard",
+                ValueError,
+                "similar_to(): JACCARD is not a distance SurrealDB ranks by: identical vectors are not the nearest with "
+                "it. Use COSINE.",
+            ),
+            (
+                "PEARSON",
+                ValueError,
+                "similar_to(): PEARSON is not a distance SurrealDB ranks by: identical vectors are not the nearest with "
+                "it. Use COSINE.",
+            ),
+        ],
+    )
+    def test_v10_a_distance_the_orm_does_not_write(self, dist: object, error: type[Exception], text: str) -> None:
+        assert _refused_unchanged(error, "embedding", _Q, 2, dist=dist) == text
+
+    @pytest.mark.parametrize(
+        ("dist", "condition"),
+        [
+            ("euclidean", "embedding <|2,EUCLIDEAN|> $_f0"),
+            ("COSINE", "embedding <|2,COSINE|> $_f0"),
+            ("Manhattan", "embedding <|2,MANHATTAN|> $_f0"),
+            ("chebyshev", "embedding <|2,CHEBYSHEV|> $_f0"),
+            ("hamming", "embedding <|2,HAMMING|> $_f0"),
+        ],
+    )
+    def test_v10_every_distance_in_any_case(self, dist: str, condition: str) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 2, dist=dist)
+        assert queryset._where_parts() == ([condition], {"_f0": [1.0, 0.0, 0.0]}, 1)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "text"),
+        [
+            (
+                "embedding",
+                [1.0, 0.0],
+                "similar_to(): the vector has 2 dimensions; field 'embedding' holds vectors of 3 (VectorField[3]).",
+            ),
+            (
+                "summary_vec",
+                [1.0, 0.0, 0.0, 0.0],
+                "similar_to(): the vector has 4 dimensions; field 'summary_vec' holds vectors of 3 (VectorField[3]).",
+            ),
+            (
+                "summary",
+                [1.0],
+                "similar_to(): the vector has 1 dimensions; field 'summary' holds vectors of 3 (index 'vec_doc_summary').",
+            ),
+        ],
+    )
+    def test_v6_the_declared_dimension(self, field: str, value: list[float], text: str) -> None:
+        assert _refused_unchanged(ValueError, field, value) == text
+
+    def test_v6_an_index_on_a_field_that_is_not_a_vector_field(self) -> None:
+        assert _raised(ValueError, VecIndexed.objects().similar_to, "embedding", [1.0, 0.0]) == (
+            "similar_to(): the vector has 2 dimensions; field 'embedding' holds vectors of 3 (index 'vec_indexed_embedding')."
+        )
+
+    def test_v6_nothing_declared(self) -> None:
+        queryset = VecDoc.objects().similar_to("meta.vec", [1.0, 0.0])
+        assert queryset._compile_query()[0] == (
+            "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE meta.vec <|10,100|> $_f0 ORDER BY "
+            "_knn_distance;"
+        )
+
+    def test_the_limit_then_the_dimension_then_the_zero_vector(self) -> None:
+        assert _refused_unchanged(ValueError, "embedding", [1.0], 0) == _V7_RANGE.format(0)
+        assert _refused_unchanged(ValueError, "embedding", [0.0, 0.0], 2, dist="cosine") == (
+            "similar_to(): the vector has 2 dimensions; field 'embedding' holds vectors of 3 (VectorField[3])."
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "value", "dist"),
+        [
+            ("embedding", [0.0, 0.0, 0.0], None),
+            ("embedding", [0, -0.0, Decimal(0)], None),
+            ("summary_vec", [0.0, 0.0, 0.0], "cosine"),
+            ("meta.vec", [0.0], "COSINE"),
+        ],
+    )
+    def test_v12_a_zero_vector_with_cosine(self, field: str, value: list[float], dist: str | None) -> None:
+        assert _refused_unchanged(ValueError, field, value, 2, dist=dist) == _V12
+
+    @pytest.mark.parametrize(
+        ("model", "field", "dist"),
+        [
+            (VecDoc, "embedding", "euclidean"),
+            (VecDoc, "summary_vec", None),
+            (VecDoc, "meta.vec", None),
+            (VecIndexed, "embedding", None),
+        ],
+    )
+    def test_a_zero_vector_without_cosine(self, model: type[BaseSurrealModel], field: str, dist: str | None) -> None:
+        queryset = model.objects().similar_to(field, [0.0, 0.0, 0.0], 2, dist=dist)
+        assert queryset._compile_query()[1] == {"_f0": [0.0, 0.0, 0.0]}
+
+    def test_a_second_call_replaces_the_first(self) -> None:
+        queryset = VecDoc.objects().similar_to("summary_vec", [0.0, 1.0, 0.0], 5, dist="hamming")
+        assert queryset.similar_to("embedding", _Q, 2) is queryset
+        assert queryset._compile_query() == (_K1, {"_f0": [1.0, 0.0, 0.0]})
+        assert queryset._similar == vector.KnnSearch("embedding", "embedding", (1.0, 0.0, 0.0), 2, None, None)
+
+    def test_the_search_held(self) -> None:
+        queryset = VecDoc.objects().similar_to("summary_vec", (1, Decimal("0.5"), Fraction(1, 4)), 3, ef=40)
+        assert queryset._similar == vector.KnnSearch("summary_vec", "summary", (1.0, 0.5, 0.25), 3, 40, None)
+        assert {type(item) for item in queryset._similar.vector} == {float}
+        with pytest.raises(AttributeError):
+            queryset._similar.k = 4  # type: ignore[misc]
+        hash(queryset._similar)
+
+    def test_k1(self) -> None:
+        assert VecDoc.objects().similar_to("embedding", [1.0, 0.0, 0.0], 2)._compile_query() == (
+            _K1,
+            {"_f0": [1.0, 0.0, 0.0]},
+        )
+
+    def test_k2_the_vector_bound_as_floats(self) -> None:
+        query, variables = (
+            VecDoc.objects().filter(category="news").similar_to("embedding", [1, 0, 0], 3, ef=40)._compile_query()
+        )
+        assert (query, variables) == (_K2, {"_f0": "news", "_f1": [1.0, 0.0, 0.0]})
+        assert type(variables["_f1"]) is list
+        assert {type(item) for item in variables["_f1"]} == {float}
+
+    def test_k3_ef_raised_to_the_limit(self) -> None:
+        assert VecDoc.objects().similar_to("embedding", _Q, 50, ef=10)._compile_query()[0] == _K3
+
+    def test_k4_an_exact_scan(self) -> None:
+        assert VecDoc.objects().similar_to("embedding", _Q, 2, dist="manhattan")._compile_query()[0] == _K4
+
+    def test_k5_order_by_replaces_the_default_order(self) -> None:
+        assert VecDoc.objects().similar_to("embedding", _Q, 2).order_by("-n")._compile_query()[0] == _K5
+        assert VecDoc.objects().order_by("-n").similar_to("embedding", _Q, 2)._compile_query()[0] == _K5
+        assert VecDoc.objects().similar_to("embedding", _Q, 2).order_by("-_knn_distance")._compile_query()[0] == (_K1_FARTHEST)
+
+    def test_k6_a_selection_and_an_aliased_field(self) -> None:
+        assert VecDoc.objects().select("title").similar_to("summary_vec", _Q)._compile_query() == (
+            _K6,
+            {"_f0": [1.0, 0.0, 0.0]},
+        )
+
+    def test_k7_an_aggregation_projects_no_distance(self) -> None:
+        assert VecDoc.objects().similar_to("embedding", _Q, 2)._compile_aggregation_query("count()") == (
+            _K7,
+            {"_f0": [1.0, 0.0, 0.0]},
+        )
+
+    def test_a_group_projects_no_distance(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 2).values("category").annotate(c=Count())
+        assert queryset._compile_group_by_query() == (
+            "SELECT category, count() AS c FROM vec_doc WHERE embedding <|2,100|> $_f0 GROUP BY category;",
+            {"_f0": [1.0, 0.0, 0.0]},
+        )
+
+    def test_k8_a_subquery(self) -> None:
+        inner = VecDoc.objects().similar_to("embedding", _Q, 2)
+        assert VecDoc.objects().filter(id__in=Subquery(inner))._compile_query() == (_K8, {"_f0": [1.0, 0.0, 0.0]})
+
+    def test_k13_after_nearby(self) -> None:
+        queryset = VecDoc.objects().nearby("loc", (0.0, 0.0), 1000).similar_to("embedding", _Q, 2)
+        query, variables = queryset._compile_query()
+        assert query == _K13
+        assert (variables["_f1"], variables["_f2"]) == (1000.0, [1.0, 0.0, 0.0])
+
+    def test_the_distance_after_the_geo_distances(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 2).annotate(away=GeoDistance("loc", (0.0, 0.0)))
+        assert queryset._compile_query()[0] == (
+            "SELECT *, IF loc.is_point() THEN geo::distance(loc, $_gd0) END AS away, vector::distance::knn() AS "
+            "_knn_distance FROM vec_doc WHERE embedding <|2,100|> $_f0 ORDER BY _knn_distance;"
+        )
+
+    def test_limit_and_offset_page_the_nearest(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 3).limit(1).offset(1)
+        assert queryset._compile_query()[0] == _K1_PAGE
+
+    def test_the_where_without_a_compiler(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 2)
+        assert queryset._build_where() == (" WHERE embedding <|2,100|> $_f0", {"_f0": [1.0, 0.0, 0.0]})
+        assert queryset._where_parts() == (["embedding <|2,100|> $_f0"], {"_f0": [1.0, 0.0, 0.0]}, 1)
+        filtered = VecDoc.objects().filter(category="news").similar_to("embedding", _Q, 3, ef=40)
+        assert filtered._where_parts() == (
+            ["category = $_f0", "embedding <|3,40|> $_f1"],
+            {"_f0": "news", "_f1": [1.0, 0.0, 0.0]},
+            2,
+        )
+        assert filtered._where_parts(5)[0] == ["category = $_f5", "embedding <|3,40|> $_f6"]
+
+    def test_a_dotted_path_records_its_link_head(self) -> None:
+        queryset = VecDoc.objects().similar_to("meta.vec", [1.0, 0.0], 2)
+        assert queryset._link_heads == {"meta"}
+        assert queryset._similar is not None and queryset._similar.column == "meta.vec"
+
+
+# The six records of the corpus: id, title, category, embedding (also the summary and the nested vector), point.
+_CORPUS = [
+    ("d1", "Cats and dogs", "pets", [1.0, 0.0, 0.0], (0.0, 0.0)),
+    ("d2", "Cats at home", "pets", [0.9, 0.1, 0.0], (50.0, 50.0)),
+    ("d3", "Rust programming", "tech", [0.0, 1.0, 0.0], (0.01, 0.01)),
+    ("d4", "Python programming", "tech", [0.1, 0.9, 0.0], (0.02, 0.0)),
+    ("d5", "Gardening", "home", [0.0, 0.0, 1.0], (10.0, 10.0)),
+    ("d6", "Cats and code", "news", [0.5, 0.5, 0.0], (0.0, 0.02)),
+]
+_EMBEDDINGS = {record_id: embedding for record_id, _, _, embedding, _ in _CORPUS}
+
+
+def _cosine(record_id: str, query: Sequence[float] = _Q) -> float:
+    """The ``COSINE`` distance of *record_id*'s embedding from *query*, in double precision."""
+    vector_ = _EMBEDDINGS[record_id]
+    dot = sum(a * b for a, b in zip(vector_, query, strict=True))
+    return 1.0 - dot / (math.sqrt(sum(a * a for a in vector_)) * math.sqrt(sum(b * b for b in query)))
+
+
+def _euclidean(record_id: str, query: Sequence[float] = _Q) -> float:
+    """The ``EUCLIDEAN`` distance of *record_id*'s embedding from *query*, in double precision."""
+    return math.dist(_EMBEDDINGS[record_id], query)
+
+
+def _seed_statements(table: str, *, doc: bool = False, nested: bool = False) -> str:
+    """The ``CREATE`` of the six records in *table* (constants of these tests): ``VecDoc``'s every column with *doc*,
+    the embedding under ``meta.vec`` with *nested*, else the title, the category and the embedding."""
+    statements = []
+    for number, (record_id, title, category, embedding, (lon, lat)) in enumerate(_CORPUS, start=1):
+        if nested:
+            columns = f"meta = {{ vec: {embedding} }}"
+        else:
+            columns = f"title = '{title}', category = '{category}', embedding = {embedding}"
+        if doc:
+            columns += f", n = {number}, summary = {embedding}, loc = ({lon}, {lat})"
+        statements.append(f"CREATE {table}:{record_id} SET {columns};")
+    return " ".join(statements)
+
+
+async def _seed(client: Any) -> None:
+    """``VecDoc``'s indexes applied (``define_indexes()``), then its six records."""
+    await VecDoc.define_indexes()
+    await _apply_ddl(client, _seed_statements("vec_doc", doc=True))
+
+
+class VecExtra(BaseSurrealModel):
+    """An ``extra="allow"`` model with a vector index."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_extra",
+        extra="allow",
+        indexes=[Index("vec_extra_embedding", "embedding", hnsw=True, dimension=3, dist="cosine")],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    embedding: VectorField[3]
+
+
+class VecNested(BaseSurrealModel):
+    """A schemaless model whose vectors sit in an object: the index is defined by hand on ``meta.vec``."""
+
+    model_config = SurrealConfigDict(table_name="vec_nested")
+
+    id: str | None = None
+    meta: dict[str, Any] | None = None
+
+
+#: The index of ``VecNested``, written by hand.
+_NESTED_INDEX = "DEFINE INDEX vec_nested_vec ON vec_nested FIELDS meta.vec HNSW DIMENSION 3 DIST EUCLIDEAN TYPE F32;"
+
+
+def _ids(records: Sequence[Any]) -> list[str]:
+    """The record ids of *records*, instances or dicts, in order."""
+    return [str(record["id"] if isinstance(record, dict) else record.id) for record in records]
+
+
+def _distances(records: Sequence[Any]) -> list[Any]:
+    """The ``_knn_distance`` of each of *records*, in order."""
+    return [record["_knn_distance"] if isinstance(record, dict) else record._knn_distance for record in records]
+
+
+class TestSimilarToE2E:
+    """``similar_to()`` on the six-record corpus, on every engine (the line under test over WebSocket and HTTP, and the
+    embedded engine): the nearest records in order with their distances — the index's metric and storage type, or the
+    exact scan of ``dist=`` —, on a field, an aliased field and a dotted path; the distance set on each instance and
+    never written back, on an ``extra="allow"`` model too; dicts holding it when a row does not validate; ``first()``,
+    ``get()`` without an id, ``order_by()``, ``limit()``/``offset()`` over the nearest; an ``ef`` below ``limit`` still
+    returns ``limit`` records; the largest ``limit`` returns the table."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_nearest_in_order_with_their_distances(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            calls = _spy(monkeypatch, client)
+            nearest = await VecDoc.objects().similar_to("embedding", _Q, 3).exec()
+            sent = _calls(calls)
+            monkeypatch.undo()
+            summary = await VecDoc.objects().similar_to("summary_vec", _Q, 3).exec()
+            every = await VecDoc.objects().similar_to("embedding", _Q, 6).exec()
+            ten = await VecDoc.objects().similar_to("embedding", _Q, 10).exec()
+        assert sent == _query(_K1_3)
+        assert all(isinstance(doc, VecDoc) for doc in nearest)
+        assert _ids(nearest) == ["d1", "d2", "d6"]
+        assert _distances(nearest) == pytest.approx([_cosine(i) for i in ("d1", "d2", "d6")], rel=1e-5)
+        assert _ids(summary) == ["d1", "d2", "d6"]
+        assert _distances(summary) == pytest.approx([_euclidean(i) for i in ("d1", "d2", "d6")], rel=1e-5)
+        assert _ids(every)[:4] == ["d1", "d2", "d6", "d4"]
+        assert sorted(_ids(every)[4:]) == ["d3", "d5"]
+        assert _distances(every) == pytest.approx([_cosine(i) for i in _ids(every)], rel=1e-5)
+        assert sorted(_ids(ten)) == ["d1", "d2", "d3", "d4", "d5", "d6"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_dist_is_an_exact_scan(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            euclidean = await VecDoc.objects().similar_to("embedding", _Q, 3, dist="euclidean").exec()
+            cosine = await VecDoc.objects().similar_to("embedding", _Q, 4, dist="cosine").exec()
+        assert _ids(euclidean) == ["d1", "d2", "d6"]
+        assert _distances(euclidean) == pytest.approx([0.0, math.sqrt(0.02), math.sqrt(0.5)], rel=1e-12)
+        assert _ids(cosine) == ["d1", "d2", "d6", "d4"]
+        assert _distances(cosine) == pytest.approx([_cosine(i) for i in ("d1", "d2", "d6", "d4")], rel=1e-9)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_distance_is_never_written_back(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            doc = (await VecDoc.objects().similar_to("embedding", _Q, 2).exec())[1]
+            assert (doc.id, doc._knn_distance) == ("d2", pytest.approx(_cosine("d2"), rel=1e-5))
+            assert "_knn_distance" not in doc.model_dump()
+            assert "_knn_distance" not in doc.model_dump(mode="json", by_alias=True)
+            # The point is cleared: this module's writes send no value the encoding boundary rewrites.
+            doc.loc = None
+            doc.n = 20
+            await doc.update()
+            updated = await client.query("SELECT * FROM vec_doc:d2;", {})
+            await doc.delete()
+            await doc.save()
+            saved = await client.query("SELECT * FROM vec_doc:d2;", {})
+        for stored in (updated, saved):
+            assert (stored[0]["n"], stored[0]["embedding"]) == (20, [0.9, 0.1, 0.0])
+            assert "_knn_distance" not in stored[0]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_extra_allow_model_never_keeps_the_distance(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await VecExtra.define_indexes()
+            await _apply_ddl(client, _seed_statements("vec_extra"))
+            docs = await VecExtra.objects().values("category").similar_to("embedding", _Q, 2).exec()
+            assert [type(doc) for doc in docs] == [VecExtra, VecExtra]
+            assert _ids(docs) == ["d1", "d2"]
+            assert _distances(docs) == pytest.approx([_cosine("d1"), _cosine("d2")], rel=1e-5)
+            for doc in docs:
+                assert doc.model_extra == {}
+                assert "_knn_distance" not in doc.model_dump()
+            first = docs[0]
+            first.title = "Cats and dogs, again"
+            await first.update()
+            updated = await client.query("SELECT * FROM vec_extra:d1;", {})
+            await first.delete()
+            await first.save()
+            saved = await client.query("SELECT * FROM vec_extra:d1;", {})
+        for stored in (updated, saved):
+            assert stored[0]["title"] == "Cats and dogs, again"
+            assert sorted(stored[0]) == ["category", "embedding", "id", "title"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_rows_that_do_not_validate_are_dicts_holding_the_distance(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            rows = await VecDoc.objects().select("category").similar_to("embedding", _Q, 2).exec()
+        assert rows == [
+            {"category": "pets", "_knn_distance": pytest.approx(_cosine("d1"), rel=1e-5)},
+            {"category": "pets", "_knn_distance": pytest.approx(_cosine("d2"), rel=1e-5)},
+        ]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_first_get_order_by_and_paging(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            first = await VecDoc.objects().similar_to("embedding", _Q, 3).first()
+            got = await VecDoc.objects().similar_to("embedding", _Q, 1).get()
+            by_n = await VecDoc.objects().similar_to("embedding", _Q, 3).order_by("-n").exec()
+            farthest = await VecDoc.objects().similar_to("embedding", _Q, 3).order_by("-_knn_distance").exec()
+            page = await VecDoc.objects().similar_to("embedding", _Q, 3).limit(1).offset(1).exec()
+        assert (first.id, first._knn_distance) == ("d1", pytest.approx(0.0))
+        assert (got.id, got._knn_distance) == ("d1", pytest.approx(0.0))
+        assert _ids(by_n) == ["d6", "d2", "d1"]
+        assert _distances(by_n) == pytest.approx([_cosine("d6"), _cosine("d2"), 0.0], rel=1e-5)
+        assert _ids(farthest) == ["d6", "d2", "d1"]
+        assert _ids(page) == ["d2"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_ef_below_the_limit_still_returns_limit_records(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            calls = _spy(monkeypatch, client)
+            five = await VecDoc.objects().similar_to("embedding", _Q, 5, ef=1).exec()
+            sent = _calls(calls)
+        assert sent == _query(_K1_5_5)
+        assert len(five) == 5
+        assert len(set(_ids(five))) == 5
+        distances = _distances(five)
+        assert distances == sorted(distances)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_largest_limit_returns_the_table(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            every = await VecDoc.objects().similar_to("embedding", _Q, 10_000).exec()
+        assert sorted(_ids(every)) == ["d1", "d2", "d3", "d4", "d5", "d6"]
+        assert _ids(every)[:4] == ["d1", "d2", "d6", "d4"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_dotted_path(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _apply_ddl(client, _NESTED_INDEX)
+            await _apply_ddl(client, _seed_statements("vec_nested", nested=True))
+            nearest = await VecNested.objects().similar_to("meta.vec", _Q, 3).exec()
+        assert _ids(nearest) == ["d1", "d2", "d6"]
+        assert _distances(nearest) == pytest.approx([_euclidean(i) for i in ("d1", "d2", "d6")], rel=1e-5)
+        assert nearest[0].meta == {"vec": [1.0, 0.0, 0.0]}

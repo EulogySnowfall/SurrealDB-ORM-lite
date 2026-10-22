@@ -18,6 +18,7 @@ from . import routing as _routing
 from . import search as _search
 from . import subquery as _subquery
 from . import time_travel as _time_travel
+from . import vector as _vector
 from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
 from .cache import EDGES, CacheRequest, QueryCache, follows_links, statement_key, ttl_seconds
 from .changefeed import ChangeModelStream, Since
@@ -123,6 +124,8 @@ class QuerySet:
         self._nearby: list[tuple[str, GeometryPoint, float]] = []
         # search() conditions (v0.35.0): field as given, column, text; the match reference is the position.
         self._search: list[tuple[str, str, str]] = []
+        # similar_to() (v0.36.0): the KNN search, checked; one per queryset (a second call replaces the first).
+        self._similar: _vector.KnnSearch | None = None
         self._tx: Any = None
         # as_of() (v0.26.0): the moment a time-travel read is made at, normalised; None reads the current state.
         self._as_of: _time_travel.AsOf | None = None
@@ -596,6 +599,121 @@ class QuerySet:
         self._search.extend((field, self._column(field), text) for field, text in conditions)
         return self
 
+    def similar_to(
+        self,
+        field: str,
+        vector: Sequence[float],
+        limit: int = 10,
+        *,
+        ef: int | None = None,
+        dist: str | None = None,
+    ) -> Self:
+        """Keep the ``limit`` records whose ``field`` vector is nearest to ``vector`` (v0.36.0) — the full
+        SurrealDB-ORM's method.
+
+        ::
+
+            docs = await Document.objects().similar_to("embedding", query_vector, limit=5).exec()
+            for doc in docs:
+                print(doc.title, doc._knn_distance)
+
+            exact = await Document.objects().similar_to("embedding", query_vector, 5, dist="cosine").exec()
+            tech = await Document.objects().filter(category="tech").similar_to("embedding", query_vector, 3).exec()
+
+        SurrealDB's KNN operator, ``<column> <|K,EF|> $vector``: an HNSW search through the field's vector index
+        (``Index(..., hnsw=True, dimension=...)`` declared on the model and applied by ``define_indexes()``; on a field
+        without one it finds no record). With ``dist=`` it is ``<column> <|K,DIST|> $vector`` instead, an exact scan of
+        every record by that distance, which needs no index. The query vector is bound as a query variable, never
+        written into the statement.
+
+        ``exec()``, ``first()`` and ``get()`` without an id return the records nearest first — unless ``order_by()`` is
+        given, which replaces that order (``order_by("-_knn_distance")`` included) — each instance carrying its
+        distance from ``vector`` as ``_knn_distance`` (a ``float``; an ``int`` with ``HAMMING``), which is never written
+        back: ``model_dump()`` and ``save()`` leave it out, on an ``extra="allow"`` model too. Rows that do not validate
+        (a ``select()`` that leaves out a required field) come back as dicts holding it. ``limit()`` and ``offset()``
+        then page through the ``limit`` nearest records.
+
+        HNSW is approximate: SurrealDB explores ``ef`` candidates (100 by default), and the ORM writes ``ef`` raised to
+        ``limit``, so without other conditions every line returns ``limit`` records when the table holds them. With a
+        condition that keeps few records the search can return fewer than ``limit``, more often on SurrealDB 2.x and the
+        embedded engine; ``dist=`` is exact. Distances are computed in the index's storage type (``F32`` by default),
+        ``dist=`` in double precision.
+
+        The other conditions — ``filter()``, ``Q``, ``nearby()``, ``search()`` and a ``Subquery`` filter — select the
+        records first, then the ``limit`` nearest among them are kept: SurrealDB 3.x applies them during the index
+        search; on SurrealDB 2.x and the embedded engine the ORM selects the records matching them first, in a ``LET``
+        of the statement. The search annotations (``SearchScore``, ``SearchHighlight``, ``SearchOffsets``) of a
+        ``search()`` are accepted in either order; on SurrealDB 3.x each of the nearest matches carries the values the
+        plain search gives it, while on SurrealDB 2.x and the embedded engine ``exec()``, ``first()`` and ``get()``
+        without an id refuse them before the statement is sent. ``count()``, the other aggregations, ``exists()`` and
+        ``values()``/``annotate()`` groups count or group the ``limit`` nearest records, with no distance;
+        ``bulk_update()``, ``bulk_delete()`` and ``patch()`` write them, by their ids; a ``Subquery`` of this queryset
+        gives them. ``get(<id>)`` and ``all()`` ignore it, as they ignore ``filter()``. ``as_of()``, ``live()``,
+        ``watch()`` and ``changes()`` refuse it.
+
+        Args:
+            field: A Python field name (an aliased field compiles its column) or a dotted path; not the record id nor,
+                on an edge model, an endpoint.
+            vector: The query vector: a ``list`` or ``tuple`` of real numbers (``int``, ``float``, any
+                ``numbers.Real``, a ``Decimal``; not a ``bool`` nor a ``str``), not empty, each finite — a NumPy array
+                with ``.tolist()``. When the model declares the field's dimension (a ``VectorField[d]`` or
+                ``Vector(d)`` on it, or a vector ``Index`` on its column), exactly ``d`` numbers.
+            limit: ``K``, the number of nearest records kept: an ``int`` from 1 to 10000.
+            ef: The HNSW search's candidate list: ``None`` (100) or an ``int`` from 1 to 10000.
+            dist: An exact scan by this distance instead of the index's search: ``EUCLIDEAN``, ``COSINE``,
+                ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``.
+
+        Returns:
+            Self: The current instance for method chaining. Called again, the last call wins.
+
+        Raises:
+            TypeError: ``field`` is not a ``str``; ``vector`` is not a ``list`` or a ``tuple``, or holds an item that is
+                not a number; ``limit`` or ``ef`` is not an ``int`` (a ``bool`` included); ``dist`` is not a ``str``.
+            ValueError: ``field`` is not a field name or a dotted path, or is the record id or an edge endpoint; the
+                model defines ``_knn_distance``; ``vector`` is empty, holds an item that is not finite, or its length
+                is not the field's declared dimension; ``limit`` or ``ef`` is outside 1 to 10000; both ``ef`` and
+                ``dist``; a distance the ORM does not write; a zero vector with ``COSINE`` (``dist="cosine"``, or no
+                ``dist`` and the field's vector index is ``COSINE``), which has no distance.
+            Each raised before any request, the queryset left unchanged.
+        """
+        _vector.checked_knn_field(field)
+        column = self.model.to_db_field(field)
+        endpoint_columns = self.model._endpoint_columns()
+        if column == RECORD_ID_COLUMN or column in endpoint_columns:
+            raise ValueError(_vector.field_refused(field, endpoint=column in endpoint_columns))
+        if hasattr(self.model, _vector.DISTANCE_ALIAS):
+            raise ValueError(_vector.distance_attribute_refused(self.model.__name__))
+        values = _vector.checked_query_vector(vector)
+        k = _vector.checked_limit(limit)
+        candidates = _vector.checked_ef(ef)
+        if candidates is not None and dist is not None:
+            raise ValueError(_vector.ef_and_dist_refused())
+        distance = None if dist is None else _vector.checked_distance(dist, subject="similar_to()")
+        index = self._vector_index(column)
+        info = self.model.model_fields.get(field)
+        declared = None if info is None else _vector.get_vector_info(info)
+        if declared is not None:
+            dimension, source = declared[0], f"VectorField[{declared[0]}]"
+        elif index is not None:
+            dimension, source = index._hnsw_options()[0], f"index {index.name!r}"
+        else:
+            dimension, source = len(values), ""
+        if len(values) != dimension:
+            raise ValueError(_vector.dimension_refused(field, len(values), dimension, source))
+        metric = distance if distance is not None or index is None else index._hnsw_options()[1]
+        if metric == "COSINE" and all(item == 0.0 for item in values):
+            raise ValueError(_vector.zero_vector_refused())
+        self._similar = _vector.KnnSearch(field, self._column(field), tuple(values), k, candidates, distance)
+        return self
+
+    def _vector_index(self, column: str) -> _search.Index | None:
+        """The vector index the model declares on *column*, or ``None`` (v0.36.0; at most one, checked when the class
+        was defined)."""
+        for index in self.model.get_indexes():
+            if index.hnsw and self.model.to_db_field(index.fields[0]) == column:
+                return index
+        return None
+
     def as_of(self, at: datetime | str | timedelta | Duration | SurrealFunc | None) -> Self:
         """Read the records as they were at a moment: SurrealQL's ``VERSION`` (v0.26.0).
 
@@ -847,14 +965,16 @@ class QuerySet:
     ) -> tuple[list[str], dict[str, Any], int]:
         """The AND-ed conditions of the WHERE clause, their bound values and the next ``$_f<N>`` number.
 
-        Filters, ``Q`` objects, ``nearby()`` and ``search()`` conditions (v0.35.0), in that order, numbered from
-        *counter* on: the outer statement starts at 0, a subquery (v0.27.0) continues the numbering of the statement
-        it goes into. A ``search()`` condition is ``<column> @<ref>@ $_f<N>``, its text bound; the match reference
-        is the condition's position in this queryset, so a subquery's references start again at 0 while its texts
-        continue the statement's numbering. With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record
-        check ``time_travel.GUARD`` is the last condition, after the ``nearby()`` ones (``search()`` never reads at a
-        moment): every other part is a single comparison or a parenthesised group, so the check applies to every row
-        they keep.
+        Filters, ``Q`` objects, ``nearby()`` and ``search()`` conditions (v0.35.0), then the KNN condition of
+        ``similar_to()`` (v0.36.0), in that order, numbered from *counter* on: the outer statement starts at 0, a
+        subquery (v0.27.0) continues the numbering of the statement it goes into. A ``search()`` condition is
+        ``<column> @<ref>@ $_f<N>``, its text bound; the match reference is the condition's position in this queryset,
+        so a subquery's references start again at 0 while its texts continue the statement's numbering. The KNN
+        condition is ``<column> <|K,EF|> $_f<N>`` or ``<column> <|K,DIST|> $_f<N>``, the query vector bound as a
+        ``list[float]``; it comes last, AND-ed at the top level of the ``WHERE``, where SurrealDB requires it. With
+        ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check ``time_travel.GUARD`` is the last
+        condition, after the ``nearby()`` ones (``search()`` never reads at a moment): every other part is a single
+        comparison or a parenthesised group, so the check applies to every row they keep.
 
         Args:
             counter: the first ``$_f<N>`` number.
@@ -906,6 +1026,13 @@ class QuerySet:
             variable = f"_f{counter}"
             parts.append(f"{column} @{reference}@ ${variable}")
             variables[variable] = text
+            counter += 1
+
+        # similar_to() (v0.36.0): the query vector is bound; K and EF are checked integers the ORM writes itself.
+        if self._similar is not None:
+            variable = f"_f{counter}"
+            parts.append(self._similar.condition(variable))
+            variables[variable] = list(self._similar.vector)
             counter += 1
 
         if as_of:
@@ -1045,6 +1172,10 @@ class QuerySet:
                 subqueries the statement is a block, ``{ LET $_sq0 = (…); (SELECT …) };``; without, the text
                 and variables of v0.26.0.
 
+        With ``similar_to()`` (v0.36.0) the distance is projected as ``vector::distance::knn() AS _knn_distance``,
+        after the ``GeoDistance`` and search annotations, and without ``order_by()`` the statement ends
+        ``ORDER BY _knn_distance`` (nearest first).
+
         Returns:
             A tuple of (query_string, variables_dict).
 
@@ -1070,12 +1201,17 @@ class QuerySet:
             distance_vars[variable] = point
         search_projection, search_vars = self._search_projection()
         projection += search_projection
+        # similar_to() (v0.36.0): the distance of the KNN, after every other per-record value.
+        if self._similar is not None:
+            projection.append(f"vector::distance::knn() AS {_vector.DISTANCE_ALIAS}")
         query = f"SELECT {', '.join(projection)} FROM {self._model_table}"
 
         query += where_clause
 
         if self._order_by:
             query += f" ORDER BY {self._order_by}"
+        elif self._similar is not None:
+            query += f" ORDER BY {_vector.DISTANCE_ALIAS}"
 
         if self._limit is not None:
             query += f" LIMIT {self._limit}"
@@ -1513,7 +1649,9 @@ class QuerySet:
         When ``values()`` and ``annotate()`` are used, returns a list of dictionaries with
         the grouped fields and aggregation results. With ``GeoDistance`` annotations, or the search
         annotations (``SearchScore``, ``SearchHighlight``, ``SearchOffsets``, v0.35.0), returns the
-        model instances, each carrying its values as attributes (see :meth:`annotate`).
+        model instances, each carrying its values as attributes (see :meth:`annotate`). With
+        ``similar_to()`` (v0.36.0) and no aggregation — ``values()`` alone included —, the same: each
+        instance carries its distance as ``_knn_distance`` (see :meth:`similar_to`).
         Served from the query cache with ``cache()`` (v0.28.0), as new instances.
 
         Returns:
@@ -1525,7 +1663,11 @@ class QuerySet:
                 any request (v0.35.0).
         """
         self._check_search_references()
-        per_record = bool(self._geo_annotations or self._search_annotations)
+        # A similar_to() statement projects the distance: without an aggregation (values() alone compiles no GROUP BY)
+        # it takes the per-record path, so _knn_distance never becomes an extra="allow" model's extra.
+        per_record = bool(
+            self._geo_annotations or self._search_annotations or (self._similar is not None and not self._annotations)
+        )
         # The values()+annotate() branch compiles no FETCH: only the other two return fetched records.
         moment = await self._time_travel_moment(fetches=per_record or not self._annotations)
         if per_record:
@@ -1548,8 +1690,8 @@ class QuerySet:
             return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
 
     async def _exec_with_annotations(self, moment: datetime | None = None) -> Any:
-        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0) and of the search annotations
-        (v0.35.0).
+        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0), of the search annotations
+        (v0.35.0) and of ``similar_to()``'s distance, ``_knn_distance`` (v0.36.0).
 
         The alias keys are taken out of each row before validation, so they never reach a field, an
         ``extra="allow"`` model's extras or a later write, then set on the instance with
@@ -1561,6 +1703,8 @@ class QuerySet:
         results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
         rows = results if isinstance(results, list) else []
         aliases = [*self._geo_annotations, *self._search_annotations]
+        if self._similar is not None:
+            aliases.append(_vector.DISTANCE_ALIAS)
         stripped: list[dict[str, Any]] = []
         annotated: list[dict[str, Any]] = []
         for row in rows:
