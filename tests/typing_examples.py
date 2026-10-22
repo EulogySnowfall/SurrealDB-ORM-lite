@@ -11,12 +11,13 @@ the assertions here are made by mypy, not at runtime.
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, assert_type
+from typing import Any, Literal, assert_type
 
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
     AccessState,
+    Analyzer,
     AuthenticatedUserMixin,
     AuthResult,
     AuthTokens,
@@ -32,6 +33,7 @@ from surreal_orm_lite import (
     GeometryCollectionField,
     GeometryField,
     GeometryPoint,
+    Index,
     IndexState,
     LineStringField,
     ModelCodeGenerator,
@@ -46,6 +48,9 @@ from surreal_orm_lite import (
     Range,
     SchemaMode,
     SchemaState,
+    SearchHighlight,
+    SearchOffsets,
+    SearchScore,
     Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
@@ -585,6 +590,36 @@ async def table_define_forms(tx: Transaction) -> None:
     y: str = await TableClauses.define_table()
     assert_type(y, str)
     assert_type(await TableClauses.define_table(overwrite=False, tx=tx), str)
+
+
+def search_value_forms() -> None:
+    """v0.35.0: the search annotations, ``Analyzer`` and ``Index`` are typed — their attributes as declared, their pure
+    renderers ``str``."""
+    assert_type(SearchScore(), SearchScore)
+    assert_type(SearchScore(1).ref, int)
+    highlight = SearchHighlight("<em>", "</em>", 0)
+    assert_type(highlight, SearchHighlight)
+    assert_type(highlight.open_tag, str)
+    assert_type(SearchOffsets(ref=2), SearchOffsets)
+    english = Analyzer("english", ["class", "blank"], ("lowercase", "snowball(english)"), function="low", comment="c")
+    assert_type(english, Analyzer)
+    assert_type(Analyzer("bare"), Analyzer)
+    assert_type(english.tokenizers, tuple[str, ...])
+    assert_type(english.filters, tuple[str, ...])
+    assert_type(english.function, str | None)
+    assert_type(english.ddl(), str)
+    assert_type(english.ddl(overwrite=False), str)
+    title = Index("post_title", "title", search_analyzer=english, bm25=True, highlights=True)
+    assert_type(title, Index)
+    assert_type(Index("post_body", ["body"], search_analyzer="english", bm25=(1.2, 0.75)), Index)
+    assert_type(Index("post_slug", ("slug",), unique=True, comment="c"), Index)
+    assert_type(Index("post_head", "meta.headline", search_analyzer=english, bm25=False), Index)
+    assert_type(title.fields, tuple[str, ...])
+    assert_type(title.bm25, tuple[float, float] | Literal[True] | None)
+    assert_type(title.search_analyzer, str | Analyzer | None)
+    assert_type(title.analyzer_name, str | None)
+    assert_type(title.ddl("post"), str)
+    assert_type(title.ddl("post", overwrite=False, line=2), str)
 
 
 @fixture

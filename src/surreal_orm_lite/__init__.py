@@ -75,6 +75,7 @@ from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
 from .query_set import QuerySet
 from .schema import Event, function_ddl
+from .search import Analyzer, Index, SearchHighlight, SearchOffsets, SearchScore
 from .signals import (
     AroundSignal,
     Signal,
@@ -202,6 +203,12 @@ __all__ = [
     # Server-side events and DDL (v0.31.0)
     "Event",
     "function_ddl",
+    # Full-text search (v0.35.0)
+    "SearchScore",
+    "SearchHighlight",
+    "SearchOffsets",
+    "Analyzer",
+    "Index",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
