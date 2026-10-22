@@ -119,7 +119,9 @@ Lists of sub-models (``TestSubModelListsE2E``, every engine of both lines): a ``
 or an untyped list, at any depth, is written ``FLEXIBLE`` by ``define_table()`` before SurrealDB 3.x, so those values
 round-trip through ``save()``, ``merge()`` and ``update()`` on every engine and the items' typed fields are still
 checked; raw, 2.x and the embedded engine drop a ``FLEXIBLE`` column's value under an array of objects from every item
-unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it.
+unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it. A key the table does not define,
+written raw in the items of an array of objects, is kept on 3.x and, before 3, when the array is ``FLEXIBLE``, as
+``define_table()`` writes a list of sub-models holding a ``FLEXIBLE`` column there.
 
 Transactions (``TestTableTransactionsE2E``, every engine of both lines): the reads run on the committed state before
 anything is queued; the statements apply with the block — at once when interactive, at the commit when buffered — and
@@ -133,13 +135,21 @@ permissions unless it declares its own, one ``DEFINE FIELD`` per field, then the
 reads and carries as ``define_table()`` does, its guards and its transaction check naming ``define_access()``. Every
 other model keeps v0.17.0's ``SCHEMALESS`` table statement with the clauses it declares — v0.17.0's text byte for byte
 when it declares none —, applied on its own when it declares permissions, whose refusal never quotes them.
-``TableType.USER`` with ``extra="allow"``, a non-``bool`` ``overwrite`` and a computed field's faulty expression are
-refused before any request, unless ``with_table=False``, which renders and applies the access statement alone.
+``TableType.USER`` with ``extra="allow"``, a non-``bool`` ``overwrite``, a computed field's faulty expression and, on a
+``SCHEMAFULL`` table, a field SIGNUP writes that ``Field(exclude=True)`` keeps out of the table (SG1, named in
+declaration order) are refused before any request, unless ``with_table=False``, which renders and applies the access
+statement alone; a ``SCHEMALESS`` table keeps such a field, and its statements are v0.17.0's. SG1 is a refusal of the
+model table DDL, as UX1 is: ``table_ddl()`` and ``define_table()`` refuse the same model, not a model that is no auth
+model, whose excluded field ``save()`` never writes.
 
 On the servers (``TestAccessE2E``, over WebSocket, both lines): a ``TableType.USER`` model's ``define_access()`` defines
 a ``SCHEMAFULL`` table with its fields and the access's permissions, and signup and signin work there; ``define_table()``
 afterwards, or a second ``define_access()``, sends the carried statements and changes nothing; a view under the table is
-refused, naming ``define_access()``.
+refused, naming ``define_access()``. SG1 is refused before any request — without it, 3.x refused the signup and 2.x
+dropped the excluded password —, by ``define_table()`` too, whose table ``define_access(with_table=False)`` otherwise
+used with no error; the same model with ``with_table=False`` over a table defined by hand, and an excluded password on a
+``SCHEMALESS`` table, sign up and sign in. A model that declares no ``table_type`` gets ``TYPE ANY`` from
+``define_access()`` and ``TYPE NORMAL`` from ``define_table()``, one declaring it the same type from both.
 
 The round trip (``TestRoundTripE2E``, every engine of both lines): ``generate_models_from_db()`` writes a table's
 clauses as keys, and each generated model's ``define_table()`` on a fresh database reads back the same table clauses
@@ -178,7 +188,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 from surrealdb import Datetime as SdkDatetime
 from surrealdb import Duration as SdkDuration
-from surrealdb import InternalError, NotAllowedError, RecordID
+from surrealdb import InternalError, NotAllowedError, RecordID, SurrealError
 from surrealdb import Range as SdkRange
 
 import surreal_orm_lite
@@ -5812,7 +5822,9 @@ class TestSubModelListsE2E:
     depth — keeps those values through ``save()``, ``merge()`` and ``update()`` after ``define_table()``, which writes
     the list ``FLEXIBLE`` before SurrealDB 3.x; its typed columns are still checked. The raw fact this is built around:
     on a ``SCHEMAFULL`` table, 2.x and the embedded engine drop a ``FLEXIBLE`` column's value under an array of objects
-    from every item unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it."""
+    from every item unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it. And in
+    the items of an array of objects, a key the table does not define, written raw, is kept on 3.x and, before 3, when
+    the array is ``FLEXIBLE`` — so after ``define_table()`` on every engine."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_define_table_writes_the_lists_flexible_before_3(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5910,6 +5922,45 @@ class TestSubModelListsE2E:
             refused = await _refusal(client, "UPDATE tdl_raw:1 SET v = [{n: 1, m: {}}] RETURN NONE;")
             assert refused is not None and "n`" in refused, _LISTS_CHANGED
             assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("flexible", [False, True], ids=["array", "array-flexible"])
+    async def test_an_undeclared_key_in_a_list_item_raw(self, kind: str, flexible: bool) -> None:
+        """A key the table does not define, written raw in the items of an array of objects: 3.x keeps it, ``FLEXIBLE``
+        or not, while it refuses one in a sub-object; before 3 the items keep it only when the array is ``FLEXIBLE``,
+        and a sub-object drops it — the facts of the README 2.x/3.x row on a write naming a field a ``SCHEMAFULL``
+        table does not define."""
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            await _apply_ddl(
+                client,
+                "DEFINE TABLE tdl_raw SCHEMAFULL; "
+                f"DEFINE FIELD v ON tdl_raw TYPE array<object>{' FLEXIBLE' if flexible else ''}; "
+                "DEFINE FIELD v.*.n ON tdl_raw TYPE string; "
+                "DEFINE FIELD o ON tdl_raw TYPE option<object>; "
+                "DEFINE FIELD o.n ON tdl_raw TYPE string;",
+            )
+            await _apply_ddl(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
+            kept = flexible or major >= 3
+            stored = [{"n": "a", "stray": {"deep": 1}}] if kept else [{"n": "a"}]
+            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _UNDECLARED_CHANGED
+            refused = await _refusal(client, "CREATE tdl_raw:2 SET v = [], o = {n: 'a', stray: 1} RETURN NONE;")
+            if major >= 3:
+                assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
+            else:
+                assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
+                assert await client.query("SELECT VALUE o FROM tdl_raw:2;", {}) == [{"n": "a"}], _UNDECLARED_CHANGED
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_undeclared_key_in_an_item_after_define_table(self, kind: str) -> None:
+        """After ``define_table()``, the items of a list of sub-models holding a ``FLEXIBLE`` column keep a key the
+        model does not declare, written raw, on every engine: 3.x keeps it in any array of objects, 2.x and the
+        embedded engine because ``define_table()`` writes the list ``FLEXIBLE`` there. The ORM never sends such a key."""
+        async with _tdl(kind) as client:
+            await TdlOrderPlain.define_table()
+            await _apply_ddl(client, "CREATE tdl_order:p1 SET tags = [{label: 'a', meta: {}, stray: 1}] RETURN NONE;")
+            tags = await client.query("SELECT VALUE tags FROM tdl_order:p1;", {})
+            assert tags == [[{"label": "a", "meta": {}, "stray": 1}]], _UNDECLARED_CHANGED
 
 
 # --- define_table(tx=…) ----------------------------------------------------------------------------------------------
@@ -6197,6 +6248,76 @@ class TdlAuthTotal(AuthenticatedUserMixin, BaseSurrealModel):
     total: Computed[int] = computed("count(items")
 
 
+class TdlAuthHidden(AuthenticatedUserMixin, BaseSurrealModel):
+    """SG1 (#296): ``TableType.USER`` with a ``Field(exclude=True)`` field SIGNUP writes — ``model_dump()`` leaves it
+    out, so the ``SCHEMAFULL`` table the model table DDL defines would not define it."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str = Field(exclude=True)
+
+
+class TdlAuthHiddenOptional(AuthenticatedUserMixin, BaseSurrealModel):
+    """SG1 with an optional excluded password, so an instance builds from a record without it: on SurrealDB 2.x the
+    signup succeeded there, and the signin failed."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str | None = Field(default=None, exclude=True)
+
+
+class TdlAuthHiddenFull(AuthenticatedUserMixin, BaseSurrealModel):
+    """SG1 on a declared ``SchemaMode.SCHEMAFULL``: two excluded fields SIGNUP writes, named in declaration order; an
+    excluded ``server_fields`` column, which SIGNUP never writes, is not."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_user", schema_mode=SchemaMode.SCHEMAFULL, server_fields=["joined"], connection="tdl"
+    )
+
+    id: str | None = None
+    nickname: str | None = Field(default=None, exclude=True)
+    email: str
+    password: str = Field(exclude=True)
+    joined: str | None = Field(default=None, exclude=True)
+
+
+class TdlAuthHiddenPlain(AuthenticatedUserMixin, BaseSurrealModel):
+    """SG1 does not apply: an excluded password on v0.17.0's ``SCHEMALESS`` table, which keeps what SIGNUP writes."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str = Field(exclude=True)
+
+
+class TdlHiddenUser(BaseSurrealModel):
+    """Not an auth model: ``TableType.USER`` with a ``Field(exclude=True)`` field, which ``save()`` never writes, so its
+    ``SCHEMAFULL`` table leaves it out and nothing is refused (SG1 is about SIGNUP)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str = Field(exclude=True)
+
+
+def _sg1(name: str, fields: str, pronoun: str = "it") -> str:
+    """The refusal of an auth model whose ``SCHEMAFULL`` table would leave out *fields* SIGNUP writes (#296)."""
+    return (
+        f"{name}: SIGNUP writes {fields}, but Field(exclude=True) keeps {pronoun} out of model_dump() and so out of the "
+        f"SCHEMAFULL table that table_ddl(), define_table() and define_access() define for the model; that table would "
+        f"refuse {pronoun} (SurrealDB 3.x) or drop {pronoun} (2.x), so no signup or signin would work. Remove "
+        f"exclude=True and leave {pronoun} out where you serialise the model instead (model_dump(exclude={{{fields}}})): "
+        f"update() and upsert() replace the record with what model_dump() writes, so even over a table defined by "
+        f"hand they would be refused or drop {pronoun}."
+    )
+
+
 class TestAccessDdl:
     """``access_ddl()``/``define_access()``: the schema mode decides — ``SCHEMAFULL`` (``TableType.USER`` or declared)
     through the model table DDL, every other model v0.17.0's ``SCHEMALESS`` statement with its declared clauses; the
@@ -6243,10 +6364,84 @@ class TestAccessDdl:
         assert model.access_ddl() == [statement, _A_ACCESS]
         assert model.access_ddl(overwrite=False)[0] == statement.replace("OVERWRITE", "IF NOT EXISTS")
 
-    @pytest.mark.parametrize("model", [TdlAuthPlain, TdlAuthRules, TdlAuthUser, TdlAuthFull, TdlAuthOpen, TdlAuthTotal])
+    @pytest.mark.parametrize(
+        "model", [TdlAuthPlain, TdlAuthRules, TdlAuthUser, TdlAuthFull, TdlAuthOpen, TdlAuthTotal, TdlAuthHidden]
+    )
     def test_with_table_false_is_unchanged(self, model: type[TdlAuthPlain]) -> None:
         assert model.access_ddl(with_table=False) == [_A_ACCESS]
         assert model.access_ddl(overwrite=False, with_table=False) == [_A_ACCESS_KEPT]
+
+    @pytest.mark.parametrize(
+        ("model", "message"),
+        [
+            (TdlAuthHidden, _sg1("TdlAuthHidden", "'password'")),
+            (TdlAuthHiddenOptional, _sg1("TdlAuthHiddenOptional", "'password'")),
+            (TdlAuthHiddenFull, _sg1("TdlAuthHiddenFull", "'nickname', 'password'", "them")),
+        ],
+        ids=["user", "optional", "declared-schemafull"],
+    )
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    def test_sg1_a_signup_field_the_table_would_leave_out(
+        self, model: type[TdlAuthHidden], message: str, overwrite: bool
+    ) -> None:
+        """#296: SIGNUP writes every field, ``model_dump()`` (and so the table) not those with ``Field(exclude=True)``;
+        the excluded fields SIGNUP writes are named in declaration order, an excluded ``server_fields`` column is not."""
+        with pytest.raises(TypeError) as raised:
+            model.access_ddl(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (TypeError, message)
+
+    def test_sg1_does_not_apply_to_a_schemaless_table(self) -> None:
+        """v0.17.0's statements byte for byte: a ``SCHEMALESS`` table keeps the excluded field SIGNUP writes."""
+        assert TdlAuthHiddenPlain.access_ddl() == [_A0, _A_ACCESS]
+        assert TdlAuthHiddenPlain.access_ddl(overwrite=False) == [_A0_KEPT, _A_ACCESS_KEPT]
+
+    async def test_sg1_from_define_access_before_any_request(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        with pytest.raises(TypeError) as raised:
+            await TdlAuthHidden.define_access()
+        assert str(raised.value) == _sg1("TdlAuthHidden", "'password'")
+        assert client.queries == []
+        assert client.version_calls == 0
+
+    @pytest.mark.parametrize(
+        ("model", "message"),
+        [
+            (TdlAuthHidden, _sg1("TdlAuthHidden", "'password'")),
+            (TdlAuthHiddenOptional, _sg1("TdlAuthHiddenOptional", "'password'")),
+            (TdlAuthHiddenFull, _sg1("TdlAuthHiddenFull", "'nickname', 'password'", "them")),
+        ],
+        ids=["user", "optional", "declared-schemafull"],
+    )
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    def test_sg1_from_table_ddl(self, model: type[TdlAuthHidden], message: str, overwrite: bool) -> None:
+        """SG1 is a refusal of the model's ``SCHEMAFULL`` table, as UX1 is: ``table_ddl()`` refuses the model too, so
+        ``define_table()`` cannot build the table that would fail SIGNUP."""
+        with pytest.raises(TypeError) as raised:
+            model.table_ddl(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (TypeError, message)
+
+    async def test_sg1_from_define_table_before_any_request(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        for overwrite in (True, False):
+            with pytest.raises(TypeError) as raised:
+                await TdlAuthHidden.define_table(overwrite=overwrite)
+            assert str(raised.value) == _sg1("TdlAuthHidden", "'password'")
+        assert client.queries == []
+        assert client.version_calls == 0
+
+    def test_sg1_only_on_an_auth_model_with_a_schemafull_table(self) -> None:
+        """``table_ddl()`` as before for an auth model whose table is not ``SCHEMAFULL`` (no declared mode) and for a
+        model that is not an auth model, whose excluded field ``save()`` never writes: both leave the field out."""
+        assert TdlAuthHiddenPlain.table_ddl() == [
+            "DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL;",
+            "DEFINE FIELD OVERWRITE `email` ON `tdl_user` TYPE string;",
+        ]
+        assert TdlHiddenUser.table_ddl() == [
+            "DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL SCHEMAFULL;",
+            "DEFINE FIELD OVERWRITE `email` ON `tdl_user` TYPE string;",
+        ]
 
     def test_ux1_from_access_ddl(self) -> None:
         with pytest.raises(TypeError) as raised:
@@ -6285,16 +6480,17 @@ class TestAccessDdl:
         assert client.queries == []
 
     async def test_with_table_false_applies_the_access_alone(self, use_client: Callable[[Any], None]) -> None:
-        """No UX1, no read: the access statement only, as in v0.17.0."""
-        for model in (TdlAuthOpen, TdlAuthUser, TdlAuthPlain):
+        """No UX1, no SG1, no read: the access statement only, as in v0.17.0."""
+        for model in (TdlAuthOpen, TdlAuthUser, TdlAuthPlain, TdlAuthHidden):
             client = _TableClient()
             use_client(client)
             assert await model.define_access(with_table=False) == [_A_ACCESS]
             assert client.queries == [_A_ACCESS]
 
     async def test_case_1_applies_v0170_statements(self, use_client: Callable[[Any], None]) -> None:
-        """No read: v0.17.0's two statements, one per call — and so for a declared clause other than permissions."""
-        for model, statement in ((TdlAuthPlain, _A0), (TdlAuthFeed, _A3), (TdlAuthHash, _A5_HASH)):
+        """No read: v0.17.0's two statements, one per call — and so for a declared clause other than permissions, or an
+        excluded field SIGNUP writes (no SG1 on a ``SCHEMALESS`` table)."""
+        for model, statement in ((TdlAuthPlain, _A0), (TdlAuthFeed, _A3), (TdlAuthHash, _A5_HASH), (TdlAuthHiddenPlain, _A0)):
             client = _TableClient()
             use_client(client)
             assert await model.define_access() == [statement, _A_ACCESS]
@@ -6417,8 +6613,9 @@ _TDL_EMAIL = "ada@example.test"
 _TDL_PASSWORD = "s3cret-passphrase"
 
 
-async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> None:
-    """``signup()`` then ``signin()`` of *model* succeed, and the record reads back its email."""
+async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> Any:
+    """``signup()`` then ``signin()`` of *model* succeed, and the record reads back its email; returns the user
+    ``signin()`` read."""
     created = await model.signup(email=_TDL_EMAIL, password=_TDL_PASSWORD)
     assert created.tokens.access
     assert created.user.email == _TDL_EMAIL
@@ -6427,6 +6624,15 @@ async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> None:
     assert signed_in.user.get_id() == created.user.get_id()
     assert signed_in.user.email == _TDL_EMAIL
     assert await client.query("SELECT VALUE email FROM tdl_user;", {}) == [_TDL_EMAIL]
+    return signed_in.user
+
+
+async def _stored_hash(client: Any) -> str:
+    """The one password hash stored in ``tdl_user`` (an argon2 hash, never the password)."""
+    [stored] = await client.query("SELECT VALUE password FROM tdl_user;", {})
+    assert isinstance(stored, str)
+    assert stored.startswith("$argon2")
+    return stored
 
 
 async def _user_table(client: Any) -> tuple[Any, dict[str, Any]]:
@@ -6501,6 +6707,111 @@ class TestAccessE2E:
             )
             assert (await _tables(client))["tdl_user"] == before
             assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+
+    @pytest.mark.parametrize("model", [TdlAuthHidden, TdlAuthHiddenOptional], ids=lambda model: model.__name__)
+    async def test_sg1_a_signup_field_the_table_would_leave_out(
+        self, monkeypatch: pytest.MonkeyPatch, model: type[TdlAuthHidden]
+    ) -> None:
+        """#296: the table v0.34.0 defined had no ``password`` column, so SurrealDB 3.x refused the signup and 2.x
+        dropped the hash — the record signup created did not fit a required ``password``, and with an optional one
+        every signin failed. ``define_access()`` now refuses before any request, and nothing is defined."""
+        async with _tdl("ws") as client:
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(TypeError) as raised:
+                await model.define_access()
+                # Reached only without the refusal: what each line does with the table defined.
+                await _signup_and_signin(model, client)
+            assert _sent(calls) == []
+            monkeypatch.undo()
+            assert str(raised.value) == _sg1(model.__name__, "'password'")
+            assert "tdl_user" not in await _tables(client)
+            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+
+    @pytest.mark.parametrize("model", [TdlAuthHidden, TdlAuthHiddenOptional], ids=lambda model: model.__name__)
+    async def test_sg1_define_table_then_define_access_without_table(
+        self, monkeypatch: pytest.MonkeyPatch, model: type[TdlAuthHidden]
+    ) -> None:
+        """The review of #296: ``define_table()`` then ``define_access(with_table=False)`` gave the table without the
+        ``password`` column, with no error, and every signup failed — 3.x refused it, 2.x returned no record (that
+        table also has none of the access's permissions). ``define_table()`` now refuses the model before any request,
+        and nothing is defined."""
+        async with _tdl("ws") as client:
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(TypeError) as raised:
+                await model.define_table()
+                # Reached only without the refusal: the access over that table, then what each line does with it.
+                await model.define_access(with_table=False)
+                await _signup_and_signin(model, client)
+            assert _sent(calls) == []
+            monkeypatch.undo()
+            assert str(raised.value) == _sg1(model.__name__, "'password'")
+            assert "tdl_user" not in await _tables(client)
+            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+
+    async def test_sg1_with_table_false_over_a_table_defined_by_hand(self) -> None:
+        """``with_table=False`` is not refused, since SG1 is a check of the model table DDL: over a table defined by
+        hand with the excluded column, the access statement alone is applied as before, and signup and signin work.
+        But ``update()`` replaces the record with what ``model_dump()`` writes, without the excluded column, and the
+        required column refuses it on both lines, which is why the refusal advises removing ``exclude=True``. The
+        stored hash stays, and signin with the original credentials still works."""
+        async with _tdl("ws") as client:
+            await _apply_ddl(
+                client,
+                "DEFINE TABLE tdl_user TYPE NORMAL SCHEMAFULL PERMISSIONS FOR select, update WHERE id = $auth.id; "
+                "DEFINE FIELD email ON tdl_user TYPE string; DEFINE FIELD password ON tdl_user TYPE string;",
+            )
+            assert await TdlAuthHidden.define_access(with_table=False) == [_A_ACCESS]
+            user = await _signup_and_signin(TdlAuthHidden, client)
+            stored = await _stored_hash(client)
+
+            user.email = "grace@example.test"
+            with pytest.raises((SurrealError, SurrealDbError), match="password"):
+                await user.update()
+            assert await _stored_hash(client) == stored
+            assert await client.query("SELECT VALUE email FROM tdl_user;", {}) == [_TDL_EMAIL]
+            signed_in = await TdlAuthHidden.signin(email=_TDL_EMAIL, password=_TDL_PASSWORD)
+            assert signed_in.user.get_id() == user.get_id()
+
+    async def test_sg1_the_advised_model_keeps_its_hash_through_update(self) -> None:
+        """The way the refusal advises, ``exclude=True`` removed: ``update()`` of another field writes back the hash the
+        instance read, so the stored password is unchanged and signin with the same password works, on both lines."""
+        async with _tdl("ws") as client:
+            assert await TdlAuthUser.define_access() == [*_A1, _A_ACCESS]
+            user = await _signup_and_signin(TdlAuthUser, client)
+            stored = await _stored_hash(client)
+
+            user.email = "grace@example.test"
+            await user.update()
+            assert await _stored_hash(client) == stored
+            signed_in = await TdlAuthUser.signin(email="grace@example.test", password=_TDL_PASSWORD)
+            assert signed_in.user.get_id() == user.get_id()
+            assert signed_in.user.email == "grace@example.test"
+
+    async def test_sg1_does_not_apply_to_a_schemaless_table(self) -> None:
+        """v0.17.0's ``SCHEMALESS`` table keeps the excluded password SIGNUP writes: applied as before, and signup and
+        signin work."""
+        async with _tdl("ws") as client:
+            assert await TdlAuthHiddenPlain.define_access() == [_A0, _A_ACCESS]
+            await _signup_and_signin(TdlAuthHiddenPlain, client)
+
+    @pytest.mark.parametrize(
+        ("model", "types"),
+        [(TdlAuthPlain, ["any", "normal", "any"]), (TdlAuthHash, ["normal", "normal", "normal"])],
+        ids=["no-table-type", "table-type"],
+    )
+    async def test_the_table_type_between_define_access_and_define_table(
+        self, model: type[TdlAuthPlain], types: list[str]
+    ) -> None:
+        """README "User models": a model that declares no ``table_type`` gets no ``TYPE`` from ``define_access()``,
+        which SurrealDB stores as ``TYPE ANY``, and ``TYPE NORMAL`` from ``define_table()``, so calling both changes the
+        type each time; declaring ``table_type`` keeps one. The schema mode and the permissions stay the same."""
+        async with _tdl("ws") as client:
+            seen: list[tuple[str | None, str | None, Mapping[str, str] | None]] = []
+            for define in (model.define_access, model.define_table, model.define_access):
+                await define()
+                state = parse_define_table((await _tables(client))["tdl_user"])
+                seen.append((state.table_type, state.schema_mode, state.permissions))
+            assert seen == [(table_type, "SCHEMALESS", _A1_PERMISSIONS) for table_type in types]
 
 
 # === the generator writes the keys back: the round trip ==============================================================
@@ -6932,6 +7243,17 @@ _SENTENCES_35 = {
         "per field and the access's permissions, then the access: signup and signin work on SurrealDB 2.x and 3.x, "
         "`define_table()` is optional, and any call order gives the same table. Every other model keeps v0.17.0's "
         "`SCHEMALESS` table.",
+        "One that declares no `table_type` gets no `TYPE` from `define_access()`, which SurrealDB stores as `TYPE ANY`, "
+        "and `TYPE NORMAL` from `define_table()`: calling both changes the table's type each time, so declare "
+        "`table_type` to keep one. The schema mode, fields and permissions are the same in any call order.",
+        "A field SIGNUP writes that `Field(exclude=True)` keeps out of `model_dump()` (`password: str = "
+        "Field(exclude=True)`) raises `TypeError` too, naming the field, before any request (with a `SCHEMAFULL` schema "
+        "mode): `define_access()` with `with_table=True` and `define_table()` both refuse it, since the table would not "
+        "define it, so SurrealDB 3.x would refuse every signup and 2.x drop the password hash, failing every signin. "
+        "Remove `exclude=True` and leave the field out where you serialise the model instead "
+        '(`model_dump(exclude={"password"})`): `update()` and `upsert()` replace the record with what `model_dump()` '
+        "writes, so even over a table defined by hand (`with_table=False`) they would be refused (a required column) "
+        "or drop the hash (an optional one), failing every later signin.",
     ),
     "Transactions, connections and the cache": (
         'A definition of the same table or field queued earlier in the block (`tx.add("DEFINE FIELD …")`) is not seen '
@@ -7049,6 +7371,7 @@ _PART_NEEDLES_35 = {
         "refused on SurrealDB 3.x",
         "`Found field 'nope', but no such field exists for table 'note'`",
         "dropped on 2.x and the embedded engine, silently: declare the field on the model",
+        'The items of a list of objects are the exception ("SurrealDB 2.x and 3.x" below)',
         "**A node model over a table that holds edges**",
         "declare `table_type=TableType.ANY` for a table that holds records and edges",
     ),
@@ -7062,6 +7385,11 @@ _PART_NEEDLES_35 = {
         "also drop the value of a `FLEXIBLE` column under a list of objects from every item",
         "unless the list is `FLEXIBLE` too, then refuse the record's next write (`Found NONE for field`)",
         "the item's typed fields are still checked",
+        "On 2.x and the embedded engine, the items of such a list then also keep a key the model does not declare, "
+        "written raw or by another client (the ORM never sends one), which they drop from a list that is not "
+        "`FLEXIBLE`: a 2.x limitation, since `FLEXIBLE` there covers the whole item.",
+        "3.x keeps such a key in the items of any list of objects, `FLEXIBLE` or not, and refuses it at the top level or "
+        "in a sub-model.",
         "`table_ddl()`, which needs no connection, writes the 3.x form",
         "the item definition `TYPE any` (`bag.*`) on every line",
         "refused on 3.x and dropped on 2.x and the embedded engine",
@@ -7162,6 +7490,17 @@ _SECTION_34_DECLARED = (
     "others)."
 )
 _SECTION_34_TABLE_TYPE = f"its other members take effect in `define_table()` ([section 35]{_LINK_35})"
+_SECTION_31_EDGE_SCHEMAFULL = (
+    "A `SCHEMAFULL` relation table with data fields gives an edge model with `schema_mode=SchemaMode.SCHEMAFULL` (since "
+    "v0.34.0): apply it with `define_table()`, which defines those fields, not `define_relation()`, which raises "
+    "`SurrealDbError` before any request ([section 34](#34-relation-constraints-relation_in-define_relation))."
+)
+_SECTION_34_EDGE_SCHEMAFULL = (
+    "- An edge model that declares `schema_mode=SchemaMode.SCHEMAFULL` and has data fields — the model "
+    "`generate_models_from_db()` writes for a `SCHEMAFULL` relation table with data fields, since v0.34.0 — is applied "
+    "with `define_table()`, not `define_relation()`: `define_relation()` defines no field, so it raises `SurrealDbError` "
+    f"before any request, and `define_table()` applies the same relation statement, then the data fields ([section 35]{_LINK_35})."
+)
 _SECTION_34_DEFINE_TABLE = (
     "`define_table()` (since v0.34.0) applies an edge model through the statement `define_relation()` carries, then its "
     "data fields; migrations come with v0.38.0."
@@ -7193,8 +7532,8 @@ _TABLE_DDL_ROWS = [
     [
         "A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records "
         "predating `SCHEMAFULL`)",
-        "the field is dropped, silently",
-        "the write is refused (`no such field exists`)",
+        "the field is dropped, silently; kept in the items of a list `define_table()` writes `FLEXIBLE` (a 2.x limitation)",
+        "the write is refused (`no such field exists`), except in the items of a list of objects, which keep it",
         "v0.34.0",
     ],
 ]
@@ -7330,6 +7669,9 @@ class TestReadmeSection35:
         assert rows["a union of `int`, `float` and `Decimal`, in any order"] == "`number`", rows
         assert rows["`datetime`, `date`"] == "`datetime`", rows
         assert rows["`RecordID`"] == "`record`", rows
+        assert rows["an `enum.Flag` or `IntFlag`"] == (
+            "`int`: Pydantic also accepts any combination of its members, and zero"
+        ), rows
         assert rows["`list`, `list[Any]`"] == "`array`, and an item definition (below)", rows
         assert rows["`dict`, `dict[K, V]`, `Mapping[K, V]`"] == "`object`, free-form", rows
         assert rows["`Optional[X]`, a union with `None`"] == "`option<X>`", rows
@@ -7418,6 +7760,7 @@ class TestReadmeSection35:
         assert not any("Generated models use comments" in bullet for bullet in bullets)
         generating = _normalised(_subsection("#### Generating models", section_31))
         assert _ONE_CLASS_PER_TABLE_35 in generating, generating
+        assert generating.count(_SECTION_31_EDGE_SCHEMAFULL) == 1, generating
         assert "where the class statement would refuse the key" in generating, generating
         for stale in ("`# Changefeed: 1d`", "are comments of its class, and the module's header"):
             assert stale not in generating, stale
@@ -7445,6 +7788,8 @@ class TestReadmeSection35:
         assert _SECTION_34_DECLARED in bullets, bullets
         assert _SECTION_34_DEFINE_TABLE in bullets[2], bullets[2]
         assert "**`TableType`'s other members take effect in `define_table()`**" in bullets[9], bullets[9]
+        applying = _readme_bullets(_subsection("#### Applying it", section_34))
+        assert _SECTION_34_EDGE_SCHEMAFULL in applying, applying
         text = _normalised(section_34)
         for stale in ("no effect until v0.34.0", "comes with v0.34.0", "keys yet", "recorded for the table DDL"):
             assert stale not in text, stale

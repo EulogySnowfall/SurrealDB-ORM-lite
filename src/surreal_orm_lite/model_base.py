@@ -47,6 +47,7 @@ from .schema import (
     read_table_fields,
     remove_event_statement,
     remove_view_statement,
+    signup_excluded_refused,
     table_holds_records,
     table_kind,
     table_permissions_text,
@@ -1493,7 +1494,9 @@ class BaseSurrealModel(BaseModel):
         ``FLEXIBLE`` following *clauses*' schema mode. Pure.
 
         Raises:
-            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"``.
+            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"`` (UX1); then, when
+                *clauses* are ``SCHEMAFULL``, an auth model (``AuthenticatedUserMixin``) with a field SIGNUP writes that
+                ``Field(exclude=True)`` keeps out of the columns (SG1, #296).
             ValueError: see :meth:`_table_columns`.
         """
         if cls._is_view():
@@ -1504,6 +1507,16 @@ class BaseSurrealModel(BaseModel):
             raise TypeError(user_extra_refused(cls.__name__))
         schemafull = clauses.schema_mode == SchemaMode.SCHEMAFULL.value
         fields = [field_statement(table, column, overwrite=overwrite, schemafull=schemafull) for column in cls._table_columns()]
+        if schemafull:
+            # Imported here, only for a SCHEMAFULL table: model_auth sits above this module.
+            from .model_auth import AuthenticatedUserMixin
+
+            # SG1 (#296), after the other refusals: SIGNUP writes a field the columns leave out, which the SCHEMAFULL
+            # table would refuse (3.x) or drop (2.x) — checked here, as UX1 is, so that table_ddl(), define_table(),
+            # access_ddl() and define_access() refuse the same model.
+            excluded: list[str] = cls._signup_fields_excluded() if issubclass(cls, AuthenticatedUserMixin) else []
+            if excluded:
+                raise TypeError(signup_excluded_refused(cls.__name__, excluded))
         return [statement, *fields]
 
     @classmethod
@@ -1546,7 +1559,12 @@ class BaseSurrealModel(BaseModel):
 
         Raises:
             TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"`` (its table is
-                ``SCHEMAFULL``, which refuses or drops the fields the model does not declare).
+                ``SCHEMAFULL``, which refuses or drops the fields the model does not declare); an auth model
+                (``AuthenticatedUserMixin``) whose declared schema mode is ``SCHEMAFULL`` with a field SIGNUP writes
+                that ``Field(exclude=True)`` keeps out of the columns (``password: str = Field(exclude=True)``), which
+                the table would refuse or drop, failing every signup or signin — ``define_access()`` refuses it too;
+                remove ``exclude=True`` (a table defined by hand would not help: ``update()`` and ``upsert()`` replace
+                the record with what ``model_dump()`` writes).
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
                 SurrealQL the ORM can embed.
 
@@ -1573,7 +1591,7 @@ class BaseSurrealModel(BaseModel):
         ``SCHEMAFULL`` (its own). *method* names the caller in the transaction check, TG1–TG4 and RG1–RG3.
 
         In order, each step before any later request: the transaction check; a view model applies
-        :meth:`define_view` (its own guards) and returns its statement; the pure statements (E1, UX1, FX1, CV1);
+        :meth:`define_view` (its own guards) and returns its statement; the pure statements (E1, UX1, FX1, CV1, SG1);
         ``INFO FOR DB`` and the table guard (:meth:`_guarded_table_statement`) — for a node model TG1 a view, TG2 a
         definition the parser cannot read, TG3 a relation table, and, for a table that exists with ``overwrite=True``,
         TG2 a carried table clause that fails its check; for an edge model ``define_relation()``'s RG1–RG3 —; for a
@@ -1722,8 +1740,9 @@ class BaseSurrealModel(BaseModel):
             The statements applied (or queued), table first, joined with ``"\\n"``.
 
         Raises:
-            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"`` — before any
-                request.
+            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"``; an auth model
+                whose declared schema mode is ``SCHEMAFULL`` with a field SIGNUP writes that ``Field(exclude=True)``
+                keeps out of the columns (see :meth:`table_ddl`) — before any request.
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
                 SurrealQL the ORM can embed — before any request.
             SurrealDbError: *tx* belongs to another connection — before any request; the table is a materialized view

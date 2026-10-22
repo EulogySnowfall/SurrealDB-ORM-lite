@@ -85,6 +85,8 @@ table's field definitions with one ``INFO FOR TABLE``, keyed by path whichever r
 definition the parser cannot read. ``table_refused()`` gives the texts of the node models' table guard (TG1–TG4),
 ``relation_table_refused()`` names ``define_table()`` when it is the caller, and ``relation_schemafull_refused()``
 refuses ``define_relation()`` of an edge model declared ``SCHEMAFULL`` with data fields, which it would not define.
+``user_extra_refused()`` and ``signup_excluded_refused()`` give the texts of UX1 and SG1, the refusals of a
+``SCHEMAFULL`` table the model table DDL checks before any request.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -1943,4 +1945,20 @@ def user_extra_refused(model: str) -> str:
     return (
         f'{model}: extra="allow" keeps fields the model does not declare, and a TableType.USER table is SCHEMAFULL, which '
         f'refuses them (SurrealDB 3.x) or drops them (2.x); remove extra="allow" from {model}.'
+    )
+
+
+def signup_excluded_refused(model: str, fields: Sequence[str]) -> str:
+    """The refusal of an auth model whose ``SCHEMAFULL`` table would leave out *fields* (SG1, #296): SIGNUP writes
+    them, ``Field(exclude=True)`` keeps them out of ``model_dump()`` and so out of the columns the model table DDL
+    defines — in ``table_ddl()``, ``define_table()`` and ``define_access()`` alike. Pure."""
+    names = ", ".join(repr(name) for name in fields)
+    pronoun = "it" if len(fields) == 1 else "them"
+    return (
+        f"{model}: SIGNUP writes {names}, but Field(exclude=True) keeps {pronoun} out of model_dump() and so out of the "
+        f"SCHEMAFULL table that table_ddl(), define_table() and define_access() define for the model; that table would "
+        f"refuse {pronoun} (SurrealDB 3.x) or drop {pronoun} (2.x), so no signup or signin would work. Remove "
+        f"exclude=True and leave {pronoun} out where you serialise the model instead (model_dump(exclude={{{names}}})): "
+        f"update() and upsert() replace the record with what model_dump() writes, so even over a table defined by "
+        f"hand they would be refused or drop {pronoun}."
     )

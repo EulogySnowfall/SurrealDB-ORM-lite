@@ -4270,7 +4270,10 @@ class Person(BaseSurrealModel):
   when the schema was read from another connection than `"default"`, then `server_fields` and `extra="allow"`
   (below). A model declares
   `id: str | None = None` first (`id: RecordID | None = None` for a view: a grouped view's ids are arrays), then one
-  line per field, in codepoint order of the columns.
+  line per field, in codepoint order of the columns. A `SCHEMAFULL` relation table with data fields gives an edge model
+  with `schema_mode=SchemaMode.SCHEMAFULL` (since v0.34.0): apply it with `define_table()`, which defines those fields,
+  not `define_relation()`, which raises `SurrealDbError` before any request
+  ([section 34](#34-relation-constraints-relation_in-define_relation)).
 - A class is named after its table in PascalCase, without singularisation (`game_tables` → `GameTables`); a name
   that is taken — a Python keyword, a name the module imports, another table's class — gets `Model` appended (`range`
   → `RangeModel`). The table's indexes and events are comments of its class, and so are its comment, change feed
@@ -5117,6 +5120,11 @@ print(await Follows.define_relation())
   other clauses.
 - `define_relation()` raises `SurrealDbError` before any DDL on a materialized view (the `OVERWRITE` would drop its
   query) and on a definition the ORM cannot read back (it could not keep the other clauses).
+- An edge model that declares `schema_mode=SchemaMode.SCHEMAFULL` and has data fields — the model
+  `generate_models_from_db()` writes for a `SCHEMAFULL` relation table with data fields, since v0.34.0 — is applied
+  with `define_table()`, not `define_relation()`: `define_relation()` defines no field, so it raises `SurrealDbError`
+  before any request, and `define_table()` applies the same relation statement, then the data fields
+  ([section 35](#35-model-table-ddl-define_table-schema_mode-permissions)).
 - SurrealDB rewrites the `in` and `out` field definitions from `IN` and `OUT` (`TYPE record<person>`): an `ASSERT`
   written on them by hand is lost. Declare the tables with `relation_in` and `relation_out` instead.
 - Why not `ALTER TABLE`, which keeps the other clauses too: on SurrealDB 2.x and the embedded engine, a raw
@@ -5616,7 +5624,10 @@ print(edge.stars)
 same schema mode. A model with `table_type=TableType.USER` (the full ORM's key for an auth table) or
 `schema_mode=SchemaMode.SCHEMAFULL` gets from `define_access()` a `SCHEMAFULL` table with one `DEFINE FIELD` per field
 and the access's permissions, then the access: signup and signin work on SurrealDB 2.x and 3.x, `define_table()` is
-optional, and any call order gives the same table. Every other model keeps v0.17.0's `SCHEMALESS` table.
+optional, and any call order gives the same table. Every other model keeps v0.17.0's `SCHEMALESS` table. One that
+declares no `table_type` gets no `TYPE` from `define_access()`, which SurrealDB stores as `TYPE ANY`, and `TYPE NORMAL`
+from `define_table()`: calling both changes the table's type each time, so declare `table_type` to keep one. The schema
+mode, fields and permissions are the same in any call order.
 
 ```python
 from surreal_orm_lite import AuthenticatedUserMixin, TableType
@@ -5641,6 +5652,13 @@ print(*table, sep="\n")
   declares its own.
 - A `TableType.USER` model with `extra="allow"` raises `TypeError` there (with `with_table=True`), since its table is
   `SCHEMAFULL`; a `server_fields` column without a constant default needs a database `DEFAULT` ("Field types" above).
+- A field SIGNUP writes that `Field(exclude=True)` keeps out of `model_dump()` (`password: str = Field(exclude=True)`)
+  raises `TypeError` too, naming the field, before any request (with a `SCHEMAFULL` schema mode): `define_access()`
+  with `with_table=True` and `define_table()` both refuse it, since the table would not define it, so SurrealDB 3.x
+  would refuse every signup and 2.x drop the password hash, failing every signin. Remove `exclude=True` and leave the
+  field out where you serialise the model instead (`model_dump(exclude={"password"})`): `update()` and `upsert()`
+  replace the record with what `model_dump()` writes, so even over a table defined by hand (`with_table=False`) they
+  would be refused (a required column) or drop the hash (an optional one), failing every later signin.
 - Upgrading: a 0.33 `TableType.USER` model's table turns `SCHEMAFULL` at its next `define_access()`; records already
   there are checked at their next write.
 
@@ -5652,7 +5670,8 @@ print(*table, sep="\n")
 - **A write naming a field the table does not define** — `merge()` with a key the model does not declare,
   `bulk_update()`, a raw query — is refused on SurrealDB 3.x
   (`Found field 'nope', but no such field exists for table 'note'`) and the field dropped on 2.x and the embedded
-  engine, silently: declare the field on the model.
+  engine, silently: declare the field on the model. The items of a list of objects are the exception ("SurrealDB 2.x
+  and 3.x" below).
 - **A node model over a table that holds edges**: `define_table()` refuses a relation table (`TYPE RELATION`), but not
   a `TYPE ANY` table holding edges, whose edges its `TYPE NORMAL` keeps while refusing every new one: declare
   `table_type=TableType.ANY` for a table that holds records and edges.
@@ -5669,7 +5688,10 @@ print(*table, sep="\n")
   of objects from every item — the `dict`, `Any` or untyped `list` of a sub-model in a `list[M]`, at any depth
   (`items.*.meta`) — unless the list is `FLEXIBLE` too, then refuse the record's next write (`Found NONE for field`).
   `define_table()` writes such a list `FLEXIBLE` before 3.x; the item's typed fields are still checked. 3.x keeps those
-  values without it.
+  values without it. On 2.x and the embedded engine, the items of such a list then also keep a key the model does not
+  declare, written raw or by another client (the ORM never sends one), which they drop from a list that is not
+  `FLEXIBLE`: a 2.x limitation, since `FLEXIBLE` there covers the whole item. 3.x keeps such a key in the items of any
+  list of objects, `FLEXIBLE` or not, and refuses it at the top level or in a sub-model.
 - On SurrealDB 3.x a required untyped array refuses an object item unless its items are defined
   (`no such field exists`): `define_table()` writes the item definition `TYPE any` (`bag.*`) on every line.
 - A write naming a field a `SCHEMAFULL` table does not define is refused on 3.x and dropped on 2.x and the embedded
@@ -6024,7 +6046,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Model table DDL (`define_table()`: `DEFINE TABLE` + `DEFINE FIELD`)                                                                    | same on both lines: one `DEFINE TABLE OVERWRITE` and one `DEFINE FIELD OVERWRITE` per column, keeping what the model does not declare                                         | the same                                                                                                                                                                            | v0.34.0                              |
 | An `Any` or untyped `list`/`set` field of a `SCHEMAFULL` model                                                                         | `define_table()` adds `FLEXIBLE` (read from `client.version()`): without it these engines empty such values, optional or not; the item definitions as on 3.x                  | kept without `FLEXIBLE` (refused there); an untyped `list` gets an item definition `TYPE any`, without which 3.x refuses an object item of a required one (`no such field exists`)  | v0.34.0                              |
 | A `list` of sub-models (`list[M]`, at any depth) holding a `dict`, an `Any` or an untyped `list`, in a `SCHEMAFULL` model              | `define_table()` also writes the `list` `FLEXIBLE`: without it these engines drop such a value from every item, then refuse the record's next write (`Found NONE for field`)  | kept without `FLEXIBLE` on the `list`, which `define_table()` does not write there                                                                                                  | v0.34.0                              |
-| A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records predating `SCHEMAFULL`) | the field is dropped, silently                                                                                                                                                | the write is refused (`no such field exists`)                                                                                                                                       | v0.34.0                              |
+| A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records predating `SCHEMAFULL`) | the field is dropped, silently; kept in the items of a list `define_table()` writes `FLEXIBLE` (a 2.x limitation)                                                             | the write is refused (`no such field exists`), except in the items of a list of objects, which keep it                                                                              | v0.34.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

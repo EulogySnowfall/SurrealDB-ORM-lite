@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.1] - 2026-10-22
+
+Follow-ups to the review of v0.34.0's model table DDL (#296): `define_access()` and
+`define_table()` refuse an auth model whose `SCHEMAFULL` table would leave out a field SIGNUP
+writes, and the README describes three behaviours of v0.34.0 more precisely. No new public API.
+
+### Fixed
+
+- **`define_access()` and `define_table()` raise `TypeError` for a signup field the table would
+  leave out** (#296). Since v0.34.0, a model whose schema mode is `SCHEMAFULL`
+  (`table_type=TableType.USER`, or a declared `schema_mode=SchemaMode.SCHEMAFULL`) gets from
+  `define_access()` and `define_table()` a `SCHEMAFULL` table with one `DEFINE FIELD` per column
+  `model_dump()` writes, while SIGNUP writes every field of the model. A field declared with
+  `Field(exclude=True)` (`password: str = Field(exclude=True)`) therefore had no column: SurrealDB
+  3.x refused every signup ("The record access signup query failed"), and 2.x dropped the value, a
+  password hash, so every signin failed. For such an auth model (`AuthenticatedUserMixin`),
+  `access_ddl()` and `define_access()` with `with_table=True`, and `table_ddl()` and
+  `define_table()`, now raise `TypeError` before any request, naming the model and the fields.
+  Remove `exclude=True` and leave the field out where you serialise the model instead
+  (`model_dump(exclude={"password"})`): a table defined by hand does not help, since `update()` and
+  `upsert()` replace the record with what `model_dump()` writes, which a required column refuses
+  and an optional one loses. `define_access(with_table=False)`, a `SCHEMALESS` table and a model
+  that is not an auth model (whose excluded field `save()` never writes) behave as before.
+
+### Notes
+
+- **A regenerated `SCHEMAFULL` edge model is applied with `define_table()`**: since v0.34.0,
+  `generate_models_from_db()` gives a `SCHEMAFULL` relation table with data fields an edge model
+  with `schema_mode=SchemaMode.SCHEMAFULL`, for which `define_relation()` raises `SurrealDbError`
+  before any request (it defines no field). Call `define_table()`, which applies the same relation
+  statement, then the data fields. README sections 31 and 34 say so.
+- **`define_access()` and `define_table()` write different table types for a model that declares
+  no `table_type`** and whose schema mode is not `SCHEMAFULL`: `define_access()` writes no `TYPE`,
+  which SurrealDB stores as `TYPE ANY`, and `define_table()` writes `TYPE NORMAL`, so a start-up
+  that calls both changes the table's type each time. Declare `table_type` to keep one type. The
+  schema mode, fields and permissions are the same in any call order; README "User models" and the
+  docstrings no longer say that the two converge on everything.
+- **Undeclared keys in `FLEXIBLE` list items on SurrealDB 2.x and the embedded engine**: the items
+  of a list `define_table()` writes `FLEXIBLE` (a list of sub-models holding a `dict`, an `Any` or
+  an untyped `list`) keep a key the model does not declare, written raw or by another client (the
+  ORM never sends one), while a list that is not `FLEXIBLE` drops it. This is a 2.x limitation:
+  `FLEXIBLE` there covers the whole item. 3.x keeps such a key in the items of any list of objects,
+  `FLEXIBLE` or not, and refuses it at the top level or in a sub-model. README section 35 and the
+  "ORM behaviour: SurrealDB 2.x vs 3.x" row on undeclared fields say so.
+- **Enum columns**: the 0.34.0 entry's list of column kinds leaves out one case: an `enum.Flag` or
+  `IntFlag` field is written `int`, since Pydantic also accepts any combination of its members, and
+  zero. The README "Field types" table, which says so, is now pinned by a test.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.34.0] - 2026-10-21
 
 Model table DDL: a model declares its table's schema mode, change feed, permissions and comment
