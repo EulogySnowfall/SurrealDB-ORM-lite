@@ -1304,19 +1304,31 @@ class BaseSurrealModel(BaseModel):
         Before any DDL (nothing sent but the reads): an index that names by ``str`` an analyzer neither the database
         nor the model's ``Analyzer`` objects define is refused; with *tx*, an analyzer to define or redefine is refused
         — SurrealDB builds an index with the analyzers committed before the transaction began: define it first,
-        outside the block. With *tx*, an index to define or redefine is also refused when the transaction has already
-        written records to the model's table — an ORM write (``save()``, ``objects(tx=…).bulk_create()``, …) or one
-        noted on every table; a definition such as ``define_table(tx=…)`` does not count, nor does a raw ``tx.add()``,
-        which the ORM does not track: SurrealDB servers do not index the records a transaction wrote before the index
-        was defined, which stay out of it after the commit — a server defect (surrealdb/surrealdb#7618 on 3.x, the
-        same on 2.x; the embedded engine indexes them). The refusal does not fail the transaction; call
-        ``define_indexes()`` without *tx* first. With *tx* and the analyzers in place, the index statements join the
-        transaction — applied at once in an interactive one (WebSocket, SurrealDB 3.x),
-        at the commit in a buffered one (HTTP, SurrealDB 2.x, the embedded engine), where a refusal comes back as the
-        transaction's own error; a block that raises applies nothing. On SurrealDB 2.x, a write to a table that held
-        records, after its index in the same block, fails the commit with a retryable ``SurrealDbConflictError`` that a
-        retry meets again. In a buffered transaction an index queued earlier in the block is not seen by the reads, and
-        is queued again (the same statement). Every cached read is dropped.
+        outside the block. With *tx*, an index to define or redefine (one removed in the block included) is also refused
+        when the transaction has already written records to the model's table — an ORM write (``save()``,
+        ``objects(tx=…).bulk_create()``, …) or one noted on every table; a definition such as ``define_table(tx=…)``
+        does not count, nor does a raw ``tx.add()``, which the ORM does not track: SurrealDB servers do not index the
+        records a transaction wrote before the index was defined, which stay out of it after the commit — a server
+        defect (surrealdb/surrealdb#7618 on 3.x, the same on 2.x; the embedded engine indexes them). Every kind of
+        index is refused, not only a full-text one: a search would miss those records, and a ``UNIQUE`` index would
+        not enforce uniqueness for them. The refusal does not fail the transaction; call ``define_indexes()`` without
+        *tx* first. With *tx* and the analyzers in place, the index statements join the transaction — applied at once
+        in an interactive one (WebSocket, SurrealDB 3.x), at the commit in a buffered one (HTTP, SurrealDB 2.x, the
+        embedded engine), where a refusal comes back as the transaction's own error; a block that raises applies
+        nothing. On SurrealDB 2.x, a write to a table that held records, after its index in the same block, fails the
+        commit with a retryable ``SurrealDbConflictError`` that a retry meets again; on an empty table it commits, as on
+        3.x. In a buffered transaction an index queued earlier in the block is not seen by the reads, and is queued
+        again (the same statement). Every cached read is dropped.
+
+        **An index removed in the transaction.** With *tx*, an index :meth:`remove_index` removed with the same *tx*
+        counts as missing, although the committed state the reads see still holds it: it is defined again after its
+        removal (``DEFINE INDEX OVERWRITE``, or ``IF NOT EXISTS`` without *overwrite*), so the commit keeps it; a later
+        call in the block compares it with committed state again. Only an index this model declares is defined again:
+        another model's on the same table comes back with that model's ``define_indexes(tx=…)``, and one no model
+        declares stays removed. A raw ``tx.add("REMOVE INDEX …")`` is not tracked. On SurrealDB 2.x, on a table that
+        held records, a block that removes an index and defines it again fails the commit with a retryable
+        ``SurrealDbConflictError`` that a retry meets again: nothing of the block is committed and the index stands as
+        before; on an empty table it commits, as on 3.x.
 
         Names are written in backticks, filters re-rendered from a closed grammar, numbers from Python numbers,
         comments as string literals. A refusal names the analyzer or the index and its table, never the statement:
@@ -1328,15 +1340,16 @@ class BaseSurrealModel(BaseModel):
             overwrite: ``True`` (default) redefines a changed analyzer or index — the model wins. ``False`` defines
                 what is missing (``IF NOT EXISTS``) and leaves what exists as it is.
             tx: optional transaction the index statements are applied with; the reads happen before anything is
-                queued.
+                queued. An index :meth:`remove_index` removed with it counts as missing.
 
         Raises:
             TypeError: *overwrite* is not a ``bool`` — before any request.
             SurrealDbError: *tx* belongs to another connection — before any request; an analyzer named by ``str`` does
                 not exist, or *tx* is given and an analyzer must be defined or redefined, or an index must be defined
-                or redefined after the transaction wrote records to the model's table (the message names the model and
-                the table) — before any DDL; the server refused a statement (``Can't apply analyzer definition: …``,
-                ``Can't apply index definition: …``, ``Can't apply index rebuild: …``).
+                or redefined (one removed in the block included) after the transaction wrote records to the model's
+                table (the message names the model and the table) — before any DDL; the server refused a statement
+                (``Can't apply analyzer definition: …``, ``Can't apply index definition: …``, ``Can't apply index
+                rebuild: …``).
             SurrealDbAuthenticationError: the session may not read the definitions or define the analyzers and
                 indexes.
 
@@ -1377,6 +1390,11 @@ class BaseSurrealModel(BaseModel):
         if any(index.search_analyzer is not None for index in indexes):
             keyword = fulltext_keyword(_time_travel.line_major(await client.version()))
         stored_indexes = await read_table_indexes(client, table, what="index", kind="definition")
+        # Issue #312: an index remove_index(tx=…) removed in this transaction still stands in committed state; it is
+        # missing once the transaction commits, so it is planned as missing (DEFINE INDEX after the removal).
+        removed = tx._indexes_removed(table) if isinstance(tx, Transaction) else frozenset()
+        if removed:
+            stored_indexes = {name: state for name, state in stored_indexes.items() if name not in removed}
         redefined = {analyzer.name for analyzer in redefine}
         definitions, rebuilds = plan_indexes(
             indexes,
@@ -1414,6 +1432,8 @@ class BaseSurrealModel(BaseModel):
             classify=True,
             subjects=[index_subject(name, table) for name, _ in definitions],
         )
+        if removed and isinstance(tx, Transaction):
+            tx._forget_index_removals(table, (name for name, _ in definitions))
         applied += await apply_rebuilds(client, tx, own_rebuilds)
         warn_redefined(redefine, [*other_rebuilds, *redefined_indexes, *own_rebuilds])
         return applied
@@ -1429,11 +1449,18 @@ class BaseSurrealModel(BaseModel):
         not starting with a digit), checked before any request. The model's cached reads are dropped. A ``search()`` of
         the field afterwards raises ``SurrealDbError`` until an index covers it again.
 
+        With *tx*, the transaction notes the removal: :meth:`define_indexes` called later with the same *tx* counts the
+        index as missing, although committed state still holds it, and defines it again after the removal when its
+        model declares it — so removing an index and defining it again in one block keeps it. On SurrealDB 2.x, on a
+        table that held records, such a block fails the commit with a retryable ``SurrealDbConflictError`` that a retry
+        meets again, and nothing of it is committed. A raw ``tx.add("REMOVE INDEX …")`` is not noted.
+
         Args:
             name: the index's name.
             missing_ok: ``True`` (default) emits ``REMOVE INDEX IF EXISTS …``, so a missing index is not an error;
                 ``False`` raises ``SurrealDbNotFoundError`` for it.
-            tx: optional transaction the statement is applied with.
+            tx: optional transaction the statement is applied with; it notes the removal for
+                :meth:`define_indexes`.
 
         Raises:
             TypeError, ValueError: *name* is not an identifier, or *missing_ok* not a ``bool`` — before any request.
@@ -1462,6 +1489,9 @@ class BaseSurrealModel(BaseModel):
             classify=True,
             subjects=[index_subject(name, table)],
         )
+        if isinstance(tx, Transaction):
+            # Issue #312: define_indexes(tx=…) reads committed state, where the index still stands.
+            tx._note_index_removal(table, name)
         return statement
 
     # ==================== Materialized views (v0.32.0) ====================

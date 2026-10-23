@@ -1561,6 +1561,46 @@ class TestPlans:
         assert _raised(TypeError, search.checked_overwrite, None) == "overwrite= must be a bool, got NoneType."
 
 
+class TestIndexRemovalNote:
+    """Issue #312: a transaction notes the indexes ``remove_index(tx=…)`` removed, by table, for
+    ``define_indexes(tx=…)`` to count them as missing; it forgets those defined again; the commit and the cancel keep
+    the note — on both strategies, without a server."""
+
+    @staticmethod
+    def _transactions() -> list[Transaction]:
+        return [transaction.BufferedTransaction(), transaction.InteractiveTransaction(None, "txn")]
+
+    def test_noted_by_table_and_forgotten_once_defined_again(self) -> None:
+        for tx in self._transactions():
+            assert tx._indexes_removed("t") == frozenset()
+            tx._note_index_removal("t", "a")
+            tx._note_index_removal("t", "b")
+            tx._note_index_removal("t", "a")
+            tx._note_index_removal("u", "a")
+            assert tx._indexes_removed("t") == frozenset({"a", "b"})
+            assert tx._indexes_removed("u") == frozenset({"a"})
+            assert tx._indexes_removed("v") == frozenset()
+            tx._forget_index_removals("t", ["a", "c"])
+            tx._forget_index_removals("v", ["a"])
+            assert tx._indexes_removed("t") == frozenset({"b"})
+            assert tx._indexes_removed("u") == frozenset({"a"})
+            assert tx._indexes_removed("v") == frozenset()
+            # A write of records or a cache note notes no index.
+            tx._note_record_write({"t"})
+            tx._note_cache_write({"t"})
+            assert tx._indexes_removed("t") == frozenset({"b"})
+
+    async def test_kept_by_the_commit_and_the_cancel(self) -> None:
+        for tx in self._transactions():
+            tx._note_index_removal("t", "a")
+            await tx.cancel()
+            assert tx._indexes_removed("t") == frozenset({"a"})
+        empty = transaction.BufferedTransaction()
+        empty._note_index_removal("t", "a")
+        await empty.commit()
+        assert empty._indexes_removed("t") == frozenset({"a"})
+
+
 # --- the indexes a changed analyzer rebuilds; define_analyzer() and remove_analyzer() (no server) -------------------
 
 
@@ -2721,6 +2761,15 @@ class FtsCites(BaseSurrealEdge):
     note: str = ""
 
 
+class FtsArticleViews(BaseSurrealModel):
+    """Another model on ``FtsArticle``'s table, declaring one index ``FtsArticle`` does not (issue #312)."""
+
+    model_config = SurrealConfigDict(table_name="fts_article", indexes=[Index("fts_article_views", "views")])
+
+    id: str | None = None
+    views: int = 0
+
+
 #: The reads ``define_indexes()`` sends, as the ORM writes them.
 _INFO_DB = "INFO FOR DB;"
 _INFO_ARTICLE = "INFO FOR TABLE `fts_article`;"
@@ -2747,6 +2796,14 @@ _TX_WRITE_PIN_3X = (
     "of an index the records the transaction wrote before defining it (surrealdb/surrealdb#7618). If this fails, the "
     "fix reached this line: define_indexes(tx=…)'s refusal after a write to the table, the README sentence and the "
     "row can be reconsidered."
+)
+
+#: The assertion message of the pin of an index removed and defined again in one transaction, on SurrealDB 2.x.
+_REMOVED_AGAIN_PIN_2X = (
+    "README section 36, Transactions, and the v0.36.2 row of the 2.x/3.x table (issue #312): SurrealDB 2.x fails the "
+    "commit of a block that removes an index and defines it again, on a table holding records, with a retryable "
+    "conflict that a retry meets again. If this fails, 2.x commits it now: the README sentence and the row can be "
+    "reconsidered."
 )
 
 #: The assertion message of the materialized-view pin on SurrealDB 3.x.
@@ -2837,7 +2894,7 @@ class TestDefineIndexesE2E:
     """``define_indexes()`` on every engine (SurrealDB 3.x and 2.x over WebSocket and HTTP, and the embedded engine):
     it reads ``INFO FOR DB``, the line and ``INFO FOR TABLE``, then applies only what changed, with the line's keyword;
     an analyzer an index names must exist, a transaction defines no analyzer, nor an index once it wrote records to the
-    model's table — each refused before any DDL."""
+    model's table — each refused before any DDL; an index the transaction removed counts as missing (issue #312)."""
 
     @pytest.mark.parametrize("overwrite", [True, False])
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3062,6 +3119,7 @@ class TestDefineIndexesE2E:
             assert analyzers == {}
             assert indexes == {}
 
+    @pytest.mark.parametrize("held", [True, False], ids=["table-holding-records", "empty-table"])
     @pytest.mark.parametrize(
         ("before", "after"),
         [(["a7"], ["a8"]), ([], ["a8"]), (["a7"], [])],
@@ -3069,16 +3127,18 @@ class TestDefineIndexesE2E:
     )
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_index_defined_in_a_transaction_that_writes_to_its_table(
-        self, kind: str, before: list[str], after: list[str]
+        self, kind: str, before: list[str], after: list[str], held: bool
     ) -> None:
         """README section 36, Transactions (issue #304), driven below the ORM's refusal with the raw statement
-        (``tx.add()``): the analyzer committed first, the table holding ``a1``; in one block, save ``a7`` (or not),
-        define the title index, save ``a8`` (or not). A SurrealDB server commits and leaves ``a7`` out of the index —
-        on 2.x a write after the index fails the commit instead, with a retryable conflict that a retry meets again;
-        the embedded engine indexes every record."""
+        (``tx.add()``): the analyzer committed first, the table holding ``a1`` (or empty, issue #312); in one block,
+        save ``a7`` (or not), define the title index, save ``a8`` (or not). A SurrealDB server commits and leaves ``a7``
+        out of the index — on 2.x a write after the index, to a table that held records, fails the commit instead, with
+        a retryable conflict that a retry meets again, while on an empty table it commits as on 3.x; the embedded
+        engine indexes every record."""
         async with _fts_models(kind) as client:
             await _apply_ddl(client, _A1)
-            await FtsArticle(id="a1", title="Physics a1", slug="a1").save()
+            if held:
+                await FtsArticle(id="a1", title="Physics a1", slug="a1").save()
             index = FtsArticle.index_ddl(line=await _keyword_line(client))[1]
             server = None if kind == "mem" else await _major(client)
 
@@ -3099,20 +3159,22 @@ class TestDefineIndexesE2E:
             rows = _ids(await FtsArticle.objects().exec())
             indexes = await _indexes(client)
             found = _ids(await FtsArticle.objects().search(title="physics").exec()) if indexes else None
-        written = sorted(["a1", *before, *after])
-        if server == 2 and after:
+        committed = ["a1"] if held else []
+        written = sorted([*committed, *before, *after])
+        if server == 2 and after and held:
             assert type(failed) is SurrealDbConflictError, "README section 36, Transactions: 2.x fails the commit"
             assert type(retried) is SurrealDbConflictError, "README section 36, Transactions: a retry meets it again"
             assert rows == ["a1"]
             assert indexes == {}
             return
-        assert failed is None
+        # Issue #312: on an empty table 2.x commits the write after the index, as 3.x does — "a table that held records".
+        assert failed is None, "README section 36, Transactions: committed (on 2.x, a table that held no record)"
         assert rows == written
         assert sorted(indexes) == ["fts_article_title"]
         if kind == "mem":
             assert found == written, "README section 36, Transactions: the embedded engine indexes every record"
         else:
-            assert found == sorted(["a1", *after]), _TX_WRITE_PIN_3X if server == 3 else "README section 36: 2.x"
+            assert found == sorted([*committed, *after]), _TX_WRITE_PIN_3X if server == 3 else "README section 36: 2.x"
 
     @pytest.mark.parametrize("write", ["save", "bulk_create", "every table"])
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3149,14 +3211,18 @@ class TestDefineIndexesE2E:
         assert indexes == {}
         assert (articles, plain) == (([], ["p1"]) if write == "every table" else (["a7"], []))
 
+    @pytest.mark.parametrize("stored", [False, True], ids=["no-index-before", "indexes-before"])
     @pytest.mark.parametrize("kind", _KINDS)
-    async def test_what_a_transaction_may_still_define(self, kind: str) -> None:
+    async def test_what_a_transaction_may_still_define(self, kind: str, stored: bool) -> None:
         """Issue #304, no false positive: ``define_table(tx=…)``, ``define_relation(tx=…)`` and ``remove_index(tx=…)``
         define, they write no record; a write to another table does not count; a call with nothing to apply is never
-        refused, whatever the block wrote."""
+        refused, whatever the block wrote. Issue #312: whether the indexes stand before the block or not — the title
+        index removed in the block is defined again."""
         async with _fts_models(kind) as client:
             line = await _keyword_line(client)
             await _apply_ddl(client, _A1)
+            if stored:
+                await FtsArticle.define_indexes()
             async with SurrealDBConnectionManager.transaction("fts") as tx:
                 await FtsPlain(id="p1", title="Physics p1").save(tx=tx)
                 await FtsArticle.define_table(tx=tx)
@@ -3172,13 +3238,125 @@ class TestDefineIndexesE2E:
             found = _ids(await FtsArticle.objects().search(title="physics").exec())
             plain = _ids(await FtsPlain.objects().exec())
         assert removed == "REMOVE INDEX IF EXISTS `fts_article_title` ON `fts_article`;"
-        assert article == FtsArticle.index_ddl(line=line)[1:]
+        assert article == FtsArticle.index_ddl(line=line)[1 : 2 if stored else None]
         assert cites == FtsCites.index_ddl(line=line)[1:]
         assert again == []
         assert sorted(indexes) == sorted(_ARTICLE_INDEXES)
         assert sorted(cites_indexes) == ["fts_cites_note"]
         assert found == ["a7"]
         assert plain == ["p1"]
+
+    @pytest.mark.parametrize("held", [True, False], ids=["table-holding-records", "empty-table"])
+    @pytest.mark.parametrize("overwrite", [True, False])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_removed_in_the_block_is_defined_again(
+        self, kind: str, overwrite: bool, held: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #312: the indexes stored before the block, ``remove_index(tx=…)`` then ``define_indexes(tx=…)`` in it.
+        The reads see the committed state, where the index still stands, but an index the transaction removed counts as
+        missing: it is defined again after its removal (``OVERWRITE``, or ``IF NOT EXISTS`` without *overwrite*) —
+        applied at once in an interactive transaction, queued after the removal in a buffered one — so the commit
+        keeps it, serving the records committed before the block. On SurrealDB 2.x, on a table holding records, the
+        commit fails instead with a retryable conflict that a retry meets again: nothing of the block is committed, the
+        index stands as before. Never lost."""
+        async with _fts_models(kind) as client:
+            line = await _keyword_line(client)
+            server = None if kind == "mem" else await _major(client)
+            await FtsArticle.define_indexes()
+            keys = ["a1", "a2"] if held else []
+            for key in keys:
+                await FtsArticle(id=key, title=f"Physics {key}", slug=key).save()
+            seen: dict[str, Any] = {}
+
+            async def block() -> SurrealDbError | None:
+                try:
+                    async with SurrealDBConnectionManager.transaction("fts") as tx:
+                        seen["interactive"] = tx.is_interactive
+                        seen["removed"] = await FtsArticle.remove_index("fts_article_title", tx=tx)
+                        calls = _spy(monkeypatch, client)
+                        seen["applied"] = await FtsArticle.define_indexes(overwrite=overwrite, tx=tx)
+                        seen["sent"] = _calls(calls)
+                        monkeypatch.undo()
+                        seen["queued"] = getattr(tx, "statements", None)
+                except SurrealDbError as error:
+                    return error
+                return None
+
+            failed = await block()
+            retried = await block() if failed is not None else None
+            indexes = await _indexes(client)
+            found = _ids(await FtsArticle.objects().search(title="physics").exec()) if "fts_article_title" in indexes else None
+        title = FtsArticle.index_ddl(overwrite=overwrite, line=line)[1]
+        assert seen["removed"] == "REMOVE INDEX IF EXISTS `fts_article_title` ON `fts_article`;"
+        assert seen["applied"] == [title]
+        if seen["interactive"]:
+            assert seen["sent"] == [*_ARTICLE_READS, ("query_raw", title)]
+        else:
+            assert seen["sent"] == _ARTICLE_READS
+            assert seen["queued"] == [seen["removed"], title]
+        if server == 2 and held:
+            assert type(failed) is SurrealDbConflictError, _REMOVED_AGAIN_PIN_2X
+            assert type(retried) is SurrealDbConflictError, _REMOVED_AGAIN_PIN_2X
+        else:
+            assert failed is None
+        assert sorted(indexes) == sorted(_ARTICLE_INDEXES)
+        assert search.index_matches(FtsArticle.get_indexes()[0], ["title"], indexes["fts_article_title"])
+        assert found == keys
+
+    @pytest.mark.parametrize("owner_defines", [False, True], ids=["owner-silent", "owner-defines"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_only_the_declared_indexes_are_defined_again(self, kind: str, owner_defines: bool) -> None:
+        """Issue #312: an index removed in the block that the model does not declare — another model's on the same
+        table — is not defined again by the model, whose declared index removed with it is; the model that declares it
+        defines it again in the same block (the removal is noted per table), else the commit applies the removal the
+        block asked for. Every other index stands."""
+        async with _fts_models(kind) as client:
+            line = await _keyword_line(client)
+            await FtsArticle.define_indexes()
+            await FtsArticleViews.define_indexes()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsArticle.remove_index("fts_article_views", tx=tx)
+                await FtsArticle.remove_index("fts_article_title", tx=tx)
+                article = await FtsArticle.define_indexes(tx=tx)
+                views = await FtsArticleViews.define_indexes(tx=tx) if owner_defines else None
+            indexes = await _indexes(client)
+        assert article == [FtsArticle.index_ddl(line=line)[1]]
+        assert views == (FtsArticleViews.index_ddl() if owner_defines else None)
+        expected = [*_ARTICLE_INDEXES, "fts_article_views"] if owner_defines else _ARTICLE_INDEXES
+        assert sorted(indexes) == sorted(expected)
+
+    @pytest.mark.parametrize("order", ["write-remove", "remove-write"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_removed_in_a_block_that_wrote_to_the_table(
+        self, kind: str, order: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #312 with #304: an index removed in a block that has written records to the model's table is to define
+        again, and so refused before any DDL (the reads alone sent, nothing joins the transaction), naming the model and
+        the table, on both strategies — not left out silently. The refusal does not fail the block: the commit applies
+        its write and the removal it asked for."""
+        async with _fts_models(kind) as client:
+            await FtsArticle.define_indexes()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                if order == "write-remove":
+                    await FtsArticle(id="a7", title="Physics a7", slug="a7").save(tx=tx)
+                await FtsArticle.remove_index("fts_article_title", tx=tx)
+                if order == "remove-write":
+                    await FtsArticle(id="a7", title="Physics a7", slug="a7").save(tx=tx)
+                queued = list(getattr(tx, "statements", []))
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as raised:
+                    await FtsArticle.define_indexes(tx=tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                still = list(getattr(tx, "statements", []))
+            indexes = await _indexes(client)
+            articles = _ids(await FtsArticle.objects().exec())
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _DI3
+        assert sent == _ARTICLE_READS
+        assert still == queued
+        assert sorted(indexes) == sorted(set(_ARTICLE_INDEXES) - {"fts_article_title"})
+        assert articles == ["a7"]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_the_table_an_index_creates(self, kind: str) -> None:
@@ -4872,6 +5050,21 @@ _PART_NEEDLES_36 = {
         "The refusal does not fail the block.",
         "a raw `tx.add()` is not tracked",
         "a retryable `SurrealDbConflictError` that a retry meets again",
+        # Issue #312: an index removed in the block is defined again; the refusal after a write covers it.
+        "An index `remove_index(tx=…)` removed earlier in the block counts as missing",
+        "`define_indexes(tx=…)` defines it again after its removal",
+        "Only an index the model declares comes back",
+        '`tx.add("REMOVE INDEX …")` is not tracked',
+        "one removed earlier in the block included",
+        # Issue #312, item 2: why the refusal covers every kind of index (surrealdb/surrealdb#7618).
+        "The refusal covers every kind of index, not only full-text ones: a search would miss those records, and a "
+        "`UNIQUE` index missing them would not enforce uniqueness for them.",
+        # Issue #312, item 3: the 2.x qualifier, pinned by the empty-table case of
+        # test_an_index_defined_in_a_transaction_that_writes_to_its_table; the removal pinned likewise.
+        "a write to a table that held records, after its index in the same block",
+        "so does a block that removes an index of a table that held records and defines it again, where the index stands "
+        "as before",
+        "On an empty table both commit, as on 3.x.",
     ),
     "Live queries": (
         "`live()` and `watch()` refuse `search()`",
@@ -4975,6 +5168,25 @@ _EMBEDDED_TX_WRITE_ROW = [
     "committed and indexed",
     "refused (left out of the index); on 2.x a write after it, to a table holding records, fails the commit",
     "v0.35.3",
+]
+#: Issue #312: the sentence v0.36.2 adds to the 2.x/3.x table's intro, its row there and its row in the embedded
+#: engine's table, cell by cell — what ``test_an_index_removed_in_the_block_is_defined_again`` pins.
+_HEADER_SENTENCE_362 = (
+    "The row added in v0.36.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
+    "identical on 3.1.5."
+)
+_REMOVED_AGAIN_ROW = [
+    "`remove_index(tx=)` then `define_indexes(tx=)` in one block, the index stored before the block",
+    "on a table holding records, the commit fails with a retryable `SurrealDbConflictError`, again on retry: nothing "
+    "committed, the index kept; on an empty table, defined again",
+    "the index is defined again after its removal and committed, serving the records committed before the block",
+    "v0.36.2",
+]
+_EMBEDDED_REMOVED_AGAIN_ROW = [
+    "`remove_index(tx=)` then `define_indexes(tx=)` in one block",
+    "the index is defined again after its removal and committed, on a table holding records too",
+    "the same on 3.x; on 2.x, on a table holding records, the commit fails with a retryable conflict",
+    "v0.36.2",
 ]
 _FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
 #: The roadmap from v0.34.0: v0.36.0 ships vector search, so the planned range starts at v0.37.0.
@@ -5123,6 +5335,13 @@ class TestReadmeSection36:
         assert_server_rows([_TX_WRITE_ROW])
         assert_server_header_sentence(_HEADER_SENTENCE_353)
         assert_embedded_rows([_EMBEDDED_TX_WRITE_ROW])
+
+    def test_index_removed_in_a_transaction_rows(self) -> None:
+        """Issue #312: v0.36.2's one row in each behaviour table, cell by cell and in version order, and its sentence
+        in the 2.x/3.x table's intro; widths kept."""
+        assert_server_rows([_REMOVED_AGAIN_ROW])
+        assert_server_header_sentence(_HEADER_SENTENCE_362)
+        assert_embedded_rows([_EMBEDDED_REMOVED_AGAIN_ROW])
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]
