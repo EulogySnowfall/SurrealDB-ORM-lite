@@ -30,6 +30,11 @@ Records written (issue #304): an ORM write of records that joins a transaction a
 for the cache only. ``define_indexes(tx=…)`` reads them (``_records_written``): SurrealDB servers do not index the
 records a transaction wrote before the index was defined. A raw ``tx.add()`` is not noted.
 
+Indexes removed (issue #312): ``remove_index(tx=…)`` notes the index it removes, by table (``_note_index_removal``).
+``define_indexes(tx=…)`` reads committed state, where that index still stands: it counts the indexes noted for its table
+(``_indexes_removed``) as missing, plans them again, and forgets those it defines (``_forget_index_removals``). The
+commit and the cancel keep the note, like the tables written. A raw ``tx.add("REMOVE INDEX …")`` is not noted.
+
 Errors (issue #278): the errors a failed transaction raises give the server's reason and the failed statement's
 position, without the server's excerpt of the statement; the server's own text stays reachable as their suppressed
 ``__context__``. A query the server or the embedded engine refuses at a buffered commit raises ``SurrealDbError`` on
@@ -232,6 +237,9 @@ class Transaction(ABC):
         # until the transaction ends.
         self._record_tables: set[str] = set()
         self._record_all = False
+        # Issue #312: the indexes remove_index(tx=…) removed in this transaction, by table, until define_indexes(tx=…)
+        # defines them again; kept until the transaction ends.
+        self._removed_indexes: dict[str, set[str]] = {}
         # Issue #268: the errors of the statements that failed in this transaction (interactive strategy).
         self._failures: list[BaseException] = []
 
@@ -291,6 +299,27 @@ class Transaction(ABC):
         """The tables an ORM write of records changed so far in this transaction (issue #304): ``None`` when one noted
         every table. ``define_indexes(tx=…)`` reads it; a raw ``tx.add()`` is not counted."""
         return None if self._record_all else frozenset(self._record_tables)
+
+    def _note_index_removal(self, table: str, name: str) -> None:
+        """Note that the index *name* of *table* was removed in this transaction — issue #312.
+
+        ``remove_index(tx=…)`` calls it once its ``REMOVE INDEX`` was applied (interactive) or queued (buffered).
+        ``define_indexes(tx=…)``, which reads committed state where the index still stands, counts it as missing. Like
+        the tables written, the commit and the cancel keep it. A raw ``tx.add()`` is not noted.
+        """
+        self._removed_indexes.setdefault(table, set()).add(name)
+
+    def _indexes_removed(self, table: str) -> frozenset[str]:
+        """The indexes of *table* removed in this transaction and not defined again since (issue #312)."""
+        return frozenset(self._removed_indexes.get(table, ()))
+
+    def _forget_index_removals(self, table: str, names: Iterable[str]) -> None:
+        """Forget the removal of the indexes *names* of *table*, which ``define_indexes(tx=…)`` defined again in this
+        transaction (issue #312): a later call compares them with committed state again, as any index the transaction
+        did not remove, instead of defining them once more. A name not noted is ignored."""
+        removed = self._removed_indexes.get(table)
+        if removed is not None:
+            removed.difference_update(names)
 
     @property
     @abstractmethod
