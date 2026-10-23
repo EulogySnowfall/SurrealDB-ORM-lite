@@ -790,7 +790,9 @@ def _note_records(tables: frozenset[str] | None, tx: Any) -> None:
         tx._note_record_write(tables)
 
 
-def invalidates(of: _Of, *, deletes: bool = False, records: bool = True) -> Callable[[F], F]:
+def invalidates(
+    of: _Of, *, deletes: bool = False, records: bool = True, refuse: Callable[[Any], None] | None = None
+) -> Callable[[F], F]:
     """Decorate an ORM write method so that it invalidates the cached reads it can change.
 
     ``of`` says which tables the call writes, from its first argument: ``"self"`` (the instance's model table),
@@ -810,6 +812,12 @@ def invalidates(of: _Of, *, deletes: bool = False, records: bool = True) -> Call
     the model's raises ``SurrealDbError`` (``routing.check_transaction()``) before the write is put in flight or noted
     on the transaction, so a refused write invalidates nothing. The transaction is read statically, never asked. A
     queryset's transaction is checked by ``objects(tx=)``.
+
+    ``refuse`` (issue #315) runs the method's own refusals — the model's materialized-view, snapshot and excluded
+    signup field checks — with the call's first argument, right after that connection check and before the tables
+    are noted on the transaction or put in flight, with a transaction or without. Whatever it raises propagates: a
+    write it refuses leaves the transaction as it was (no statement, no table noted) and invalidates nothing. It is
+    not called when the arguments do not bind (Python raises the function's own error).
     """
     if of not in _RESOLVERS:
         raise ValueError(f"invalidates() takes one of {sorted(_RESOLVERS)}, not {of!r}")
@@ -830,6 +838,8 @@ def invalidates(of: _Of, *, deletes: bool = False, records: bool = True) -> Call
                 arg0 = bound.arguments[first]
                 model = arg0 if isinstance(arg0, type) else type(arg0)
                 _routing.check_transaction(model, tx, f"{model.__name__}.{func.__name__}()")
+            if refuse is not None and first in bound.arguments:
+                refuse(bound.arguments[first])
             if records and tx is not None:
                 _note_records(tables, tx)
             async with writing(tables, tx):

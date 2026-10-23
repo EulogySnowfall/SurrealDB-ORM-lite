@@ -5,6 +5,7 @@ import logging
 import os
 import traceback
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -27,6 +28,8 @@ from surreal_orm_lite import (
     AuthResult,
     AuthTokens,
     BaseSurrealModel,
+    Index,
+    QuerySet,
     SchemaMode,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
@@ -37,6 +40,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite._sdk import SurrealError
 from surreal_orm_lite.schema import signup_excluded_refused
 from surreal_orm_lite.signals import around_save, around_update, post_save, post_update, pre_save, pre_update
+from surreal_orm_lite.time_travel import snapshot_write_refused
 from surreal_orm_lite.transaction import BufferedTransaction
 from tests.conftest import orm_client
 
@@ -665,6 +669,9 @@ class TestAuthValidation:
         assert requests == []
         assert fired == []
         assert tx.statements == [] and tx.variables == {}
+        # #315: nor is the table noted on the transaction — for define_indexes(tx=)'s check (#304) or the query cache.
+        assert tx._records_written() == frozenset()
+        assert tx._cache_written() == frozenset()
         assert str(raised.value) == signup_excluded_refused("HiddenWriter", ["password"])
         for call in ("update()", "upsert()", "authenticate()", "refresh()"):
             assert call in str(raised.value)
@@ -741,6 +748,52 @@ class TestExcludedSignupFieldWriteE2E:
                 assert await stored_hash() == stored, f"{call}() changed the stored hash"
                 assert refused is not None, f"{call}() did not refuse the model"
                 assert str(refused) == signup_excluded_refused("HashKeeper", ["password"])
+
+
+class IndexedKeeper(AuthenticatedUserMixin, BaseSurrealModel):
+    """An auth model whose excluded password field SG1 refuses in ``update()``/``upsert()``, with an index to define."""
+
+    model_config = SurrealConfigDict(
+        table_name="sg1_indexed_keeper", indexes=[Index("sg1_indexed_keeper_email", "email", unique=True)]
+    )
+
+    id: str | None = None
+    email: str
+    password: str = Field(exclude=True)
+
+
+class TestRefusedWriteInTransactionE2E:
+    """#315 on both server lines: a write the model refuses in a transaction — SG1 (#310), or the refusal of a snapshot
+    read with ``as_of()`` — leaves the transaction as it was. ``define_indexes(tx=…)`` on the same table then defines
+    the index instead of refusing it as if a record had been written there (#304), and the commit applies it (at once
+    on SurrealDB 3.x over WebSocket, interactive; at the commit on 2.x, buffered)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("refusal", ["signup", "snapshot"])
+    @pytest.mark.parametrize("call", ["update", "upsert"])
+    async def test_define_indexes_follows_a_refused_write(self, refusal: str, call: str) -> None:
+        moment = datetime(2021, 6, 1, tzinfo=UTC)
+        me = IndexedKeeper(id="ada", email="ada@example.test", password="$argon2id$stored-hash")
+        if refusal == "snapshot":
+            QuerySet._mark_snapshots(me, moment)
+        async with orm_client("sg1_indexed_keeper") as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                with pytest.raises((TypeError, SurrealDbError)) as raised:
+                    await getattr(me, call)(tx=tx)
+                written = (tx._records_written(), tx._cache_written())
+                applied = await IndexedKeeper.define_indexes(tx=tx)
+            info = await client.query("INFO FOR TABLE sg1_indexed_keeper;", {})
+            rows = await client.query("SELECT * FROM sg1_indexed_keeper;", {})
+        if refusal == "signup":
+            assert type(raised.value) is TypeError
+            assert str(raised.value) == signup_excluded_refused("IndexedKeeper", ["password"])
+        else:
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == snapshot_write_refused("IndexedKeeper", f"{call}()", moment)
+        assert written == (frozenset(), frozenset())
+        assert applied == IndexedKeeper.index_ddl()
+        assert list(info["indexes"]) == ["sg1_indexed_keeper_email"]
+        assert rows == []
 
 
 class TestDefineAccessInTransactionE2E:

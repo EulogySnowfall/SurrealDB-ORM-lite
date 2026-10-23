@@ -583,6 +583,29 @@ def _snapshot_moment(instance: BaseModel) -> datetime | None:
     return (instance.__pydantic_private__ or {}).get("_surreal_as_of")
 
 
+def _write_refusals(call: str, *, view: bool = True, signup: bool = False) -> Callable[[Any], None]:
+    """The model's own refusals of the instance write *call* (``"update()"``, named as the user wrote it), for
+    ``invalidates(refuse=…)`` (issue #315).
+
+    In this order: the materialized view (W1, :meth:`BaseSurrealModel._reject_view_write`; ``view=False`` for the
+    relation helpers, which write the edge table), the snapshot (:meth:`BaseSurrealModel._reject_snapshot_write`),
+    then, with ``signup=True`` (the full replaces :meth:`~BaseSurrealModel.update` and
+    :meth:`~BaseSurrealModel.upsert`), SG1 (:meth:`BaseSurrealModel._reject_signup_excluded`). The wrapper calls it
+    with the instance after ``routing.check_transaction()`` and before the write's tables are noted on the transaction
+    or put in flight, so a refused write leaves the transaction as it was: no statement, no table noted for
+    ``define_indexes(tx=…)`` (#304) or the query cache. A write decorated with it does not repeat these checks.
+    """
+
+    def refuse(instance: Any) -> None:
+        if view:
+            instance._reject_view_write(call)
+        instance._reject_snapshot_write(call)
+        if signup:
+            instance._reject_signup_excluded()
+
+    return refuse
+
+
 class SurrealConfigDict(ConfigDict, total=False):
     """
     SurrealConfigDict is a configuration dictionary for SurrealDB models.
@@ -795,9 +818,10 @@ class BaseSurrealModel(BaseModel):
         """Refuse *method* (named with its ``()``) on a snapshot, an instance read with ``as_of()`` (v0.26.0).
 
         Called at the start of every instance write — right after the materialized-view check of the writes that
-        have one (:meth:`_reject_view_write`, v0.32.0) —, so no signal, transaction or request runs before it. The
-        marker is read through :func:`_snapshot_moment`, the only reader (an instance pickled by v0.25.x may have no
-        private state).
+        have one (:meth:`_reject_view_write`, v0.32.0) —, so no signal, transaction or request runs before it: by the
+        write's ``invalidates(refuse=…)`` (:func:`_write_refusals`), before its tables are noted on the transaction, so
+        a refused write leaves the transaction as it was (#315). The marker is read through :func:`_snapshot_moment`,
+        the only reader (an instance pickled by v0.25.x may have no private state).
 
         Raises:
             SurrealDbError: the instance holds the record as it was at a moment, not the current record.
@@ -1473,8 +1497,10 @@ class BaseSurrealModel(BaseModel):
 
         SurrealDB computes a view's records from its ``view_query``, so the ORM never writes them: the first statement
         of every ORM write of the model — the instance writes and the queryset's — before the snapshot check, any
-        signal, transaction use or request. The relation helpers write the edge table, not the view, and stay
-        allowed; raw SurrealQL is never guarded.
+        signal, transaction use or request. An instance write runs it through its ``invalidates(refuse=…)``
+        (:func:`_write_refusals`), before its table is noted on the transaction, which a refused write leaves as it
+        was (#315). The relation helpers write the edge table, not the view, and stay allowed; raw SurrealQL is never
+        guarded.
 
         Raises:
             TypeError: the model is a materialized view (W1, naming the class and *call*).
@@ -1491,7 +1517,9 @@ class BaseSurrealModel(BaseModel):
         Called by :meth:`_table_ddl`, after its other refusals, and by the full replaces :meth:`update` and
         :meth:`upsert`, right after the view and snapshot checks — before any signal, transaction use or request: they
         write what ``model_dump()`` writes, so they would drop the stored value of such a field (a password hash, and
-        every later signin fails).
+        every later signin fails). There it runs in their ``invalidates(refuse=…)`` (:func:`_write_refusals`), before
+        the model's table is noted on the transaction: a refused ``update(tx=…)`` or ``upsert(tx=…)`` leaves nothing on
+        the transaction — no statement, and no table noted for ``define_indexes(tx=…)`` or the query cache (#315).
 
         Raises:
             TypeError: the auth model and those fields, in declaration order (``schema.signup_excluded_refused()``).
@@ -3076,20 +3104,22 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(rows)
         return self, True
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("save()"))
     async def _save_naming(self, fields: Iterable[str], tx: Transaction | None = None) -> Self:
         """``save()`` that also writes the ``server_fields`` among ``fields``.
 
         Backs the create branch of ``get_or_create``/``update_or_create``, where a server field
         can legitimately be named — as a lookup criterion or in ``defaults`` — and must then be
-        stored, or the next identical lookup would miss the row and create another one.
+        stored, or the next identical lookup would miss the row and create another one. It refuses a
+        materialized view and a snapshot as ``save()`` does, naming ``save()``, before its table is noted
+        on the transaction (#315) — also when it writes a server field, which does not go through ``save()``.
         """
         keep = frozenset(fields) & self.get_server_fields()
         if not keep:
             return await self.save(tx=tx)
         return await self._save_with_signals(functools.partial(self._do_save, keep=keep), tx)
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("save()"))
     async def save(
         self,
         tx: Transaction | None = None,
@@ -3137,8 +3167,6 @@ class BaseSurrealModel(BaseModel):
             values are unknown until commit, so the instance keeps its pre-save values for
             those fields — ``refresh()`` after commit if you need them.
         """
-        self._reject_view_write("save()")
-        self._reject_snapshot_write("save()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
             self._reject_computed_writes(server_values, "save(server_values=)")
@@ -3398,7 +3426,7 @@ class BaseSurrealModel(BaseModel):
             return rows[0].get("before"), rows[0].get("after")
         return None, None
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("upsert()", signup=True))
     async def upsert(self, tx: Transaction | None = None) -> Self:
         """
         Insert the model instance, or fully replace it if a record with the same id exists.
@@ -3416,6 +3444,11 @@ class BaseSurrealModel(BaseModel):
         in a transaction ``around_save`` is skipped and ``post_save`` is deferred to a
         successful commit (consistent with ``save(tx=)``).
 
+        The view, snapshot and SG1 refusals below come before the model's table is noted on
+        ``tx``: a call they refuse leaves nothing on the transaction — no statement, and no table
+        noted as written, so a later ``define_indexes(tx=…)`` of the model is not refused for it
+        and the commit drops no cached read for it (#315).
+
         Raises:
             TypeError: the model is a materialized view (W1); or an auth model
                 (``AuthenticatedUserMixin``) with a field SIGNUP writes that ``Field(exclude=True)``
@@ -3424,12 +3457,9 @@ class BaseSurrealModel(BaseModel):
                 without ``tx``.
             SurrealDbError: the instance is a snapshot read with ``as_of()``.
         """
-        self._reject_view_write("upsert()")
-        self._reject_snapshot_write("upsert()")
-        self._reject_signup_excluded()
         return await self._save_with_signals(self._do_upsert, tx)
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("update()", signup=True))
     async def update(self, tx: Transaction | None = None) -> Any:
         """
         Update the model instance to the database.
@@ -3474,6 +3504,11 @@ class BaseSurrealModel(BaseModel):
             The updated row as the SDK reads it (``[]`` for a record that does not exist), or
             ``None`` in a transaction.
 
+        The view, snapshot and SG1 refusals below come before the model's table is noted on
+        ``tx``: a call they refuse leaves nothing on the transaction — no statement, and no table
+        noted as written, so a later ``define_indexes(tx=…)`` of the model is not refused for it
+        and the commit drops no cached read for it (#315).
+
         Raises:
             TypeError: the model is a materialized view (W1); or an auth model
                 (``AuthenticatedUserMixin``) with a field SIGNUP writes that ``Field(exclude=True)``
@@ -3482,9 +3517,6 @@ class BaseSurrealModel(BaseModel):
                 without ``tx``.
             SurrealDbError: the instance is a snapshot read with ``as_of()``, or it has no id.
         """
-        self._reject_view_write("update()")
-        self._reject_snapshot_write("update()")
-        self._reject_signup_excluded()
         sender = self.__class__
         data = self._write_payload(replace=True)
         record_id = self._record_id()
@@ -3593,7 +3625,7 @@ class BaseSurrealModel(BaseModel):
         await post_update.send(sender, instance=self, update_fields=update_fields)
         return None
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("merge()"))
     async def merge(
         self,
         tx: Transaction | None = None,
@@ -3647,8 +3679,6 @@ class BaseSurrealModel(BaseModel):
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
             >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
         """
-        self._reject_view_write("merge()")
-        self._reject_snapshot_write("merge()")
         self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
@@ -3692,7 +3722,7 @@ class BaseSurrealModel(BaseModel):
 
     # ==================== Patch & atomic operations ====================
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("patch()"))
     async def patch(self, operations: list[dict[str, Any]], tx: Transaction | None = None) -> Self:
         """Apply a JSON Patch (RFC 6902) to this record.
 
@@ -3710,8 +3740,6 @@ class BaseSurrealModel(BaseModel):
         name a field either way — ``/password`` or its column ``/password_hash`` — and are
         rewritten to the column before they are sent.
         """
-        self._reject_view_write("patch()")
-        self._reject_snapshot_write("patch()")
         validate_patch_operations(operations)
         self._reject_computed_patch(operations, "patch()")
         operations = self._columns_for_patch(operations)
@@ -3727,18 +3755,16 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(record)
         return self
 
-    async def _atomic_update(self, set_expr: str, variables: dict[str, Any], tx: Transaction | None, *, label: str) -> Self:
+    async def _atomic_update(self, set_expr: str, variables: dict[str, Any], tx: Transaction | None) -> Self:
         """Run ``UPDATE $rid SET <set_expr>`` atomically and sync ``self`` with the result.
 
         Shared by the atomic helpers. ``$rid`` and every value in ``variables`` are bound
         (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
         Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
         ``self`` stale (the new value is computed server-side, unknown until commit).
-        ``label`` is the calling method's name with its ``()``, for the view refusal (v0.32.0) and the snapshot
-        refusal (v0.26.0).
+        Each helper refuses a materialized view (v0.32.0) and a snapshot (v0.26.0) under its own
+        name through its ``invalidates(refuse=…)`` (#315), before its field is checked.
         """
-        self._reject_view_write(label)
-        self._reject_snapshot_write(label)
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("atomic operations require an explicit id.")
@@ -3753,7 +3779,7 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(rows)
         return self
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_append()"))
     async def atomic_append(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically append ``value`` to an array ``field`` (duplicates allowed).
 
@@ -3761,11 +3787,9 @@ class BaseSurrealModel(BaseModel):
         semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(
-            f"{column} = array::append({column}, $value)", {"value": value}, tx, label="atomic_append()"
-        )
+        return await self._atomic_update(f"{column} = array::append({column}, $value)", {"value": value}, tx)
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_remove()"))
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of ``value`` from an array ``field``.
 
@@ -3774,11 +3798,9 @@ class BaseSurrealModel(BaseModel):
         but only the first on 2.6.x.) Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(
-            f"{column} = array::complement({column}, [$value])", {"value": value}, tx, label="atomic_remove()"
-        )
+        return await self._atomic_update(f"{column} = array::complement({column}, [$value])", {"value": value}, tx)
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_set_add()"))
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically add ``value`` to an array ``field`` only if not already present.
 
@@ -3786,11 +3808,9 @@ class BaseSurrealModel(BaseModel):
         ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(
-            f"{column} = array::add({column}, $value)", {"value": value}, tx, label="atomic_set_add()"
-        )
+        return await self._atomic_update(f"{column} = array::add({column}, $value)", {"value": value}, tx)
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_increment()"))
     async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
         """Atomically add ``amount`` (default 1) to a numeric ``field``.
 
@@ -3811,7 +3831,7 @@ class BaseSurrealModel(BaseModel):
                 f"Set the new value with merge({field}=…) instead."
             )
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx, label="atomic_increment()")
+        return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx)
 
     @staticmethod
     def _as_value_list(values: Any) -> list[Any]:
@@ -3822,7 +3842,7 @@ class BaseSurrealModel(BaseModel):
             return list(values)
         raise ValueError(f"values must be a list of items, got {type(values).__name__}")
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_append_many()"))
     async def atomic_append_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically append every element of ``values`` to an array ``field`` (duplicates allowed).
 
@@ -3836,10 +3856,9 @@ class BaseSurrealModel(BaseModel):
             f"{column} = array::concat({column}, $values)",
             {"values": self._as_value_list(values)},
             tx,
-            label="atomic_append_many()",
         )
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_set_add_many()"))
     async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically add every element of ``values`` to an array ``field``, skipping any already present.
 
@@ -3852,10 +3871,9 @@ class BaseSurrealModel(BaseModel):
             f"{column} = array::add({column}, $values)",
             {"values": self._as_value_list(values)},
             tx,
-            label="atomic_set_add_many()",
         )
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_remove_many()"))
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of every element of ``values`` from an array ``field``.
 
@@ -3867,10 +3885,9 @@ class BaseSurrealModel(BaseModel):
             f"{column} = array::complement({column}, $values)",
             {"values": self._as_value_list(values)},
             tx,
-            label="atomic_remove_many()",
         )
 
-    @_cache.invalidates("self", deletes=True)
+    @_cache.invalidates("self", deletes=True, refuse=_write_refusals("delete()"))
     async def delete(self, tx: Transaction | None = None) -> None:
         """
         Delete the model instance from the database.
@@ -3884,8 +3901,6 @@ class BaseSurrealModel(BaseModel):
         ``around_delete`` is skipped (the write is deferred to commit) and
         ``post_delete`` only fires after a successful commit.
         """
-        self._reject_view_write("delete()")
-        self._reject_snapshot_write("delete()")
         sender = self.__class__
         record_id = self._record_id()
         if record_id is None:
@@ -4119,7 +4134,7 @@ class BaseSurrealModel(BaseModel):
         **edge_data: Any,
     ) -> list[dict[str, Any]]: ...
 
-    @_cache.invalidates("edge")
+    @_cache.invalidates("edge", refuse=_write_refusals("relate()", view=False))
     async def relate(
         self,
         edge: "str | type[BaseSurrealEdge]",
@@ -4202,7 +4217,6 @@ class BaseSurrealModel(BaseModel):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await user.relate(Follows, other_user, tx=tx)
         """
-        self._reject_snapshot_write("relate()")
         self._check_relation("relate", self._model_of(target), self._edge_model(edge))
         if isinstance(edge, type) and issubclass(edge, BaseSurrealModel) and edge.__surreal_edge__:
             fields = self._merge_edge_fields(data, edge_data, edge.to_py_field)
@@ -4329,7 +4343,7 @@ class BaseSurrealModel(BaseModel):
         with contextlib.suppress(NotFoundError):
             await client.query(statement, _encoding.encode(variables))
 
-    @_cache.invalidates("edge")
+    @_cache.invalidates("edge", refuse=_write_refusals("remove_relation()", view=False))
     async def remove_relation(
         self,
         edge: "str | type[BaseSurrealEdge]",
@@ -4390,7 +4404,6 @@ class BaseSurrealModel(BaseModel):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await user.remove_relation(Follows, other_user, tx=tx)
         """
-        self._reject_snapshot_write("remove_relation()")
         self._check_relation("remove_relation", self._model_of(target), self._edge_model(edge))
         edge_name = self._edge_name(edge)
         source = self._graph_source()
@@ -4408,7 +4421,7 @@ class BaseSurrealModel(BaseModel):
             variables = {"src": source, "dst": self._graph_target(target)}
         await self._run_graph_delete(statement, variables, tx)
 
-    @_cache.invalidates("edge")
+    @_cache.invalidates("edge", refuse=_write_refusals("remove_all_relations()", view=False))
     async def remove_all_relations(
         self,
         edge: "str | type[BaseSurrealEdge] | Sequence[str | type[BaseSurrealEdge]]",
@@ -4453,7 +4466,6 @@ class BaseSurrealModel(BaseModel):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await user.remove_all_relations(["likes", "blocks"], direction="both", tx=tx)
         """
-        self._reject_snapshot_write("remove_all_relations()")
         self._check_direction(direction)
         edges = edge if isinstance(edge, (list, tuple)) else (edge,)
         self._check_relation("remove_all_relations", *(self._edge_model(item) for item in edges))

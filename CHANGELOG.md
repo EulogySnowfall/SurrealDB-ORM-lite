@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.1] - 2026-10-23
+
+Follow-ups to the review of v0.35.4 (#315): an instance write that the model refuses (a
+materialized view, a snapshot read with `as_of()`, an auth model with an excluded signup field)
+now leaves its transaction exactly as it was, and the docstring of `access_ddl()` lists every call
+that refuses an excluded signup field. No new public API.
+
+### Fixed
+
+- **A refused instance write no longer marks its table as written on the transaction** (#315).
+  With `tx=`, the model's own refusals ran after the ORM had noted the model's table on the
+  transaction. A refused `update(tx=tx)` or `upsert(tx=tx)` (materialized view, snapshot, excluded
+  signup field), a `save()`, `merge()`, `patch()`, `atomic_*()` or `delete()` refused on a view
+  or a snapshot, or a `relate()`, `remove_relation()` or `remove_all_relations()` refused on a
+  snapshot queued no statement but left the table noted. A caller that caught the error and kept using the
+  transaction then had a later `define_indexes(tx=tx)` on that table refused by the v0.35.3 check
+  (#304), and the commit dropped the table's cached reads although nothing was written. These
+  refusals now run right after the connection check and before anything is noted: the transaction
+  keeps no statement and no table, `define_indexes(tx=tx)` is accepted, and the refused call
+  invalidates no cached read, with a transaction or without. The v0.35.4 entry's "nothing is added
+  to the transaction" now holds for the transaction's bookkeeping too. Refusal order (view,
+  snapshot, then excluded signup field) and messages are unchanged; the behaviour is the same on
+  SurrealDB 2.x and 3.x and on both transaction strategies.
+
+### Changed
+
+- **The atomic helpers and an edge's `save()` refuse a view or a snapshot before checking their
+  arguments** (#315). `atomic_append()`, `atomic_remove()`, `atomic_set_add()`,
+  `atomic_increment()` and the `atomic_*_many()` helpers checked the field name (`atomic_increment()`
+  a duration amount, the `atomic_*_many()` helpers a `values` that is not a list) before the view
+  and snapshot refusals: on a view or a snapshot, an invalid argument now raises the view's
+  `TypeError` or the snapshot's `SurrealDbError` instead of the argument's error. An edge read with
+  `as_of()` raises the snapshot error before the `save(server_values=…)` and `save(extra_vars=…)`
+  refusal. Valid calls are unchanged.
+
+### Notes
+
+- **Docs**: the `Raises` section of `access_ddl()` lists every call that refuses an auth model
+  with an excluded signup field, as `signup()` and the error message do: `table_ddl()`,
+  `define_table()`, `define_access()`, `signup()`, `signin()`, `authenticate()`, `refresh()`,
+  `update()` and `upsert()`.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0, plus 3.1.5 for backward
+  compatibility.
+
 ## [0.36.0] - 2026-10-23
 
 Vector search: a queryset finds the records whose vector is nearest to a query vector with the

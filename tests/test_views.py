@@ -75,7 +75,7 @@ import re
 import sys
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -1291,6 +1291,40 @@ _VIEW_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
 
 _WRITE_IDS = [row[0] for row in _VIEW_WRITES]
 
+#: #315: the instance writes of :data:`_VIEW_WRITES` (the first 13 rows) and ``_save_naming()``, which W1 names
+#: ``save()``.
+_INSTANCE_TX_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    *_VIEW_WRITES[:13],
+    ("_save_naming", "save()", lambda s, tx: s._save_naming(["status"], tx=tx)),
+]
+
+#: #315: each atomic helper with an argument it refuses on an ordinary model — a field name that is not one
+#: (``ValueError``), for ``atomic_increment()`` a duration amount (``TypeError``), for the ``atomic_*_many()`` helpers
+#: a ``values`` that is not a list (``ValueError``) —, named as W1 names it.
+_INVALID_ATOMIC_CALLS: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    ("atomic_append", "atomic_append()", lambda s, tx: s.atomic_append("bad field!", "x", tx=tx)),
+    ("atomic_remove", "atomic_remove()", lambda s, tx: s.atomic_remove("bad field!", "x", tx=tx)),
+    ("atomic_set_add", "atomic_set_add()", lambda s, tx: s.atomic_set_add("bad field!", "x", tx=tx)),
+    ("atomic_increment", "atomic_increment()", lambda s, tx: s.atomic_increment("bad field!", tx=tx)),
+    (
+        "atomic_increment-duration",
+        "atomic_increment()",
+        lambda s, tx: s.atomic_increment("total", timedelta(seconds=1), tx=tx),
+    ),
+    ("atomic_append_many", "atomic_append_many()", lambda s, tx: s.atomic_append_many("bad field!", ["x"], tx=tx)),
+    ("atomic_set_add_many", "atomic_set_add_many()", lambda s, tx: s.atomic_set_add_many("bad field!", ["x"], tx=tx)),
+    ("atomic_remove_many", "atomic_remove_many()", lambda s, tx: s.atomic_remove_many("bad field!", ["x"], tx=tx)),
+    ("atomic_append_many-values", "atomic_append_many()", lambda s, tx: s.atomic_append_many("status", "x", tx=tx)),
+    ("atomic_set_add_many-values", "atomic_set_add_many()", lambda s, tx: s.atomic_set_add_many("status", "x", tx=tx)),
+    ("atomic_remove_many-values", "atomic_remove_many()", lambda s, tx: s.atomic_remove_many("status", "x", tx=tx)),
+]
+
+#: What :data:`_INVALID_ATOMIC_CALLS` raise on an ordinary model: the argument's own error.
+_ATOMIC_ARGUMENT_ERROR = (
+    r"^(Invalid atomic field name 'bad field!'|atomic_increment\(\) adds a number, not a duration"
+    r"|values must be a list of items, got str$)"
+)
+
 
 class _UntouchableTx:
     """A transaction a refused write must never reach: any use of it fails the test."""
@@ -1380,6 +1414,68 @@ class TestWriteGuard:
         assert str(raised.value).startswith("Cannot modify materialized view 'order_stats'")
         assert fired == []
         assert client_requests == []
+
+    @pytest.mark.parametrize(("name", "call", "write"), _INSTANCE_TX_WRITES, ids=[row[0] for row in _INSTANCE_TX_WRITES])
+    async def test_a_refused_instance_write_leaves_the_transaction_as_it_was(
+        self,
+        client_requests: list[str],
+        name: str,
+        call: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        """#315: with a real transaction, W1 refuses an instance write before the wrapper notes its table on the
+        transaction — no statement, no table written with records (which ``define_indexes(tx=…)`` reads, #304), no
+        table for the query cache at the commit —, naming the public method (``save()`` for ``_save_naming()``)."""
+        tx = BufferedTransaction(client=None)
+        with _pre_signals(OrderStats) as fired, pytest.raises(TypeError) as raised:
+            await write(_stats(), tx)
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
+        assert fired == []
+        assert client_requests == []
+        assert (tx.statements, tx.variables) == ([], {})
+        assert tx._records_written() == frozenset()
+        assert tx._cache_written() == frozenset()
+
+    async def test_save_naming_a_server_field_is_refused(self, client_requests: list[str]) -> None:
+        """#315: ``_save_naming()`` (the create branch of ``get_or_create()``/``update_or_create()`` and of
+        ``relate(EdgeModel, …)``) writing a ``server_fields`` field skips ``save()``: it refuses a view model as
+        ``save()`` does, with or without a transaction, which it leaves as it was."""
+
+        class ServerStats(OrderStats):
+            model_config = SurrealConfigDict(table_name="server_stats", server_fields=["revenue"])
+
+        for tx in (None, BufferedTransaction(client=None)):
+            with pytest.raises(TypeError) as raised:
+                await _stats(ServerStats, "server_stats")._save_naming(["revenue"], tx=tx)
+            assert str(raised.value) == _w1("server_stats", "ServerStats.save()")
+            if tx is not None:
+                assert (tx.statements, tx._records_written(), tx._cache_written()) == ([], frozenset(), frozenset())
+        assert client_requests == []
+
+    @pytest.mark.parametrize("in_tx", [False, True], ids=["no-tx", "tx"])
+    @pytest.mark.parametrize(("name", "call", "write"), _INVALID_ATOMIC_CALLS, ids=[row[0] for row in _INVALID_ATOMIC_CALLS])
+    async def test_an_atomic_helper_refuses_a_view_before_checking_its_arguments(
+        self,
+        client_requests: list[str],
+        in_tx: bool,
+        name: str,
+        call: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        """#315 (0.36.1, Changed): an argument the helper refuses — an invalid field name, a duration amount, a
+        ``values`` that is not a list — raises its own error on an ordinary model, but W1 on a view model, whose
+        refusal runs first in the helper's ``invalidates(refuse=…)``, naming the helper; a transaction is left as it
+        was."""
+        with pytest.raises((ValueError, TypeError), match=_ATOMIC_ARGUMENT_ERROR):
+            await write(_stats(PlainStats, "plain_stats"), None)
+        tx = BufferedTransaction(client=None) if in_tx else None
+        with _pre_signals(OrderStats) as fired, pytest.raises(TypeError) as raised:
+            await write(_stats(), tx)
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
+        assert fired == []
+        assert client_requests == []
+        if tx is not None:
+            assert (tx.statements, tx._records_written(), tx._cache_written()) == ([], frozenset(), frozenset())
 
     @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
     async def test_an_ordinary_model_is_not_refused(
