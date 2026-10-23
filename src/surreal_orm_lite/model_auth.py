@@ -287,9 +287,10 @@ class AuthenticatedUserMixin:
         ``BaseSurrealModel._table_ddl()`` (behind ``table_ddl()`` and ``define_table()``), :meth:`access_ddl` (behind
         :meth:`define_access`, with or without the table), :meth:`_auth_variables` (behind :meth:`signup` and
         :meth:`signin`), :meth:`authenticate`, :meth:`refresh`, and ``update()`` and ``upsert()`` (through
-        ``BaseSurrealModel._reject_signup_excluded()``, with or without ``tx``, before any signal) call it before any
-        request: whichever call loads the record — ``authenticate()``, a ``get()``, a signup by another client —,
-        ``update()`` and ``upsert()`` would drop the stored hash.
+        ``BaseSurrealModel._reject_signup_excluded()``, with or without ``tx``, before any signal and before the table
+        is noted on the transaction, #315) call it before any request: whichever call loads the record —
+        ``authenticate()``, a ``get()``, a signup by another client —, ``update()`` and ``upsert()`` would drop the
+        stored hash.
 
         Raises:
             TypeError: naming the model and those fields, in declaration order (``schema.signup_excluded_refused()``).
@@ -410,9 +411,12 @@ class AuthenticatedUserMixin:
                 be refused by a required column, and a ``SCHEMAFULL`` table would not define
                 the field (SurrealDB 3.x would refuse every signup, 2.x drop the value). The
                 message names the model and the fields, in declaration order; ``table_ddl()``,
-                ``define_table()``, :meth:`signup` and :meth:`signin` refuse that model too.
-                Remove ``exclude=True`` and pass ``exclude=`` to ``model_dump()`` where you
-                serialise the model.
+                ``define_table()``, :meth:`define_access`, :meth:`signup`, :meth:`signin`,
+                :meth:`authenticate`, :meth:`refresh`, ``update()`` and ``upsert()`` refuse that
+                model too (``schema.signup_excluded_refused()``), the last two before any signal,
+                with or without ``tx`` — leaving nothing on the transaction (#315). Remove
+                ``exclude=True`` and pass ``exclude=`` to ``model_dump()`` where you serialise
+                the model.
             ValueError: an auth key naming no field of the model, an unknown hashing family or
                 duration, a primary key SIGNUP cannot bind; with ``with_table=True`` and a
                 ``SCHEMAFULL`` schema mode, a ``FLEXIBLE`` request on a kind without an object
