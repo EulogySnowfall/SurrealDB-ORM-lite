@@ -10,44 +10,45 @@
 
 ## Overview
 
-| Version           | Theme                                                               | Status  |
-| ----------------- | ------------------------------------------------------------------- | ------- |
-| v0.2.x            | Core ORM (CRUD, QuerySet, Filters)                                  | Done    |
-| v0.3.0            | Aggregations & Utilities                                            | Done    |
-| v0.4.0            | Model Signals                                                       | Done    |
-| v0.5.0            | Bulk Operations & Q Objects                                         | Done    |
-| v0.6.0            | Relations & Graph                                                   | Done    |
-| v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                                   | Done    |
-| v0.8.0            | Transactions ORM (core, `tx=`)                                      | Done    |
-| v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)                     | Done    |
-| v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)                     | Done    |
-| v0.13.0           | Tier 1 — SurrealFunc & server-side values                           | Done    |
-| v0.14.0           | Tier 1 — Computed Fields                                            | Done    |
-| v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)                          | Done    |
-| v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)                 | Done    |
-| v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)                      | Done    |
-| v0.18.0           | Tier 1 — Field aliases & DX                                         | Done    |
-| v0.19.0           | Tier 1 — Live queries (base), raw notifications                     | Done    |
-| v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)                     | Done    |
-| v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)                   | Done    |
-| v0.22.0           | Tier 1 — Core (native typed relations)                              | Done    |
-| v0.23.0           | Tier 2 — Rich field types                                           | Done    |
-| v0.24.0           | Tier 2 — Geospatial fields                                          | Done    |
-| v0.25.0           | Tier 2 — Embedded test engine                                       | Done    |
-| v0.26.0           | Tier 2 — Time travel (versioned storage)                            | Done    |
-| v0.27.0           | Tier 2 — Subqueries                                                 | Done    |
-| v0.28.0           | Tier 2 — Query cache                                                | Done    |
-| v0.29.0           | Tier 2 — Multi-database                                             | Done    |
-| v0.30.0           | Tier 3 — Schema introspection                                       | Done    |
-| v0.31.0           | Tier 3 — Server-side events & DDL helpers                           | Done    |
-| v0.32.0           | Tier 3 — Materialized views                                         | Done    |
-| v0.33.0           | Tier 3 — `TYPE RELATION` enforcement                                | Done    |
-| v0.34.0           | Tier 3 — Model table DDL                                            | Done    |
-| v0.35.0           | Tier 3 — Full-text search                                           | Done    |
-| v0.36.0 – v0.40.0 | Tier 3 — Advanced (vector/hybrid search, migrations, CLI), 5 minors | Planned |
-| v0.41.0           | Beta Phase (API freeze, hardening)                                  | Planned |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)                              | Planned |
-| v2.1.0+           | Future (post-GA)                                                    | Future  |
+| Version           | Theme                                                        | Status  |
+| ----------------- | ------------------------------------------------------------ | ------- |
+| v0.2.x            | Core ORM (CRUD, QuerySet, Filters)                           | Done    |
+| v0.3.0            | Aggregations & Utilities                                     | Done    |
+| v0.4.0            | Model Signals                                                | Done    |
+| v0.5.0            | Bulk Operations & Q Objects                                  | Done    |
+| v0.6.0            | Relations & Graph                                            | Done    |
+| v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                            | Done    |
+| v0.8.0            | Transactions ORM (core, `tx=`)                               | Done    |
+| v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)              | Done    |
+| v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)              | Done    |
+| v0.13.0           | Tier 1 — SurrealFunc & server-side values                    | Done    |
+| v0.14.0           | Tier 1 — Computed Fields                                     | Done    |
+| v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)                   | Done    |
+| v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)          | Done    |
+| v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)               | Done    |
+| v0.18.0           | Tier 1 — Field aliases & DX                                  | Done    |
+| v0.19.0           | Tier 1 — Live queries (base), raw notifications              | Done    |
+| v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)              | Done    |
+| v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)            | Done    |
+| v0.22.0           | Tier 1 — Core (native typed relations)                       | Done    |
+| v0.23.0           | Tier 2 — Rich field types                                    | Done    |
+| v0.24.0           | Tier 2 — Geospatial fields                                   | Done    |
+| v0.25.0           | Tier 2 — Embedded test engine                                | Done    |
+| v0.26.0           | Tier 2 — Time travel (versioned storage)                     | Done    |
+| v0.27.0           | Tier 2 — Subqueries                                          | Done    |
+| v0.28.0           | Tier 2 — Query cache                                         | Done    |
+| v0.29.0           | Tier 2 — Multi-database                                      | Done    |
+| v0.30.0           | Tier 3 — Schema introspection                                | Done    |
+| v0.31.0           | Tier 3 — Server-side events & DDL helpers                    | Done    |
+| v0.32.0           | Tier 3 — Materialized views                                  | Done    |
+| v0.33.0           | Tier 3 — `TYPE RELATION` enforcement                         | Done    |
+| v0.34.0           | Tier 3 — Model table DDL                                     | Done    |
+| v0.35.0           | Tier 3 — Full-text search                                    | Done    |
+| v0.36.0           | Tier 3 — Vector search                                       | Done    |
+| v0.37.0 – v0.40.0 | Tier 3 — Advanced (hybrid search, migrations, CLI), 4 minors | Planned |
+| v0.41.0           | Beta Phase (API freeze, hardening)                           | Planned |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)                       | Planned |
+| v2.1.0+           | Future (post-GA)                                             | Future  |
 
 > **Versioning note**: the GA is numbered **v2.0.0** to mirror the official SurrealDB SDK 2.0
 > as a branding choice. This is **independent** of the dependency pin, which stays
@@ -106,7 +107,7 @@ pieces stay out.
 | `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                              | ✅ v0.33.0     |
 | Model table DDL (`define_table()`)     | `DEFINE TABLE` + `DEFINE FIELD` via `query()`               | ✅ v0.34.0     |
 | Full-Text Search (BM25)                | `DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*` | ✅ v0.35.0     |
-| Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator                  | v0.36.0        |
+| Vector Search (KNN, HNSW)              | `DEFINE INDEX … HNSW` + KNN operator `<\|K,EF\|>`           | ✅ v0.36.0     |
 | Hybrid Search (RRF)                    | vector + FTS fusion                                         | v0.37.0        |
 | Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`            | v0.38.0        |
 | CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                                 | v0.39.0        |
@@ -170,7 +171,7 @@ moves it to the `surrealdb[embedded]` extra.
 | TYPE RELATION enforcement     | yes        | ✅ v0.33.0                    |
 | Model table DDL               | yes        | ✅ v0.34.0 (`define_table()`) |
 | Full-Text Search (BM25)       | yes        | ✅ v0.35.0                    |
-| Vector Search (KNN/HNSW)      | yes        | v0.36.0                       |
+| Vector Search (KNN/HNSW)      | yes        | ✅ v0.36.0                    |
 | Hybrid Search (RRF)           | yes        | v0.37.0                       |
 | Migrations & CLI              | yes        | v0.38 – v0.39                 |
 | Test fixtures & factories     | yes        | v0.25.0 + v0.40.0             |
@@ -813,6 +814,49 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   manager for tables without a model; `Index(concurrently=True)`, with v0.36.0's vector indexes.
   Analyzers and indexes in migrations → v0.38.0
 
+### Version 0.36.0 — Vector search (`similar_to()`)
+
+- A queryset finds the records whose vector is nearest to a query vector with the full
+  SurrealDB-ORM's API: `QuerySet.similar_to(field, vector, limit=10, *, ef=None)`, each record's
+  distance set as `_knn_distance` (nearest first unless `order_by()` is given), plus `dist=`, an
+  addition: an exact, brute-force search that needs no index. The query vector is bound as a query
+  variable; `limit` and `ef` go from 1 to 10 000, and `ef` is written raised to `limit`.
+  `similar_to()` applies wherever `filter()` does — `count()`, `exists()`, the aggregations,
+  `values()` groups, `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery` — where the full
+  ORM applies it to `exec()` only; with `search()`, the matches are ranked by the vector
+- A model declares its vector fields with `VectorField[d]` (the full ORM's) or its typed form
+  `Annotated[list[float] | None, Vector(d)] = None`, which type checkers accept; both check their
+  values on writes and reads (exactly `d` finite numbers) and `define_table()` writes them
+  `option<array<float, d>>`. Vector indexes are `Index(hnsw=True, ...)` with the full ORM's
+  `CreateIndex` arguments (`dimension`, `dist`, `vector_type`, `efc`, `m`), in
+  `SurrealConfigDict(indexes=[...])`: every HNSW option is written, the same statement on both
+  lines, and `define_indexes()` never rebuilds an unchanged vector index
+- Measured differences: SurrealDB 2.x and the embedded engine answer too few or no records next to
+  many conditions (one on an indexed field among them), so there the ORM selects every other
+  condition — a full-text match included — in a `LET` first, while 3.x applies them during the
+  index search; search annotations combine with `similar_to()` on 3.x, and on 2.x and the embedded
+  engine the ORM refuses them, while `count()`, `exists()` and the aggregations still answer; the
+  bulk writes act on the ids of the `limit` nearest, selected first, since a write holding the KNN
+  operator acts on every matching record on 2.x and on none next to a range on an indexed field on
+  3.x; 2.x returns at most `ef` records; HNSW returns fewer than `limit` records next to a
+  selective condition more often on 2.x; an index without `TYPE` stores `F64` on the embedded
+  engine (`F32` on servers); `MTREE` is accepted on 2.x and a parse error on 3.x. Same code on
+  2.7.0, 3.3.4 and the embedded engine (3.1.5 retro: a field without a vector index answers every
+  record, and `similar_to()` next to `search()` every match, each with no distance)
+- Refused before any request: `similar_to()` with `as_of()` (the index holds the records' current
+  vectors); with `live()`/`watch()`, in their condition or a `Subquery`, since SurrealDB accepts a
+  live query whose condition holds the vector search but never notifies it; with `changes()`. A
+  query vector of the wrong length, when the model declares the dimension, and a zero vector with
+  `COSINE` are refused too
+- Deferred: `hybrid_search()` and the RRF fusion of `similar_to()` and `search()` → v0.37.0 (which
+  also decides whether SurrealDB 2.x gets search annotations next to `similar_to()`); the
+  `MINKOWSKI` distance with its order; `Index(concurrently=True)` with a build status check
+  (`INFO FOR INDEX`), the follow-up to v0.35.0's deferred `concurrently`; `F16` vectors and
+  `HASHED_VECTOR` on SurrealDB 3.x; `DISKANN` indexes on 3.x; vector functions in `annotate()`
+  (`vector::similarity::cosine()`, `vector::distance::*`); `VectorField` and `Index(hnsw=True)` in
+  generated models (with v0.38.0/v0.39.0); `similar_to(dist=…)` with `as_of()` on versioned
+  stores. `MTREE`, `JACCARD` and `PEARSON` are not offered
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -1027,7 +1071,7 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 | Version    | Theme                                               | SDK 2.0 realization                                         |
 | ---------- | --------------------------------------------------- | ----------------------------------------------------------- |
 | ✅ v0.35.0 | Full-Text Search (`search()`, BM25 score/highlight) | `DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*` |
-| v0.36.0    | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW/MTREE` + KNN operator                  |
+| ✅ v0.36.0 | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW` + KNN operator `<\|K,EF\|>`           |
 | v0.37.0    | Hybrid Search (RRF)                                 | vector + FTS fusion                                         |
 
 ### 🛠️ Phase H — Tooling

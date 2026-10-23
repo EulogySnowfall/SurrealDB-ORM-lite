@@ -4977,13 +4977,19 @@ _EMBEDDED_TX_WRITE_ROW = [
     "v0.35.3",
 ]
 _FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
+#: The roadmap from v0.34.0: v0.36.0 ships vector search, so the planned range starts at v0.37.0.
 _ROADMAP_ROWS_36 = [
     ["v0.34.0", "Tier 3 — Model table DDL", "✅ Released"],
     ["v0.35.0", "Tier 3 — Full-text search", "✅ Released"],
-    ["v0.36.0 – v0.40.0", "Tier 3 — Advanced (vector and hybrid search, migrations, CLI)", "📋 Planned"],
-    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
+    ["v0.37.0 – v0.40.0", "Tier 3 — Advanced (hybrid search, migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROW_36 = ["Full-Text Search", "✅ v0.35.0 (`search()`)", "✅"]
+#: "Coming from the full SurrealDB-ORM", bullet 10, since v0.36.0 (whitespace normalised).
+_BULLET_10_36 = (
+    "- **`Index` has no `concurrently` argument**: it covers plain, `UNIQUE`, full-text and, since v0.36.0, vector "
+    "indexes (section 37)."
+)
 #: "Supported Filter Lookups": the clause that ends the ``match``/``regex`` item.
 _LOOKUP_CLAUSE_36 = f"full-text search is the separate `search()` API ([section 36]{_LINK_36})."
 
@@ -5026,14 +5032,19 @@ class TestReadmeSection36:
     "Supported Filter Lookups" sentence; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_36_follows_section_35(self) -> None:
-        """Right after section 35 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 35 (after its "Coming from" bullets), then section 37 (v0.36.0), and before the ``---``
+        of "Configuration Options"."""
         text = _readme()
         start_35 = text.index(f"\n{_SECTION_35}\n")
         start_36 = text.index(f"\n{_SECTION_36}\n")
         configuration = text.index("\n## Configuration Options\n")
         assert start_35 < start_36 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_35 + 1 : configuration], re.MULTILINE) == [_SECTION_35, _SECTION_36]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 36 ends before the --- of the next part"
+        assert re.findall(r"^#{2,3} .*$", text[start_35 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_35,
+            _SECTION_36,
+            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         assert re.findall(r"^#### (.*)$", _section_36(), re.MULTILINE) == _SUBSECTIONS_36
@@ -5067,6 +5078,11 @@ class TestReadmeSection36:
         for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_36, strict=True):
             assert bullet.startswith("- **"), bullet
             assert phrase in bullet, (phrase, bullet)
+
+    def test_coming_from_bullet_10_names_vector_indexes(self) -> None:
+        """v0.36.0 adds vector indexes to ``Index``: bullet 10 keeps its key phrase and names them."""
+        bullets = _readme_bullets(_part_36("Coming from the full SurrealDB-ORM"))
+        assert bullets[9] == _BULLET_10_36, bullets[9]
 
     def test_no_local_reference(self) -> None:
         """No design reference and no issue number in the section."""
@@ -5202,6 +5218,13 @@ def _released_35() -> bool:
     return rows[0][0] == "✅ v0.35.0"
 
 
+def _released_36() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.36.0 (vector search) as released: its Phase G row carries the ✅ the
+    release adds."""
+    rows = [cells for _, cells in _table_rows(_subsection(_PHASE_G, _roadmap()))]
+    return rows[1][0] == "✅ v0.36.0"
+
+
 def _row(text: str, heading: str, first: str) -> list[str]:
     """The row of the first table under *heading* whose first cell is *first*."""
     rows = [cells for _, cells in _table_rows(_subsection(heading, text)) if cells[0] == first]
@@ -5212,12 +5235,17 @@ def _row(text: str, heading: str, first: str) -> list[str]:
 class TestRoadmap35:
     """``docs/ROADMAP.md`` records v0.35.0 as planned, or — once its Phase G row carries ✅ — as released: done in the
     overview, ✅ in the SDK and comparison tables and in Phase G, its block in "Completed versions" right after
-    v0.34.0's. The Phase G row decides which state the whole file must be in."""
+    v0.34.0's. The Phase G row decides which state the whole file must be in. Once v0.36.0 is released too, its rows
+    follow v0.35.0's (``tests/test_vector.py::TestRoadmap36`` checks them)."""
 
     def test_overview(self) -> None:
         roadmap = _roadmap()
         overview = [cells for _, cells in _table_rows(_subsection("## Overview", roadmap))]
         start = [cells[0] for cells in overview].index("v0.34.0") + 1
+        if _released_36():
+            assert overview[start] == _OVERVIEW_35[0], overview
+            assert overview[start + 1][0] == "v0.36.0", overview
+            return
         expected = _OVERVIEW_35 if _released_35() else _PLANNED_OVERVIEW_35
         assert overview[start : start + len(expected)] == expected, overview
         assert overview[start + len(expected)][0] == "v0.41.0", overview
@@ -5235,7 +5263,7 @@ class TestRoadmap35:
     def test_phase_g(self) -> None:
         rows = [cells for _, cells in _table_rows(_subsection(_PHASE_G, _roadmap()))]
         assert rows[0] == (_PHASE_G_35 if _released_35() else _PLANNED_PHASE_G_35), rows
-        assert [cells[0] for cells in rows[1:]] == ["v0.36.0", "v0.37.0"], rows
+        assert [cells[0] for cells in rows[1:]] == ["✅ v0.36.0" if _released_36() else "v0.36.0", "v0.37.0"], rows
 
     def test_completed_versions(self) -> None:
         """Released: v0.35.0's block right after v0.34.0's. Planned: no such block."""

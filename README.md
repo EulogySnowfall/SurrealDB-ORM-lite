@@ -219,6 +219,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)    | ✅     |
 | Model table DDL (`define_table()`, `schema_mode`, `permissions`)              | ✅     |
 | Full-text search (`search()`, BM25 score and highlights)                      | ✅     |
+| Vector search (`similar_to()`, KNN, HNSW indexes)                             | ✅     |
 
 ### Supported Filter Lookups
 
@@ -6102,11 +6103,326 @@ print(await NoteV2.objects().search(text="physics").count())
 - **The index keyword follows the server line**: `FULLTEXT` on SurrealDB 3.x, `SEARCH` on 2.x and the embedded engine;
   the full ORM writes `FULLTEXT` only, which 2.x refuses.
 - **A `COMMENT` is escaped with a backslash**; the full ORM's doubled quote is a parse error on both lines.
-- **`Index` has no `concurrently` argument and no vector arguments yet**: it covers plain, `UNIQUE` and full-text
-  indexes; vector indexes come in v0.36.0.
+- **`Index` has no `concurrently` argument**: it covers plain, `UNIQUE`, full-text and, since v0.36.0, vector
+  indexes (section 37).
 - **`filter(x__match=...)` stays a regular expression**: this library's `match` lookup, not SurrealDB's `@@`;
   `search()` is the full-text path.
 - **`hybrid_search()` comes in v0.37.0.**
+
+### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)
+
+Since v0.36.0 a queryset finds the records whose vector is nearest to a query vector with the full SurrealDB-ORM's
+API — `similar_to()`, each record's distance set as `_knn_distance` — over the vector fields a model declares with
+`VectorField` and the HNSW indexes it declares with `Index(hnsw=True)` and applies with `define_indexes()`. SurrealDB
+searches the index and computes the distances on the server; the ORM binds the query vector as a query variable. The
+same code runs on SurrealDB 2.x, 3.x and the embedded engine, except where the
+[2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The examples assume a configured connection: they
+run as written, in order, on the embedded engine (`mem://`).
+
+#### Declare and apply
+
+`VectorField[d]` is the full ORM's vector field: a list of `d` numbers, optional and `None` by default, which
+`define_table()` writes `option<array<float, d>>`; `VectorField[d, "F64"]` also names its storage type (`F64`, `F32` —
+the default —, `I64`, `I32` or `I16`). An `Index` with `hnsw=True` is a vector index, with `CreateIndex`'s arguments:
+`dimension=` (required: the vectors' length, 1 to 65535), `dist=` (`EUCLIDEAN` by default, `COSINE`, `MANHATTAN`,
+`CHEBYSHEV` or `HAMMING`, in any case), `vector_type=`, `efc=` (the build's candidate list, 150 by default) and `m=`
+(the links per node, 2 to 127, 12 by default). It covers one field, and the model lists it in
+`SurrealConfigDict(indexes=[...])` next to the full-text indexes of
+[section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index). Its attributes hold what was
+declared (`None` for an option not given). When the class is defined, two vector indexes on one column are refused,
+and so is a vector index whose dimension or storage type differs from its field's `VectorField`.
+
+```python
+from surreal_orm_lite import (
+    Analyzer,
+    BaseSurrealModel,
+    Index,
+    PointField,
+    SearchHighlight,
+    SearchScore,
+    Subquery,
+    SurrealConfigDict,
+    SurrealDbError,
+    VectorField,
+)
+
+PLAIN = Analyzer("plain", ["blank"], ["lowercase"])
+
+
+class Document(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="document",
+        indexes=[
+            Index("document_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("document_title", "title", search_analyzer=PLAIN, highlights=True),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    featured: bool = False
+    location: PointField = None
+    embedding: VectorField[3]  # three numbers keep the examples short; an embedding model gives hundreds
+
+
+print(*Document.index_ddl(), sep="\n")
+# DEFINE ANALYZER OVERWRITE `plain` TOKENIZERS blank FILTERS lowercase;
+# DEFINE INDEX OVERWRITE `document_embedding` ON `document` FIELDS `embedding` HNSW DIMENSION 3 DIST COSINE TYPE F32 EFC 150 M 12;
+# DEFINE INDEX OVERWRITE `document_title` ON `document` FIELDS `title` FULLTEXT ANALYZER `plain` HIGHLIGHTS;
+await Document.define_table()  # the table first, its `embedding` column an option<array<float, 3>>
+applied = await Document.define_indexes()
+print(applied == Document.index_ddl(line=2))  # the embedded engine is a SurrealDB 2.x core: SEARCH
+# True
+print(await Document.define_indexes())  # nothing changed, nothing applied: the vector index is not rebuilt
+# []
+```
+
+The ORM writes every HNSW option — `DIST`, `TYPE`, `EFC` and `M`, SurrealDB's defaults when not given — so every
+engine stores the same index: the embedded engine would otherwise store `F64` vectors where servers store `F32`.
+`define_indexes()` compares the declared vector index with the stored one and redefines it only when an option, the
+field or the comment changed — a rebuild, which reads every record of the table — and `index_ddl()` renders the same
+`HNSW` statement for SurrealDB 2.x and 3.x.
+
+A vector field's value is checked on every write and on every read: `None`, or a `list` or `tuple` of exactly `d`
+real numbers (`int`, `float`, a `Decimal`; not a `bool` nor a `str`), each finite, kept as a `list[float]`; anything
+else raises Pydantic's `ValidationError`. A stored vector that fails the check — another length, a `NaN` — makes
+`exec()` return its row as a dict, as for any row that does not validate.
+
+```python
+try:
+    Document(title="Too short", embedding=[1.0, 0.0])
+except ValueError as error:  # pydantic.ValidationError
+    print(error.errors()[0]["msg"])
+# Value error, expected 3 numbers, got 2
+```
+
+To move a table to another dimension — a new embedding model, 384 numbers to 768 —, first declare the field
+`list[float] | None` without its vector index, apply `define_table()` (the column then takes any length) and remove
+the index (`remove_index()`), which refuses a vector of another length: reads keep returning instances while records
+of both lengths exist. Once every record holds the new length, declare `VectorField[768]` and an index with
+`dimension=768`, then apply `define_table()` and `define_indexes()`.
+
+#### Type checkers
+
+Type checkers do not understand `VectorField[1536]` (mypy: `"VectorField" expects no type arguments`), as in the full
+ORM: in type-checked code, write `embedding: Annotated[list[float] | None, Vector(1536)] = None`, which the ORM reads
+the same way. `Vector(dimension, vector_type="F32")` is the marker `VectorField` builds, so both spellings are one
+field: the same checks, the same column and the same JSON schema. Without the Pydantic mypy plugin, mypy only knows a
+default written in the class body: write `= None`, or `= Field(default=None, alias="…")` for an aliased field.
+`get_vector_info()` and `is_vector_field()`, from `surreal_orm_lite.vector`, read either spelling.
+
+```python
+from typing import Annotated
+
+from pydantic import Field
+
+from surreal_orm_lite import Vector
+from surreal_orm_lite.vector import get_vector_info, is_vector_field
+
+
+class Passage(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="passage")
+
+    id: str | None = None
+    text: str
+    embedding: Annotated[list[float] | None, Vector(1536)] = None
+    summary: Annotated[list[float] | None, Vector(384, "F64")] = Field(default=None, alias="summary_vec")
+
+
+passage = Passage(text="Typed vectors")  # type checkers accept it: both vectors default to None
+print(passage.embedding, passage.summary)
+# None None
+print(get_vector_info(Passage.model_fields["embedding"]), get_vector_info(Passage.model_fields["summary"]))
+# (1536, 'F32') (384, 'F64')
+print(get_vector_info(Document.model_fields["embedding"]), is_vector_field(Passage.model_fields["text"]))
+# (3, 'F32') False
+```
+
+#### Find the nearest
+
+`similar_to(field, vector, limit=10, *, ef=None, dist=None)` keeps the `limit` records whose `field` vector is nearest
+to `vector`. The field is a Python field name (an aliased field searches its column) or a dotted path; the vector is
+a `list` or `tuple` of numbers, of the field's dimension when the model declares it (a NumPy array: `.tolist()`),
+checked before any request and bound, never written into the statement. A second `similar_to()` replaces the first.
+`exec()`, `first()` and `get()` without an id set each record's distance as `_knn_distance` — a number, in the
+index's metric or `dist=`'s —, never written back (`model_dump()`, `save()` and `update()` leave it out); rows that
+do not validate (a `select()` leaving out a required field) come back as dicts holding it.
+`order_by("-_knn_distance")` or any field sorts them otherwise.
+
+`similar_to(field, vector, limit)` keeps the `limit` nearest records, `limit` and `ef` going up to 10 000; `limit()`
+and `offset()` then page through them, and without `order_by()` they come nearest first.
+
+```python
+corpus = [
+    ("d1", "Cats and dogs", "pets", [1.0, 0.0, 0.0], (0.0, 0.0)),
+    ("d2", "Cats at home", "pets", [0.9, 0.1, 0.0], (50.0, 50.0)),
+    ("d3", "Rust programming", "tech", [0.0, 1.0, 0.0], (0.01, 0.01)),
+    ("d4", "Python programming", "tech", [0.1, 0.9, 0.0], (0.02, 0.0)),
+    ("d5", "Gardening", "home", [0.0, 0.0, 1.0], (10.0, 10.0)),
+    ("d6", "Cats and code", "news", [0.5, 0.5, 0.0], (0.0, 0.02)),
+]
+for key, title, category, embedding, location in corpus:
+    await Document(id=key, title=title, category=category, embedding=embedding, location=location).save()
+
+query = [1.0, 0.0, 0.0]
+for document in await Document.objects().similar_to("embedding", query, 3).exec():
+    print(document.id, round(document._knn_distance, 4))
+# d1 0.0
+# d2 0.0061
+# d6 0.2929
+nearest = await Document.objects().similar_to("embedding", query).first()
+print(nearest.id, "_knn_distance" in nearest.model_dump())
+# d1 False
+page = Document.objects().similar_to("embedding", query, 4).offset(2).limit(2)
+print([document.id for document in await page.exec()])
+# ['d6', 'd4']
+```
+
+`ef` (100 by default) sizes the HNSW search: a larger value finds the true nearest records more often, at a cost. The
+ORM writes it raised to `limit`, so without other conditions every line returns `limit` records when the table holds
+them.
+
+`similar_to()` reads the field's HNSW index: on a field without one it finds no record. Pass `dist=` for an exact scan
+that needs no index.
+
+```python
+print([document.id for document in await Document.objects().similar_to("embedding", query, 3, ef=40).exec()])
+# ['d1', 'd2', 'd6']
+exact = await Document.objects().similar_to("embedding", query, 2, dist="euclidean").exec()
+print([(document.id, round(document._knn_distance, 4)) for document in exact])  # double precision
+# [('d1', 0.0), ('d2', 0.1414)]
+```
+
+#### With other conditions
+
+`similar_to()` applies wherever `filter()` does, AND-ed with `filter()`, `Q`, `nearby()`, `search()` and a
+`Subquery` filter: `exec()`, `first()`, `get()` without an id, `count()`, `exists()`, the aggregations, `values()`
+groups, `bulk_update()`, `bulk_delete()`, `patch()`, and a `Subquery` of the queryset
+([section 28](#28-subqueries-subquery)). `get(<id>)` and `all()` ignore it, as they ignore `filter()`. The bulk
+writes act on the `limit` nearest records, whose ids they select first, and return their number; their `limit()`,
+`offset()` and `order_by()` are ignored, as for every bulk write. With `search()`, the records matching the text are
+ranked by the vector.
+
+Other conditions select the records first, then `similar_to()` keeps the nearest among them: SurrealDB 3.x applies
+them during the index search. SurrealDB 2.x and the embedded engine answer too few records, or none, next to many
+conditions (one on an indexed field among them), so there the ORM selects the records matching them in a `LET` first,
+which is slower: upgrade to SurrealDB 3.x for large tables.
+
+```python
+tech = Document.objects().filter(category="tech").similar_to("embedding", query, 2)
+print([document.id for document in await tech.exec()])
+# ['d4', 'd3']
+around = Document.objects().nearby("location", (0.0, 0.0), 3000).similar_to("embedding", query, 2)
+print([document.id for document in await around.exec()])
+# ['d1', 'd6']
+cats = Document.objects().search(title="cats").similar_to("embedding", [0.0, 1.0, 0.0], 2)
+print([document.id for document in await cats.exec()])  # the matches, ranked by the vector
+# ['d6', 'd2']
+print(await Document.objects().similar_to("embedding", query, 3).count())
+# 3
+print(await Document.objects().filter(category="pets").similar_to("embedding", query, 1).bulk_update(featured=True))
+# 1
+print([document.id for document in await Document.objects().filter(featured=True).exec()])
+# ['d1']
+nearest_three = Subquery(Document.objects().similar_to("embedding", query, 3))
+print(await Document.objects().filter(id__in=nearest_three, category="pets").count())
+# 2
+not_pets = Subquery(Document.objects().filter(category__in=["tech", "news"]))
+in_subquery = Document.objects().filter(id__in=not_pets).similar_to("embedding", query, 2)
+print([document.id for document in await in_subquery.exec()])
+# ['d6', 'd4']
+```
+
+On SurrealDB 3.x, search annotations (`SearchScore`, `SearchHighlight`, `SearchOffsets`) give each of the nearest
+matches the score, highlight and offsets that the same `search()` gives it without `similar_to()`. On SurrealDB 2.x
+and the embedded engine the ORM refuses them before the statement is sent, since there it selects the matches first
+and the vector search holds no match to score, highlight or locate; `count()`, `exists()` and the aggregations, which
+return no annotation, still answer. The examples run on the embedded engine, which is why this one prints the
+refusal.
+
+```python
+programming = Document.objects().search(title="programming").similar_to("embedding", [0.0, 1.0, 0.0], 2)
+annotated = programming.annotate(score=SearchScore(0), snippet=SearchHighlight("<b>", "</b>", 0))
+try:
+    for document in await annotated.exec():
+        print(document.title, document.snippet, round(document.score, 4), round(document._knn_distance, 4))
+except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server
+    print(exc)
+# similar_to() cannot be combined with SearchScore on SurrealDB 2.x or the embedded engine: there the ORM selects the full-text matches first, so the vector search holds no match to score, highlight or locate. Keep search() as a condition, or use SurrealDB 3.x.
+print(await annotated.count(), await annotated.exists())
+# 2 True
+```
+
+#### What SurrealDB decides
+
+- HNSW is approximate: with a condition that keeps few records, a search can return fewer than `limit` records,
+  depending on how the index was built. SurrealDB 2.x and the embedded engine do so more often, even with a condition
+  that keeps a tenth of the table. Pass `dist=` for an exact scan.
+- Distances are computed in the index's `vector_type` (`F32` by default: single precision), so they can differ from
+  Python's in the last digits; `dist=` computes in double precision.
+- `COSINE` has no distance for a zero vector: `similar_to()` refuses a zero query vector when the distance is
+  `COSINE` — `dist="cosine"`, or the model's `COSINE` index on the field —, and a record holding a zero vector gets a
+  `nan` distance.
+- A vector index refuses a record whose vector has another length. A query vector of another length is refused
+  before any request when the model declares the dimension (its `VectorField` or its vector index); otherwise
+  SurrealDB refuses it, and the ORM raises `SurrealDbError` naming the field and both lengths (a bulk write in a
+  transaction relays SurrealDB's error).
+
+```python
+try:
+    Document.objects().similar_to("embedding", [0.0, 0.0, 0.0])
+except ValueError as error:
+    print(error)
+# similar_to(): a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance.
+```
+
+#### Not supported
+
+- Search annotations with `similar_to()` on SurrealDB 2.x and the embedded engine, for the reads that return records
+  (`exec()`, `first()`, `get()` without an id): `SurrealDbError` before the statement is sent. `search()` as a
+  condition stays available there, and `count()`, `exists()` and the aggregations answer.
+- `as_of()` ([section 27](#27-time-travel-as_of)): `similar_to()` with `as_of()` raises `SurrealDbError` before any
+  request, in either order and in a subquery under it. The index holds the records' current vectors, so a time-travel
+  read would pick its neighbours by their vectors now.
+- `live()`/`watch()` ([section 21](#21-live-queries-real-time-notifications)) refuse `similar_to()`, and a `Subquery`
+  holding it, before any request: SurrealDB accepts a live query whose condition holds the vector search but never
+  notifies it. Read the nearest records with `similar_to()` and watch them by id.
+- `changes()` ([section 22](#22-change-feeds-changes)): a change feed refuses `similar_to()` (`SurrealDbError`).
+- `MTREE` indexes (SurrealDB 3.x refuses them; one stored under a declared index's name is redefined `HNSW`), the
+  `MINKOWSKI`, `JACCARD` and `PEARSON` distances, `F16` vectors and `DISKANN` indexes, and `concurrently`.
+
+#### Coming from the full SurrealDB-ORM
+
+- **`similar_to()` keeps the full ORM's signature and `_knn_distance`**:
+  `similar_to(field, vector, limit=10, *, ef=None)`, the distance set on each instance as `_knn_distance`, nearest
+  first unless `order_by()` is given.
+- **`dist=` is an addition** of this library: an exact, brute-force search that needs no index (SurrealDB's
+  `<|K,DISTANCE|>`).
+- **`similar_to()` applies wherever `filter()` applies**: `count()`, the aggregations, `values()` groups, `exists()`,
+  `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery`; the full ORM applies it to `exec()` only. The bulk
+  writes act on the ids of the `limit` nearest records, selected first.
+- **Refused where SurrealDB cannot honour it**: `as_of()`, `live()`/`watch()` or `changes()` with `similar_to()`,
+  before any request, and search annotations with `similar_to()` on SurrealDB 2.x and the embedded engine, before the
+  statement is sent; the full ORM sends them.
+- **Checked before any request**: the vector's numbers, its length against the field's `VectorField` or index,
+  `limit` and `ef` (1 to 10 000; the full ORM sends any value), and the `Index` vector arguments.
+- **`ef` is raised to `limit`** on every line; the full ORM writes it as given, and SurrealDB 2.x then returns at most
+  `ef` records.
+- **Other conditions are selected first on SurrealDB 2.x** (a `LET`), since 2.x answers too few or no records next to
+  many of them, one on an indexed field among them; the full ORM sends one statement.
+- **Every HNSW option is written**, and `define_indexes()` compares before it applies: an unchanged vector index is
+  never rebuilt.
+- **`VectorField` checks its values**: their length and finite numbers, on reads too; the full ORM's accepts any list
+  of floats. `Vector(d)` is its typed form, which type checkers accept.
+- **No `MTREE`, `MINKOWSKI`, `JACCARD` or `PEARSON`, and no `concurrently` yet**; the full ORM writes `MINKOWSKI`
+  without its order, which SurrealDB refuses.
+- **Vector functions in `annotate()`** (`vector::similarity::cosine()`…) are not available yet; `hybrid_search()`
+  comes in v0.37.0.
+- **`get_vector_info()` and `is_vector_field()` are imported from `surreal_orm_lite.vector`**: the full ORM has them
+  in `surreal_orm.fields`, a module this library does not have.
+- **`generate_models_from_db()` does not write `VectorField` yet**, while the full ORM's generator writes it for a
+  field with an HNSW index.
 
 ---
 
@@ -6230,7 +6546,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -6382,6 +6698,14 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `live()` with a `Subquery` that searches a field without a full-text index                                                             | `SurrealDbError` naming the field, before the live query starts                                                                                                               | the same (the live query would never notify); 3.1 starts it                                                                                                                         | v0.35.0                              |
 | An auth model with a `Field(exclude=True)` field SIGNUP writes (`password: str = Field(exclude=True)`)                                 | `TypeError` before any request, whatever the schema mode and `with_table`: the DDL methods, `signup()`, `signin()`, `authenticate()`, `refresh()`, `update()`, `upsert()`     | same on both lines (a check of the model, no request)                                                                                                                               | v0.35.2                              |
 | `define_indexes(tx=)` in a block that writes to the model's table (an ORM write before the index, a write after it)                    | a write before it: refused (left out of the index); a write after it, to a table holding records, fails the commit with a retryable `SurrealDbConflictError`, again on retry  | a write before it: refused (left out of the index, [surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618)); a write after it is committed and indexed                 | v0.35.3                              |
+| Vector index (`Index(hnsw=True)`, `define_indexes()`)                                                                                  | `HNSW` as on 3.x (the ORM writes `DIST`, `TYPE`, `EFC` and `M` and one field); 2.x also accepts `MTREE`, which `similar_to()` does not use                                    | `HNSW`, one field per index; `MTREE` is a parse error                                                                                                                               | v0.36.0                              |
+| `similar_to()` with `ef` below `limit`                                                                                                 | the ORM writes `ef` raised to `limit`: 2.x would return at most `ef` records                                                                                                  | the same statement: 3.x returns `limit` records either way                                                                                                                          | v0.36.0                              |
+| `similar_to()` with other conditions (`filter()`, `Q`, `nearby()`, `search()`)                                                         | the ORM selects the records matching them first (a `LET`): 2.x answers too few or no records next to many of them, an indexed field's included                                | every condition stays next to the KNN operator, applied during the index search (faster)                                                                                            | v0.36.0                              |
+| `similar_to()` and `search()` in one queryset                                                                                          | the ORM selects the full-text matches first (a `LET`): 2.x answers no record next to a full-text match; search annotations are refused                                        | the match stays next to the KNN operator, with its scores, highlights and offsets; 3.1 answers every match, with no distance                                                        | v0.36.0                              |
+| `bulk_update()`, `bulk_delete()`, `patch()` with `similar_to()`                                                                        | the ORM writes the ids of the `limit` nearest: 2.x's exact scan in a write would act on every matching record                                                                 | the same: 3.x writes nothing when a range on an indexed field shares the KNN operator                                                                                               | v0.36.0                              |
+| `similar_to()` with a condition that keeps few records                                                                                 | HNSW is approximate: fewer than `limit` records, depending on how the index was built, even with a tenth of the table kept; `dist=` is exact                                  | rarer; also seen with a `Subquery` id list keeping a few percent of the table                                                                                                       | v0.36.0                              |
+| `similar_to(dist=…)` with a condition on a linked record's field                                                                       | the ORM selects the matching records first (a `LET`): 2.x's exact scan would return every matching record, ignoring `limit`                                                   | the condition stays next to the KNN operator                                                                                                                                        | v0.36.0                              |
+| `similar_to()` on a field without a vector index                                                                                       | no record                                                                                                                                                                     | no record; 3.1 answers every record, with no distance                                                                                                                               | v0.36.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -6420,6 +6744,7 @@ Capabilities not listed behave as on a 2.x server.
 | Model table DDL (v0.34.0)                                           | as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops that field, except in the items of a list `define_table()` writes `FLEXIBLE`, which keep it                          | 3.x keeps those values without `FLEXIBLE` and refuses that write, except in list items that define a field      | v0.34.0 |
 | Full-text search (v0.35.0)                                          | as on a 2.x server: `SEARCH ANALYZER`, a term in more than half the documents scores below zero, BM25 statistics grow with each rebuild and keep deleted records, `remove_analyzer()` refuses an analyzer an index uses; an index defined in the transaction that defines its analyzer sees it, which `define_indexes(tx=…)` refuses all the same     | 3.x writes `FULLTEXT ANALYZER`, scores such a term `0.0`, keeps BM25 statistics exact and refuses that removal  | v0.35.0 |
 | `define_indexes(tx=)` in a block that writes to the model's table   | an ORM write before it: refused all the same, although this engine indexes its records; a write after it is committed and indexed                                                                                                                                                                                                                     | refused (left out of the index); on 2.x a write after it, to a table holding records, fails the commit          | v0.35.3 |
+| Vector search (v0.36.0)                                             | as on a 2.x server: `MTREE` accepted, at most `ef` records returned (the ORM raises `ef` to `limit`), other conditions selected first in a `LET` (search annotations refused), writes made by the ids of the nearest, fewer records with a selective condition; an index without `TYPE` is `F64` (servers: `F32`), so the ORM always writes `TYPE`    | 3.x refuses `MTREE`, applies the conditions during the index search and keeps search annotations                | v0.36.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -6438,41 +6763,42 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-| Version           | Theme                                                         | Status      |
-| ----------------- | ------------------------------------------------------------- | ----------- |
-| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration                  | ✅ Released |
-| v0.8.0            | Transactions ORM (`tx=`)                                      | ✅ Released |
-| v0.9.0            | Transactions — QuerySet & interactive (3.x)                   | ✅ Released |
-| v0.10.0           | upsert / update_or_create / get_or_create                     | ✅ Released |
-| v0.11.0           | patch / atomic field & array ops                              | ✅ Released |
-| v0.12.0           | retry_on_conflict & optimistic concurrency                    | ✅ Released |
-| v0.13.0           | SurrealFunc & server-side values                              | ✅ Released |
-| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)                      | ✅ Released |
-| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops             | ✅ Released |
-| v0.15.0           | `call_function()` — custom `fn::` stored functions            | ✅ Released |
-| v0.16.0           | Connection auth (`signin`/`signup`/`info`)                    | ✅ Released |
-| v0.17.0           | Model auth (`AuthenticatedUserMixin`)                         | ✅ Released |
-| v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`             | ✅ Released |
-| v0.19.0           | Live queries (base): `live()` / `kill()`, raw notifs          | ✅ Released |
-| v0.20.0           | Typed live queries: `LiveModelStream`, diff, filters          | ✅ Released |
-| v0.21.0           | Auto-resubscribe & change feeds (`changes()`)                 | ✅ Released |
-| v0.22.0           | Tier 1 — Native typed relations                               | ✅ Released |
-| v0.23.0           | Rich field types                                              | ✅ Released |
-| v0.24.0           | Geospatial fields                                             | ✅ Released |
-| v0.25.0           | Embedded test engine                                          | ✅ Released |
-| v0.26.0           | Time travel (versioned storage)                               | ✅ Released |
-| v0.27.0           | Subqueries                                                    | ✅ Released |
-| v0.28.0           | Query cache                                                   | ✅ Released |
-| v0.29.0           | Tier 2 — Multi-database                                       | ✅ Released |
-| v0.30.0           | Tier 3 — Schema introspection                                 | ✅ Released |
-| v0.31.0           | Tier 3 — Server-side events and DDL helpers                   | ✅ Released |
-| v0.32.0           | Tier 3 — Materialized views                                   | ✅ Released |
-| v0.33.0           | Tier 3 — `TYPE RELATION` constraints                          | ✅ Released |
-| v0.34.0           | Tier 3 — Model table DDL                                      | ✅ Released |
-| v0.35.0           | Tier 3 — Full-text search                                     | ✅ Released |
-| v0.36.0 – v0.40.0 | Tier 3 — Advanced (vector and hybrid search, migrations, CLI) | 📋 Planned  |
-| v0.41.0           | Beta Phase (API freeze, hardening)                            | 📋 Planned  |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)                        | 📋 Planned  |
+| Version           | Theme                                                | Status      |
+| ----------------- | ---------------------------------------------------- | ----------- |
+| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration         | ✅ Released |
+| v0.8.0            | Transactions ORM (`tx=`)                             | ✅ Released |
+| v0.9.0            | Transactions — QuerySet & interactive (3.x)          | ✅ Released |
+| v0.10.0           | upsert / update_or_create / get_or_create            | ✅ Released |
+| v0.11.0           | patch / atomic field & array ops                     | ✅ Released |
+| v0.12.0           | retry_on_conflict & optimistic concurrency           | ✅ Released |
+| v0.13.0           | SurrealFunc & server-side values                     | ✅ Released |
+| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)             | ✅ Released |
+| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops    | ✅ Released |
+| v0.15.0           | `call_function()` — custom `fn::` stored functions   | ✅ Released |
+| v0.16.0           | Connection auth (`signin`/`signup`/`info`)           | ✅ Released |
+| v0.17.0           | Model auth (`AuthenticatedUserMixin`)                | ✅ Released |
+| v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`    | ✅ Released |
+| v0.19.0           | Live queries (base): `live()` / `kill()`, raw notifs | ✅ Released |
+| v0.20.0           | Typed live queries: `LiveModelStream`, diff, filters | ✅ Released |
+| v0.21.0           | Auto-resubscribe & change feeds (`changes()`)        | ✅ Released |
+| v0.22.0           | Tier 1 — Native typed relations                      | ✅ Released |
+| v0.23.0           | Rich field types                                     | ✅ Released |
+| v0.24.0           | Geospatial fields                                    | ✅ Released |
+| v0.25.0           | Embedded test engine                                 | ✅ Released |
+| v0.26.0           | Time travel (versioned storage)                      | ✅ Released |
+| v0.27.0           | Subqueries                                           | ✅ Released |
+| v0.28.0           | Query cache                                          | ✅ Released |
+| v0.29.0           | Tier 2 — Multi-database                              | ✅ Released |
+| v0.30.0           | Tier 3 — Schema introspection                        | ✅ Released |
+| v0.31.0           | Tier 3 — Server-side events and DDL helpers          | ✅ Released |
+| v0.32.0           | Tier 3 — Materialized views                          | ✅ Released |
+| v0.33.0           | Tier 3 — `TYPE RELATION` constraints                 | ✅ Released |
+| v0.34.0           | Tier 3 — Model table DDL                             | ✅ Released |
+| v0.35.0           | Tier 3 — Full-text search                            | ✅ Released |
+| v0.36.0           | Tier 3 — Vector search                               | ✅ Released |
+| v0.37.0 – v0.40.0 | Tier 3 — Advanced (hybrid search, migrations, CLI)   | 📋 Planned  |
+| v0.41.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
 > Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
 > `query()` SurrealQL) — no custom SDK. GA is numbered **v2.0.0** to mirror SDK 2.0; the `1.x`
@@ -6530,7 +6856,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | TYPE RELATION enforcement     | ✅ v0.33.0 (`relation_in`, `define_relation()`)                       | ✅ DDL (`TableType.RELATION`, migrations) |
 | Model table DDL               | ✅ v0.34.0 (`define_table()`)                                         | ✅                                        |
 | Full-Text Search              | ✅ v0.35.0 (`search()`)                                               | ✅                                        |
-| Vector Search (KNN/HNSW)      | v0.36.0                                                               | ✅                                        |
+| Vector Search (KNN/HNSW)      | ✅ v0.36.0 (`similar_to()`)                                           | ✅                                        |
 | Hybrid Search (RRF)           | v0.37.0                                                               | ✅                                        |
 | Migrations & CLI              | v0.38 – v0.39                                                         | ✅                                        |
 | Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.40.0                          | ✅                                        |

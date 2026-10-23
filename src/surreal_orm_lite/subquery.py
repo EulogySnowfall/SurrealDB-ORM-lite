@@ -224,6 +224,12 @@ class SubqueryCompiler:
         searched: (table, column) → the field as given, for each ``search()`` condition of the statement's subqueries
             (v0.35.0): the missing-index error names the field, and a live query checks each column's full-text index
             before it starts.
+        knn_fields: (table, column) → the field as given, for each ``similar_to()`` of the statement's subqueries:
+            the dimension error names the field (v0.36.0).
+        knn_prefilter: the statement is for a line below SurrealDB 3 (2.x, the embedded engine): every condition of a
+            KNN's ``WHERE`` but an id subquery goes into a ``LET`` id subquery (v0.36.0).
+        knn_conditions: a KNN of the statement shares its ``WHERE`` with a condition that is not an id subquery: the
+            caller reads the line (v0.36.0).
         warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
             ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
             re-send for a missing subquery table), so each read warns once (v0.28.1).
@@ -245,6 +251,9 @@ class SubqueryCompiler:
     edge_tables: set[str] = field(default_factory=set)
     view_tables: set[str] = field(default_factory=set)
     searched: dict[tuple[str, str], str] = field(default_factory=dict)
+    knn_fields: dict[tuple[str, str], str] = field(default_factory=dict)
+    knn_prefilter: bool = False
+    knn_conditions: bool = False
     warn: bool = True
     variable_like: list[str] = field(default_factory=list)
     _stack: list[int] = field(default_factory=list)

@@ -5,10 +5,121 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.36.0] - 2026-10-23
+
+Vector search: a queryset finds the records whose vector is nearest to a query vector with the
+full SurrealDB-ORM's `similar_to()`, each record's distance set as `_knn_distance`, over the
+vector fields a model declares with `VectorField` and the HNSW indexes it declares with
+`Index(hnsw=True)` and applies with `define_indexes()`. SurrealDB searches the index and computes
+the distances on the server; the ORM binds the query vector as a query variable. The same code
+runs on SurrealDB 2.x, 3.x and the embedded engine. The second minor of Tier 3's search phase.
+
+### Added
+
+- **`QuerySet.similar_to(field, vector, limit=10, *, ef=None, dist=None)`**, the full
+  SurrealDB-ORM's method: keeps the `limit` records whose `field` vector is nearest to `vector`,
+  through the field's HNSW index (SurrealDB's KNN operator). The field is a Python field name (an
+  aliased field searches its column) or a dotted path; the vector is a `list` or `tuple` of finite
+  numbers, bound, never written into the statement. `exec()`, `first()` and `get()` without an id
+  set each record's distance as `_knn_distance`, never written back (`model_dump()`, `save()` and
+  `update()` leave it out); without `order_by()` the records come nearest first, and
+  `limit()`/`offset()` page through them. A second `similar_to()` replaces the first. **`dist=`**
+  is an addition: an exact, brute-force search that needs no index. `similar_to()` applies
+  wherever `filter()` does, AND-ed with `filter()`, `Q`, `nearby()`, `search()` and a `Subquery`
+  filter: `exec()`, `first()`, `get()` without an id, `count()`, `exists()`, the aggregations,
+  `values()` groups, `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery` (the full ORM
+  applies it to `exec()` only). `get(<id>)` and `all()` ignore it, as they ignore `filter()`. With
+  `search()`, the records matching the text are ranked by the vector.
+- **`VectorField[d]`** (or `VectorField[d, "F64"]`), the full ORM's vector field, **and its typed
+  form `Vector`**: `embedding: Annotated[list[float] | None, Vector(1536)] = None`, which type
+  checkers accept where they reject `VectorField[1536]`. Both spellings are one field, optional and
+  `None` by default: `None` or a `list`/`tuple` of exactly `d` finite real numbers, kept as a
+  `list[float]` and checked on every write and every read (a stored vector of another length makes
+  `exec()` return its row as a dict), with a fixed-length array JSON schema. `define_table()`
+  writes the column `option<array<float, d>>`. `get_vector_info()` and `is_vector_field()`, from
+  `surreal_orm_lite.vector`, read either spelling.
+- **Vector indexes: `Index(name, field, hnsw=True, dimension=, dist=, vector_type=, efc=, m=)`**,
+  with the full ORM's `CreateIndex` arguments: `dimension` (required, 1 to 65535), `dist`
+  (`EUCLIDEAN` by default, `COSINE`, `MANHATTAN`, `CHEBYSHEV` or `HAMMING`, in any case),
+  `vector_type` (`F64`, `F32` by default, `I64`, `I32` or `I16`), `efc` (1 to 65535, 150 by
+  default) and `m` (2 to 127, 12 by default). A vector index covers one field and is listed in
+  `SurrealConfigDict(indexes=[...])` next to the full-text ones; its attributes hold what was
+  declared. When the class is defined, two vector indexes on one column are refused, and so is a
+  vector index whose dimension or storage type differs from its field's `VectorField`.
+  `index_ddl()` renders the same `HNSW` statement for SurrealDB 2.x and 3.x; `define_indexes()`
+  compares a declared vector index with the stored one and redefines it only when an option, the
+  field or the comment changed, so an unchanged vector index is never rebuilt; `remove_index()`
+  removes one by name.
+- README section 37, "Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)"
+  (declaring and applying, type checkers, finding the nearest, other conditions, what SurrealDB
+  decides, what is not supported, a note for users of the full SurrealDB-ORM), eight rows of the
+  "ORM behaviour: SurrealDB 2.x vs 3.x" table and one of the embedded engine's, and the example
+  notebook `examples/v0.36.0_vector_search.ipynb`.
+
+  ```python
+  class Document(BaseSurrealModel):
+      model_config = SurrealConfigDict(
+          table_name="document",
+          indexes=[Index("document_embedding", "embedding", hnsw=True, dimension=3, dist="cosine")],
+      )
+
+      id: str | None = None
+      title: str
+      category: str = ""
+      embedding: VectorField[3]
+
+
+  await Document.define_table()
+  await Document.define_indexes()  # [] when nothing changed: the vector index is not rebuilt
+  pets = Document.objects().filter(category="pets").similar_to("embedding", [1.0, 0.0, 0.0], 3)
+  for document in await pets.exec():  # nearest first
+      print(document.title, document._knn_distance)
+  ```
 
 ### Notes
 
+- **`limit` and `ef` go from 1 to 10 000**, checked before any request with the vector's numbers,
+  its length (when the model declares the field's dimension, by its `VectorField` or its vector
+  index) and the `Index` vector arguments; the full ORM sends any value. **`ef`** (100 by default)
+  **is written raised to `limit`** on every line: SurrealDB 2.x would return at most `ef` records.
+- **Every HNSW option is written** (`DIST`, `TYPE`, `EFC` and `M`, SurrealDB's defaults when not
+  given), so every engine stores the same index: the embedded engine would otherwise store `F64`
+  vectors where servers store `F32`. `Index` keeps the options as declared.
+- **Other conditions select the records first, then `similar_to()` keeps the nearest among
+  them.** SurrealDB 3.x applies them during the index search. SurrealDB 2.x and the embedded engine
+  answer too few records, or none, next to many conditions (one on an indexed field among them),
+  so there the ORM selects the records matching every other condition — a full-text match
+  included — in a `LET` first, which is slower: upgrade to SurrealDB 3.x for large tables.
+- **Search annotations combine with `similar_to()` on SurrealDB 3.x; on 2.x and the embedded
+  engine the ORM refuses them, since the matches are selected first, while `count()`, `exists()`
+  and the aggregations still answer.** The refusal is a `SurrealDbError` from `exec()`, `first()`
+  and `get()` without an id, before the statement is sent.
+- **`bulk_update()`, `bulk_delete()` and `patch()` of a `similar_to()` queryset write the `limit`
+  nearest records by their ids**, selected first, and return their number: they write the records
+  the same read returns, on every line. A write holding the KNN operator would act on every
+  matching record on SurrealDB 2.x, and on none next to a range on an indexed field on 3.x.
+- **HNSW is approximate**: with a condition that keeps few records, a search can return fewer than
+  `limit` records, depending on how the index was built, more often on SurrealDB 2.x and the
+  embedded engine; `dist=` is exact. Distances are computed in the index's `vector_type` (`F32`,
+  single precision, by default), `dist=`'s in double precision.
+- **A field without an HNSW index answers no record** (`dist=` needs none). A query vector whose
+  length differs from the index's, on a model that does not declare the dimension, raises
+  `SurrealDbError` naming the field and both lengths. A zero query vector with `COSINE` raises
+  `ValueError`: it has no distance.
+- **Refused before any request** (`SurrealDbError`): `similar_to()` with `as_of()`, in either order
+  and in a subquery under it (the index holds the records' current vectors); with `live()` and
+  `watch()`, in their condition or in a `Subquery`, since SurrealDB accepts a live query whose
+  condition holds the vector search but never notifies it — read the nearest records with
+  `similar_to()` and watch them by id; and with `changes()`.
+- **Moving a table to another dimension** (a new embedding model): declare the field
+  `list[float] | None` without its vector index while records of both lengths exist, then the new
+  `VectorField[d]` and a matching index; README section 37 gives the steps.
+- **SurrealDB 3.1** (tested with 3.1.5 for backward compatibility): a field without a vector index
+  answers every record, and `similar_to()` next to `search()` every match, each with no distance.
+- **Not yet**: `MTREE` indexes (SurrealDB 3.x refuses them; one stored under a declared index's
+  name is redefined `HNSW`), the `MINKOWSKI`, `JACCARD` and `PEARSON` distances, `F16` vectors,
+  `DISKANN` indexes, `Index(concurrently=True)`, vector functions in `annotate()` and
+  `VectorField` in generated models. `hybrid_search()` comes in v0.37.0.
 - **Undeclared keys in list items: fixed in SurrealDB 3.4** (#308): SurrealDB 3.x (measured on
   3.1.5 and 3.3.4) keeps a key a `SCHEMAFULL` table does not define in the items of a list whose
   items define a field, as the 0.35.2 note on #301 below says. SurrealDB 3.4 (nightly at the time
@@ -16,6 +127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   35 and the 3.x cell of the v0.34.0 row of "ORM behaviour: SurrealDB 2.x vs 3.x" now say so. The
   raw test also measures an object inside a list item that defines no key: refused on 3.x
   (`no such field exists`), emptied on 2.x and the embedded engine. No ORM behaviour changes.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
 
 ## [0.35.4] - 2026-10-23
 

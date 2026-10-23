@@ -56,6 +56,7 @@ from .schema import _carried_expression, _carried_rule, _identifier_name, _overw
 from .schema_state import FieldState
 from .surql_literal import _identifier, _quoted, to_surql_literal
 from .types import Duration, Range
+from .vector import Vector
 
 __all__ = [
     "Column",
@@ -341,6 +342,10 @@ def _map(annotation: Any, metadata: tuple[Any, ...]) -> tuple[Kind, bool]:
     if kinds is not None:
         geometry = KName("geometry") if kinds == _ALL_KINDS else KName("geometry", _ordered(kinds))
         return (KUnion((_NONE, geometry)) if _admits_none(annotation) else geometry), False
+    vector = next((item for item in metadata if isinstance(item, Vector)), None)
+    if vector is not None:
+        # The marker accepts None whatever the annotation says: both spellings are optional.
+        return KUnion((_NONE, KName("array", (KName("float"), str(vector.dimension))))), False
     if annotation is Any or annotation is object:
         return _ANY, False
     if annotation is None or annotation is NoneType:
@@ -365,7 +370,9 @@ def field_kind(annotation: Any, metadata: Iterable[Any] = ()) -> Kind:
     then: ``str`` and its subclasses ``string``; ``bool``; ``int``; ``float``; ``Decimal`` ``decimal``; a union of
     exactly ``int``, ``float`` and ``Decimal`` ``number``; ``datetime`` and ``date`` ``datetime``; ``timedelta``, the
     ORM's and the SDK's ``Duration`` ``duration``; ``UUID`` ``uuid``; ``bytes``; ``RecordID`` ``record``; a geometry
-    field or class ``geometry<…>`` (its kinds in SurrealDB's order, bare ``geometry`` for every kind); ``Range``
+    field or class ``geometry<…>`` (its kinds in SurrealDB's order, bare ``geometry`` for every kind); a vector field
+    (v0.36.0: ``VectorField[d]``, or a ``Vector(d)`` marker in an ``Annotated`` annotation) ``option<array<float, d>>``
+    whatever its storage type, since the marker accepts ``None``; ``Range``
     ``range``; ``Literal[…]`` the union of its ``str`` and ``int`` values (``bool`` as ``bool``, ``None`` as ``none``,
     any other value ``any``); an ``enum.Flag`` (``IntFlag`` included) ``int``, since Pydantic accepts any combination of
     its members and zero (``any`` when a member's value is not an ``int``); an enum whose values are all ``str``, or all

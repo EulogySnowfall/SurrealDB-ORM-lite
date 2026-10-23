@@ -18,6 +18,7 @@ from . import routing as _routing
 from . import search as _search
 from . import subquery as _subquery
 from . import time_travel as _time_travel
+from . import vector as _vector
 from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
 from .cache import EDGES, CacheRequest, QueryCache, follows_links, statement_key, ttl_seconds
 from .changefeed import ChangeModelStream, Since
@@ -123,6 +124,8 @@ class QuerySet:
         self._nearby: list[tuple[str, GeometryPoint, float]] = []
         # search() conditions (v0.35.0): field as given, column, text; the match reference is the position.
         self._search: list[tuple[str, str, str]] = []
+        # similar_to() (v0.36.0): the KNN search, checked; one per queryset (a second call replaces the first).
+        self._similar: _vector.KnnSearch | None = None
         self._tx: Any = None
         # as_of() (v0.26.0): the moment a time-travel read is made at, normalised; None reads the current state.
         self._as_of: _time_travel.AsOf | None = None
@@ -596,6 +599,129 @@ class QuerySet:
         self._search.extend((field, self._column(field), text) for field, text in conditions)
         return self
 
+    def similar_to(
+        self,
+        field: str,
+        vector: Sequence[float],
+        limit: int = 10,
+        *,
+        ef: int | None = None,
+        dist: str | None = None,
+    ) -> Self:
+        """Keep the ``limit`` records whose ``field`` vector is nearest to ``vector`` (v0.36.0) — the full
+        SurrealDB-ORM's method.
+
+        ::
+
+            docs = await Document.objects().similar_to("embedding", query_vector, limit=5).exec()
+            for doc in docs:
+                print(doc.title, doc._knn_distance)
+
+            exact = await Document.objects().similar_to("embedding", query_vector, 5, dist="cosine").exec()
+            tech = await Document.objects().filter(category="tech").similar_to("embedding", query_vector, 3).exec()
+
+        SurrealDB's KNN operator, ``<column> <|K,EF|> $vector``: an HNSW search through the field's vector index
+        (``Index(..., hnsw=True, dimension=...)`` declared on the model and applied by ``define_indexes()``; on a field
+        without one it finds no record). With ``dist=`` it is ``<column> <|K,DIST|> $vector`` instead, an exact scan of
+        every record by that distance, which needs no index. The query vector is bound as a query variable, never
+        written into the statement.
+
+        ``exec()``, ``first()`` and ``get()`` without an id return the records nearest first — unless ``order_by()`` is
+        given, which replaces that order (``order_by("-_knn_distance")`` included) — each instance carrying its
+        distance from ``vector`` as ``_knn_distance`` (a ``float``; an ``int`` with ``HAMMING``), which is never written
+        back: ``model_dump()`` and ``save()`` leave it out, on an ``extra="allow"`` model too. Rows that do not validate
+        (a ``select()`` that leaves out a required field) come back as dicts holding it. ``limit()`` and ``offset()``
+        then page through the ``limit`` nearest records.
+
+        HNSW is approximate: SurrealDB explores ``ef`` candidates (100 by default), and the ORM writes ``ef`` raised to
+        ``limit``, so without other conditions every line returns ``limit`` records when the table holds them. With a
+        condition that keeps few records the search can return fewer than ``limit``, more often on SurrealDB 2.x and the
+        embedded engine; ``dist=`` is exact. Distances are computed in the index's storage type (``F32`` by default),
+        ``dist=`` in double precision.
+
+        The other conditions — ``filter()``, ``Q``, ``nearby()``, ``search()`` and a ``Subquery`` filter — select the
+        records first, then the ``limit`` nearest among them are kept: SurrealDB 3.x applies them during the index
+        search; on SurrealDB 2.x and the embedded engine the ORM selects the records matching them first, in a ``LET``
+        of the statement. The search annotations (``SearchScore``, ``SearchHighlight``, ``SearchOffsets``) of a
+        ``search()`` are accepted in either order; on SurrealDB 3.x each of the nearest matches carries the values the
+        plain search gives it, while on SurrealDB 2.x and the embedded engine ``exec()``, ``first()`` and ``get()``
+        without an id refuse them before the statement is sent. ``count()``, the other aggregations, ``exists()`` and
+        ``values()``/``annotate()`` groups count or group the ``limit`` nearest records, with no distance;
+        ``bulk_update()``, ``bulk_delete()`` and ``patch()`` write them, by their ids; a ``Subquery`` of this queryset
+        gives them. ``get(<id>)`` and ``all()`` ignore it, as they ignore ``filter()``. ``as_of()``, ``live()``,
+        ``watch()`` and ``changes()`` refuse it.
+
+        When the model does not declare the field's dimension, SurrealDB checks ``vector`` against the vector index: a
+        vector of another length raises ``SurrealDbError`` naming the field and both lengths, caused by the server's
+        error — on a read, in a transaction too, and on a bulk write outside a transaction. Inside a transaction a bulk
+        write relays the server's error, as the transaction reports it.
+
+        Args:
+            field: A Python field name (an aliased field compiles its column) or a dotted path; not the record id nor,
+                on an edge model, an endpoint.
+            vector: The query vector: a ``list`` or ``tuple`` of real numbers (``int``, ``float``, any
+                ``numbers.Real``, a ``Decimal``; not a ``bool`` nor a ``str``), not empty, each finite — a NumPy array
+                with ``.tolist()``. When the model declares the field's dimension (a ``VectorField[d]`` or
+                ``Vector(d)`` on it, or a vector ``Index`` on its column), exactly ``d`` numbers.
+            limit: ``K``, the number of nearest records kept: an ``int`` from 1 to 10000.
+            ef: The HNSW search's candidate list: ``None`` (100) or an ``int`` from 1 to 10000.
+            dist: An exact scan by this distance instead of the index's search: ``EUCLIDEAN``, ``COSINE``,
+                ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``.
+
+        Returns:
+            Self: The current instance for method chaining. Called again, the last call wins.
+
+        Raises:
+            TypeError: ``field`` is not a ``str``; ``vector`` is not a ``list`` or a ``tuple``, or holds an item that is
+                not a number; ``limit`` or ``ef`` is not an ``int`` (a ``bool`` included); ``dist`` is not a ``str``.
+            ValueError: ``field`` is not a field name or a dotted path, or is the record id or an edge endpoint; the
+                model defines ``_knn_distance``; ``vector`` is empty, holds an item that is not finite, or its length
+                is not the field's declared dimension; ``limit`` or ``ef`` is outside 1 to 10000; both ``ef`` and
+                ``dist``; a distance the ORM does not write; a zero vector with ``COSINE`` (``dist="cosine"``, or no
+                ``dist`` and the field's vector index is ``COSINE``), which has no distance.
+            SurrealDbError: the queryset reads ``as_of()`` (checked last).
+            Each raised before any request, the queryset left unchanged.
+        """
+        _vector.checked_knn_field(field)
+        column = self.model.to_db_field(field)
+        endpoint_columns = self.model._endpoint_columns()
+        if column == RECORD_ID_COLUMN or column in endpoint_columns:
+            raise ValueError(_vector.field_refused(field, endpoint=column in endpoint_columns))
+        if hasattr(self.model, _vector.DISTANCE_ALIAS):
+            raise ValueError(_vector.distance_attribute_refused(self.model.__name__))
+        values = _vector.checked_query_vector(vector)
+        k = _vector.checked_limit(limit)
+        candidates = _vector.checked_ef(ef)
+        if candidates is not None and dist is not None:
+            raise ValueError(_vector.ef_and_dist_refused())
+        distance = None if dist is None else _vector.checked_distance(dist, subject="similar_to()")
+        index = self._vector_index(column)
+        info = self.model.model_fields.get(field)
+        declared = None if info is None else _vector.get_vector_info(info)
+        if declared is not None:
+            dimension, source = declared[0], f"VectorField[{declared[0]}]"
+        elif index is not None:
+            dimension, source = index._hnsw_options()[0], f"index {index.name!r}"
+        else:
+            dimension, source = len(values), ""
+        if len(values) != dimension:
+            raise ValueError(_vector.dimension_refused(field, len(values), dimension, source))
+        metric = distance if distance is not None or index is None else index._hnsw_options()[1]
+        if metric == "COSINE" and all(item == 0.0 for item in values):
+            raise ValueError(_vector.zero_vector_refused())
+        if self._as_of is not None:
+            raise SurrealDbError(_vector.time_travel_refused())
+        self._similar = _vector.KnnSearch(field, self._column(field), tuple(values), k, candidates, distance)
+        return self
+
+    def _vector_index(self, column: str) -> _search.Index | None:
+        """The vector index the model declares on *column*, or ``None`` (v0.36.0; at most one, checked when the class
+        was defined)."""
+        for index in self.model.get_indexes():
+            if index.hnsw and self.model.to_db_field(index.fields[0]) == column:
+                return index
+        return None
+
     def as_of(self, at: datetime | str | timedelta | Duration | SurrealFunc | None) -> Self:
         """Read the records as they were at a moment: SurrealQL's ``VERSION`` (v0.26.0).
 
@@ -650,6 +776,8 @@ class QuerySet:
         ``search()`` (v0.35.0) is refused with a moment, whichever comes first: a full-text match reads the index,
         which holds the records' current text, so the read would select records by their text now. A ``Subquery``
         holding ``search()`` is refused under an outer ``as_of()`` when the statement compiles, before any request.
+        ``similar_to()`` (v0.36.0) is refused the same ways: the vector index holds the records' current vectors, so
+        the read would pick its neighbours by their vectors now.
 
         A time-travel queryset is read-only: ``bulk_create()``, ``bulk_update()``, ``bulk_delete()``,
         ``patch()``, ``update_or_create()``, ``get_or_create()``, ``delete_table()``, ``query()``, ``live()``,
@@ -664,8 +792,8 @@ class QuerySet:
             ValueError: a string that is not ISO-8601; a negative duration; a moment outside
                 1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z.
             SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``); a moment on a queryset
-                with ``cache()`` (v0.28.0: a time-travel read is never cached) or with ``search()`` (v0.35.0).
-                ``as_of(None)`` is accepted.
+                with ``cache()`` (v0.28.0: a time-travel read is never cached), with ``search()`` (v0.35.0) or with
+                ``similar_to()`` (v0.36.0). ``as_of(None)`` is accepted.
         """
         if self._tx is not None:
             raise SurrealDbError(_time_travel.transaction_refused())
@@ -673,6 +801,8 @@ class QuerySet:
             raise SurrealDbError(_CACHE_AS_OF)
         if at is not None and self._search:
             raise SurrealDbError(_search.time_travel_refused())
+        if at is not None and self._similar is not None:
+            raise SurrealDbError(_vector.time_travel_refused())
         self._as_of = _time_travel.normalise_as_of(at)
         return self
 
@@ -817,7 +947,12 @@ class QuerySet:
     # ==================== Internal query building ====================
 
     def _subquery_compiler(
-        self, empty_tables: frozenset[str] = frozenset(), *, inline: bool = False, warn: bool = True
+        self,
+        empty_tables: frozenset[str] = frozenset(),
+        *,
+        inline: bool = False,
+        warn: bool = True,
+        knn_prefilter: bool = False,
     ) -> SubqueryCompiler:
         """A compiler for the subqueries of one statement of this queryset (v0.27.0).
 
@@ -831,6 +966,8 @@ class QuerySet:
             empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
             inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
             warn: emit the warnings of the filter values (v0.28.1); ``False`` for a statement this read compiled once.
+            knn_prefilter: compile the form below SurrealDB 3 (v0.36.0): the conditions next to a KNN selected first,
+                in a ``LET`` (:meth:`_where_parts`).
         """
         return SubqueryCompiler(
             inline=inline,
@@ -839,6 +976,7 @@ class QuerySet:
             outer_model=self.model,
             variables=dict(self._variables),
             warn=warn,
+            knn_prefilter=knn_prefilter,
             _stack=[id(self)],
         )
 
@@ -847,14 +985,28 @@ class QuerySet:
     ) -> tuple[list[str], dict[str, Any], int]:
         """The AND-ed conditions of the WHERE clause, their bound values and the next ``$_f<N>`` number.
 
-        Filters, ``Q`` objects, ``nearby()`` and ``search()`` conditions (v0.35.0), in that order, numbered from
-        *counter* on: the outer statement starts at 0, a subquery (v0.27.0) continues the numbering of the statement
-        it goes into. A ``search()`` condition is ``<column> @<ref>@ $_f<N>``, its text bound; the match reference
-        is the condition's position in this queryset, so a subquery's references start again at 0 while its texts
-        continue the statement's numbering. With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record
-        check ``time_travel.GUARD`` is the last condition, after the ``nearby()`` ones (``search()`` never reads at a
-        moment): every other part is a single comparison or a parenthesised group, so the check applies to every row
-        they keep.
+        Filters, ``Q`` objects, ``nearby()`` and ``search()`` conditions (v0.35.0), then the KNN condition of
+        ``similar_to()`` (v0.36.0), in that order, numbered from *counter* on: the outer statement starts at 0, a
+        subquery (v0.27.0) continues the numbering of the statement it goes into. A ``search()`` condition is
+        ``<column> @<ref>@ $_f<N>``, its text bound; the match reference is the condition's position in this queryset,
+        so a subquery's references start again at 0 while its texts continue the statement's numbering. The KNN
+        condition is ``<column> <|K,EF|> $_f<N>`` or ``<column> <|K,DIST|> $_f<N>``, the query vector bound as a
+        ``list[float]``; it comes last, AND-ed at the top level of the ``WHERE``, where SurrealDB requires it.
+
+        With a statement's compiler, the parts next to the KNN that are not one of the ORM's id subqueries
+        (``vector.id_subquery_part()``: ``id IN $_sq<N>``, ``$_sq<N> CONTAINS id`` on a view) — a comparison, a ``Q``,
+        a ``nearby()`` or ``search()`` condition — set ``subqueries.knn_conditions``: the caller reads the line. In the
+        form for SurrealDB 3.x they stay inline. In the form below 3 (``subqueries.knn_prefilter``: SurrealDB 2.x, the
+        embedded engine) they go into ``LET $_sq<N> = (SELECT VALUE id FROM <table> WHERE <parts AND-ed>);`` and the
+        ``WHERE`` keeps the id subqueries, then ``id IN $_sq<N>`` (``$_sq<N> CONTAINS id`` on a view model, as
+        ``id__in`` writes it), then the KNN: SurrealDB 2.x answers wrong records for a KNN next to a condition on an
+        indexed column, a function call, a negation, a group, a dotted path or a full-text match, while it answers
+        right through ids selected first — and the ORM cannot know a column's indexes. The ``LET`` reads the
+        statement's own table and follows the ``LET`` s of the parts' own subqueries; inside a ``Subquery``, it
+        precedes the subquery's own. Without a compiler the KNN is written inline. With
+        ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check ``time_travel.GUARD`` is the last
+        condition, after the ``nearby()`` ones (``search()`` never reads at a moment): every other part is a single
+        comparison or a parenthesised group, so the check applies to every row they keep.
 
         Args:
             counter: the first ``$_f<N>`` number.
@@ -908,6 +1060,29 @@ class QuerySet:
             variables[variable] = text
             counter += 1
 
+        # similar_to() (v0.36.0): the query vector is bound; K and EF are checked integers the ORM writes itself.
+        if self._similar is not None:
+            variable = f"_f{counter}"
+            knn = self._similar.condition(variable)
+            variables[variable] = list(self._similar.vector)
+            counter += 1
+            others = [part for part in parts if not _vector.id_subquery_part(part)]
+            if subqueries is None or not others:
+                parts.append(knn)
+            elif not subqueries.knn_prefilter:
+                # The form for SurrealDB 3.x, which applies every condition during the index search.
+                subqueries.knn_conditions = True
+                parts.append(knn)
+            else:
+                # Below SurrealDB 3: the records matching the other conditions selected first, by their ids.
+                subqueries.knn_conditions = True
+                name = f"{_subquery.LET_PREFIX}{len(subqueries.lets)}"
+                subqueries.lets.append(
+                    f"LET ${name} = (SELECT VALUE id FROM {self._model_table} WHERE {' AND '.join(others)});"
+                )
+                kept = [part for part in parts if _vector.id_subquery_part(part)]
+                parts = [*kept, f"${name} CONTAINS id" if view else f"id IN ${name}", knn]
+
         if as_of:
             parts.append(_time_travel.GUARD)
 
@@ -940,6 +1115,38 @@ class QuerySet:
 
         return " WHERE " + " AND ".join(parts), variables
 
+    def _write_where(self, compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
+        """The ``WHERE`` clause of a bulk write by filter (:meth:`bulk_update`, :meth:`bulk_delete`, :meth:`patch`) and
+        its values, compiled with the statement's *compiler*.
+
+        Without ``similar_to()`` it is :meth:`_build_where`'s, unchanged. With it (v0.36.0) the write goes by the ids
+        of the nearest records: ``LET $_sq<N> = (SELECT VALUE id FROM <table> WHERE <conditions> AND <knn>);`` joins
+        the statement's block — after the ``LET`` s of its conditions (its subqueries', and below SurrealDB 3 the
+        pre-filter's, :meth:`_where_parts`), so ``N`` is taken once they are compiled — and the write says ``WHERE id
+        IN $_sq<N>``: it writes as many records as the same read returns, on every line. A write never carries the KNN
+        operator: there an exact search (``dist=``) writes every matching record on SurrealDB 2.x and the embedded
+        engine, and a range on an indexed column next to the KNN writes nothing on every engine.
+
+        The ``LET`` reads the model's own table, registered in ``compiler.tables`` as a subquery's: when SurrealDB 3.x
+        confirms that table missing (``compiler.empty_tables``), the ids are bound to ``[]`` and nothing else is
+        compiled, so the write reads it as empty, as it does without ``similar_to()``. A view model never gets here
+        (its writes are refused first), so the write always says ``id IN``. ``limit()``, ``offset()`` and
+        ``order_by()`` are not written, as for every bulk write.
+        """
+        if self._similar is None:
+            return self._build_where(subqueries=compiler)
+        table = self._model_table
+        compiler.tables.add(table)
+        if table in compiler.empty_tables:
+            values: dict[str, Any] = {}
+            select = "[]"
+        else:
+            where, values = self._build_where(subqueries=compiler)
+            select = f"(SELECT VALUE id FROM {table}{where})"
+        name = f"{_subquery.LET_PREFIX}{len(compiler.lets)}"
+        compiler.lets.append(f"LET ${name} = {select};")
+        return f" WHERE id IN ${name}", values
+
     def _subquery_select(self, compiler: SubqueryCompiler, counter: int) -> tuple[str, dict[str, Any], int]:
         """This queryset as the sub-SELECT of another queryset's filter (v0.27.0); its values and the next counter.
 
@@ -951,8 +1158,8 @@ class QuerySet:
         rendered first (their ``LET`` s precede its own). Under the outer ``as_of()`` (``compiler.moment``) it
         carries the per-record guard and ``VERSION $_as_of``: the server never applies the outer ``VERSION`` to a
         ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. Each of its ``search()`` conditions is
-        recorded in ``compiler.searched`` (v0.35.0). ``fetch()`` is ignored, as in the full
-        SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
+        recorded in ``compiler.searched`` (v0.35.0), its ``similar_to()`` in ``compiler.knn_fields`` (v0.36.0).
+        ``fetch()`` is ignored, as in the full SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
 
         Called by :meth:`SubqueryCompiler.reference`, which first refuses a queryset that is its own subquery.
 
@@ -962,7 +1169,8 @@ class QuerySet:
                 ``variables()`` binding a name of the statement to another value; and its filters' own refusals.
                 Its ``limit()`` and ``offset()`` were checked when they were called (a non-negative integer).
             SurrealDbError: an ``as_of()`` of its own; a transaction that is not the outer queryset's; ``search()``
-                under the outer ``as_of()`` (v0.35.0).
+                under the outer ``as_of()`` (v0.35.0); ``similar_to()`` under the outer ``as_of()`` or in a live query
+                (v0.36.0).
         """
         offenders = {
             "annotate()": bool(self._annotations),
@@ -978,6 +1186,10 @@ class QuerySet:
             raise SurrealDbError(_subquery.transaction_refused())
         if self._search and compiler.moment is not None:
             raise SurrealDbError(_search.time_travel_refused())
+        if self._similar is not None and compiler.moment is not None:
+            raise SurrealDbError(_vector.time_travel_refused())
+        if self._similar is not None and compiler.inline:
+            raise SurrealDbError(_vector.live_subquery_refused())
         column = self.select_item[0] if self.select_item else "id"
         validate_field_name(column, "subquery select field")
         order_columns: list[str] = []
@@ -998,6 +1210,8 @@ class QuerySet:
             return "[]", {}, counter
         for field, search_column, _ in self._search:
             compiler.searched[(table, search_column)] = field
+        if self._similar is not None:
+            compiler.knn_fields[(table, self._similar.column)] = self._similar.field
         parts, values, counter = self._where_parts(counter, as_of=compiler.moment is not None, subqueries=compiler)
         where = " WHERE " + " AND ".join(parts) if parts else ""
         tail = ""
@@ -1033,7 +1247,11 @@ class QuerySet:
         return f"{query}{_time_travel.VERSION_CLAUSE};", {**variables, _time_travel.MOMENT_VARIABLE: moment}
 
     def _compile_query(
-        self, moment: datetime | None = None, *, subqueries: SubqueryCompiler | None = None
+        self,
+        moment: datetime | None = None,
+        *,
+        subqueries: SubqueryCompiler | None = None,
+        for_exists: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """
         Compile the QuerySet parameters into a parameterized SQL query.
@@ -1044,6 +1262,15 @@ class QuerySet:
             subqueries: The compiler of the statement's subqueries (v0.27.0); a new one by default. With
                 subqueries the statement is a block, ``{ LET $_sq0 = (…); (SELECT …) };``; without, the text
                 and variables of v0.26.0.
+            for_exists: private, ``exists()`` only (v0.36.0): below SurrealDB 3 the search annotations are left out of
+                a ``similar_to()`` statement instead of refused — a boolean answer needs none. Elsewhere it changes
+                nothing.
+
+        With ``similar_to()`` (v0.36.0) the distance is projected as ``vector::distance::knn() AS _knn_distance``,
+        after the ``GeoDistance`` and search annotations, and without ``order_by()`` the statement ends
+        ``ORDER BY _knn_distance`` (nearest first). Its search annotations are projected in the form for SurrealDB
+        3.x only: the form below 3 (``subqueries.knn_prefilter``) selects the full-text matches in a ``LET``, so its
+        outer statement holds no match to score, highlight or locate, and SurrealDB 2.x would answer ``NONE`` for each.
 
         Returns:
             A tuple of (query_string, variables_dict).
@@ -1053,8 +1280,16 @@ class QuerySet:
             ValueError, SurrealDbError: a subquery the ORM cannot compile (README section 28).
             ValueError: a search annotation whose match reference ``search()`` did not give this queryset
                 (v0.35.0, :meth:`_check_search_references`).
+            SurrealDbError: this queryset's own ``similar_to()`` with a search annotation, compiled in the form below
+                SurrealDB 3 (v0.36.0), never with ``for_exists``; raised before any ``LET`` is written.
         """
         self._check_search_references()
+        drop_search = False
+        if subqueries is not None and subqueries.knn_prefilter and self._similar is not None and self._search_annotations:
+            if not for_exists:
+                first = next(iter(self._search_annotations.values()))
+                raise SurrealDbError(_vector.search_annotation_refused(type(first).__name__))
+            drop_search = True
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
         compiler.moment = moment
@@ -1068,14 +1303,19 @@ class QuerySet:
             variable = f"_gd{index}"
             projection.append(f"IF {column}.is_point() THEN geo::distance({column}, ${variable}) END AS {alias}")
             distance_vars[variable] = point
-        search_projection, search_vars = self._search_projection()
+        search_projection, search_vars = ([], {}) if drop_search else self._search_projection()
         projection += search_projection
+        # similar_to() (v0.36.0): the distance of the KNN, after every other per-record value.
+        if self._similar is not None:
+            projection.append(f"vector::distance::knn() AS {_vector.DISTANCE_ALIAS}")
         query = f"SELECT {', '.join(projection)} FROM {self._model_table}"
 
         query += where_clause
 
         if self._order_by:
             query += f" ORDER BY {self._order_by}"
+        elif self._similar is not None:
+            query += f" ORDER BY {_vector.DISTANCE_ALIAS}"
 
         if self._limit is not None:
             query += f" LIMIT {self._limit}"
@@ -1233,6 +1473,7 @@ class QuerySet:
         *,
         subquery_tables: frozenset[str] = frozenset(),
         searched: Mapping[str, str] | None = None,
+        knn_fields: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Execute a read query. Routes through the transaction when one is attached
@@ -1252,6 +1493,11 @@ class QuerySet:
         ``__context__`` (``search.missing_index_refusal()``). In a transaction that error replaces the SDK's in the
         transaction's failures, so the commit that fails afterwards chains it, never the server's text.
 
+        A query vector whose length is not its vector index's dimension (v0.36.0) raises ``SurrealDbError`` naming the
+        field and both lengths, from the server's error, whose text holds nothing else (``vector.dimension_refusal()``):
+        a read, and a write by filter outside a transaction — its ``LET`` selects the nearest records' ids. In a
+        transaction that error replaces the SDK's in the transaction's failures, as above.
+
         Args:
             query: the statement.
             variables: its bound values (the queryset's ``variables()`` when ``None``).
@@ -1262,14 +1508,18 @@ class QuerySet:
                 naming another table, it is the outer table's and reads as no rows. Every other error is relayed.
             searched: the columns the statement searches, each mapped to its field as given — this queryset's and
                 its subqueries' (:meth:`_searched_columns`); ``None``: this queryset's own.
+            knn_fields: the columns the statement searches with a KNN, each mapped to its field as given — this
+                queryset's and its subqueries' (:meth:`_knn_columns`); ``None``: this queryset's own.
 
         Raises:
             _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist (caught by
                 :meth:`_run_compiled`).
-            SurrealDbError: a searched field has no full-text index.
+            SurrealDbError: a searched field has no full-text index; a query vector's length is not its vector
+                index's dimension.
         """
         vars_ = variables if variables is not None else self._variables
         columns = searched if searched is not None else self._searched_columns()
+        vectors = knn_fields if knn_fields is not None else self._knn_columns()
         if self._tx is not None:
             try:
                 return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
@@ -1290,6 +1540,11 @@ class QuerySet:
                     self._tx._absorb_failure(exc)
                     self._tx._note_failure(refusal)
                     raise refusal from None
+                refusal = _vector.dimension_refusal(exc, vectors)
+                if refusal is not None:
+                    self._tx._absorb_failure(exc)
+                    self._tx._note_failure(refusal)
+                    raise refusal from exc
                 raise
         client = await self._manager().get_client()
         try:
@@ -1300,6 +1555,9 @@ class QuerySet:
             refusal = _search.missing_index_refusal(exc, columns)
             if refusal is not None:
                 raise refusal from None
+            refusal = _vector.dimension_refusal(exc, vectors)
+            if refusal is not None:
+                raise refusal from exc
             if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
                 raise SurrealDbError(_time_travel.server_refused(exc)) from exc
             raise
@@ -1309,6 +1567,14 @@ class QuerySet:
         its subqueries (``compiler.searched``), then this queryset's own ``search()`` conditions."""
         columns = {} if compiler is None else {column: field for (_, column), field in compiler.searched.items()}
         return {**columns, **{column: field for field, column, _ in self._search}}
+
+    def _knn_columns(self, compiler: SubqueryCompiler | None = None) -> dict[str, str]:
+        """The columns a statement of this queryset searches with a KNN, each mapped to its field as given (v0.36.0):
+        this queryset's own ``similar_to()``, then its subqueries' (``compiler.knn_fields``)."""
+        columns = {} if self._similar is None else {self._similar.column: self._similar.field}
+        for (_, column), field in ({} if compiler is None else compiler.knn_fields).items():
+            columns.setdefault(column, field)
+        return columns
 
     async def _reads_as_empty(self, exc: ServerError, subquery_tables: frozenset[str]) -> bool:
         """Whether the server's error *exc* reads as no rows; ``False`` relays it.
@@ -1400,18 +1666,30 @@ class QuerySet:
         *,
         write: bool = False,
         warn: bool = True,
+        knn_prefilter: bool | None = None,
     ) -> Any:
         """The loop of :meth:`_run_compiled`, as in v0.27.0: compile, send, and on a confirmed missing subquery
         table compile again with that subquery bound to ``[]`` and send again.
 
         The filter values' warnings are given by the first compilation only, and only with *warn* (v0.28.1):
         ``False`` when :meth:`_run_cached` compiled the statement for this read already. The fields the statement's
-        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them."""
+        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them, and so are the
+        fields their ``similar_to()`` searches (v0.36.0, ``knn_fields=``), so a dimension error names them.
+
+        A KNN next to other conditions (v0.36.0, ``compiler.knn_conditions``) is compiled for the line: *knn_prefilter*
+        ``None`` decides it once, right after the first compilation — the line read once per client
+        (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is checked,
+        queued or sent — and every later compilation of this read or write (a re-send for a missing subquery table
+        included) uses that decision; :meth:`_run_cached` passes the one it took."""
         empty: frozenset[str] = frozenset()
         while True:
-            compiler = self._subquery_compiler(empty, warn=warn)
+            compiler = self._subquery_compiler(empty, warn=warn, knn_prefilter=bool(knn_prefilter))
             warn = False
             query, variables = compile_statement(compiler)
+            if knn_prefilter is None:
+                knn_prefilter = await self._below_3(compiler)
+                if knn_prefilter:
+                    continue
             self._check_links()
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
@@ -1420,7 +1698,10 @@ class QuerySet:
                 return await self._execute_query(query, variables)
             # The fields the subqueries search (v0.35.0), which a missing-index error names; _execute_query() maps
             # this queryset's own. Only a subquery that searches adds the argument: the call is otherwise v0.27.0's.
+            # The same for the fields their similar_to() searches (v0.36.0), which a dimension error names.
             searched: dict[str, Any] = {"searched": self._searched_columns(compiler)} if compiler.searched else {}
+            if compiler.knn_fields:
+                searched["knn_fields"] = self._knn_columns(compiler)
             try:
                 return await self._execute_query(query, variables, subquery_tables=read, **searched)
             except _subquery._MissingSubqueryTable as missing:
@@ -1437,9 +1718,17 @@ class QuerySet:
         the view from tables the ORM does not track. On a miss :meth:`_run_uncached` sends it, compiling it again
         (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
         compilation gives the filter values' warnings, once per read.
+
+        A KNN next to other conditions (v0.36.0) is keyed in its line's form: the line is read after the first
+        compilation and, below SurrealDB 3, the statement compiled again for the key; the decision is passed on to
+        :meth:`_run_uncached`, so a read the compilation refuses stores nothing.
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
+        knn_prefilter = await self._below_3(compiler)
+        if knn_prefilter:
+            compiler = self._subquery_compiler(warn=False, knn_prefilter=True)
+            query, variables = compile_statement(compiler)
         self._check_links()
         tables = {self._model_table, *compiler.tables}
         if self.model.__surreal_edge__ or compiler.edge_tables:
@@ -1457,8 +1746,17 @@ class QuerySet:
             variables,
             frozenset(tables),
             any_table,
-            lambda: self._run_uncached(compile_statement, warn=False),
+            lambda: self._run_uncached(compile_statement, warn=False, knn_prefilter=knn_prefilter),
         )
+
+    async def _below_3(self, compiler: SubqueryCompiler) -> bool:
+        """Whether the statement *compiler* compiled is for a line below SurrealDB 3 and needs the form with the
+        conditions next to its KNN selected first (v0.36.0): only when it has such conditions
+        (``compiler.knn_conditions``) is the line read, once per client (``time_travel.cached_major()``) — on the
+        connection's client, an interactive transaction's included. A version that cannot be read counts as 3."""
+        if not compiler.knn_conditions:
+            return False
+        return await _time_travel.cached_major(await self._manager().get_client()) < 3
 
     async def _cached_read(
         self,
@@ -1513,7 +1811,9 @@ class QuerySet:
         When ``values()`` and ``annotate()`` are used, returns a list of dictionaries with
         the grouped fields and aggregation results. With ``GeoDistance`` annotations, or the search
         annotations (``SearchScore``, ``SearchHighlight``, ``SearchOffsets``, v0.35.0), returns the
-        model instances, each carrying its values as attributes (see :meth:`annotate`).
+        model instances, each carrying its values as attributes (see :meth:`annotate`). With
+        ``similar_to()`` (v0.36.0) and no aggregation — ``values()`` alone included —, the same: each
+        instance carries its distance as ``_knn_distance`` (see :meth:`similar_to`).
         Served from the query cache with ``cache()`` (v0.28.0), as new instances.
 
         Returns:
@@ -1523,9 +1823,15 @@ class QuerySet:
         Raises:
             ValueError: a search annotation whose match reference ``search()`` did not give this queryset, before
                 any request (v0.35.0).
+            SurrealDbError: a search annotation with ``similar_to()`` on SurrealDB 2.x or the embedded engine
+                (v0.36.0), once the line is read and before the statement is sent.
         """
         self._check_search_references()
-        per_record = bool(self._geo_annotations or self._search_annotations)
+        # A similar_to() statement projects the distance: without an aggregation (values() alone compiles no GROUP BY)
+        # it takes the per-record path, so _knn_distance never becomes an extra="allow" model's extra.
+        per_record = bool(
+            self._geo_annotations or self._search_annotations or (self._similar is not None and not self._annotations)
+        )
         # The values()+annotate() branch compiles no FETCH: only the other two return fetched records.
         moment = await self._time_travel_moment(fetches=per_record or not self._annotations)
         if per_record:
@@ -1548,8 +1854,8 @@ class QuerySet:
             return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
 
     async def _exec_with_annotations(self, moment: datetime | None = None) -> Any:
-        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0) and of the search annotations
-        (v0.35.0).
+        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0), of the search annotations
+        (v0.35.0) and of ``similar_to()``'s distance, ``_knn_distance`` (v0.36.0).
 
         The alias keys are taken out of each row before validation, so they never reach a field, an
         ``extra="allow"`` model's extras or a later write, then set on the instance with
@@ -1561,6 +1867,8 @@ class QuerySet:
         results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
         rows = results if isinstance(results, list) else []
         aliases = [*self._geo_annotations, *self._search_annotations]
+        if self._similar is not None:
+            aliases.append(_vector.DISTANCE_ALIAS)
         stripped: list[dict[str, Any]] = []
         annotated: list[dict[str, Any]] = []
         for row in rows:
@@ -2044,7 +2352,9 @@ class QuerySet:
         Check if any records match the current query.
 
         It compiles the full projection, as ``exec()`` does: a search annotation (v0.35.0) is sent with its
-        ``LIMIT 1`` and its match reference checked first, before any request.
+        ``LIMIT 1`` and its match reference checked first, before any request; with ``similar_to()`` on SurrealDB 2.x
+        or the embedded engine, where ``exec()`` refuses search annotations, they are left out (v0.36.0): the answer
+        needs none.
 
         Returns:
             True if at least one record matches, False otherwise.
@@ -2057,7 +2367,7 @@ class QuerySet:
         original_limit = self._limit
         try:
             self._limit = 1
-            results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
+            results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c, for_exists=True))
 
             if isinstance(results, list):
                 return len(results) > 0
@@ -2178,7 +2488,8 @@ class QuerySet:
         A subquery in the filters (v0.27.0) is read by the server in the same statement, a block
         ``{ LET $_sq0 = (…); (UPDATE …) };``: one request, and on SurrealDB 3.x a subquery table that does not exist
         reads as empty, as on 2.x (outside a transaction; inside one, the server's error is the transaction's). A
-        value to write is data, never a subquery.
+        value to write is data, never a subquery. With ``similar_to()`` (v0.36.0) it updates the ``limit`` nearest
+        records among those the filters select, by their ids (:meth:`_write_where`).
 
         Args:
             **kwargs: Fields and values to update.
@@ -2206,7 +2517,7 @@ class QuerySet:
         self.model._reject_computed_writes(kwargs, "bulk_update()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = self._build_where(subqueries=compiler)
+            where_clause, where_vars = self._write_where(compiler)
             set_parts: list[str] = []
             set_vars: dict[str, Any] = {}
             for i, (field, value) in enumerate(kwargs.items()):
@@ -2226,7 +2537,8 @@ class QuerySet:
         Delete all records matching the current filters.
 
         A subquery in the filters (v0.27.0) is read by the server in the same statement, as for
-        :meth:`bulk_update`.
+        :meth:`bulk_update`. With ``similar_to()`` (v0.36.0) it deletes the ``limit`` nearest records among those the
+        filters select, by their ids (:meth:`_write_where`).
 
         Returns:
             The number of deleted records (``0`` inside a buffered transaction, whose statements run at commit).
@@ -2240,7 +2552,7 @@ class QuerySet:
         self._reject_time_travel("bulk_delete()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = self._build_where(subqueries=compiler)
+            where_clause, where_vars = self._write_where(compiler)
             query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
             return compiler.wrap(query), {**compiler.variables, **where_vars}
 
@@ -2255,7 +2567,9 @@ class QuerySet:
         Whole table if unfiltered. Returns the number of affected rows. Participates in
         ``objects(tx=)`` like the other bulk operations. ``operations`` is validated then bound
         as ``$_ops`` (never string-interpolated). Emits no signals. A subquery in the filters
-        (v0.27.0) is read by the server in the same statement, as for :meth:`bulk_update`.
+        (v0.27.0) is read by the server in the same statement, as for :meth:`bulk_update`. With ``similar_to()``
+        (v0.36.0) it patches the ``limit`` nearest records among those the filters select, by their ids
+        (:meth:`_write_where`).
 
         Example::
 
@@ -2269,7 +2583,7 @@ class QuerySet:
         self.model._reject_computed_patch(operations, "patch()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = self._build_where(subqueries=compiler)
+            where_clause, where_vars = self._write_where(compiler)
             query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
             ops = self.model._columns_for_patch(operations)
             return compiler.wrap(query), {**compiler.variables, **where_vars, "_ops": ops}
@@ -2717,10 +3031,14 @@ class QuerySet:
         the caller fixes them all at once.
 
         ``search()`` (v0.35.0) is refused first, on its own: SurrealDB accepts a live query whose condition holds a
-        full-text match and never notifies it; the refusal names the subquery form, which notifies.
+        full-text match and never notifies it; the refusal names the subquery form, which notifies. ``similar_to()``
+        (v0.36.0) next, on its own too: SurrealDB accepts a live query whose condition holds a KNN operator and never
+        notifies it.
         """
         if self._search:
             raise SurrealDbError(_search.live_refused())
+        if self._similar is not None:
+            raise SurrealDbError(_vector.live_refused())
         unsupported = {
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -2861,6 +3179,10 @@ class QuerySet:
         ``SurrealDbError`` naming the field otherwise: without the index, SurrealDB 3.x would accept the live query
         and never notify. Do not remove that index while the live query runs.
 
+        **Vector search (v0.36.0).** ``similar_to()`` is refused: SurrealDB accepts a live query whose condition holds
+        a KNN operator and never notifies it. So is a subquery holding ``similar_to()``: the nearest records change
+        with every write. Read them with ``similar_to()`` and watch them by id.
+
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
         deprecated, and never resubscribes: the caller owns that uuid.
 
@@ -2874,8 +3196,8 @@ class QuerySet:
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
             ``offset``/``objects(tx=)``/``cache()`` (v0.28.0: a stream is never cached), for ``search()``
-            (v0.35.0), and on a queryset read ``as_of()`` (a live query streams the current changes, v0.26.0),
-            here; for a non-WebSocket connection (the embedded engine included: read its change feed with
+            (v0.35.0), for ``similar_to()`` and a subquery holding it (v0.36.0), and on a queryset read ``as_of()``
+            (a live query streams the current changes, v0.26.0), here; for a non-WebSocket connection (the embedded engine included: read its change feed with
             :meth:`changes`), or a field a subquery searches without a full-text index (v0.35.0), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile, here.
@@ -2911,9 +3233,10 @@ class QuerySet:
         ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
-        :meth:`live`, and so do its refusals (``as_of()``, ``cache()`` and ``search()`` included, here) and its
-        subqueries (inline, the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
-        missing one; the fields they search checked for a full-text index: ``SurrealDbError`` naming one without).
+        :meth:`live`, and so do its refusals (``as_of()``, ``cache()``, ``search()`` and ``similar_to()`` included,
+        here) and its subqueries (inline, the tables they read checked on start: ``SurrealDbNotFoundError`` on
+        SurrealDB 3.x for a missing one; the fields they search checked for a full-text index: ``SurrealDbError``
+        naming one without).
         """
         self._reject_time_travel("watch()")
         return LiveStream(
@@ -2934,6 +3257,7 @@ class QuerySet:
             "filter()": bool(self._filters or self._q_filters),
             "nearby()": bool(self._nearby),
             "search()": bool(self._search),
+            "similar_to()": self._similar is not None,
             "variables()": bool(self._variables),
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -2979,9 +3303,9 @@ class QuerySet:
             keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
-        :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()`` and ``search()`` included), here; on
-            start, for a table that does not exist or has no change feed (on the table or on its database), or for a
-            datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
+        :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()``, ``search()`` and ``similar_to()``
+            included), here; on start, for a table that does not exist or has no change feed (on the table or on its
+            database), or for a datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
         self._reject_time_travel("changes()")

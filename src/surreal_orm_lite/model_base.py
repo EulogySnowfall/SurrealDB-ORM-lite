@@ -114,6 +114,7 @@ from .utils import (
     validate_thing,
     warn_on_multiple_statements,
 )
+from .vector import get_vector_info
 
 if TYPE_CHECKING:
     from .edge import BaseSurrealEdge
@@ -664,11 +665,13 @@ class SurrealConfigDict(ConfigDict, total=False):
             class is defined (none on a materialized view); Field(json_schema_extra={"flexible":
             True}) requests it for one field.
         indexes (Sequence[Index] | None): The table's indexes (v0.35.0) — Index(...) objects with
-            the full SurrealDB-ORM's CreateIndex arguments: plain, UNIQUE and full-text
-            (search_analyzer=) indexes, rendered by index_ddl() and applied by define_indexes().
-            Checked when the class is defined: a list or tuple of Index with distinct names, none
-            on a materialized view, at most one full-text index per column (an aliased field
-            counted under its column), and one Analyzer object per analyzer name. Inherited by
+            the full SurrealDB-ORM's CreateIndex arguments: plain, UNIQUE, full-text
+            (search_analyzer=) and vector (hnsw=True, v0.36.0) indexes, rendered by index_ddl() and
+            applied by define_indexes(). Checked when the class is defined: a list or tuple of
+            Index with distinct names, none on a materialized view, at most one full-text index and
+            one vector index per column (an aliased field counted under its column), one Analyzer
+            object per analyzer name, and a vector index on a VectorField of the field's dimension
+            and storage type (F32 when the index declares none). Inherited by
             subclasses unless they set their own (indexes=[] drops them) — a subclass with another
             table defines the same indexes on its own table.
 
@@ -853,8 +856,9 @@ class BaseSurrealModel(BaseModel):
         computed field (``schema.check_view_config()``) — inherited values included. So is, right
         after it, the ``indexes`` key (v0.35.0, ``search.check_indexes_config()``): ``None``, or a
         ``list`` or ``tuple`` of ``Index`` with distinct names, none on a view, one full-text index
-        per column and one ``Analyzer`` definition per analyzer name — inherited values included,
-        the messages naming the subclass. So are the ``table_type``, ``relation_in``,
+        per column and one ``Analyzer`` definition per analyzer name, one vector index per column
+        and, on a vector field, of its dimension and storage type (v0.36.0) — inherited values
+        included, the messages naming the subclass. So are the ``table_type``, ``relation_in``,
         ``relation_out`` and ``enforced`` keys (v0.33.0), when any of them is not ``None``: a
         ``TableType`` (``RELATION`` on an edge only), and the relation keys on an edge model only
         (``schema.check_relation_config()``). So are, on every model and after the relation keys,
@@ -889,7 +893,12 @@ class BaseSurrealModel(BaseModel):
             )
         indexes = cls.model_config.get("indexes")
         if indexes is not None:
-            check_indexes_config(cls, indexes, view=cls._is_view(), column=cls.to_db_field)
+            vectors = {
+                cls.to_db_field(name): info
+                for name, field in cls.model_fields.items()
+                if (info := get_vector_info(field)) is not None
+            }
+            check_indexes_config(cls, indexes, view=cls._is_view(), column=cls.to_db_field, vectors=vectors)
         relation = {key: cls.model_config.get(key) for key in ("table_type", "relation_in", "relation_out", "enforced")}
         if any(value is not None for value in relation.values()):
             check_relation_config(cls, edge=cls.__surreal_edge__, **relation)
