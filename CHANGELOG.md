@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.35.3] - 2026-10-22
+## [0.35.3] - 2026-10-23
 
 Follow-ups to the review of v0.35.0's full-text search (#304): the warning of `define_indexes()`
 names every index it rebuilds, and `define_indexes(tx=…)` refuses to define an index in a
