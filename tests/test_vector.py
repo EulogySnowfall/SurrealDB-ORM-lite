@@ -117,6 +117,17 @@ condition, and a transaction queues the block of its line. ``TestWriteByIdsE2E``
 records the same read returns — next to a range on an indexed column, with an exact search, next to a comparison,
 alone — and returns their number, a table that does not exist written as empty; ``TestWriteByIdsTxE2E`` writes them in
 an interactive transaction and in a buffered one.
+
+The dimension of the vector index (``TestDimensionRefusal``): SurrealDB's refusal of a query vector whose length is not
+the index's dimension becomes ``SurrealDbError`` naming the field — the statement's own, its subqueries', several as
+"one of the fields" — and both lengths read from the server's text, chained to the server's error; in a transaction
+that error takes the server's place among the transaction's failures. ``TestDimensionE2E``, on a model that does not
+declare the dimension (a hand-made index on a plain list field): a read and a count on every engine, and a write by
+the ids of the nearest outside a transaction (SurrealDB 3.1 relays its own error from the ``LET``); a declared
+dimension refuses the vector before any request. ``TestTransactionsE2E``: in an interactive transaction (SurrealDB 3.x
+over WebSocket) the vector search sees the transaction's write, and a read refused for its dimension fails the commit,
+caused by the ORM's error; in a buffered one (HTTP, SurrealDB 2.x, the embedded engine) a read raises, as every read
+does there.
 """
 
 import ast
@@ -135,7 +146,7 @@ from typing import Annotated, Any, Literal
 
 import pytest
 from pydantic import Field, ValidationError
-from surrealdb import RecordID
+from surrealdb import InternalError, RecordID, ServerError
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -4121,3 +4132,301 @@ class TestWriteByIdsTxE2E:
         assert added == [(_RANGE_PREFILTERED if major < 3 else _RANGE_INLINE, _RANGE_VARIABLES)]
         assert written == (2 if interactive else 0)
         assert hits == ["d4", "d6"]
+
+
+#: SurrealDB's refusal of a query vector of two numbers for a vector index of dimension 3, the same on every engine.
+_DIMENSION_ERROR = "Incorrect vector dimension (2). Expected a vector of 3 dimension."
+#: The ORM's error for that refusal on the field ``embedding``.
+_VD1 = "similar_to(): the vector has 2 dimensions; the vector index on field 'embedding' expects 3."
+#: The query vector of two numbers.
+_SHORT = [1.0, 0.0]
+
+
+class VecLoose(BaseSurrealModel):
+    """A schemaless model whose vectors are plain lists: its vector index is defined by hand, so the ORM does not know
+    the dimension."""
+
+    model_config = SurrealConfigDict(table_name="vec_loose")
+
+    id: str | None = None
+    title: str = ""
+    category: str = ""
+    hit: bool = False
+    embedding: list[float] | None = None
+
+
+#: ``VecLoose``'s vector index, written by hand: dimension 3.
+_LOOSE_INDEX = "DEFINE INDEX vec_loose_embedding ON vec_loose FIELDS embedding HNSW DIMENSION 3 DIST COSINE TYPE F32;"
+
+
+async def _seed_loose(client: Any) -> None:
+    """``VecLoose``'s index, then the six records."""
+    await _apply_ddl(client, f"{_LOOSE_INDEX} {_seed_statements('vec_loose')}")
+
+
+class _DimensionClient:
+    """A client whose every query fails with SurrealDB's dimension error: records what it was sent."""
+
+    def __init__(self) -> None:
+        self.error = InternalError("Internal", _DIMENSION_ERROR)
+        self.sent: list[str] = []
+
+    async def query(self, statement: str, variables: Any = None) -> Any:
+        self.sent.append(statement)
+        raise self.error
+
+    async def version(self) -> str:
+        pytest.fail("a statement without another condition reads no line")
+
+
+def _dimension_client(monkeypatch: pytest.MonkeyPatch) -> _DimensionClient:
+    """Every read acquires one :class:`_DimensionClient`, returned."""
+    client = _DimensionClient()
+
+    async def get_client(*args: Any, **kwargs: Any) -> Any:
+        return client
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+    return client
+
+
+class _DimensionTx:
+    """A transaction whose every read fails with SurrealDB's dimension error, noted among its failures as a
+    transaction notes the error of a statement run in it."""
+
+    def __init__(self) -> None:
+        self.error = InternalError("Internal", _DIMENSION_ERROR)
+        self.failures: list[BaseException] = []
+
+    @property
+    def is_interactive(self) -> bool:
+        return True
+
+    async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        self.failures.append(self.error)
+        raise self.error
+
+    def _absorb_failure(self, error: BaseException) -> None:
+        self.failures = [failure for failure in self.failures if failure is not error]
+
+    def _note_failure(self, error: BaseException) -> None:
+        self.failures.append(error)
+
+
+class TestDimensionRefusal:
+    """SurrealDB's refusal of a query vector whose length is not its vector index's dimension, read without a request:
+    ``SurrealDbError`` names the statement's vector field — several as "one of the fields" — and both lengths read from
+    the server's text, chained to the server's error; any other error, an unreadable text or a statement without a
+    vector search is relayed. In a transaction the ORM's error replaces the server's among its failures."""
+
+    def test_the_server_s_refusal(self) -> None:
+        error = InternalError("Internal", _DIMENSION_ERROR)
+        assert vector.is_dimension_error(error) is True
+        refusal = vector.dimension_refusal(error, {"embedding": "embedding"})
+        assert type(refusal) is SurrealDbError
+        assert str(refusal) == _VD1
+
+    def test_the_field_as_given_and_the_lengths_read(self) -> None:
+        error = InternalError("Internal", "Incorrect vector dimension (0). Expected a vector of 1536 dimension.")
+        assert str(vector.dimension_refusal(error, {"summary": "summary_vec"})) == (
+            "similar_to(): the vector has 0 dimensions; the vector index on field 'summary_vec' expects 1536."
+        )
+
+    def test_several_fields(self) -> None:
+        error = InternalError("Internal", _DIMENSION_ERROR)
+        fields = {"embedding": "embedding", "summary": "summary_vec", "meta.vec": "embedding"}
+        assert str(vector.dimension_refusal(error, fields)) == (
+            "similar_to(): the vector has 2 dimensions; the vector index on one of the fields 'embedding', "
+            "'summary_vec' expects 3."
+        )
+
+    def test_any_other_error_is_relayed(self) -> None:
+        fields = {"embedding": "embedding"}
+        assert vector.is_dimension_error(ValueError(_DIMENSION_ERROR)) is False
+        assert vector.dimension_refusal(ValueError(_DIMENSION_ERROR), fields) is None
+        other = InternalError("Internal", "There was a problem with the database")
+        assert vector.is_dimension_error(other) is False
+        assert vector.dimension_refusal(other, fields) is None
+        unreadable = InternalError("Internal", "Incorrect vector dimension (two).")
+        assert vector.is_dimension_error(unreadable) is True
+        assert vector.dimension_refusal(unreadable, fields) is None
+        assert vector.dimension_refusal(InternalError("Internal", _DIMENSION_ERROR), {}) is None
+
+    async def test_a_read_names_its_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _dimension_client(monkeypatch)
+        with pytest.raises(SurrealDbError) as raised:
+            await VecLoose.objects().similar_to("embedding", _SHORT).exec()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _VD1
+        assert raised.value.__cause__ is client.error
+        assert len(client.sent) == 1
+
+    async def test_a_subquery_s_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _dimension_client(monkeypatch)
+        inner = VecDoc.objects().similar_to("summary_vec", [1.0, 0.0, 0.0], 2)
+        with pytest.raises(SurrealDbError) as raised:
+            await VecRanked.objects().filter(id__in=Subquery(inner)).count()
+        assert str(raised.value) == (
+            "similar_to(): the vector has 2 dimensions; the vector index on field 'summary_vec' expects 3."
+        )
+        assert raised.value.__cause__ is client.error
+        assert len(client.sent) == 1
+
+    async def test_its_own_and_a_subquery_s_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _dimension_client(monkeypatch)
+        inner = VecDoc.objects().similar_to("summary_vec", [1.0, 0.0, 0.0], 2)
+        queryset = VecLoose.objects().filter(id__in=Subquery(inner)).similar_to("embedding", _SHORT)
+        with pytest.raises(SurrealDbError) as raised:
+            await queryset.exec()
+        assert str(raised.value) == (
+            "similar_to(): the vector has 2 dimensions; the vector index on one of the fields 'embedding', "
+            "'summary_vec' expects 3."
+        )
+        assert raised.value.__cause__ is client.error
+
+    async def test_a_write_by_the_ids_of_the_nearest(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _dimension_client(monkeypatch)
+        with pytest.raises(SurrealDbError) as raised:
+            await VecLoose.objects().similar_to("embedding", _SHORT).bulk_update(hit=True)
+        assert str(raised.value) == _VD1
+        assert raised.value.__cause__ is client.error
+        assert len(client.sent) == 1
+
+    async def test_a_query_without_a_vector_search_relays_the_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _dimension_client(monkeypatch)
+        with pytest.raises(InternalError) as raised:
+            await VecLoose.objects().filter(category="tech").exec()
+        assert raised.value is client.error
+
+    async def test_a_read_in_a_transaction(self) -> None:
+        tx = _DimensionTx()
+        with pytest.raises(SurrealDbError) as raised:
+            await VecLoose.objects(tx=tx).similar_to("embedding", _SHORT).exec()
+        assert str(raised.value) == _VD1
+        assert raised.value.__cause__ is tx.error
+        assert tx.failures == [raised.value]
+
+
+class TestDimensionE2E:
+    """A query vector of another length than the vector index's dimension, on a model that does not declare the
+    dimension (a hand-made index on a plain list field): SurrealDB's refusal becomes ``SurrealDbError`` naming the field
+    and both lengths, caused by the server's error — a read and a count on every engine; a write by the ids of the
+    nearest outside a transaction on SurrealDB 3.3, 2.x and the embedded engine, where SurrealDB 3.1 relays its own
+    error from the ``LET`` — and nothing is written. A declared dimension refuses the vector before any request."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_read_and_a_count(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_loose(client)
+            queryset = VecLoose.objects().similar_to("embedding", _SHORT)
+            errors: list[BaseException] = []
+            for call in (queryset.exec, queryset.count):
+                with pytest.raises(SurrealDbError) as raised:
+                    await call()
+                errors.append(raised.value)
+        assert [type(error) for error in errors] == [SurrealDbError, SurrealDbError]
+        assert [str(error) for error in errors] == [_VD1, _VD1]
+        for error in errors:
+            assert isinstance(error.__cause__, ServerError)
+            assert _DIMENSION_ERROR in str(error.__cause__)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_by_the_ids_of_the_nearest(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_loose(client)
+            line = await _line(client)
+            with pytest.raises((SurrealDbError, ServerError)) as raised:
+                await VecLoose.objects().similar_to("embedding", _SHORT).bulk_update(hit=True)
+            hits = await client.query("SELECT VALUE id FROM vec_loose WHERE hit = true;", {})
+        assert hits == []
+        if line == (3, 1):
+            assert isinstance(raised.value, ServerError)
+            assert "HNSW KNN search failed" in str(raised.value), "SurrealDB 3.1 fails the LET with its own error"
+            return
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _VD1
+        assert isinstance(raised.value.__cause__, ServerError)
+        assert _DIMENSION_ERROR in str(raised.value.__cause__)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_declared_dimension_refuses_before_any_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(ValueError) as raised:
+                await VecDoc.objects().similar_to("embedding", _SHORT).exec()
+            sent = _calls(calls)
+        assert str(raised.value) == (
+            "similar_to(): the vector has 2 dimensions; field 'embedding' holds vectors of 3 (VectorField[3])."
+        )
+        assert sent == []
+
+
+async def _native_transactions(kind: str, client: Any) -> bool:
+    """Whether ``transaction()`` on *kind* is interactive: WebSocket on SurrealDB 3.x."""
+    return kind == "ws" and await _major(client) >= 3
+
+
+#: The existing refusal of a read inside a buffered transaction.
+_BUFFERED_READ = (
+    "Reads inside a transaction require a WebSocket connection to SurrealDB 3.x (native interactive transactions); "
+    "the current transaction is buffered (HTTP or SurrealDB 2.6.x)."
+)
+
+
+class TestTransactionsE2E:
+    """``similar_to()`` in a transaction, on every engine: in an interactive one (SurrealDB 3.x over WebSocket) the
+    vector search sees the transaction's own write, which the others see after the commit, and a read refused for its
+    vector's dimension fails the commit, caused by the ORM's error; in a buffered one (HTTP, SurrealDB 2.x, the embedded
+    engine) a read raises, as every read does there, and the write is applied at the commit."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_search_sees_the_transaction_s_write(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            interactive = await _native_transactions(kind, client)
+            refused: pytest.ExceptionInfo[SurrealDbError] | None = None
+            inside: list[str] | None = None
+            outside: list[str] | None = None
+            async with SurrealDBConnectionManager.transaction("vec") as tx:
+                await VecDoc(id="d7", title="Cats and mice", category="pets", embedding=[0.95, 0.05, 0.0]).save(tx=tx)
+                if interactive:
+                    inside = _ids(await VecDoc.objects(tx=tx).similar_to("embedding", _Q, 3).exec())
+                    outside = _ids(await VecDoc.objects().similar_to("embedding", _Q, 3).exec())
+                else:
+                    with pytest.raises(SurrealDbError) as refused:
+                        await VecDoc.objects(tx=tx).similar_to("embedding", _Q, 3).exec()
+            after = _ids(await VecDoc.objects().similar_to("embedding", _Q, 3).exec())
+        assert after == ["d1", "d7", "d2"]
+        if interactive:
+            assert inside == ["d1", "d7", "d2"]
+            assert outside == ["d1", "d2", "d6"], "the others see the write after the commit"
+        else:
+            assert refused is not None
+            assert type(refused.value) is SurrealDbError
+            assert str(refused.value) == _BUFFERED_READ
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_dimension_error_fails_the_commit(self, kind: str) -> None:
+        """The read raises the ORM's error; the block that catches it and ends normally gets the commit's error,
+        caused by that very error, and nothing is committed."""
+        async with _vec_models(kind) as client:
+            if not await _native_transactions(kind, client):
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            await _seed_loose(client)
+            read: pytest.ExceptionInfo[SurrealDbError] | None = None
+            with pytest.raises(SurrealDbError) as commit:
+                async with SurrealDBConnectionManager.transaction("vec") as tx:
+                    with pytest.raises(SurrealDbError) as read:
+                        await VecLoose.objects(tx=tx).similar_to("embedding", _SHORT).exec()
+                    await VecLoose(id="d7", title="Cats and mice", embedding=[0.95, 0.05, 0.0]).save(tx=tx)
+            stored = sorted(_ids(await VecLoose.objects().all()))
+        assert read is not None
+        assert type(read.value) is SurrealDbError
+        assert str(read.value) == _VD1
+        assert isinstance(read.value.__cause__, ServerError)
+        assert str(commit.value) == (
+            "The transaction was cancelled: a statement in it failed; nothing was committed (SurrealDbError)"
+        )
+        assert commit.value.__cause__ is read.value
+        assert stored == ["d1", "d2", "d3", "d4", "d5", "d6"]

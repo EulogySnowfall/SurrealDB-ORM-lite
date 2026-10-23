@@ -36,13 +36,17 @@ column, a function call, a negation, a group, a dotted path, a full-text match �
 records matching them first, in a ``LET`` of the statement, and the KNN searches those ids. ``id_subquery_part()``
 tells the only parts that stay next to the KNN on every line: the ORM's own id subqueries.
 
+**The server's dimension error.** When the model does not declare a field's dimension, SurrealDB checks the query
+vector against the vector index and refuses one of another length; ``dimension_refusal()`` reads that refusal into the
+ORM's error, naming the field and both lengths (``is_dimension_error()`` tells it).
+
 The module sits low in the package: it imports neither ``search``, ``model_base``, ``query_set`` nor
 ``connection_manager``, so each of them can import it.
 """
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from numbers import Real
@@ -53,6 +57,8 @@ from pydantic.fields import FieldInfo
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import core_schema
 
+from ._sdk import ServerError
+from .exceptions import SurrealDbError
 from .utils import VALID_FIELD_PATTERN, validate_field_name
 
 __all__ = ["VectorField", "Vector", "get_vector_info", "is_vector_field"]
@@ -98,6 +104,12 @@ DISTANCE_ALIAS = "_knn_distance"
 #: The two forms the ORM writes for a ``Subquery`` given to ``id__in``: ``id IN $_sq<N>``, and ``$_sq<N> CONTAINS id``
 #: on a view model (v0.32.0) — the only parts of a KNN statement's ``WHERE`` kept next to the KNN on every line.
 _ID_SUBQUERY_PART = re.compile(r"id IN \$_sq[0-9]+|\$_sq[0-9]+ CONTAINS id")
+
+#: The start of SurrealDB's refusal of a query vector whose length is not its vector index's dimension, the same on
+#: every engine: ``Incorrect vector dimension (2). Expected a vector of 3 dimension.``
+_DIMENSION_MARKER = "Incorrect vector dimension ("
+#: The two lengths that refusal gives: the query vector's, then the index's dimension.
+_DIMENSION_LENGTHS = re.compile(r"Incorrect vector dimension \((\d+)\)\. Expected a vector of (\d+) dimension")
 
 _DISTANCE_LIST = "EUCLIDEAN, COSINE, MANHATTAN, CHEBYSHEV and HAMMING"
 _VECTOR_TYPE_LIST = "F64, F32, I64, I32 and I16"
@@ -521,6 +533,38 @@ def dimension_refused(field: str, n: int, d: int, source: str) -> str:
     """The refusal of a query vector of *n* numbers for *field*, which holds vectors of *d* as *source* declares
     (``VectorField[d]``, or ``index 'name'``)."""
     return f"similar_to(): the vector has {n} dimensions; field {field!r} holds vectors of {d} ({source})."
+
+
+def is_dimension_error(error: BaseException) -> bool:
+    """Whether *error* is SurrealDB's refusal of a query vector whose length is not its vector index's dimension (a
+    ``ServerError``)."""
+    return isinstance(error, ServerError) and _DIMENSION_MARKER in str(error)
+
+
+def dimension_error_refused(fields: Sequence[str], n: int, d: int) -> str:
+    """The ORM's error for a query vector of *n* numbers that a vector index of dimension *d* refused. *fields*: the
+    vector fields of the statement; one is named alone, several as "one of the fields"."""
+    named = ", ".join(repr(field) for field in fields)
+    where = f"field {named}" if len(fields) == 1 else f"one of the fields {named}"
+    return f"similar_to(): the vector has {n} dimensions; the vector index on {where} expects {d}."
+
+
+def dimension_refusal(error: BaseException, fields: Mapping[str, str]) -> SurrealDbError | None:
+    """The ORM's error for SurrealDB's refusal *error* of a query vector whose length is not its vector index's
+    dimension, not raised; ``None`` for any other error.
+
+    *fields* maps each column the statement searches with a KNN to its field as given (the queryset's own, then its
+    subqueries'). The server names neither, so the error names that field, or each of them when there are several. The
+    two lengths are read from the server's text, which holds nothing else: the caller raises the error ``from`` it.
+    ``None`` too — the server's error relayed — when that text cannot be read or the statement searches no vector.
+    """
+    if not is_dimension_error(error):
+        return None
+    lengths = _DIMENSION_LENGTHS.search(str(error))
+    names = list(dict.fromkeys(fields.values()))
+    if lengths is None or not names:
+        return None
+    return SurrealDbError(dimension_error_refused(names, int(lengths.group(1)), int(lengths.group(2))))
 
 
 def zero_vector_refused() -> str:

@@ -651,6 +651,11 @@ class QuerySet:
         gives them. ``get(<id>)`` and ``all()`` ignore it, as they ignore ``filter()``. ``as_of()``, ``live()``,
         ``watch()`` and ``changes()`` refuse it.
 
+        When the model does not declare the field's dimension, SurrealDB checks ``vector`` against the vector index: a
+        vector of another length raises ``SurrealDbError`` naming the field and both lengths, caused by the server's
+        error — on a read, in a transaction too, and on a bulk write outside a transaction. Inside a transaction a bulk
+        write relays the server's error, as the transaction reports it.
+
         Args:
             field: A Python field name (an aliased field compiles its column) or a dotted path; not the record id nor,
                 on an edge model, an endpoint.
@@ -1468,6 +1473,7 @@ class QuerySet:
         *,
         subquery_tables: frozenset[str] = frozenset(),
         searched: Mapping[str, str] | None = None,
+        knn_fields: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Execute a read query. Routes through the transaction when one is attached
@@ -1487,6 +1493,11 @@ class QuerySet:
         ``__context__`` (``search.missing_index_refusal()``). In a transaction that error replaces the SDK's in the
         transaction's failures, so the commit that fails afterwards chains it, never the server's text.
 
+        A query vector whose length is not its vector index's dimension (v0.36.0) raises ``SurrealDbError`` naming the
+        field and both lengths, from the server's error, whose text holds nothing else (``vector.dimension_refusal()``):
+        a read, and a write by filter outside a transaction — its ``LET`` selects the nearest records' ids. In a
+        transaction that error replaces the SDK's in the transaction's failures, as above.
+
         Args:
             query: the statement.
             variables: its bound values (the queryset's ``variables()`` when ``None``).
@@ -1497,14 +1508,18 @@ class QuerySet:
                 naming another table, it is the outer table's and reads as no rows. Every other error is relayed.
             searched: the columns the statement searches, each mapped to its field as given — this queryset's and
                 its subqueries' (:meth:`_searched_columns`); ``None``: this queryset's own.
+            knn_fields: the columns the statement searches with a KNN, each mapped to its field as given — this
+                queryset's and its subqueries' (:meth:`_knn_columns`); ``None``: this queryset's own.
 
         Raises:
             _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist (caught by
                 :meth:`_run_compiled`).
-            SurrealDbError: a searched field has no full-text index.
+            SurrealDbError: a searched field has no full-text index; a query vector's length is not its vector
+                index's dimension.
         """
         vars_ = variables if variables is not None else self._variables
         columns = searched if searched is not None else self._searched_columns()
+        vectors = knn_fields if knn_fields is not None else self._knn_columns()
         if self._tx is not None:
             try:
                 return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
@@ -1525,6 +1540,11 @@ class QuerySet:
                     self._tx._absorb_failure(exc)
                     self._tx._note_failure(refusal)
                     raise refusal from None
+                refusal = _vector.dimension_refusal(exc, vectors)
+                if refusal is not None:
+                    self._tx._absorb_failure(exc)
+                    self._tx._note_failure(refusal)
+                    raise refusal from exc
                 raise
         client = await self._manager().get_client()
         try:
@@ -1535,6 +1555,9 @@ class QuerySet:
             refusal = _search.missing_index_refusal(exc, columns)
             if refusal is not None:
                 raise refusal from None
+            refusal = _vector.dimension_refusal(exc, vectors)
+            if refusal is not None:
+                raise refusal from exc
             if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
                 raise SurrealDbError(_time_travel.server_refused(exc)) from exc
             raise
@@ -1544,6 +1567,14 @@ class QuerySet:
         its subqueries (``compiler.searched``), then this queryset's own ``search()`` conditions."""
         columns = {} if compiler is None else {column: field for (_, column), field in compiler.searched.items()}
         return {**columns, **{column: field for field, column, _ in self._search}}
+
+    def _knn_columns(self, compiler: SubqueryCompiler | None = None) -> dict[str, str]:
+        """The columns a statement of this queryset searches with a KNN, each mapped to its field as given (v0.36.0):
+        this queryset's own ``similar_to()``, then its subqueries' (``compiler.knn_fields``)."""
+        columns = {} if self._similar is None else {self._similar.column: self._similar.field}
+        for (_, column), field in ({} if compiler is None else compiler.knn_fields).items():
+            columns.setdefault(column, field)
+        return columns
 
     async def _reads_as_empty(self, exc: ServerError, subquery_tables: frozenset[str]) -> bool:
         """Whether the server's error *exc* reads as no rows; ``False`` relays it.
@@ -1642,7 +1673,8 @@ class QuerySet:
 
         The filter values' warnings are given by the first compilation only, and only with *warn* (v0.28.1):
         ``False`` when :meth:`_run_cached` compiled the statement for this read already. The fields the statement's
-        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them.
+        subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them, and so are the
+        fields their ``similar_to()`` searches (v0.36.0, ``knn_fields=``), so a dimension error names them.
 
         A KNN next to other conditions (v0.36.0, ``compiler.knn_conditions``) is compiled for the line: *knn_prefilter*
         ``None`` decides it once, right after the first compilation — the line read once per client
@@ -1666,7 +1698,10 @@ class QuerySet:
                 return await self._execute_query(query, variables)
             # The fields the subqueries search (v0.35.0), which a missing-index error names; _execute_query() maps
             # this queryset's own. Only a subquery that searches adds the argument: the call is otherwise v0.27.0's.
+            # The same for the fields their similar_to() searches (v0.36.0), which a dimension error names.
             searched: dict[str, Any] = {"searched": self._searched_columns(compiler)} if compiler.searched else {}
+            if compiler.knn_fields:
+                searched["knn_fields"] = self._knn_columns(compiler)
             try:
                 return await self._execute_query(query, variables, subquery_tables=read, **searched)
             except _subquery._MissingSubqueryTable as missing:
