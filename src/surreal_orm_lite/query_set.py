@@ -1110,6 +1110,38 @@ class QuerySet:
 
         return " WHERE " + " AND ".join(parts), variables
 
+    def _write_where(self, compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
+        """The ``WHERE`` clause of a bulk write by filter (:meth:`bulk_update`, :meth:`bulk_delete`, :meth:`patch`) and
+        its values, compiled with the statement's *compiler*.
+
+        Without ``similar_to()`` it is :meth:`_build_where`'s, unchanged. With it (v0.36.0) the write goes by the ids
+        of the nearest records: ``LET $_sq<N> = (SELECT VALUE id FROM <table> WHERE <conditions> AND <knn>);`` joins
+        the statement's block — after the ``LET`` s of its conditions (its subqueries', and below SurrealDB 3 the
+        pre-filter's, :meth:`_where_parts`), so ``N`` is taken once they are compiled — and the write says ``WHERE id
+        IN $_sq<N>``: it writes as many records as the same read returns, on every line. A write never carries the KNN
+        operator: there an exact search (``dist=``) writes every matching record on SurrealDB 2.x and the embedded
+        engine, and a range on an indexed column next to the KNN writes nothing on every engine.
+
+        The ``LET`` reads the model's own table, registered in ``compiler.tables`` as a subquery's: when SurrealDB 3.x
+        confirms that table missing (``compiler.empty_tables``), the ids are bound to ``[]`` and nothing else is
+        compiled, so the write reads it as empty, as it does without ``similar_to()``. A view model never gets here
+        (its writes are refused first), so the write always says ``id IN``. ``limit()``, ``offset()`` and
+        ``order_by()`` are not written, as for every bulk write.
+        """
+        if self._similar is None:
+            return self._build_where(subqueries=compiler)
+        table = self._model_table
+        compiler.tables.add(table)
+        if table in compiler.empty_tables:
+            values: dict[str, Any] = {}
+            select = "[]"
+        else:
+            where, values = self._build_where(subqueries=compiler)
+            select = f"(SELECT VALUE id FROM {table}{where})"
+        name = f"{_subquery.LET_PREFIX}{len(compiler.lets)}"
+        compiler.lets.append(f"LET ${name} = {select};")
+        return f" WHERE id IN ${name}", values
+
     def _subquery_select(self, compiler: SubqueryCompiler, counter: int) -> tuple[str, dict[str, Any], int]:
         """This queryset as the sub-SELECT of another queryset's filter (v0.27.0); its values and the next counter.
 
@@ -2421,7 +2453,8 @@ class QuerySet:
         A subquery in the filters (v0.27.0) is read by the server in the same statement, a block
         ``{ LET $_sq0 = (…); (UPDATE …) };``: one request, and on SurrealDB 3.x a subquery table that does not exist
         reads as empty, as on 2.x (outside a transaction; inside one, the server's error is the transaction's). A
-        value to write is data, never a subquery.
+        value to write is data, never a subquery. With ``similar_to()`` (v0.36.0) it updates the ``limit`` nearest
+        records among those the filters select, by their ids (:meth:`_write_where`).
 
         Args:
             **kwargs: Fields and values to update.
@@ -2449,7 +2482,7 @@ class QuerySet:
         self.model._reject_computed_writes(kwargs, "bulk_update()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = self._build_where(subqueries=compiler)
+            where_clause, where_vars = self._write_where(compiler)
             set_parts: list[str] = []
             set_vars: dict[str, Any] = {}
             for i, (field, value) in enumerate(kwargs.items()):
@@ -2469,7 +2502,8 @@ class QuerySet:
         Delete all records matching the current filters.
 
         A subquery in the filters (v0.27.0) is read by the server in the same statement, as for
-        :meth:`bulk_update`.
+        :meth:`bulk_update`. With ``similar_to()`` (v0.36.0) it deletes the ``limit`` nearest records among those the
+        filters select, by their ids (:meth:`_write_where`).
 
         Returns:
             The number of deleted records (``0`` inside a buffered transaction, whose statements run at commit).
@@ -2483,7 +2517,7 @@ class QuerySet:
         self._reject_time_travel("bulk_delete()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = self._build_where(subqueries=compiler)
+            where_clause, where_vars = self._write_where(compiler)
             query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
             return compiler.wrap(query), {**compiler.variables, **where_vars}
 
@@ -2498,7 +2532,9 @@ class QuerySet:
         Whole table if unfiltered. Returns the number of affected rows. Participates in
         ``objects(tx=)`` like the other bulk operations. ``operations`` is validated then bound
         as ``$_ops`` (never string-interpolated). Emits no signals. A subquery in the filters
-        (v0.27.0) is read by the server in the same statement, as for :meth:`bulk_update`.
+        (v0.27.0) is read by the server in the same statement, as for :meth:`bulk_update`. With ``similar_to()``
+        (v0.36.0) it patches the ``limit`` nearest records among those the filters select, by their ids
+        (:meth:`_write_where`).
 
         Example::
 
@@ -2512,7 +2548,7 @@ class QuerySet:
         self.model._reject_computed_patch(operations, "patch()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = self._build_where(subqueries=compiler)
+            where_clause, where_vars = self._write_where(compiler)
             query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
             ops = self.model._columns_for_patch(operations)
             return compiler.wrap(query), {**compiler.variables, **where_vars, "_ops": ops}

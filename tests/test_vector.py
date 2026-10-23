@@ -107,6 +107,16 @@ text after the line is read and before anything is sent, queued in a transaction
 them out of its statement and answers; a queryset without its own ``similar_to()`` compiles as before.
 ``TestSearchAnnotationsWithKnnE2E``: on SurrealDB 3.x each of the nearest matches carries the score, highlight and
 offsets the plain search gives it; below 3 the refusals, ``exists()`` and ``count()`` on every engine.
+
+The bulk writes of a vector search (``TestWriteByIds``): ``bulk_update()``, ``bulk_delete()`` and ``patch()`` of a
+``similar_to()`` queryset bind the ids of the nearest records in a ``LET`` of the statement's block — after the
+``LET`` s of the other conditions, the pre-filter's below SurrealDB 3 included — and write by those ids, so the write
+itself never carries the KNN operator; that ``LET`` reads the model's table, bound to ``[]`` once SurrealDB 3.x confirms
+it missing; a view model's write is refused first; the line is read once per write and only next to another
+condition, and a transaction queues the block of its line. ``TestWriteByIdsE2E`` writes, on every engine, exactly the
+records the same read returns — next to a range on an indexed column, with an exact search, next to a comparison,
+alone — and returns their number, a table that does not exist written as empty; ``TestWriteByIdsTxE2E`` writes them in
+an interactive transaction and in a buffered one.
 """
 
 import ast
@@ -116,7 +126,7 @@ import math
 import os
 import pickle
 import re
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -156,7 +166,8 @@ from surreal_orm_lite import (
     vector,
 )
 from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_index, render_kind
-from surreal_orm_lite.subquery import SubqueryCompiler, _MissingSubqueryTable
+from surreal_orm_lite.schema import view_write_refused
+from surreal_orm_lite.subquery import TABLE_PROBE, SubqueryCompiler, _MissingSubqueryTable
 from surreal_orm_lite.utils import validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
 
@@ -3736,3 +3747,377 @@ class TestSearchAnnotationsWithKnnE2E:
             same = plain[str(doc.id)]
             assert doc.s == pytest.approx(same.s)
             assert (doc.h, doc.o) == (same.h, same.o)
+
+
+# === Bulk writes by the ids of the nearest records ==================================================================
+
+#: K12: ``similar_to()`` alone and ``bulk_update(n=9)``: the ids of the nearest in a ``LET``, the same on every line.
+_K12 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE embedding <|1,100|> $_f0); (UPDATE vec_doc SET n = $_v0 WHERE id "
+    "IN $_sq0) };"
+)
+#: K12b: a range next to an exact search and ``bulk_delete()``, in the form for SurrealDB 3.x, then below 3.
+_K12B_3X = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE n > $_f0 AND embedding <|2,COSINE|> $_f1); (DELETE vec_doc WHERE "
+    "id IN $_sq0 RETURN BEFORE) };"
+)
+_K12B = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN "
+    "$_sq0 AND embedding <|2,COSINE|> $_f1); (DELETE vec_doc WHERE id IN $_sq1 RETURN BEFORE) };"
+)
+#: K12c: a comparison next to the index search and ``patch()``, in the form below SurrealDB 3.
+_K12C = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE "
+    "id IN $_sq0 AND embedding <|1,100|> $_f1); (UPDATE vec_doc PATCH $_ops WHERE id IN $_sq1) };"
+)
+#: K12d: K12's write once SurrealDB 3.x confirmed that the table does not exist.
+_K12D = "{ LET $_sq0 = []; (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq0) };"
+#: An id subquery next to the KNN: its ``LET`` first, then the ids of the nearest; with its table missing, ``[]``.
+_K12_BY_SUBQUERY = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id "
+    "IN $_sq0 AND embedding <|2,100|> $_f1); (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq1) };"
+)
+_K12_BY_EMPTY_SUBQUERY = (
+    "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f0); "
+    "(UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq1) };"
+)
+
+#: ``VecRanked``'s writes: ``filter(n__gt=2).similar_to("embedding", _Q, 2)`` (and ``dist="cosine"``) with
+#: ``bulk_update(hit=True)``, in the form for SurrealDB 3.x and in the form below 3.
+_RANGE_INLINE = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0 AND embedding <|2,100|> $_f1); (UPDATE vec_ranked "
+    "SET hit = $_v0 WHERE id IN $_sq0) };"
+)
+_RANGE_PREFILTERED = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_ranked WHERE "
+    "id IN $_sq0 AND embedding <|2,100|> $_f1); (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq1) };"
+)
+_RANGE_EXACT_INLINE = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0 AND embedding <|2,COSINE|> $_f1); (UPDATE "
+    "vec_ranked SET hit = $_v0 WHERE id IN $_sq0) };"
+)
+_RANGE_EXACT_PREFILTERED = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_ranked WHERE "
+    "id IN $_sq0 AND embedding <|2,COSINE|> $_f1); (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq1) };"
+)
+#: ``similar_to("embedding", _Q, 2, dist="cosine").bulk_delete()``: the same on every line.
+_DELETE_NEAREST = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE embedding <|2,COSINE|> $_f0); (DELETE vec_ranked WHERE id IN "
+    "$_sq0 RETURN BEFORE) };"
+)
+#: ``filter(category="tech").similar_to("embedding", _Q, 1).patch(…)``, in the form for SurrealDB 3.x, then below 3.
+_PATCH_INLINE = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE category = $_f0 AND embedding <|1,100|> $_f1); (UPDATE "
+    "vec_ranked PATCH $_ops WHERE id IN $_sq0) };"
+)
+_PATCH_PREFILTERED = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE category = $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_ranked "
+    "WHERE id IN $_sq0 AND embedding <|1,100|> $_f1); (UPDATE vec_ranked PATCH $_ops WHERE id IN $_sq1) };"
+)
+#: ``similar_to("embedding", _Q, 2).bulk_update(hit=True)``: the same on every line; then with the table missing.
+_UPDATE_NEAREST = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE embedding <|2,100|> $_f0); (UPDATE vec_ranked SET hit = $_v0 "
+    "WHERE id IN $_sq0) };"
+)
+_UPDATE_NONE = "{ LET $_sq0 = []; (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq0) };"
+
+#: The variables of ``VecRanked``'s range writes.
+_RANGE_VARIABLES = {"_f0": 2, "_f1": [1.0, 0.0, 0.0], "_v0": True}
+#: The operations of the ``patch()`` writes.
+_HIT = [{"op": "replace", "path": "/hit", "value": True}]
+
+
+def _the_write(statement: str) -> str:
+    """The write of a compiled block: what follows its last ``LET …;``."""
+    return statement.rsplit("LET ", 1)[1].split(";", 1)[1]
+
+
+async def _captured_write(
+    monkeypatch: pytest.MonkeyPatch,
+    queryset: Any,
+    call: Callable[[Any], Awaitable[int]],
+    *,
+    empty: frozenset[str] = frozenset(),
+    knn_prefilter: bool = False,
+) -> tuple[tuple[str, dict[str, Any]], SubqueryCompiler]:
+    """*call* (a bulk write of *queryset*) with a fake ``_run_compiled``, which compiles the write once with a new
+    compiler (*empty*, *knn_prefilter* given), sends nothing and returns ``[]``: the statement and that compiler."""
+    captured: list[tuple[tuple[str, dict[str, Any]], SubqueryCompiler]] = []
+
+    async def run_compiled(
+        compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]], *, write: bool = False
+    ) -> Any:
+        assert write is True
+        compiler = queryset._subquery_compiler(empty, knn_prefilter=knn_prefilter)
+        captured.append((compile_statement(compiler), compiler))
+        return []
+
+    monkeypatch.setattr(queryset, "_run_compiled", run_compiled)
+    assert await call(queryset) == 0
+    assert len(captured) == 1
+    statement, compiler = captured[0]
+    if queryset._similar is not None:
+        assert "<|" not in _the_write(statement[0]), "a write never carries the KNN operator"
+        assert " WHERE id IN $_sq" in _the_write(statement[0])
+    return statement, compiler
+
+
+def _ranged(dist: str | None = None) -> Any:
+    """``VecRanked.objects().filter(n__gt=2).similar_to("embedding", _Q, 2, dist=dist)``: d6, d4."""
+    return VecRanked.objects().filter(n__gt=2).similar_to("embedding", _Q, 2, dist=dist)
+
+
+async def _hits(client: Any) -> list[str]:
+    """The keys of the ``vec_ranked`` records whose ``hit`` is true, sorted."""
+    rows = await client.query("SELECT VALUE id FROM vec_ranked WHERE hit = true;", {})
+    return sorted(str(row.id) for row in rows)
+
+
+async def _ranked_left(client: Any) -> list[str]:
+    """The keys of the ``vec_ranked`` records, sorted."""
+    rows = await client.query("SELECT VALUE id FROM vec_ranked;", {})
+    return sorted(str(row.id) for row in rows)
+
+
+def _added(monkeypatch: pytest.MonkeyPatch, tx: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Record each ``(statement, variables)`` *tx*'s ``add()`` receives (and let it through)."""
+    added: list[tuple[str, dict[str, Any]]] = []
+    real = tx.add
+
+    async def add(statement: str, variables: dict[str, Any] | None = None) -> Any:
+        added.append((statement, dict(variables or {})))
+        return await real(statement, variables)
+
+    monkeypatch.setattr(tx, "add", add)
+    return added
+
+
+class TestWriteByIds:
+    """``bulk_update()``, ``bulk_delete()`` and ``patch()`` of a ``similar_to()`` queryset write the records whose ids
+    the KNN ``SELECT`` returns, bound in a ``LET`` of the statement's block — the other conditions' ``LET`` s first,
+    below SurrealDB 3 the pre-filter's too —, so the write itself never carries the KNN operator; the ``LET`` reads the
+    model's table, so a table SurrealDB 3.x confirms missing binds it to ``[]``. The line is read once per write, and
+    only for a KNN next to another condition; a transaction queues the block of its line."""
+
+    @pytest.mark.parametrize("knn_prefilter", [False, True])
+    async def test_k12_similar_to_alone(self, knn_prefilter: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 1)
+        statement, compiler = await _captured_write(
+            monkeypatch, queryset, lambda qs: qs.bulk_update(n=9), knn_prefilter=knn_prefilter
+        )
+        assert statement == (_K12, {"_f0": [1.0, 0.0, 0.0], "_v0": 9})
+        assert compiler.knn_conditions is False
+        assert compiler.tables == {"vec_doc"}
+
+    async def test_k12b_a_range_next_to_an_exact_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def k12b() -> Any:
+            return VecDoc.objects().filter(n__gt=2).similar_to("embedding", _Q, 2, dist="cosine")
+
+        variables = {"_f0": 2, "_f1": [1.0, 0.0, 0.0]}
+        inline, compiler = await _captured_write(monkeypatch, k12b(), lambda qs: qs.bulk_delete())
+        assert inline == (_K12B_3X, variables)
+        assert compiler.knn_conditions is True
+        assert compiler.tables == {"vec_doc"}
+        prefiltered, compiler = await _captured_write(monkeypatch, k12b(), lambda qs: qs.bulk_delete(), knn_prefilter=True)
+        assert prefiltered == (_K12B, variables)
+        assert compiler.knn_conditions is True
+        assert compiler.tables == {"vec_doc"}
+
+    async def test_k12c_patch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        operations = [{"op": "replace", "path": "/n", "value": 9}]
+        queryset = VecDoc.objects().filter(category="tech").similar_to("embedding", _Q, 1)
+        statement, compiler = await _captured_write(monkeypatch, queryset, lambda qs: qs.patch(operations), knn_prefilter=True)
+        assert statement == (_K12C, {"_f0": "tech", "_f1": [1.0, 0.0, 0.0], "_ops": operations})
+        assert compiler.tables == {"vec_doc"}
+
+    async def test_k12d_a_missing_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 1)
+        statement, compiler = await _captured_write(
+            monkeypatch, queryset, lambda qs: qs.bulk_update(n=9), empty=frozenset({"vec_doc"})
+        )
+        assert statement == (_K12D, {"_v0": 9})
+        assert compiler.tables == {"vec_doc"}
+
+    @pytest.mark.parametrize("knn_prefilter", [False, True])
+    async def test_an_id_subquery_s_let_comes_first(self, knn_prefilter: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        def by_subquery() -> Any:
+            ranked = Subquery(VecRanked.objects().filter(n__gt=2))
+            return VecDoc.objects().filter(id__in=ranked).similar_to("embedding", _Q, 2)
+
+        statement, compiler = await _captured_write(
+            monkeypatch, by_subquery(), lambda qs: qs.bulk_update(n=9), knn_prefilter=knn_prefilter
+        )
+        assert statement == (_K12_BY_SUBQUERY, {"_f0": 2, "_f1": [1.0, 0.0, 0.0], "_v0": 9})
+        assert compiler.knn_conditions is False
+        assert compiler.tables == {"vec_ranked", "vec_doc"}
+        emptied, compiler = await _captured_write(
+            monkeypatch, by_subquery(), lambda qs: qs.bulk_update(n=9), empty=frozenset({"vec_ranked"})
+        )
+        assert emptied == (_K12_BY_EMPTY_SUBQUERY, {"_f0": [1.0, 0.0, 0.0], "_v0": 9})
+        assert compiler.tables == {"vec_ranked", "vec_doc"}
+
+    async def test_without_similar_to_the_write_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        queryset = VecDoc.objects().filter(category="tech")
+        statement, compiler = await _captured_write(monkeypatch, queryset, lambda qs: qs.bulk_update(n=9))
+        assert statement == ("UPDATE vec_doc SET n = $_v0 WHERE category = $_f0;", {"_f0": "tech", "_v0": 9})
+        assert compiler.tables == set()
+
+    @pytest.mark.parametrize(
+        ("call", "name"),
+        [
+            (lambda qs: qs.bulk_update(title="x"), "bulk_update()"),
+            (lambda qs: qs.bulk_delete(), "bulk_delete()"),
+            (lambda qs: qs.patch(_HIT), "patch()"),
+        ],
+        ids=["bulk_update", "bulk_delete", "patch"],
+    )
+    async def test_a_view_model_s_write_is_refused_first(self, call: Any, name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        queryset = VecView.objects().filter(category="tech").similar_to("embedding", _Q, 2)
+        compiled: list[Any] = []
+
+        async def run_compiled(compile_statement: Any, *, write: bool = False) -> Any:
+            compiled.append(compile_statement)
+            return []
+
+        monkeypatch.setattr(queryset, "_run_compiled", run_compiled)
+        with pytest.raises(TypeError) as raised:
+            await call(queryset)
+        assert str(raised.value) == view_write_refused("vec_view", f"VecView.objects().{name}")
+        assert compiled == []
+
+    @pytest.mark.parametrize(("major", "first"), [(2, _RANGE_PREFILTERED), (3, _RANGE_INLINE)], ids=["2x", "3x"])
+    async def test_the_line_is_decided_once_per_write(self, major: int, first: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, major)
+        queryset = _ranged()
+        executed = _executed(monkeypatch, queryset)
+        assert await queryset.bulk_update(hit=True) == 0
+        # The fake confirms the table missing: the write is compiled again, its ids bound to [], in the same form.
+        assert executed == [(first, _RANGE_VARIABLES), (_UPDATE_NONE, {"_v0": True})]
+        assert len(reads) == 1
+
+    async def test_no_line_without_a_condition(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        alone = VecRanked.objects().similar_to("embedding", _Q, 2)
+        by_ids = VecRanked.objects().filter(id__in=Subquery(VecRanked.objects().filter(n__gt=2)))
+        for call in (
+            lambda: alone.bulk_update(hit=True),
+            lambda: alone.bulk_delete(),
+            lambda: alone.patch(_HIT),
+            lambda: by_ids.similar_to("embedding", _Q, 2).bulk_update(hit=True),
+        ):
+            for queryset in (alone, by_ids):
+                _executed(monkeypatch, queryset, [])
+            await call()
+        assert reads == []
+
+    async def test_a_transaction_queues_the_block_of_its_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = _line_answers(monkeypatch, 2)
+        tx = _ReadTx()
+        written = await VecRanked.objects(tx=tx).filter(n__gt=2).similar_to("embedding", _Q, 2).bulk_update(hit=True)
+        assert written == 0
+        assert tx.added == [(_RANGE_PREFILTERED, _RANGE_VARIABLES)]
+        assert tx.reads == []
+        assert len(reads) == 1
+
+
+class TestWriteByIdsE2E:
+    """The bulk writes of a ``similar_to()`` queryset on every engine: they write exactly the records the same read
+    returns — next to a range on an indexed column, with an exact search, with a comparison and alone — and return
+    their number; the spy shows one block whose write goes by the ids of the nearest, the other conditions selected
+    first below SurrealDB 3 and inline on 3.x, the line read only for a write with a condition. A table that does not
+    exist is written as empty."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(
+        ("dist", "inline", "prefiltered"),
+        [(None, _RANGE_INLINE, _RANGE_PREFILTERED), ("cosine", _RANGE_EXACT_INLINE, _RANGE_EXACT_PREFILTERED)],
+        ids=["index", "exact"],
+    )
+    async def test_bulk_update_next_to_an_indexed_range(
+        self, kind: str, dist: str | None, inline: str, prefiltered: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            written = await _ranged(dist).bulk_update(hit=True)
+            sent = _calls(calls)
+            hits = await _hits(client)
+        assert written == 2
+        assert hits == ["d4", "d6"]
+        assert sent == [("version", None), *_query(prefiltered if major < 3 else inline)]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_bulk_delete_of_the_exact_nearest(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+            calls = _spy(monkeypatch, client)
+            deleted = await VecRanked.objects().similar_to("embedding", _Q, 2, dist="cosine").bulk_delete()
+            sent = _calls(calls)
+            left = await _ranked_left(client)
+        assert deleted == 2
+        assert left == ["d3", "d4", "d5", "d6"]
+        assert sent == _query(_DELETE_NEAREST)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_patch_next_to_an_indexed_column(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            patched = await VecRanked.objects().filter(category="tech").similar_to("embedding", _Q, 1).patch(_HIT)
+            sent = _calls(calls)
+            hits = await _hits(client)
+        assert patched == 1
+        assert hits == ["d4"]
+        assert sent == [("version", None), *_query(_PATCH_PREFILTERED if major < 3 else _PATCH_INLINE)]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_bulk_update_of_the_nearest(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+            calls = _spy(monkeypatch, client)
+            written = await VecRanked.objects().similar_to("embedding", _Q, 2).bulk_update(hit=True)
+            sent = _calls(calls)
+            hits = await _hits(client)
+        assert written == 2
+        assert hits == ["d1", "d2"]
+        assert sent == _query(_UPDATE_NEAREST)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_table_that_does_not_exist(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SurrealDB 3.x refuses the ``LET`` on a table that does not exist: confirmed missing, the ids are bound to
+        ``[]`` and the write is sent again, as for every subquery table; 2.x and the embedded engine answer none."""
+        async with _vec_models(kind) as client:
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            written = await VecRanked.objects().similar_to("embedding", _Q, 2).bulk_update(hit=True)
+            sent = _calls(calls)
+        assert written == 0
+        if major >= 3:
+            assert sent == [*_query(_UPDATE_NEAREST), *_query(TABLE_PROBE), *_query(_UPDATE_NONE)]
+        else:
+            assert sent == _query(_UPDATE_NEAREST)
+
+
+class TestWriteByIdsTxE2E:
+    """A bulk write of a ``similar_to()`` queryset next to an indexed range in a transaction: in an interactive one
+    (SurrealDB 3.x over WebSocket) it runs at once and returns its count; in a buffered one (HTTP, SurrealDB 2.x, the
+    embedded engine) the block of the line — both ``LET`` s below 3 — is queued and runs at the commit. Either way the
+    commit leaves exactly the nearest records the read gives written."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_in_a_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+            major = await _major(client)
+            interactive = kind == "ws" and major >= 3
+            async with SurrealDBConnectionManager.transaction("vec") as tx:
+                assert tx.is_interactive is interactive
+                added = _added(monkeypatch, tx)
+                ranged = VecRanked.objects(tx=tx).filter(n__gt=2).similar_to("embedding", _Q, 2)
+                written = await ranged.bulk_update(hit=True)
+            hits = await _hits(client)
+        assert added == [(_RANGE_PREFILTERED if major < 3 else _RANGE_INLINE, _RANGE_VARIABLES)]
+        assert written == (2 if interactive else 0)
+        assert hits == ["d4", "d6"]
