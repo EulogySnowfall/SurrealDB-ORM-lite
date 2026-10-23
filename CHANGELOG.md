@@ -33,11 +33,12 @@ that refuses an excluded signup field. No new public API.
 
 - **The atomic helpers and an edge's `save()` refuse a view or a snapshot before checking their
   arguments** (#315). `atomic_append()`, `atomic_remove()`, `atomic_set_add()`,
-  `atomic_increment()` and the `atomic_*_many()` helpers checked the field name (and
-  `atomic_increment()` a duration amount) before the view and snapshot refusals: on a view or a
-  snapshot, an invalid argument now raises the view's `TypeError` or the snapshot's
-  `SurrealDbError` instead of the argument's error. An edge read with `as_of()` raises the snapshot
-  error before the `save(server_values=…)` refusal. Valid calls are unchanged.
+  `atomic_increment()` and the `atomic_*_many()` helpers checked the field name (`atomic_increment()`
+  a duration amount, the `atomic_*_many()` helpers a `values` that is not a list) before the view
+  and snapshot refusals: on a view or a snapshot, an invalid argument now raises the view's
+  `TypeError` or the snapshot's `SurrealDbError` instead of the argument's error. An edge read with
+  `as_of()` raises the snapshot error before the `save(server_values=…)` and `save(extra_vars=…)`
+  refusal. Valid calls are unchanged.
 
 ### Notes
 

@@ -1667,6 +1667,29 @@ _SNAPSHOT_TX_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]]
     ("_save_naming", "save()", lambda s, tx: s._save_naming(["n"], tx=tx)),
 ]
 
+#: #315: each atomic helper with an argument it refuses on a current record — a field name that is not one
+#: (``ValueError``), for ``atomic_increment()`` a duration amount (``TypeError``), for the ``atomic_*_many()`` helpers
+#: a ``values`` that is not a list (``ValueError``) —, named as T9 names it.
+_INVALID_SNAPSHOT_ATOMIC_CALLS: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    ("atomic_append", "atomic_append()", lambda s, tx: s.atomic_append("bad field!", "x", tx=tx)),
+    ("atomic_remove", "atomic_remove()", lambda s, tx: s.atomic_remove("bad field!", "x", tx=tx)),
+    ("atomic_set_add", "atomic_set_add()", lambda s, tx: s.atomic_set_add("bad field!", "x", tx=tx)),
+    ("atomic_increment", "atomic_increment()", lambda s, tx: s.atomic_increment("bad field!", tx=tx)),
+    ("atomic_increment-duration", "atomic_increment()", lambda s, tx: s.atomic_increment("n", timedelta(seconds=1), tx=tx)),
+    ("atomic_append_many", "atomic_append_many()", lambda s, tx: s.atomic_append_many("bad field!", ["x"], tx=tx)),
+    ("atomic_set_add_many", "atomic_set_add_many()", lambda s, tx: s.atomic_set_add_many("bad field!", ["x"], tx=tx)),
+    ("atomic_remove_many", "atomic_remove_many()", lambda s, tx: s.atomic_remove_many("bad field!", ["x"], tx=tx)),
+    ("atomic_append_many-values", "atomic_append_many()", lambda s, tx: s.atomic_append_many("tags", "x", tx=tx)),
+    ("atomic_set_add_many-values", "atomic_set_add_many()", lambda s, tx: s.atomic_set_add_many("tags", "x", tx=tx)),
+    ("atomic_remove_many-values", "atomic_remove_many()", lambda s, tx: s.atomic_remove_many("tags", "x", tx=tx)),
+]
+
+#: What :data:`_INVALID_SNAPSHOT_ATOMIC_CALLS` raise on the current record: the argument's own error.
+_ATOMIC_ARGUMENT_ERROR = (
+    r"^(Invalid atomic field name 'bad field!'|atomic_increment\(\) adds a number, not a duration"
+    r"|values must be a list of items, got str$)"
+)
+
 
 @pytest.fixture
 def no_client(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -1733,6 +1756,57 @@ class TestSnapshotWriteLeavesTheTransaction:
             assert str(info.value) == time_travel.snapshot_write_refused("SnapServerOwned", "save()", M2021)
         assert no_client == []
         _assert_untouched(tx)
+
+    @pytest.mark.parametrize("in_tx", [False, True], ids=["no-tx", "tx"])
+    @pytest.mark.parametrize(
+        ("name", "method", "write"), _INVALID_SNAPSHOT_ATOMIC_CALLS, ids=[row[0] for row in _INVALID_SNAPSHOT_ATOMIC_CALLS]
+    )
+    async def test_an_atomic_helper_refuses_a_snapshot_before_checking_its_arguments(
+        self,
+        no_client: list[str],
+        in_tx: bool,
+        name: str,
+        method: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        """#315 (0.36.1, Changed): an argument the helper refuses — an invalid field name, a duration amount, a
+        ``values`` that is not a list — raises its own error on the current record, but T9 on a snapshot, whose
+        refusal runs first in the helper's ``invalidates(refuse=…)``, naming the helper; a transaction is left as it
+        was."""
+        with pytest.raises((ValueError, TypeError), match=_ATOMIC_ARGUMENT_ERROR):
+            await write(Snap(id="a", n=10), None)
+        snapshot = QuerySet._mark_snapshots(Snap(id="a", n=10), M2021)
+        tx = BufferedTransaction(client=None) if in_tx else None
+        with pytest.raises(SurrealDbError) as info:
+            await write(snapshot, tx)
+        assert str(info.value) == time_travel.snapshot_write_refused("Snap", method, M2021)
+        assert no_client == []
+        if tx is not None:
+            _assert_untouched(tx)
+
+    @pytest.mark.parametrize("in_tx", [False, True], ids=["no-tx", "tx"])
+    @pytest.mark.parametrize(
+        "given",
+        [{"server_values": {"quantity": SurrealFunc("1 + 1")}}, {"extra_vars": {"step": 1}}],
+        ids=["server_values", "extra_vars"],
+    )
+    async def test_an_edge_refuses_a_snapshot_before_server_values(
+        self, no_client: list[str], in_tx: bool, given: dict[str, Any]
+    ) -> None:
+        """#315 (0.36.1, Changed): an edge's ``save(server_values=…)`` (or ``extra_vars=``) raises its own error on the
+        current edge, but T9 on an edge read with ``as_of()``, whose refusal runs first in ``save()``'s
+        ``invalidates(refuse=…)``; a transaction is left as it was."""
+        endpoints = {"in_": RecordID("SnapAuthor", "alice"), "out": RecordID("SnapAuthor", "widget")}
+        with pytest.raises(SurrealDbError, match=r"^save\(server_values=\) is not available on an edge"):
+            await SnapBought(id="b1", **endpoints).save(**given)
+        snapshot = QuerySet._mark_snapshots(SnapBought(id="b1", **endpoints), MAX_MOMENT)
+        tx = BufferedTransaction(client=None) if in_tx else None
+        with pytest.raises(SurrealDbError) as info:
+            await snapshot.save(tx=tx, **given)
+        assert str(info.value) == time_travel.snapshot_write_refused("SnapBought", "save()", MAX_MOMENT)
+        assert no_client == []
+        if tx is not None:
+            _assert_untouched(tx)
 
     async def test_the_transaction_still_takes_a_write(self, no_client: list[str]) -> None:
         """The refusal does not spoil the transaction: the current record's write joins it and notes its table."""
