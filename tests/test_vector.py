@@ -139,12 +139,20 @@ matching one on 2.x and the embedded engine), each right when its records are se
 whose ``WHERE`` holds the KNN (2.x's exact scan writes every record; next to a range on an indexed field no record is
 written, on any engine); a search score in the ``LET`` form (``None`` below 3, an error on 3.x); a live query whose
 condition holds the KNN, which never notifies.
+
+The documentation (``TestReadmeSection37``): README section 37 — its place after section 36, its seven subsections,
+its examples (run on ``mem://`` as written, each printed line equal to its comment; the search annotations' block
+printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences and thirteen "Coming from"
+bullets word for word —, the eight rows of the 2.x/3.x table and the row of the embedded engine's, cell by cell within
+the tables' widths, the header sentence, and the features, roadmap and comparison rows. ``TestRoadmap36``:
+``docs/ROADMAP.md`` records v0.36.0 as planned, or — once its Phase G row carries ✅ — as released.
 """
 
 import ast
 import asyncio
 import contextlib
 import copy
+import inspect
 import math
 import os
 import pickle
@@ -192,8 +200,16 @@ from surreal_orm_lite import (
 from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_index, render_kind
 from surreal_orm_lite.schema import view_write_refused
 from surreal_orm_lite.subquery import TABLE_PROBE, SubqueryCompiler, _MissingSubqueryTable
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
+from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _md_tables
 
 _EXPORTS = ["VectorField", "Vector"]
 
@@ -4795,3 +4811,586 @@ class TestLinePinsE2E:
                 await SurrealDBConnectionManager.kill(every_id)
         assert created["action"] == LiveAction.CREATE
         assert created["result"]["title"] == "Cats and mice"
+
+
+# === README: section 37, the behaviour tables, the features, roadmap and comparison rows; docs/ROADMAP.md ===========
+
+_SECTION_36 = "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
+_SECTION_37 = "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)"
+#: Section 37's subsections, in order, after an untitled intro.
+_SUBSECTIONS_37 = [
+    "Declare and apply",
+    "Type checkers",
+    "Find the nearest",
+    "With other conditions",
+    "What SurrealDB decides",
+    "Not supported",
+    "Coming from the full SurrealDB-ORM",
+]
+#: The parts of section 37 whose ``python`` blocks run on ``mem://`` (the others have none).
+_PARTS_WITH_EXAMPLES_37 = [
+    "Declare and apply",
+    "Type checkers",
+    "Find the nearest",
+    "With other conditions",
+    "What SurrealDB decides",
+]
+_S37_TYPE = (
+    "The ORM writes every HNSW option — `DIST`, `TYPE`, `EFC` and `M`, SurrealDB's defaults when not given — so "
+    "every engine stores the same index: the embedded engine would otherwise store `F64` vectors where servers "
+    "store `F32`."
+)
+_S37_TYPED = (
+    'Type checkers do not understand `VectorField[1536]` (mypy: `"VectorField" expects no type arguments`), as '
+    "in the full ORM: in type-checked code, write `embedding: Annotated[list[float] | None, Vector(1536)] = None`, "
+    "which the ORM reads the same way."
+)
+_S37_LIMIT = (
+    "`similar_to(field, vector, limit)` keeps the `limit` nearest records, `limit` and `ef` going up to 10 000; "
+    "`limit()` and `offset()` then page through them, and without `order_by()` they come nearest first."
+)
+_S37_EF = (
+    "`ef` (100 by default) sizes the HNSW search: a larger value finds the true nearest records more often, at a "
+    "cost. The ORM writes it raised to `limit`, so without other conditions every line returns `limit` records "
+    "when the table holds them."
+)
+_S37_NO_INDEX = (
+    "`similar_to()` reads the field's HNSW index: on a field without one it finds no record. Pass `dist=` for an "
+    "exact scan that needs no index."
+)
+_S37_FILTERS = (
+    "Other conditions select the records first, then `similar_to()` keeps the nearest among them: SurrealDB 3.x "
+    "applies them during the index search. SurrealDB 2.x and the embedded engine answer too few records, or none, "
+    "next to many conditions (one on an indexed field among them), so there the ORM selects the records matching "
+    "them in a `LET` first, which is slower: upgrade to SurrealDB 3.x for large tables."
+)
+_S37_SCORES = (
+    "On SurrealDB 3.x, search annotations (`SearchScore`, `SearchHighlight`, `SearchOffsets`) give each of the "
+    "nearest matches the score, highlight and offsets that the same `search()` gives it without `similar_to()`. "
+    "On SurrealDB 2.x and the embedded engine the ORM refuses them before the statement is sent, since there it "
+    "selects the matches first and the vector search holds no match to score, highlight or locate; `count()`, "
+    "`exists()` and the aggregations, which return no annotation, still answer. The examples run on the embedded "
+    "engine, which is why this one prints the refusal."
+)
+_S37_APPROX = (
+    "HNSW is approximate: with a condition that keeps few records, a search can return fewer than `limit` "
+    "records, depending on how the index was built. SurrealDB 2.x and the embedded engine do so more often, "
+    "even with a condition that keeps a tenth of the table. Pass `dist=` for an exact scan."
+)
+_S37_PRECISION = (
+    "Distances are computed in the index's `vector_type` (`F32` by default: single precision), so they can differ "
+    "from Python's in the last digits; `dist=` computes in double precision."
+)
+#: The nine sentences section 37 says word for word (whitespace normalised), with their subsection.
+_SENTENCES_37 = [
+    ("Declare and apply", _S37_TYPE),
+    ("Type checkers", _S37_TYPED),
+    ("Find the nearest", _S37_LIMIT),
+    ("Find the nearest", _S37_EF),
+    ("Find the nearest", _S37_NO_INDEX),
+    ("With other conditions", _S37_FILTERS),
+    ("With other conditions", _S37_SCORES),
+    ("What SurrealDB decides", _S37_APPROX),
+    ("What SurrealDB decides", _S37_PRECISION),
+]
+#: What each part of section 37 says (key phrases, whitespace normalised); the intro under ``""``.
+_PART_NEEDLES_37 = {
+    "": (
+        "Since v0.36.0",
+        "the full SurrealDB-ORM's",
+        "`similar_to()`",
+        "`_knn_distance`",
+        "`Index(hnsw=True)`",
+        "binds the query vector",
+        "SurrealDB 2.x, 3.x and the embedded engine",
+        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "`mem://`",
+    ),
+    "Declare and apply": (
+        "`VectorField[d]`",
+        '`VectorField[d, "F64"]`',
+        "`option<array<float, d>>`",
+        "`CreateIndex`'s arguments",
+        "`dimension=`",
+        "`dist=`",
+        "`vector_type=`",
+        "`efc=`",
+        "`m=`",
+        "`SurrealConfigDict(indexes=[...])`",
+        "two vector indexes on one column are refused",
+        "`define_table()`",
+        "`define_indexes()`",
+        "`index_ddl()`",
+        "on every write and on every read",
+        "`ValidationError`",
+        "return its row as a dict",
+        "`list[float] | None`",
+        "`remove_index()`",
+        "`VectorField[768]`",
+    ),
+    "Type checkers": (
+        '`Vector(dimension, vector_type="F32")`',
+        'Field(default=None, alias="…")',
+        "`get_vector_info()`",
+        "`is_vector_field()`",
+        "`surreal_orm_lite.vector`",
+    ),
+    "Find the nearest": (
+        "`similar_to(field, vector, limit=10, *, ef=None, dist=None)`",
+        "an aliased field searches its column",
+        "a dotted path",
+        "`.tolist()`",
+        "A second `similar_to()` replaces the first",
+        "`first()`",
+        "never written back",
+        "dicts holding it",
+        '`order_by("-_knn_distance")`',
+    ),
+    "With other conditions": (
+        "`filter()`",
+        "`Q`",
+        "`nearby()`",
+        "`search()`",
+        "`count()`",
+        "`exists()`",
+        "`values()`",
+        "`bulk_update()`",
+        "`bulk_delete()`",
+        "`patch()`",
+        "`Subquery`",
+        "`get(<id>)` and `all()` ignore it",
+        "whose ids they select first",
+        "ranked by the vector",
+    ),
+    "What SurrealDB decides": ("zero vector", "`nan`", "naming the field and both lengths"),
+    "Not supported": (
+        "on SurrealDB 2.x and the embedded engine",
+        "`search()` as a condition stays available there",
+        "`as_of()`",
+        "`live()`/`watch()`",
+        "`changes()`",
+        "`MTREE`",
+        "`MINKOWSKI`",
+        "`JACCARD`",
+        "`PEARSON`",
+        "`F16`",
+        "`DISKANN`",
+        "`concurrently`",
+    ),
+}
+#: The thirteen "Coming from the full SurrealDB-ORM" bullets, word for word (whitespace normalised), in order.
+_COMING_FROM_37 = [
+    "**`similar_to()` keeps the full ORM's signature and `_knn_distance`**: `similar_to(field, vector, limit=10, *, "
+    "ef=None)`, the distance set on each instance as `_knn_distance`, nearest first unless `order_by()` is given.",
+    "**`dist=` is an addition** of this library: an exact, brute-force search that needs no index (SurrealDB's "
+    "`<|K,DISTANCE|>`).",
+    "**`similar_to()` applies wherever `filter()` applies**: `count()`, the aggregations, `values()` groups, "
+    "`exists()`, `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery`; the full ORM applies it to "
+    "`exec()` only. The bulk writes act on the ids of the `limit` nearest records, selected first.",
+    "**Refused where SurrealDB cannot honour it**: `as_of()`, `live()`/`watch()` or `changes()` with "
+    "`similar_to()`, before any request, and search annotations with `similar_to()` on SurrealDB 2.x and the "
+    "embedded engine, before the statement is sent; the full ORM sends them.",
+    "**Checked before any request**: the vector's numbers, its length against the field's `VectorField` or "
+    "index, `limit` and `ef` (1 to 10 000; the full ORM sends any value), and the `Index` vector arguments.",
+    "**`ef` is raised to `limit`** on every line; the full ORM writes it as given, and SurrealDB 2.x then returns "
+    "at most `ef` records.",
+    "**Other conditions are selected first on SurrealDB 2.x** (a `LET`), since 2.x answers too few or no records "
+    "next to many of them, one on an indexed field among them; the full ORM sends one statement.",
+    "**Every HNSW option is written**, and `define_indexes()` compares before it applies: an unchanged vector index "
+    "is never rebuilt.",
+    "**`VectorField` checks its values**: their length and finite numbers, on reads too; the full ORM's accepts "
+    "any list of floats. `Vector(d)` is its typed form, which type checkers accept.",
+    "**No `MTREE`, `MINKOWSKI`, `JACCARD` or `PEARSON`, and no `concurrently` yet**; the full ORM writes "
+    "`MINKOWSKI` without its order, which SurrealDB refuses.",
+    "**Vector functions in `annotate()`** (`vector::similarity::cosine()`…) are not available yet; "
+    "`hybrid_search()` comes in v0.37.0.",
+    "**`get_vector_info()` and `is_vector_field()` are imported from `surreal_orm_lite.vector`**: the full ORM has "
+    "them in `surreal_orm.fields`, a module this library does not have.",
+    "**`generate_models_from_db()` does not write `VectorField` yet**, while the full ORM's generator writes it for "
+    "a field with an HNSW index.",
+]
+#: One key phrase per "Coming from" bullet, in order (the accepted differences).
+_COMING_FROM_PHRASES_37 = (
+    "keeps the full ORM's signature",
+    "`dist=` is an addition",
+    "`similar_to()` applies wherever",
+    "search annotations with `similar_to()`",
+    "its length against the field's",
+    "`ef` is raised to `limit`",
+    "selected first on SurrealDB 2.x",
+    "Every HNSW option is written",
+    "`VectorField` checks its values",
+    "No `MTREE`",
+    "Vector functions in `annotate()`",
+    "imported from `surreal_orm_lite.vector`",
+    "does not write `VectorField` yet",
+)
+#: The search annotations' block (*With other conditions*): run on the embedded engine, it prints the ORM's refusal.
+_ANNOTATED_EXCEPT = "except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server"
+#: The term that block searches: found in fewer than half the section's documents, so its BM25 score is not 0.
+_ANNOTATED_TERM = "programming"
+_HEADER_SENTENCE_36 = (
+    "Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs."
+)
+#: Exactly the eight rows v0.36.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
+_VECTOR_ROWS = [
+    [
+        "Vector index (`Index(hnsw=True)`, `define_indexes()`)",
+        "`HNSW` as on 3.x (the ORM writes `DIST`, `TYPE`, `EFC` and `M` and one field); 2.x also accepts `MTREE`, "
+        "which `similar_to()` does not use",
+        "`HNSW`, one field per index; `MTREE` is a parse error",
+        "v0.36.0",
+    ],
+    [
+        "`similar_to()` with `ef` below `limit`",
+        "the ORM writes `ef` raised to `limit`: 2.x would return at most `ef` records",
+        "the same statement: 3.x returns `limit` records either way",
+        "v0.36.0",
+    ],
+    [
+        "`similar_to()` with other conditions (`filter()`, `Q`, `nearby()`, `search()`)",
+        "the ORM selects the records matching them first (a `LET`): 2.x answers too few or no records next to many "
+        "of them, an indexed field's included",
+        "every condition stays next to the KNN operator, applied during the index search (faster)",
+        "v0.36.0",
+    ],
+    [
+        "`similar_to()` and `search()` in one queryset",
+        "the ORM selects the full-text matches first (a `LET`): 2.x answers no record next to a full-text match; "
+        "search annotations are refused",
+        "the match stays next to the KNN operator, with its scores, highlights and offsets; 3.1 answers every match, "
+        "with no distance",
+        "v0.36.0",
+    ],
+    [
+        "`bulk_update()`, `bulk_delete()`, `patch()` with `similar_to()`",
+        "the ORM writes the ids of the `limit` nearest: 2.x's exact scan in a write would act on every matching record",
+        "the same: 3.x writes nothing when a range on an indexed field shares the KNN operator",
+        "v0.36.0",
+    ],
+    [
+        "`similar_to()` with a condition that keeps few records",
+        "HNSW is approximate: fewer than `limit` records, depending on how the index was built, even with a tenth of "
+        "the table kept; `dist=` is exact",
+        "rarer; also seen with a `Subquery` id list keeping a few percent of the table",
+        "v0.36.0",
+    ],
+    [
+        "`similar_to(dist=…)` with a condition on a linked record's field",
+        "the ORM selects the matching records first (a `LET`): 2.x's exact scan would return every matching record, "
+        "ignoring `limit`",
+        "the condition stays next to the KNN operator",
+        "v0.36.0",
+    ],
+    [
+        "`similar_to()` on a field without a vector index",
+        "no record",
+        "no record; 3.1 answers every record, with no distance",
+        "v0.36.0",
+    ],
+]
+#: The row v0.36.0 adds to the embedded engine's table, cell by cell.
+_EMBEDDED_VECTOR_ROW = [
+    "Vector search (v0.36.0)",
+    "as on a 2.x server: `MTREE` accepted, at most `ef` records returned (the ORM raises `ef` to `limit`), other "
+    "conditions selected first in a `LET` (search annotations refused), writes made by the ids of the nearest, "
+    "fewer records with a selective condition; an index without `TYPE` is `F64` (servers: `F32`), so the ORM "
+    "always writes `TYPE`",
+    "3.x refuses `MTREE`, applies the conditions during the index search and keeps search annotations",
+    "v0.36.0",
+]
+_FEATURES_ROW_37 = ["Vector search (`similar_to()`, KNN, HNSW indexes)", "✅"]
+_ROADMAP_ROWS_37 = [
+    ["v0.35.0", "Tier 3 — Full-text search", "✅ Released"],
+    ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
+    ["v0.37.0 – v0.40.0", "Tier 3 — Advanced (hybrid search, migrations, CLI)", "📋 Planned"],
+    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_ROW_37 = ["Vector Search (KNN/HNSW)", "✅ v0.36.0 (`similar_to()`)", "✅"]
+#: The rows the pins of this module name in their messages (each must be one of ``_VECTOR_ROWS``).
+_PINNED_ROWS = [_VECTOR_INDEX_ROW, _ROW_EF, _ROW_CONDITIONS, _ROW_SEARCH, _ROW_WRITES, _ROW_LINKED, _ROW_NO_INDEX]
+
+
+def _section_37() -> str:
+    return _readme_part(_SECTION_37)
+
+
+def _part_37(heading: str) -> str:
+    """One ``####`` subsection of section 37, as written (the intro for ``""``)."""
+    if not heading:
+        return _section_37().split("\n#### ", 1)[0]
+    return _subsection(f"#### {heading}", _section_37())
+
+
+def _readme_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _readme_printed(block: str) -> list[str]:
+    """What a README example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _readme_bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+def _similar_to_bounds(block: str) -> list[tuple[str, object]]:
+    """The ``limit`` and ``ef`` of every ``similar_to()`` call of a README block, as written: an ``int`` literal, or
+    the source of any other expression."""
+    tree = compile(block, "<README section 37>", "exec", flags=ast.PyCF_ONLY_AST | ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+    found: list[tuple[str, object]] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "similar_to"):
+            continue
+        given = {"limit": node.args[2]} if len(node.args) > 2 else {}
+        given.update({keyword.arg: keyword.value for keyword in node.keywords if keyword.arg in ("limit", "ef")})
+        for name, value in given.items():
+            found.append((name, value.value if isinstance(value, ast.Constant) else ast.unparse(value)))
+    return found
+
+
+class TestReadmeSection37:
+    """README section 37 and what v0.36.0 changes elsewhere in the README: section 37's place, subsections, examples
+    (run on ``mem://`` as written, each printed line equal to its comment), sentences and "Coming from" bullets; the
+    features, roadmap, comparison and both behaviour tables."""
+
+    def test_section_37_follows_section_36(self) -> None:
+        """Right after section 36 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        text = _readme()
+        start_36 = text.index(f"\n{_SECTION_36}\n")
+        start_37 = text.index(f"\n{_SECTION_37}\n")
+        configuration = text.index("\n## Configuration Options\n")
+        assert start_36 < start_37 < configuration
+        assert re.findall(r"^#{2,3} .*$", text[start_36 + 1 : configuration], re.MULTILINE) == [_SECTION_36, _SECTION_37]
+        assert text[:configuration].rstrip().endswith("\n---"), "section 37 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_37(), re.MULTILINE) == _SUBSECTIONS_37
+
+    def test_where_the_examples_stand(self) -> None:
+        """Each part that shows code opens with prose and holds ``python`` blocks; the intro and the other parts hold
+        none; the section has ``python`` fences only."""
+        for heading in ["", *_SUBSECTIONS_37]:
+            part = _part_37(heading)
+            blocks = _readme_blocks(part)
+            assert bool(blocks) is (heading in _PARTS_WITH_EXAMPLES_37), heading
+            if blocks:
+                assert not part.split("\n", 2)[2].lstrip().startswith("```"), heading
+        fences = re.findall(r"^```(\S*)$", _section_37(), re.MULTILINE)
+        assert fences and fences == ["python", ""] * (len(fences) // 2), fences
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_37))
+    def test_what_each_part_says(self, heading: str) -> None:
+        text = _normalised(_part_37(heading))
+        missing = [needle for needle in _PART_NEEDLES_37[heading] if needle not in text]
+        assert not missing, missing
+
+    @pytest.mark.parametrize(("heading", "sentence"), _SENTENCES_37, ids=[f"s{index}" for index in range(1, 10)])
+    def test_sentences_word_for_word(self, heading: str, sentence: str) -> None:
+        """Each of the nine sentences exactly once in its subsection, and nowhere else in the section."""
+        assert len(_SENTENCES_37) == 9
+        assert _normalised(_part_37(heading)).count(sentence) == 1, sentence
+        assert _normalised(_section_37()).count(sentence) == 1, sentence
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """Thirteen bullets, each word for word, a bold lead and one key phrase each, in order."""
+        bullets = _readme_bullets(_part_37("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_37) == len(_COMING_FROM_PHRASES_37) == 13, bullets
+        for bullet, text, phrase in zip(bullets, _COMING_FROM_37, _COMING_FROM_PHRASES_37, strict=True):
+            assert bullet == f"- {text}", (bullet, text)
+            assert bullet.startswith("- **") and phrase in bullet, (phrase, bullet)
+
+    def test_the_search_annotations_block(self) -> None:
+        """*With other conditions*: one block annotates a ``SearchScore`` and a ``SearchHighlight`` next to
+        ``similar_to()`` inside ``try``, catching ``SurrealDbError`` on the embedded engine; what it prints is the
+        ORM's refusal for ``SearchScore``. The section's full-text index declares ``highlights=True``."""
+        [block] = [code for code in _readme_blocks(_part_37("With other conditions")) if "SearchScore(" in code]
+        assert "similar_to(" in block and 'SearchHighlight("<b>", "</b>", 0)' in block, block
+        assert f'search(title="{_ANNOTATED_TERM}")' in block, block
+        assert re.search(rf"^{re.escape(_ANNOTATED_EXCEPT)}$", block, re.MULTILINE), block
+        assert _readme_printed(block)[0] == _VS1.format("SearchScore"), _readme_printed(block)
+        assert "highlights=True" in "".join(_readme_blocks(_part_37("Declare and apply")))
+
+    def test_limit_and_ef_within_the_range(self) -> None:
+        """Every ``similar_to()`` of the examples gives ``limit`` and ``ef`` as ``int`` literals from 1 to 10000."""
+        found = [bound for block in _readme_blocks(_section_37()) for bound in _similar_to_bounds(block)]
+        assert {name for name, _ in found} == {"limit", "ef"}, found
+        assert all(isinstance(value, int) and 1 <= value <= 10_000 for _, value in found), found
+
+    def test_no_local_reference(self) -> None:
+        """No design reference and no issue number in the section."""
+        section = _section_37()
+        for marker in ("§", r"\bspec\b", r"\.claude"):
+            assert re.search(marker, section) is None, marker
+        assert re.findall(r"(?<![(\w])#\d+", section) == []
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 37 names a heading."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        links = re.findall(r"\]\(#([^)]+)\)", _section_37())
+        assert len(links) >= 5, links
+        assert [link for link in links if link not in anchors] == []
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly eight rows, Since v0.36.0, together and in version order before the table's last row; the table
+        keeps its widths."""
+        assert_server_rows(_VECTOR_ROWS)
+
+    def test_the_pins_name_these_rows(self) -> None:
+        """Each README row a pin of this module names is one of the eight rows."""
+        firsts = {f"README row '{row[0]}'" for row in _VECTOR_ROWS}
+        assert [row for row in _PINNED_ROWS if row not in firsts] == []
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        assert_server_header_sentence(_HEADER_SENTENCE_36)
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
+        assert_embedded_rows([_EMBEDDED_VECTOR_ROW])
+
+    def test_features_row(self) -> None:
+        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        firsts = [row[0] for row in features]
+        assert _FEATURES_ROW_37 in features, features
+        full_text = "Full-text search (`search()`, BM25 score and highlights)"
+        assert firsts.index(_FEATURES_ROW_37[0]) == firsts.index(full_text) + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        start = [row[0] for row in roadmap].index("v0.35.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_37, roadmap
+        assert "v0.36.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
+
+    def test_comparison_row(self) -> None:
+        """Released, right after full-text search and before hybrid search."""
+        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [row[0] for row in comparison]
+        start = firsts.index("Full-Text Search")
+        assert comparison[start + 1] == _COMPARISON_ROW_37, comparison
+        assert firsts[start + 2] == "Hybrid Search (RRF)", firsts
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.36.0 touches keeps one cell count per line and no escaped pipe; section 37 has no table."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _readme_part("### ORM behaviour: the embedded engine"),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        found = [lines for part in parts for lines in _md_tables(part)]
+        assert len(found) == len(parts)
+        for lines in found:
+            assert len({line.count("|") for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+        assert _md_tables(_section_37()) == []
+
+    async def test_section_37_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines. The term the
+        search annotations' block searches is in fewer than half the section's documents."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_37"}
+        try:
+            async with embedded_database():
+                for code in _readme_blocks(_section_37()):
+                    compiled = compile(code, "<README section 37>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
+            titles = [str(row[1]).lower() for row in namespace["corpus"]]
+            assert 0 < 2 * sum(_ANNOTATED_TERM in title for title in titles) < len(titles), titles
+        finally:
+            namespace.clear()
+
+
+# --- docs/ROADMAP.md --------------------------------------------------------------------------------------------------
+
+_ROADMAP = Path(__file__).resolve().parents[1] / "docs" / "ROADMAP.md"
+_PHASE_G = "### 🔎 Phase G — Advanced search"
+_SDK_TABLE = "## 🆕 Everything unlocked by the official SDK 2.0"
+_COMPARISON_TABLE = "## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison"
+#: The rows v0.36.0 holds while planned, by table.
+_PLANNED_OVERVIEW_36 = [["v0.36.0 – v0.40.0", "Tier 3 — Advanced (vector/hybrid search, migrations, CLI), 5 minors", "Planned"]]
+_PLANNED_UNLOCKED_36 = ["Vector Search (KNN, HNSW/MTREE)", "`DEFINE INDEX … HNSW/MTREE` + KNN operator", "v0.36.0"]
+_PLANNED_COMPARISON_36 = ["Vector Search (KNN/HNSW)", "yes", "v0.36.0"]
+_PLANNED_PHASE_G_36 = ["v0.36.0", "Vector Search (`similar_to()`, KNN)", "`DEFINE INDEX … HNSW/MTREE` + KNN operator"]
+#: The rows v0.36.0 holds once released, by table, and its "Completed versions" heading (a ``|`` in a cell is
+#: written ``\|`` in the Markdown, read back as ``|``).
+_OVERVIEW_36 = [
+    ["v0.36.0", "Tier 3 — Vector search", "Done"],
+    ["v0.37.0 – v0.40.0", "Tier 3 — Advanced (hybrid search, migrations, CLI), 4 minors", "Planned"],
+]
+_UNLOCKED_36 = ["Vector Search (KNN, HNSW)", "`DEFINE INDEX … HNSW` + KNN operator `<|K,EF|>`", "✅ v0.36.0"]
+_COMPARISON_36 = ["Vector Search (KNN/HNSW)", "yes", "✅ v0.36.0"]
+_PHASE_G_36 = ["✅ v0.36.0", "Vector Search (`similar_to()`, KNN)", "`DEFINE INDEX … HNSW` + KNN operator `<|K,EF|>`"]
+_COMPLETED_HEADING_35 = "### Version 0.35.0 — Full-text search (`search()`)"
+_COMPLETED_HEADING_36 = "### Version 0.36.0 — Vector search (`similar_to()`)"
+#: What the released block names among what it defers: the background build of an index.
+_DEFERRED_NEEDLES_36 = ("concurrently=True", "build status check")
+
+
+def _roadmap() -> str:
+    return _ROADMAP.read_text(encoding="utf-8")
+
+
+def _roadmap_rows(heading: str) -> list[list[str]]:
+    """The rows of the first table under *heading*, each cell's escaped ``\\|`` read as ``|``."""
+    return [[cell.replace("\\|", "|") for cell in cells] for _, cells in _table_rows(_subsection(heading, _roadmap()))]
+
+
+def _released_36() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.36.0 as released: its Phase G row carries the ✅ the release adds."""
+    return _roadmap_rows(_PHASE_G)[1][0] == "✅ v0.36.0"
+
+
+class TestRoadmap36:
+    """``docs/ROADMAP.md`` records v0.36.0 as planned, or — once its Phase G row carries ✅ — as released: done in the
+    overview, ✅ in the SDK and comparison tables (the SDK table naming HNSW alone) and in Phase G, its block in
+    "Completed versions" right after v0.35.0's. The Phase G row decides which state the whole file must be in."""
+
+    def test_overview(self) -> None:
+        overview = _roadmap_rows("## Overview")
+        start = [cells[0] for cells in overview].index("v0.35.0") + 1
+        expected = _OVERVIEW_36 if _released_36() else _PLANNED_OVERVIEW_36
+        assert overview[start : start + len(expected)] == expected, overview
+        assert overview[start + len(expected)][0] == "v0.41.0", overview
+
+    def test_sdk_table(self) -> None:
+        expected = _UNLOCKED_36 if _released_36() else _PLANNED_UNLOCKED_36
+        rows = _roadmap_rows(_SDK_TABLE)
+        assert [cells for cells in rows if cells[0].startswith("Vector Search")] == [expected], rows
+
+    def test_comparison_table(self) -> None:
+        expected = _COMPARISON_36 if _released_36() else _PLANNED_COMPARISON_36
+        rows = _roadmap_rows(_COMPARISON_TABLE)
+        assert [cells for cells in rows if cells[0].startswith("Vector Search")] == [expected], rows
+
+    def test_phase_g(self) -> None:
+        rows = _roadmap_rows(_PHASE_G)
+        assert rows[1] == (_PHASE_G_36 if _released_36() else _PLANNED_PHASE_G_36), rows
+        assert [cells[0] for cells in rows[2:]] == ["v0.37.0"], rows
+
+    def test_completed_versions(self) -> None:
+        """Released: v0.36.0's block right after v0.35.0's, naming the deferred background build. Planned: no such
+        block."""
+        roadmap = _roadmap()
+        completed = roadmap.split("\n## Completed versions\n", 1)[1].split("\n## ", 1)[0]
+        headings = re.findall(r"^### .*$", completed, re.MULTILINE)
+        if not _released_36():
+            assert _COMPLETED_HEADING_36 not in headings, headings
+            return
+        assert headings[headings.index(_COMPLETED_HEADING_36) - 1] == _COMPLETED_HEADING_35, headings
+        block = _normalised(_subsection(_COMPLETED_HEADING_36, completed))
+        missing = [needle for needle in _DEFERRED_NEEDLES_36 if needle not in block]
+        assert not missing, missing

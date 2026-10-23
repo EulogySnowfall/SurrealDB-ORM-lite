@@ -5157,9 +5157,9 @@ class TestMultiDatabaseDocs:
     C4, C7, P5, P8, P9)."""
 
     def test_section_30_follows_section_29(self) -> None:
-        """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), section 32
-        (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0) and section 36 (v0.35.0), and
-        before the ``---`` of "Configuration Options"."""
+        """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), section 32 (v0.31.0),
+        section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0) and section 37 (v0.36.0),
+        and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_29 = readme.index(f"\n{_SECTION_29}\n")
         start_30 = readme.index(f"\n{_SECTION_30}\n")
@@ -5174,6 +5174,7 @@ class TestMultiDatabaseDocs:
             "### 34. Relation constraints (`relation_in`, `define_relation()`)",
             "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
+            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
 
