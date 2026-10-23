@@ -25,9 +25,15 @@ def _connect() -> None:
 
 
 async def _setup():
+    """Connect, define and clear the fixtures' tables; return the client.
+
+    The tables are defined first so that a read never hits a missing table on a fresh
+    SurrealDB 3.x server (``NotFoundError``). ``IF NOT EXISTS`` keeps an existing definition.
+    """
     _connect()
     client = await SurrealDBConnectionManager.get_client()
     for table in TABLES:
+        await client.query(f"DEFINE TABLE IF NOT EXISTS {table};", {})
         with contextlib.suppress(Exception):
             await client.query(f"DELETE {table};", {})
     return client
