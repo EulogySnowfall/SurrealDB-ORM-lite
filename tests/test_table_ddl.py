@@ -5941,10 +5941,12 @@ class TestSubModelListsE2E:
         table does not define.
 
         3.x keeps it only once a field of the object is defined: in the items of ``v`` (``v.*.n``) and in an object
-        inside an item that defines one (``z.*.s.k``), not in the items of an array that defines none (``w``).
-        SurrealDB's documentation of ``FLEXIBLE`` says every object of an array that is not ``FLEXIBLE`` refuses such
-        a key. Every write goes through ``_refusal()``: a 3.x that starts refusing it in ``v`` or ``z`` too fails here
-        with ``_UNDECLARED_CHANGED``, which names the README rows to update."""
+        inside an item that defines one (``z.*.s.k``), not in the items of an array that defines none (``w``) nor in
+        an object inside an item that defines no key (``y.*.s``, which 2.x and the embedded engine empty). SurrealDB's
+        documentation of ``FLEXIBLE`` says every object of an array that is not ``FLEXIBLE`` refuses such a key, and
+        SurrealDB 3.4 (nightly at the time of writing) does. Every write goes through ``_refusal()``: a 3.x pin that
+        starts refusing it in ``v`` or ``z`` too fails here with ``_UNDECLARED_CHANGED``, which names the README rows
+        to update."""
         async with _tdl(kind) as client:
             major = await _major(client)
             flex = " FLEXIBLE" if flexible else ""
@@ -5958,7 +5960,10 @@ class TestSubModelListsE2E:
                 "DEFINE FIELD w ON tdl_raw TYPE option<array<object>>; "
                 f"DEFINE FIELD z ON tdl_raw TYPE option<array<object>>{flex}; "
                 "DEFINE FIELD z.*.s ON tdl_raw TYPE object; "
-                "DEFINE FIELD z.*.s.k ON tdl_raw TYPE int;",
+                "DEFINE FIELD z.*.s.k ON tdl_raw TYPE int; "
+                "DEFINE FIELD y ON tdl_raw TYPE option<array<object>>; "
+                "DEFINE FIELD y.*.n ON tdl_raw TYPE option<string>; "
+                "DEFINE FIELD y.*.s ON tdl_raw TYPE option<object>;",
             )
             refused = await _refusal(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
             assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
@@ -5981,6 +5986,13 @@ class TestSubModelListsE2E:
             else:
                 assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
                 assert await client.query("SELECT VALUE w FROM tdl_raw:3;", {}) == [[{}]], _UNDECLARED_CHANGED
+            refused = await _refusal(client, "CREATE tdl_raw:5 SET v = [], y = [{n: 'a', s: {stray: 1}}] RETURN NONE;")
+            if major >= 3:
+                assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
+            else:
+                assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
+                stored = [{"n": "a", "s": {}}]
+                assert await client.query("SELECT VALUE y FROM tdl_raw:5;", {}) == [stored], _UNDECLARED_CHANGED
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_undeclared_key_in_an_item_after_define_table(self, kind: str) -> None:
