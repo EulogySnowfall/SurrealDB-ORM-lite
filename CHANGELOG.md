@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Notes
+
+- **Undeclared keys in list items: fixed in SurrealDB 3.4** (#308): SurrealDB 3.x (measured on
+  3.1.5 and 3.3.4) keeps a key a `SCHEMAFULL` table does not define in the items of a list whose
+  items define a field, as the 0.35.2 note on #301 below says. SurrealDB 3.4 (nightly at the time
+  of writing) refuses it there too, as SurrealDB's documentation of `FLEXIBLE` says. README section
+  35 and the 3.x cell of the v0.34.0 row of "ORM behaviour: SurrealDB 2.x vs 3.x" now say so. The
+  raw test also measures an object inside a list item that defines no key: refused on 3.x
+  (`no such field exists`), emptied on 2.x and the embedded engine. No ORM behaviour changes.
+
 ## [0.35.4] - 2026-10-23
 
 `update()`, `upsert()`, `authenticate()` and `refresh()` refuse an auth model whose signup field
