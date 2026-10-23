@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.2] - 2026-10-23
+
+Follow-ups to the review of v0.35.3 (#312): an index that `remove_index(tx=…)` removed earlier in
+a transaction is defined again by `define_indexes(tx=…)` in the same block instead of being lost
+at the commit, and the docs say why the refusal after a write covers every kind of index. No new
+public API.
+
+### Fixed
+
+- **`remove_index(tx=…)` then `define_indexes(tx=…)` in one block no longer loses an existing
+  index** (#312). `define_indexes(tx=…)` reads `INFO FOR TABLE` outside the transaction, where an
+  index removed earlier in the block still stands: it planned nothing, returned `[]`, and the
+  commit applied the removal, leaving the table without the index and without an error (since
+  v0.35.0, over WebSocket and HTTP and on the embedded engine, on SurrealDB 2.x and 3.x).
+  `remove_index(tx=…)` now notes the removal on the transaction, and `define_indexes(tx=…)`
+  counts the noted index as missing: it defines it again after the removal
+  (`DEFINE INDEX OVERWRITE`, or `IF NOT EXISTS` with `overwrite=False`), so the commit keeps
+  it, and a later call in the block compares it with committed state again. Only an index the
+  model declares comes back: another model's index on the same table comes back with that
+  model's `define_indexes(tx=…)`, and one no model declares stays removed. When the block has
+  already written records to the table, the call is refused before any DDL, as since v0.35.3. A
+  raw `tx.add("REMOVE INDEX …")` is not tracked.
+- **The same fix also applies to vector (HNSW) indexes since v0.36.0**: on v0.36.0 and v0.36.1,
+  `remove_index(tx=…)` then `define_indexes(tx=…)` lost an HNSW index at the commit on every
+  engine; it is now defined again, as a full-text or `UNIQUE` index is.
+
+### Notes
+
+- **Removing an index and defining it again in one block on SurrealDB 2.x**: on a table that
+  held records, the commit fails with a retryable `SurrealDbConflictError` that a retry meets
+  again, a 2.x limitation; nothing of the block is committed and the index stands as before. On an
+  empty table it commits, as on SurrealDB 3.x and the embedded engine. A row in each behaviour
+  table of the README ("ORM behaviour: SurrealDB 2.x vs 3.x" and the embedded engine's) describes
+  each engine's outcome, which tests pin.
+- **A write after `define_indexes(tx=…)` on SurrealDB 2.x**: the v0.35.3 qualifier "to a table
+  that held records" is now pinned: on an empty table, a write after the index in the same block
+  commits and is indexed.
+- **Docs**: README section 36 (Transactions) and the `define_indexes()` docstring say why the
+  refusal after a write covers every kind of index, not only full-text ones: a search would miss
+  those records, and a `UNIQUE` index missing them would not enforce uniqueness for them
+  ([surrealdb/surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618)).
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.36.1] - 2026-10-23
 
 Follow-ups to the review of v0.35.4 (#315): an instance write that the model refuses (a
