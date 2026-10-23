@@ -117,6 +117,7 @@ from .utils import (
 
 if TYPE_CHECKING:
     from .edge import BaseSurrealEdge
+    from .model_auth import AuthenticatedUserMixin
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,16 @@ _ANNOTATED: Any = typing.Annotated
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
 # statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
 _PYDANTIC_DIR = os.path.dirname(os.path.abspath(pydantic.__file__))
+
+
+@functools.cache
+def _auth_mixin() -> "type[AuthenticatedUserMixin]":
+    """``model_auth.AuthenticatedUserMixin``, imported on first use — ``model_auth`` sits above this module — and kept,
+    so that the SG1 check of the full replaces ``update()`` and ``upsert()`` (#310) costs a call and an
+    ``issubclass()`` on every model."""
+    from .model_auth import AuthenticatedUserMixin
+
+    return AuthenticatedUserMixin
 
 
 def _legacy_table_name(cls: type) -> str | None:
@@ -1463,6 +1474,23 @@ class BaseSurrealModel(BaseModel):
             raise TypeError(view_write_refused(cls.get_table_name(), f"{cls.__name__}.{call}"))
 
     @classmethod
+    def _reject_signup_excluded(cls) -> None:
+        """SG1 (#296, #299, #310) on an auth model (``AuthenticatedUserMixin``): refuse it when a field SIGNUP writes is
+        one ``Field(exclude=True)`` keeps out of ``model_dump()`` (``_refuse_signup_fields_excluded()``); nothing on any
+        other model. Pure.
+
+        Called by :meth:`_table_ddl`, after its other refusals, and by the full replaces :meth:`update` and
+        :meth:`upsert`, right after the view and snapshot checks — before any signal, transaction use or request: they
+        write what ``model_dump()`` writes, so they would drop the stored value of such a field (a password hash, and
+        every later signin fails).
+
+        Raises:
+            TypeError: the auth model and those fields, in declaration order (``schema.signup_excluded_refused()``).
+        """
+        if issubclass(cls, _auth_mixin()):
+            cls._refuse_signup_fields_excluded()
+
+    @classmethod
     def _require_view(cls, method: str) -> str:
         """The model's view query (:meth:`get_view_query`), or V11 naming *method* (``"view_ddl()"``) (v0.32.0).
 
@@ -1792,15 +1820,11 @@ class BaseSurrealModel(BaseModel):
             raise TypeError(user_extra_refused(cls.__name__))
         schemafull = clauses.schema_mode == SchemaMode.SCHEMAFULL.value
         fields = [field_statement(table, column, overwrite=overwrite, schemafull=schemafull) for column in cls._table_columns()]
-        # Imported here: model_auth sits above this module.
-        from .model_auth import AuthenticatedUserMixin
-
-        if issubclass(cls, AuthenticatedUserMixin):
-            # SG1 (#296, #299), after the other refusals, whatever the schema mode: SIGNUP writes a field model_dump()
-            # leaves out, which update() and upsert() would drop and a SCHEMAFULL table would refuse (3.x) or drop
-            # (2.x) — checked here, as UX1 is, so that table_ddl() and define_table() refuse the model access_ddl(),
-            # define_access(), signup() and signin() refuse.
-            cls._refuse_signup_fields_excluded()
+        # SG1 (#296, #299, #310) on an auth model, after the other refusals, whatever the schema mode: SIGNUP writes a
+        # field model_dump() leaves out, which update() and upsert() would drop and a SCHEMAFULL table would refuse
+        # (3.x) or drop (2.x) — checked here, as UX1 is, so that table_ddl() and define_table() refuse the model
+        # access_ddl(), define_access(), signup(), signin(), authenticate(), refresh(), update() and upsert() refuse.
+        cls._reject_signup_excluded()
         return [statement, *fields]
 
     @classmethod
@@ -3382,9 +3406,18 @@ class BaseSurrealModel(BaseModel):
         Emits the same signals as ``save()`` (``pre_save``/``around_save``/``post_save``);
         in a transaction ``around_save`` is skipped and ``post_save`` is deferred to a
         successful commit (consistent with ``save(tx=)``).
+
+        Raises:
+            TypeError: the model is a materialized view (W1); or an auth model
+                (``AuthenticatedUserMixin``) with a field SIGNUP writes that ``Field(exclude=True)``
+                keeps out of ``model_dump()`` (SG1, #310): the replace would drop its stored value
+                (a password hash) — before any signal, transaction use or request, with or
+                without ``tx``.
+            SurrealDbError: the instance is a snapshot read with ``as_of()``.
         """
         self._reject_view_write("upsert()")
         self._reject_snapshot_write("upsert()")
+        self._reject_signup_excluded()
         return await self._save_with_signals(self._do_upsert, tx)
 
     @_cache.invalidates("self")
@@ -3431,9 +3464,18 @@ class BaseSurrealModel(BaseModel):
         Returns:
             The updated row as the SDK reads it (``[]`` for a record that does not exist), or
             ``None`` in a transaction.
+
+        Raises:
+            TypeError: the model is a materialized view (W1); or an auth model
+                (``AuthenticatedUserMixin``) with a field SIGNUP writes that ``Field(exclude=True)``
+                keeps out of ``model_dump()`` (SG1, #310): the replace would drop its stored value
+                (a password hash) — before any signal, transaction use or request, with or
+                without ``tx``.
+            SurrealDbError: the instance is a snapshot read with ``as_of()``, or it has no id.
         """
         self._reject_view_write("update()")
         self._reject_snapshot_write("update()")
+        self._reject_signup_excluded()
         sender = self.__class__
         data = self._write_payload(replace=True)
         record_id = self._record_id()

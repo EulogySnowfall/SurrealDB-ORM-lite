@@ -6380,7 +6380,7 @@ def _sg1(name: str, fields: str, pronoun: str = "it") -> str:
         f"SCHEMAFULL table defined from the model has no column for {pronoun} either (SurrealDB 3.x refuses the signup, "
         f"2.x drops {pronoun}). Remove exclude=True and leave {pronoun} out where you serialise the model instead "
         f"(model_dump(exclude={{{fields}}})); until then table_ddl(), define_table(), access_ddl(), define_access(), "
-        f"signup() and signin() refuse {name}."
+        f"signup(), signin(), authenticate(), refresh(), update() and upsert() refuse {name}."
     )
 
 
@@ -7329,17 +7329,22 @@ _BLOCKS_BY_PART_35 = {
     "Security": [],
     "Coming from the full SurrealDB-ORM": [],
 }
-#: The bullet of section 35's "User models" on SG1, whatever the schema mode (#296, #299), whitespace normalised.
+#: The bullet of section 35's "User models" on SG1, whatever the schema mode (#296, #299), extended to `authenticate()`,
+#: `refresh()`, `update()` and `upsert()` by v0.35.4 (#310), whitespace normalised.
 _USER_MODELS_SG1 = (
     "An auth model with a field SIGNUP writes that `Field(exclude=True)` keeps out of `model_dump()` (`password: str = "
     "Field(exclude=True)`) raises `TypeError` too, naming the fields, before any request and whatever its schema mode: "
-    "`table_ddl()`, `define_table()`, `access_ddl()` and `define_access()` (with or without the table), `signup()` and "
-    "`signin()` refuse it. `update()` and `upsert()` replace the record with what `model_dump()` writes, so on any "
-    "table (`SCHEMALESS`, or defined by hand with `with_table=False`) they would drop the password hash, failing every "
-    "later signin, or be refused by a required column; a `SCHEMAFULL` table would not define the field either, so "
-    "SurrealDB 3.x would refuse every signup and 2.x drop the hash. Remove `exclude=True` and leave the field out where "
-    'you serialise the model instead (`model_dump(exclude={"password"})`). **Changed**: such a model on a `SCHEMALESS` '
-    "table or with `with_table=False` used to be accepted, and its first `update()` or `upsert()` dropped the hash."
+    "`table_ddl()`, `define_table()`, `access_ddl()` and `define_access()` (with or without the table), `signup()`, "
+    "`signin()`, `authenticate()` and `refresh()` refuse it, and so do `update()` and `upsert()`, with or without "
+    "`tx=` and before any signal. `update()` and `upsert()` replace the record with what `model_dump()` writes, so on "
+    "any table (`SCHEMALESS`, or defined by hand with `with_table=False`) they would drop the password hash, failing "
+    "every later signin, or be refused by a required column; a `SCHEMAFULL` table would not define the field either, "
+    "so SurrealDB 3.x would refuse every signup and 2.x drop the hash. Remove `exclude=True` and leave the field out "
+    'where you serialise the model instead (`model_dump(exclude={"password"})`). **Changed**: such a model on a '
+    "`SCHEMALESS` table or with `with_table=False` used to be accepted, and its first `update()` or `upsert()` dropped "
+    "the hash; until v0.35.4, `authenticate()`, `refresh()`, `update()` and `upsert()` still accepted it, so a record "
+    "signed up elsewhere (another client, an access defined by hand) and loaded with `authenticate()` or `get()` lost "
+    "its hash the same way."
 )
 #: The sentences section 35 says word for word (whitespace normalised), each once, by subsection.
 _SENTENCES_35 = {
@@ -8027,30 +8032,36 @@ class TestReadmeSection35:
             namespace.clear()
 
 
-#: The row v0.35.2 adds to the 2.x/3.x table (#299), cell by cell, within the table's column widths.
+#: The row v0.35.2 adds to the 2.x/3.x table (#299), cell by cell, within the table's column widths; v0.35.4 extends
+#: it to `authenticate()`, `refresh()`, `update()` and `upsert()` (#310).
 _SG1_ROW = [
     "An auth model with a `Field(exclude=True)` field SIGNUP writes (`password: str = Field(exclude=True)`)",
-    "`TypeError` before any request, whatever the schema mode and `with_table`: the four DDL methods, `signup()` and "
-    "`signin()`",
+    "`TypeError` before any request, whatever the schema mode and `with_table`: the DDL methods, `signup()`, "
+    "`signin()`, `authenticate()`, `refresh()`, `update()`, `upsert()`",
     "same on both lines (a check of the model, no request)",
     "v0.35.2",
 ]
 _HEADER_SENTENCE_352 = "The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5."
-#: The paragraph section 19 gives SG1 (#299), whitespace normalised.
+#: The paragraph section 19 gives SG1 (#299), extended by v0.35.4 (#310), whitespace normalised.
 _SECTION_19_SG1 = (
     "**Keep the password field in `model_dump()`.** SIGNUP writes every field, while `update()` and `upsert()` replace "
     "the record with what `model_dump()` writes: a field declared `Field(exclude=True)` (`password: str = "
     "Field(exclude=True)`) would lose its stored value, the password hash, and every later signin would fail. Such a "
     "model raises `TypeError`, naming the fields, before any request and whatever its schema mode: `access_ddl()`, "
-    "`define_access()` (with or without the table), `table_ddl()`, `define_table()`, `signup()` and `signin()` refuse "
-    "it. Remove `exclude=True` and leave the field out where you serialise the model instead "
-    '(`model_dump(exclude={"password"})`).'
+    "`define_access()` (with or without the table), `table_ddl()`, `define_table()`, `signup()`, `signin()`, "
+    "`authenticate()` and `refresh()` refuse it, and so do `update()` and `upsert()` (with or without `tx=`, before any "
+    "signal), whoever wrote the record — another client, an access defined by hand, a session opened before the "
+    "upgrade. Remove `exclude=True` and leave the field out where you serialise the model instead "
+    '(`model_dump(exclude={"password"})`). **Changed in v0.35.4**: `authenticate()`, `refresh()`, `update()` and '
+    "`upsert()` used to accept such a model, so a record loaded with `authenticate()` or `get()` lost its hash at its "
+    "first `update()` or `upsert()`."
 )
 
 
 class TestReadmeSg1:
-    """What v0.35.2 says of SG1 whatever the schema mode (#299): section 19's paragraph, after the note on the hash;
-    section 35's "User models" bullet (:data:`_SENTENCES_35`); the row and the sentence of the 2.x/3.x table."""
+    """What v0.35.2 says of SG1 whatever the schema mode (#299), and v0.35.4 of its refusal by `authenticate()`,
+    `refresh()`, `update()` and `upsert()` (#310): section 19's paragraph, after the note on the hash; section 35's
+    "User models" bullet (:data:`_SENTENCES_35`); the row and the sentence of the 2.x/3.x table."""
 
     def test_section_19_paragraph(self) -> None:
         section_19 = _normalised(_readme_part(_SECTION_19))

@@ -1286,8 +1286,12 @@ gives such a model the same table, so the two can be called in any order.
 record with what `model_dump()` writes: a field declared `Field(exclude=True)` (`password: str = Field(exclude=True)`)
 would lose its stored value, the password hash, and every later signin would fail. Such a model raises `TypeError`,
 naming the fields, before any request and whatever its schema mode: `access_ddl()`, `define_access()` (with or without
-the table), `table_ddl()`, `define_table()`, `signup()` and `signin()` refuse it. Remove `exclude=True` and leave the
-field out where you serialise the model instead (`model_dump(exclude={"password"})`).
+the table), `table_ddl()`, `define_table()`, `signup()`, `signin()`, `authenticate()` and `refresh()` refuse it, and so
+do `update()` and `upsert()` (with or without `tx=`, before any signal), whoever wrote the record — another client, an
+access defined by hand, a session opened before the upgrade. Remove `exclude=True` and leave the field out where you
+serialise the model instead (`model_dump(exclude={"password"})`). **Changed in v0.35.4**: `authenticate()`, `refresh()`,
+`update()` and `upsert()` used to accept such a model, so a record loaded with `authenticate()` or `get()` lost its
+hash at its first `update()` or `upsert()`.
 
 #### Renewing a session (SurrealDB 3.x only)
 
@@ -5664,12 +5668,15 @@ print(*table, sep="\n")
 - An auth model with a field SIGNUP writes that `Field(exclude=True)` keeps out of `model_dump()`
   (`password: str = Field(exclude=True)`) raises `TypeError` too, naming the fields, before any request and whatever
   its schema mode: `table_ddl()`, `define_table()`, `access_ddl()` and `define_access()` (with or without the table),
-  `signup()` and `signin()` refuse it. `update()` and `upsert()` replace the record with what `model_dump()` writes,
+  `signup()`, `signin()`, `authenticate()` and `refresh()` refuse it, and so do `update()` and `upsert()`, with or
+  without `tx=` and before any signal. `update()` and `upsert()` replace the record with what `model_dump()` writes,
   so on any table (`SCHEMALESS`, or defined by hand with `with_table=False`) they would drop the password hash, failing
   every later signin, or be refused by a required column; a `SCHEMAFULL` table would not define the field either, so
   SurrealDB 3.x would refuse every signup and 2.x drop the hash. Remove `exclude=True` and leave the field out where
   you serialise the model instead (`model_dump(exclude={"password"})`). **Changed**: such a model on a `SCHEMALESS`
-  table or with `with_table=False` used to be accepted, and its first `update()` or `upsert()` dropped the hash.
+  table or with `with_table=False` used to be accepted, and its first `update()` or `upsert()` dropped the hash; until
+  v0.35.4, `authenticate()`, `refresh()`, `update()` and `upsert()` still accepted it, so a record signed up elsewhere
+  (another client, an access defined by hand) and loaded with `authenticate()` or `get()` lost its hash the same way.
 - Upgrading: a 0.33 `TableType.USER` model's table turns `SCHEMAFULL` at its next `define_access()`; records already
   there are checked at their next write.
 
@@ -6373,7 +6380,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Two `search()` fields AND-ed                                                                                                           | only the records matching every field, each field scored as if searched alone                                                                                                 | the same on 3.3; 3.1 can also return records that match only one of the fields, scored `0.0` on the other                                                                           | v0.35.0                              |
 | `search()` on a field without a full-text index                                                                                        | `SurrealDbError` naming the field                                                                                                                                             | the same; 3.1 answers no record                                                                                                                                                     | v0.35.0                              |
 | `live()` with a `Subquery` that searches a field without a full-text index                                                             | `SurrealDbError` naming the field, before the live query starts                                                                                                               | the same (the live query would never notify); 3.1 starts it                                                                                                                         | v0.35.0                              |
-| An auth model with a `Field(exclude=True)` field SIGNUP writes (`password: str = Field(exclude=True)`)                                 | `TypeError` before any request, whatever the schema mode and `with_table`: the four DDL methods, `signup()` and `signin()`                                                    | same on both lines (a check of the model, no request)                                                                                                                               | v0.35.2                              |
+| An auth model with a `Field(exclude=True)` field SIGNUP writes (`password: str = Field(exclude=True)`)                                 | `TypeError` before any request, whatever the schema mode and `with_table`: the DDL methods, `signup()`, `signin()`, `authenticate()`, `refresh()`, `update()`, `upsert()`     | same on both lines (a check of the model, no request)                                                                                                                               | v0.35.2                              |
 | `define_indexes(tx=)` in a block that writes to the model's table (an ORM write before the index, a write after it)                    | a write before it: refused (left out of the index); a write after it, to a table holding records, fails the commit with a retryable `SurrealDbConflictError`, again on retry  | a write before it: refused (left out of the index, [surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618)); a write after it is committed and indexed                 | v0.35.3                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 

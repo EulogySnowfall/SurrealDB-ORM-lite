@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.4] - 2026-10-23
+
+`update()`, `upsert()`, `authenticate()` and `refresh()` refuse an auth model whose signup field
+is declared `Field(exclude=True)`, as the DDL methods, `signup()` and `signin()` do since v0.35.2
+(#310): a record signed up elsewhere and loaded through such a model no longer loses its stored
+password hash at its first `update()` or `upsert()`. No new public API.
+
+### Changed
+
+- **`authenticate()`, `refresh()`, `update()` and `upsert()` raise the v0.35.2 `TypeError` for
+  an auth model with an excluded signup field** (#310). For a model built on
+  `AuthenticatedUserMixin` with a field SIGNUP writes that `Field(exclude=True)` keeps out of
+  `model_dump()` (`password: str = Field(exclude=True)`), `update()` and `upsert()` now raise it
+  before any request and any `pre_save`/`pre_update` signal, with or without `tx=` (nothing is
+  added to the transaction), and `authenticate()` and `refresh()` before any request (a refresh
+  token is not spent). The message, `schema.signup_excluded_refused()`, now names every refusing
+  call: `table_ddl()`, `define_table()`, `access_ddl()`, `define_access()`, `signup()`,
+  `signin()`, `authenticate()`, `refresh()`, `update()` and `upsert()`. Auth models without
+  `exclude=True`, and models that are not auth models, write and authenticate as before.
+
+### Fixed
+
+- **A record signed up elsewhere no longer loses its password hash at `update()` or `upsert()`
+  of a model with an excluded signup field** (#310). v0.35.2 refused such a model in the DDL
+  methods, `signup()` and `signin()`, but not in the calls that drop the value: when the access
+  was defined by hand or by an earlier deploy and the account signed up through another client,
+  `SurrealDBConnectionManager.signup()` or a session opened before the upgrade, an instance
+  returned by `authenticate()` or loaded with `get()` wrote the record back without the hash at
+  its first `update()` or `upsert()`, with no error: the hash became `NONE` on a `SCHEMALESS`
+  table or an optional column, and every later signin failed. These calls are now refused first
+  (see Changed), and the stored record stays as it was. README section 19, "User models" and the
+  v0.35.2 row of "ORM behaviour: SurrealDB 2.x vs 3.x" describe it; the behaviour is the same on
+  both lines.
+
 ## [0.35.3] - 2026-10-23
 
 Follow-ups to the review of v0.35.0's full-text search (#304): the warning of `define_indexes()`
