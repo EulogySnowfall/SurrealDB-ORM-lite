@@ -36,6 +36,9 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite._sdk import SurrealError
 from surreal_orm_lite.schema import signup_excluded_refused
+from surreal_orm_lite.signals import around_save, around_update, post_save, post_update, pre_save, pre_update
+from surreal_orm_lite.transaction import BufferedTransaction
+from tests.conftest import orm_client
 
 HOST = os.getenv("SURREALDB_HOST", "localhost")
 PORT = os.getenv("SURREALDB_PORT", "8000")
@@ -585,11 +588,111 @@ class TestAuthValidation:
             await calls[method]()
         assert requests == []
         assert str(raised.value) == signup_excluded_refused("HiddenUser", ["password", "nickname"])
-        for part in ("HiddenUser: SIGNUP writes 'password', 'nickname',", "Remove exclude=True", "signup() and signin()"):
+        for part in (
+            "HiddenUser: SIGNUP writes 'password', 'nickname',",
+            "Remove exclude=True",
+            "signup(), signin(), authenticate(), refresh(), update() and upsert() refuse HiddenUser.",
+        ):
             assert part in str(raised.value)
         with pytest.raises(TypeError) as ddl:
             HiddenUser.access_ddl(with_table=False)
         assert str(ddl.value) == str(raised.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["update", "update(tx=)", "upsert", "upsert(tx=)", "authenticate", "refresh"])
+    async def test_an_excluded_signup_field_refuses_the_writes_and_auth_calls_before_anything(
+        self, monkeypatch: pytest.MonkeyPatch, method: str
+    ) -> None:
+        """#310: ``update()`` and ``upsert()`` replace the stored record with what ``model_dump()`` writes, so on an
+        instance loaded with ``get()`` or returned by ``authenticate()`` they would drop the hash an access defined by
+        hand (or another client) stored. They refuse the model with SG1's ``TypeError``, with or without ``tx=``, as
+        ``authenticate()`` and ``refresh()`` do — before any request, any signal and any use of the transaction."""
+
+        class HiddenWriter(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="hidden_writer", connection="sg1", with_refresh=True)
+
+            id: str | None = None
+            email: str
+            password: str = Field(exclude=True)
+
+        requests: list[str] = []
+
+        def no_request(name: str) -> Any:
+            def refuse(*args: Any, **kwargs: Any) -> Any:
+                requests.append(name)
+                raise AssertionError(f"{name}() was called")
+
+            return refuse
+
+        for name in ("ephemeral_client", "get_client", "_exclusive_embedded_client"):
+            monkeypatch.setattr(SurrealDBConnectionManager, name, no_request(name))
+        # A server nobody listens on: a request that slipped through would fail with another error.
+        SurrealDBConnectionManager.add_connection(
+            "sg1", url="ws://127.0.0.1:9/rpc", user="root", password="root", namespace="ns", database="db"
+        )
+        fired: list[str] = []
+
+        async def on_signal(sender: Any, **kwargs: Any) -> None:
+            fired.append("signal")
+
+        async def around(sender: Any, **kwargs: Any) -> AsyncIterator[None]:
+            fired.append("around")
+            yield
+
+        signals = (pre_save, post_save, pre_update, post_update)
+        for signal in signals:
+            signal.connect(HiddenWriter)(on_signal)
+        for wrapper in (around_save, around_update):
+            wrapper.connect(HiddenWriter)(around)
+        tx = BufferedTransaction(client=None)
+        user = HiddenWriter(id="ada", email="a@b.c", password="$argon2id$stored-hash")
+        calls = {
+            "update": lambda: user.update(),
+            "update(tx=)": lambda: user.update(tx=tx),
+            "upsert": lambda: user.upsert(),
+            "upsert(tx=)": lambda: user.upsert(tx=tx),
+            "authenticate": lambda: HiddenWriter.authenticate("token"),
+            "refresh": lambda: HiddenWriter.refresh("refresh-token"),
+        }
+        try:
+            with pytest.raises(TypeError) as raised:
+                await calls[method]()
+        finally:
+            for signal in signals:
+                signal.disconnect(on_signal, HiddenWriter)
+            for wrapper in (around_save, around_update):
+                wrapper.disconnect(around, HiddenWriter)
+        assert requests == []
+        assert fired == []
+        assert tx.statements == [] and tx.variables == {}
+        assert str(raised.value) == signup_excluded_refused("HiddenWriter", ["password"])
+        for call in ("update()", "upsert()", "authenticate()", "refresh()"):
+            assert call in str(raised.value)
+
+    @pytest.mark.asyncio
+    async def test_update_and_upsert_still_write_without_an_excluded_signup_field(self) -> None:
+        """#310 refuses only an auth model with an excluded signup field: an auth model without one, and a model that
+        is not an auth model (whatever it excludes), keep writing."""
+
+        class PlainUser(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="plain_user")
+
+            id: str | None = None
+            email: str
+            password: str
+
+        class NotAuth(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="not_auth")
+
+            id: str | None = None
+            email: str
+            secret: str = Field(default="", exclude=True)
+
+        tx = BufferedTransaction(client=None)
+        for instance in (PlainUser(id="a", email="a@b.c", password="hash"), NotAuth(id="b", email="b@c.d", secret="s")):
+            await instance.update(tx=tx)
+            await instance.upsert(tx=tx)
+        assert [statement.split(" ", 1)[0] for statement in tx.statements] == ["UPDATE", "UPSERT", "UPDATE", "UPSERT"]
 
     @pytest.mark.asyncio
     async def test_refresh_on_a_model_without_with_refresh_says_so(self) -> None:
@@ -600,6 +703,44 @@ class TestAuthValidation:
                 await E2EUser.refresh("any-token")
         finally:
             await SurrealDBConnectionManager.unset_connection()
+
+
+class TestExcludedSignupFieldWriteE2E:
+    """#310 on both server lines: the refused ``update()`` and ``upsert()`` leave the stored hash as it was."""
+
+    @pytest.mark.asyncio
+    async def test_update_and_upsert_keep_the_stored_hash(self) -> None:
+        class HashKeeper(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="sg1_hash_keeper")
+
+            id: str | None = None
+            email: str
+            password: str = Field(exclude=True)
+
+        async with orm_client("sg1_hash_keeper") as client:
+            # The row an access defined by hand (or another client) leaves: the hash SIGNUP stores.
+            await client.query(
+                "CREATE sg1_hash_keeper:ada CONTENT { email: $email, password: crypto::argon2::generate($password) };",
+                {"email": "ada@example.test", "password": AUTH_PASSWORD},
+            )
+
+            async def stored_hash() -> Any:
+                return await client.query("SELECT VALUE password FROM ONLY sg1_hash_keeper:ada;", {})
+
+            stored = await stored_hash()
+            assert isinstance(stored, str) and stored.startswith("$argon2")
+            me = await HashKeeper.objects().get("ada")
+            assert me.password == stored
+
+            for call in ("update", "upsert"):
+                refused: TypeError | None = None
+                try:
+                    await getattr(me, call)()
+                except TypeError as exc:
+                    refused = exc
+                assert await stored_hash() == stored, f"{call}() changed the stored hash"
+                assert refused is not None, f"{call}() did not refuse the model"
+                assert str(refused) == signup_excluded_refused("HashKeeper", ["password"])
 
 
 class TestDefineAccessInTransactionE2E:

@@ -88,7 +88,8 @@ refuses ``define_relation()`` of an edge model declared ``SCHEMAFULL`` with data
 ``user_extra_refused()`` gives the text of UX1, the refusal of a ``SCHEMAFULL`` table the model table DDL checks before
 any request, and ``signup_excluded_refused()`` that of SG1, an auth model with a field SIGNUP writes that
 ``Field(exclude=True)`` keeps out of ``model_dump()``, refused whatever its schema mode by the model table DDL, the
-access DDL, ``signup()`` and ``signin()`` (#299).
+access DDL, ``signup()`` and ``signin()`` (#299), ``authenticate()``, ``refresh()``, ``update()`` and ``upsert()``
+(#310).
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -1955,8 +1956,9 @@ def signup_excluded_refused(model: str, fields: Sequence[str]) -> str:
     ``Field(exclude=True)`` keeps out of ``model_dump()`` (SG1): ``update()`` and ``upsert()`` replace the stored record
     with what ``model_dump()`` writes, whatever the table's schema mode, so they drop them or a required column refuses
     them (#299), and a ``SCHEMAFULL`` table defined from the model has no column for them (#296). ``table_ddl()``,
-    ``define_table()``, ``access_ddl()``, ``define_access()``, ``signup()`` and ``signin()`` raise it before any
-    request. Pure."""
+    ``define_table()``, ``access_ddl()``, ``define_access()``, ``signup()``, ``signin()``, ``authenticate()``,
+    ``refresh()``, ``update()`` and ``upsert()`` raise it before any request — ``update()`` and ``upsert()`` before any
+    signal too, with or without ``tx`` (#310), whoever wrote the record they replace. Pure."""
     names = ", ".join(repr(name) for name in fields)
     pronoun = "it" if len(fields) == 1 else "them"
     return (
@@ -1966,5 +1968,5 @@ def signup_excluded_refused(model: str, fields: Sequence[str]) -> str:
         f"SCHEMAFULL table defined from the model has no column for {pronoun} either (SurrealDB 3.x refuses the signup, "
         f"2.x drops {pronoun}). Remove exclude=True and leave {pronoun} out where you serialise the model instead "
         f"(model_dump(exclude={{{names}}})); until then table_ddl(), define_table(), access_ddl(), define_access(), "
-        f"signup() and signin() refuse {model}."
+        f"signup(), signin(), authenticate(), refresh(), update() and upsert() refuse {model}."
     )

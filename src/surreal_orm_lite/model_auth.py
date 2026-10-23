@@ -282,11 +282,14 @@ class AuthenticatedUserMixin:
 
     @classmethod
     def _refuse_signup_fields_excluded(cls) -> None:
-        """SG1 (#296, #299): refuse a model with a field SIGNUP writes that ``Field(exclude=True)`` keeps out of
+        """SG1 (#296, #299, #310): refuse a model with a field SIGNUP writes that ``Field(exclude=True)`` keeps out of
         ``model_dump()`` (:meth:`_signup_fields_excluded`), whatever its schema mode. Pure:
         ``BaseSurrealModel._table_ddl()`` (behind ``table_ddl()`` and ``define_table()``), :meth:`access_ddl` (behind
-        :meth:`define_access`, with or without the table) and :meth:`_auth_variables` (behind :meth:`signup` and
-        :meth:`signin`) call it before any request.
+        :meth:`define_access`, with or without the table), :meth:`_auth_variables` (behind :meth:`signup` and
+        :meth:`signin`), :meth:`authenticate`, :meth:`refresh`, and ``update()`` and ``upsert()`` (through
+        ``BaseSurrealModel._reject_signup_excluded()``, with or without ``tx``, before any signal) call it before any
+        request: whichever call loads the record — ``authenticate()``, a ``get()``, a signup by another client —,
+        ``update()`` and ``upsert()`` would drop the stored hash.
 
         Raises:
             TypeError: naming the model and those fields, in declaration order (``schema.signup_excluded_refused()``).
@@ -954,7 +957,9 @@ class AuthenticatedUserMixin:
             TypeError: the model has a field SIGNUP writes that ``Field(exclude=True)`` keeps
                 out of ``model_dump()`` (see :meth:`access_ddl`) — before any request, so an
                 access defined by hand cannot leave a record that ``update()`` or ``upsert()``
-                would strip of its password hash.
+                would strip of its password hash. :meth:`signin`, :meth:`authenticate`,
+                :meth:`refresh`, ``update()`` and ``upsert()`` refuse such a model the same way
+                (#310), whoever wrote the record.
             ValueError: for an unknown field or a missing required one — before any request.
             SurrealDbAuthenticationError: if the server refuses the signup, or returns no
                 record for the new session (the message says how to grant the permission).
@@ -1004,11 +1009,14 @@ class AuthenticatedUserMixin:
         on the embedded engine too.
 
         Raises:
+            TypeError: as in :meth:`signup` (#310) — before any request: the instance returned
+                would be one ``update()`` and ``upsert()`` strip of its password hash.
             SurrealDbAuthenticationError: if the token is malformed, expired or revoked. A
                 malformed one is rejected by the SDK's own schema check without ever reaching
                 the server, and is normalised here like any other auth failure.
             SurrealDbError: on the embedded engine without ``bind=True``.
         """
+        cls._refuse_signup_fields_excluded()
         # On a server, bind=True adopts the token on the shared connection once it resolved to an
         # instance; on the embedded engine the exchange runs on the shared session and adopts the
         # token itself — one SDK authenticate(), not a second one through the manager.
@@ -1031,6 +1039,9 @@ class AuthenticatedUserMixin:
             you.
 
         Raises:
+            TypeError: as in :meth:`signup` (#310) — before any request, so the refresh token is
+                not spent: the instance returned would be one ``update()`` and ``upsert()`` strip
+                of its password hash.
             ValueError: if no connection is configured, or the model is not declared with
                 ``with_refresh=True`` — both before any request.
             SurrealDbAuthenticationError: if the token is spent or expired, or the server does
@@ -1042,6 +1053,7 @@ class AuthenticatedUserMixin:
                 it (:meth:`SurrealDBConnectionManager.get_refresh_token`) and the shared session
                 is signed in as that record. The error says which.
         """
+        cls._refuse_signup_fields_excluded()
         manager: type[SurrealDBConnectionManager] = cls._connection_manager()  # type: ignore[attr-defined]
         manager.require_connection()
         if not cls._auth_setting("with_refresh", False):

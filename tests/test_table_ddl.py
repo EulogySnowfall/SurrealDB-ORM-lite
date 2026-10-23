@@ -6380,7 +6380,7 @@ def _sg1(name: str, fields: str, pronoun: str = "it") -> str:
         f"SCHEMAFULL table defined from the model has no column for {pronoun} either (SurrealDB 3.x refuses the signup, "
         f"2.x drops {pronoun}). Remove exclude=True and leave {pronoun} out where you serialise the model instead "
         f"(model_dump(exclude={{{fields}}})); until then table_ddl(), define_table(), access_ddl(), define_access(), "
-        f"signup() and signin() refuse {name}."
+        f"signup(), signin(), authenticate(), refresh(), update() and upsert() refuse {name}."
     )
 
 
