@@ -485,7 +485,7 @@ class AuthenticatedUserMixin:
         return statements
 
     @classmethod
-    @_cache.invalidates("cls")
+    @_cache.invalidates("cls", records=False)
     async def define_access(
         cls,
         *,

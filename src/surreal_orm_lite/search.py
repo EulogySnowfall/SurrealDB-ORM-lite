@@ -1063,6 +1063,16 @@ def transaction_analyzer_refused(model: str, name: str) -> str:
     )
 
 
+def transaction_write_refused(model: str, table: str) -> str:
+    """The refusal of ``define_indexes(tx=…)`` when the transaction has already written records to *table*, the
+    model's (issue #304): SurrealDB servers leave those records out of the index."""
+    return (
+        f"{model}.define_indexes(tx=…) cannot define an index on table {table!r} in a transaction that has already "
+        "written to that table: SurrealDB servers do not index the records a transaction wrote before the index was "
+        f"defined. Call {model}.define_indexes() without tx= first, then write in the transaction."
+    )
+
+
 def plan_indexes(
     indexes: Iterable[Index],
     table: str,
@@ -1139,6 +1149,9 @@ async def apply_rebuilds(client: Any, tx: Any, rebuilds: Sequence[IndexUse]) -> 
 def warn_redefined(redefine: Iterable[Analyzer], rebuilt: Sequence[IndexUse]) -> None:
     """Log one warning per analyzer of *redefine*, naming the indexes of *rebuilt* (``(table, index, analyzer)``) that
     use it, in order: ``Analyzer 'english' redefined; 2 index(es) rebuilt: page.page_title, post.post_title``.
+
+    *rebuilt* is every index the caller rebuilt, in the order applied: a ``REBUILD INDEX``, and an index it redefined
+    (``DEFINE INDEX OVERWRITE`` rebuilds it — issue #304).
 
     An analyzer belongs to the database: two models declaring two definitions of one name redefine it in turn, and
     rebuild every index using it each time — the warning makes that visible.

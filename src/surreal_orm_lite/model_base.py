@@ -79,6 +79,7 @@ from .search import (
     remove_index_statement,
     stored_indexes_using,
     transaction_analyzer_refused,
+    transaction_write_refused,
     warn_redefined,
 )
 from .signals import (
@@ -950,7 +951,7 @@ class BaseSurrealModel(BaseModel):
         return statements
 
     @classmethod
-    @_cache.invalidates("cls")
+    @_cache.invalidates("cls", records=False)
     async def define_computed_fields(
         cls,
         overwrite: bool = True,
@@ -1238,7 +1239,8 @@ class BaseSurrealModel(BaseModel):
         index of the database that uses it: ``INFO FOR TABLE`` of every other table (one request each, only then), and
         ``REBUILD INDEX`` for each of their indexes using it (sorted by table then index) before the index definitions,
         then for each unchanged index of this table using it after them (the declared ones in declaration order, then
-        the others). One warning per redefined analyzer names the indexes rebuilt (logger
+        the others). One warning per redefined analyzer names the indexes rebuilt, in the order applied — the indexes
+        this call defines with it included, which their ``DEFINE INDEX OVERWRITE`` rebuilds (logger
         ``surreal_orm_lite.search``). A rebuild re-reads the table — seconds per thousands of records on SurrealDB 2.x
         and the embedded engine.
 
@@ -1258,11 +1260,19 @@ class BaseSurrealModel(BaseModel):
         Before any DDL (nothing sent but the reads): an index that names by ``str`` an analyzer neither the database
         nor the model's ``Analyzer`` objects define is refused; with *tx*, an analyzer to define or redefine is refused
         — SurrealDB builds an index with the analyzers committed before the transaction began: define it first,
-        outside the block. With *tx* and the analyzers in place, the index statements join the transaction — applied at
-        once in an interactive one (WebSocket, SurrealDB 3.x), at the commit in a buffered one (HTTP, SurrealDB 2.x,
-        the embedded engine), where a refusal comes back as the transaction's own error; a block that raises applies
-        nothing. In a buffered transaction an index queued earlier in the block is not seen by the reads, and is
-        queued again (the same statement). Every cached read is dropped.
+        outside the block. With *tx*, an index to define or redefine is also refused when the transaction has already
+        written records to the model's table — an ORM write (``save()``, ``objects(tx=…).bulk_create()``, …) or one
+        noted on every table; a definition such as ``define_table(tx=…)`` does not count, nor does a raw ``tx.add()``,
+        which the ORM does not track: SurrealDB servers do not index the records a transaction wrote before the index
+        was defined, which stay out of it after the commit — a server defect (surrealdb/surrealdb#7618 on 3.x, the
+        same on 2.x; the embedded engine indexes them). The refusal does not fail the transaction; call
+        ``define_indexes()`` without *tx* first. With *tx* and the analyzers in place, the index statements join the
+        transaction — applied at once in an interactive one (WebSocket, SurrealDB 3.x),
+        at the commit in a buffered one (HTTP, SurrealDB 2.x, the embedded engine), where a refusal comes back as the
+        transaction's own error; a block that raises applies nothing. On SurrealDB 2.x, a write to a table that held
+        records, after its index in the same block, fails the commit with a retryable ``SurrealDbConflictError`` that a
+        retry meets again. In a buffered transaction an index queued earlier in the block is not seen by the reads, and
+        is queued again (the same statement). Every cached read is dropped.
 
         Names are written in backticks, filters re-rendered from a closed grammar, numbers from Python numbers,
         comments as string literals. A refusal names the analyzer or the index and its table, never the statement:
@@ -1279,9 +1289,10 @@ class BaseSurrealModel(BaseModel):
         Raises:
             TypeError: *overwrite* is not a ``bool`` — before any request.
             SurrealDbError: *tx* belongs to another connection — before any request; an analyzer named by ``str`` does
-                not exist, or *tx* is given and an analyzer must be defined or redefined — before any DDL; the server
-                refused a statement (``Can't apply analyzer definition: …``, ``Can't apply index definition: …``,
-                ``Can't apply index rebuild: …``).
+                not exist, or *tx* is given and an analyzer must be defined or redefined, or an index must be defined
+                or redefined after the transaction wrote records to the model's table (the message names the model and
+                the table) — before any DDL; the server refused a statement (``Can't apply analyzer definition: …``,
+                ``Can't apply index definition: …``, ``Can't apply index rebuild: …``).
             SurrealDbAuthenticationError: the session may not read the definitions or define the analyzers and
                 indexes.
 
@@ -1332,9 +1343,17 @@ class BaseSurrealModel(BaseModel):
             keyword=keyword,
             redefined=redefined,
         )
+        # Issue #304: SurrealDB servers do not index the records a transaction wrote before the index was defined.
+        # Under tx the analyzers are in place (refused above otherwise), so the definitions are all that would join it.
+        if tx is not None and definitions:
+            written = tx._records_written() if isinstance(tx, Transaction) else frozenset()
+            if written is None or table in written:
+                raise SurrealDbError(transaction_write_refused(cls.__name__, table))
         # A redefined analyzer leaves every index using it with its old tokens: the table's declared indexes (above),
         # its other indexes (another model's, or defined by hand), and every other table's — one INFO FOR TABLE each.
         analyzer_of = {index.name: index.analyzer_name or "" for index in indexes}
+        # Issue #304: an index this call redefines is rebuilt by its DEFINE INDEX OVERWRITE; the warning names it too.
+        redefined_indexes = [(table, name, analyzer_of[name]) for name, _ in definitions if analyzer_of[name] in redefined]
         own_rebuilds = [(table, name, analyzer_of[name]) for name, _ in rebuilds]
         own_rebuilds += stored_indexes_using(table, stored_indexes, redefined, skip=analyzer_of)
         other_rebuilds: list[tuple[str, str, str]] = []
@@ -1352,11 +1371,11 @@ class BaseSurrealModel(BaseModel):
             subjects=[index_subject(name, table) for name, _ in definitions],
         )
         applied += await apply_rebuilds(client, tx, own_rebuilds)
-        warn_redefined(redefine, [*other_rebuilds, *own_rebuilds])
+        warn_redefined(redefine, [*other_rebuilds, *redefined_indexes, *own_rebuilds])
         return applied
 
     @classmethod
-    @_cache.invalidates("cls")
+    @_cache.invalidates("cls", records=False)
     async def remove_index(cls, name: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
         """Remove the index named *name* from this model's table (v0.35.0) and return the statement applied.
 
@@ -1494,7 +1513,7 @@ class BaseSurrealModel(BaseModel):
         return view_statement(cls.get_table_name(), query, overwrite, clauses=cls._declared_table_clauses())
 
     @classmethod
-    @_cache.invalidates("cls")
+    @_cache.invalidates("cls", records=False)
     async def define_view(cls, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
         """Apply this materialized view to the database (v0.32.0) and return the statement applied.
 
@@ -1594,7 +1613,7 @@ class BaseSurrealModel(BaseModel):
         return statement
 
     @classmethod
-    @_cache.invalidates("cls")
+    @_cache.invalidates("cls", records=False)
     async def remove_view(cls, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
         """Remove this materialized view from the database (v0.32.0) and return the statement applied.
 
@@ -1923,7 +1942,7 @@ class BaseSurrealModel(BaseModel):
         return [table_statement, *field_statements]
 
     @classmethod
-    @_cache.invalidates("cls")
+    @_cache.invalidates("cls", records=False)
     async def define_table(cls, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
         """Apply this model's table and field definitions (v0.34.0; the full SurrealDB-ORM's method) and return the
         statements applied — or queued, with a buffered transaction — table first, joined with ``"\\n"`` (the full

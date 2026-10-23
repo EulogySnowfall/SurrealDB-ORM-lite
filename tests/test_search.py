@@ -61,12 +61,19 @@ before any request. Pinned: an analyzer and an index using it defined in one tra
 (README row "Full-text index"); the table ``DEFINE INDEX`` creates, which ``define_table(overwrite=False)`` keeps and
 ``define_table()`` replaces (README section 36, the order of ``define_table()`` and ``define_indexes()``); an index on a
 materialized view's table, which SurrealDB 3.x does not update with the records the view gains (README section 36, Not
-supported: surrealdb/surrealdb#7377).
+supported: surrealdb/surrealdb#7377). With a transaction that already wrote records to the model's table (an ORM write,
+or one noted on every table), an index to define is refused before any DDL (issue #304), on both strategies, without
+failing the transaction; a definition (``define_table()``, ``define_relation()``), a write to another table and a call
+with nothing to apply are accepted. Pinned below that refusal (README section 36, Transactions, and the v0.35.3 rows of
+both behaviour tables): an index defined after a write in the same transaction leaves that record out on SurrealDB
+servers (surrealdb/surrealdb#7618 on 3.x), a write after it fails a 2.x commit with a retryable conflict that a retry
+meets again, and the embedded engine indexes every record.
 
 A changed analyzer (``TestAnalyzerScan``, ``TestAnalyzerChangeE2E``, every engine): ``define_indexes()`` redefines it,
 then rebuilds every index of the database that uses it — the other tables' (one ``INFO FOR TABLE`` each, sorted by
-table then index), then the model's table's, declared or not — and logs one warning naming them; a search tokenised the
-new way then finds the records indexed before. Pinned (README section 36, Changing an analyzer): without the rebuild,
+table then index), then the model's table's, declared or not — and logs one warning naming them in the order applied,
+an index redefined in the same call included (issue #304); a search tokenised the new way then finds the records
+indexed before. Pinned (README section 36, Changing an analyzer): without the rebuild,
 SurrealDB leaves those records with their old tokens. The connection manager's ``define_analyzer()`` and
 ``remove_analyzer()`` (``TestAnalyzerManagerApi``, ``TestDefineAnalyzerE2E``, ``TestRemoveAnalyzerE2E``) run on the
 current connection: a new analyzer defined, an equal one left, a changed one redefined with its indexes rebuilt
@@ -173,6 +180,7 @@ from surreal_orm_lite import (
     Subquery,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
+    SurrealDbConflictError,
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealDbNotFoundError,
@@ -2726,6 +2734,20 @@ _DI2 = (
     "with the analyzers committed before the transaction began. Call SurrealDBConnectionManager.define_analyzer() "
     "without tx= first, then define_indexes(tx=…)."
 )
+#: Issue #304: the refusal of ``define_indexes(tx=…)`` after a write of records to the model's table in the block.
+_DI3 = (
+    "FtsArticle.define_indexes(tx=…) cannot define an index on table 'fts_article' in a transaction that has already "
+    "written to that table: SurrealDB servers do not index the records a transaction wrote before the index was "
+    "defined. Call FtsArticle.define_indexes() without tx= first, then write in the transaction."
+)
+
+#: The assertion message of the pin of an index defined after a write in the same transaction, on SurrealDB 3.x.
+_TX_WRITE_PIN_3X = (
+    "README section 36, Transactions, and the v0.35.3 row of the 2.x/3.x table (issue #304): SurrealDB 3.x leaves out "
+    "of an index the records the transaction wrote before defining it (surrealdb/surrealdb#7618). If this fails, the "
+    "fix reached this line: define_indexes(tx=…)'s refusal after a write to the table, the README sentence and the "
+    "row can be reconsidered."
+)
 
 #: The assertion message of the materialized-view pin on SurrealDB 3.x.
 _VIEW_PIN_3X = (
@@ -2814,7 +2836,8 @@ def _register_other(kind: str) -> None:
 class TestDefineIndexesE2E:
     """``define_indexes()`` on every engine (SurrealDB 3.x and 2.x over WebSocket and HTTP, and the embedded engine):
     it reads ``INFO FOR DB``, the line and ``INFO FOR TABLE``, then applies only what changed, with the line's keyword;
-    an analyzer an index names must exist, and a transaction defines no analyzer — both refused before any DDL."""
+    an analyzer an index names must exist, a transaction defines no analyzer, nor an index once it wrote records to the
+    model's table — each refused before any DDL."""
 
     @pytest.mark.parametrize("overwrite", [True, False])
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3039,6 +3062,124 @@ class TestDefineIndexesE2E:
             assert analyzers == {}
             assert indexes == {}
 
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [(["a7"], ["a8"]), ([], ["a8"]), (["a7"], [])],
+        ids=["write-index-write", "index-write", "write-index"],
+    )
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_defined_in_a_transaction_that_writes_to_its_table(
+        self, kind: str, before: list[str], after: list[str]
+    ) -> None:
+        """README section 36, Transactions (issue #304), driven below the ORM's refusal with the raw statement
+        (``tx.add()``): the analyzer committed first, the table holding ``a1``; in one block, save ``a7`` (or not),
+        define the title index, save ``a8`` (or not). A SurrealDB server commits and leaves ``a7`` out of the index —
+        on 2.x a write after the index fails the commit instead, with a retryable conflict that a retry meets again;
+        the embedded engine indexes every record."""
+        async with _fts_models(kind) as client:
+            await _apply_ddl(client, _A1)
+            await FtsArticle(id="a1", title="Physics a1", slug="a1").save()
+            index = FtsArticle.index_ddl(line=await _keyword_line(client))[1]
+            server = None if kind == "mem" else await _major(client)
+
+            async def block() -> SurrealDbError | None:
+                try:
+                    async with SurrealDBConnectionManager.transaction("fts") as tx:
+                        for key in before:
+                            await FtsArticle(id=key, title=f"Physics {key}", slug=key).save(tx=tx)
+                        await tx.add(index)
+                        for key in after:
+                            await FtsArticle(id=key, title=f"Physics {key}", slug=key).save(tx=tx)
+                except SurrealDbError as error:
+                    return error
+                return None
+
+            failed = await block()
+            retried = await block() if failed is not None else None
+            rows = _ids(await FtsArticle.objects().exec())
+            indexes = await _indexes(client)
+            found = _ids(await FtsArticle.objects().search(title="physics").exec()) if indexes else None
+        written = sorted(["a1", *before, *after])
+        if server == 2 and after:
+            assert type(failed) is SurrealDbConflictError, "README section 36, Transactions: 2.x fails the commit"
+            assert type(retried) is SurrealDbConflictError, "README section 36, Transactions: a retry meets it again"
+            assert rows == ["a1"]
+            assert indexes == {}
+            return
+        assert failed is None
+        assert rows == written
+        assert sorted(indexes) == ["fts_article_title"]
+        if kind == "mem":
+            assert found == written, "README section 36, Transactions: the embedded engine indexes every record"
+        else:
+            assert found == sorted(["a1", *after]), _TX_WRITE_PIN_3X if server == 3 else "README section 36: 2.x"
+
+    @pytest.mark.parametrize("write", ["save", "bulk_create", "every table"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_that_wrote_to_the_table_defines_no_index(
+        self, kind: str, write: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #304: after an ORM write of records to the model's table in the same transaction — or a write noted
+        on every table —, refused before any DDL (the reads alone sent, nothing joins the transaction), naming the model
+        and the table, on both strategies; the refusal does not fail the transaction, whose write is committed."""
+        async with _fts_models(kind) as client:
+            await _apply_ddl(client, _A1)
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                if write == "save":
+                    await FtsArticle(id="a7", title="Physics a7", slug="a7").save(tx=tx)
+                elif write == "bulk_create":
+                    await FtsArticle.objects(tx=tx).bulk_create([FtsArticle(id="a7", title="Physics a7", slug="a7")])
+                else:
+                    await FtsPlain(id="p1", title="Physics p1").save(tx=tx)
+                    tx._note_record_write(None)
+                queued = list(getattr(tx, "statements", []))
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as raised:
+                    await FtsArticle.define_indexes(tx=tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                still = list(getattr(tx, "statements", []))
+            indexes = await _indexes(client)
+            articles = _ids(await FtsArticle.objects().exec())
+            plain = _ids(await FtsPlain.objects().exec())
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _DI3
+        assert sent == _ARTICLE_READS
+        assert still == queued
+        assert indexes == {}
+        assert (articles, plain) == (([], ["p1"]) if write == "every table" else (["a7"], []))
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_what_a_transaction_may_still_define(self, kind: str) -> None:
+        """Issue #304, no false positive: ``define_table(tx=…)``, ``define_relation(tx=…)`` and ``remove_index(tx=…)``
+        define, they write no record; a write to another table does not count; a call with nothing to apply is never
+        refused, whatever the block wrote."""
+        async with _fts_models(kind) as client:
+            line = await _keyword_line(client)
+            await _apply_ddl(client, _A1)
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsPlain(id="p1", title="Physics p1").save(tx=tx)
+                await FtsArticle.define_table(tx=tx)
+                await FtsCites.define_relation(tx=tx)
+                removed = await FtsArticle.remove_index("fts_article_title", tx=tx)
+                article = await FtsArticle.define_indexes(tx=tx)
+                cites = await FtsCites.define_indexes(tx=tx)
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsArticle(id="a7", title="Physics a7", slug="a7").save(tx=tx)
+                again = await FtsArticle.define_indexes(tx=tx)
+            indexes = await _indexes(client)
+            cites_indexes = await _indexes(client, "fts_cites")
+            found = _ids(await FtsArticle.objects().search(title="physics").exec())
+            plain = _ids(await FtsPlain.objects().exec())
+        assert removed == "REMOVE INDEX IF EXISTS `fts_article_title` ON `fts_article`;"
+        assert article == FtsArticle.index_ddl(line=line)[1:]
+        assert cites == FtsCites.index_ddl(line=line)[1:]
+        assert again == []
+        assert sorted(indexes) == sorted(_ARTICLE_INDEXES)
+        assert sorted(cites_indexes) == ["fts_cites_note"]
+        assert found == ["a7"]
+        assert plain == ["p1"]
+
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_the_table_an_index_creates(self, kind: str) -> None:
         """README section 36, the sentence on calling ``define_table()`` before ``define_indexes()``: on a missing table
@@ -3233,6 +3374,53 @@ class FtsPostLower(FtsPost):
     )
 
 
+class FtsPostBoth(FtsPost):
+    """``FtsPost`` with a second full-text index, on ``body``, both holding ``FTS_PLAIN``."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_post",
+        indexes=[
+            Index("fts_post_title", "title", search_analyzer=FTS_PLAIN),
+            Index("fts_post_body", "body", search_analyzer=FTS_PLAIN),
+        ],
+    )
+
+
+class FtsPostBothLower(FtsPost):
+    """``FtsPostBoth`` with its analyzer redeclared lower-casing, and ``fts_post_title`` with ``HIGHLIGHTS``: the title
+    index is redefined, the body index unchanged."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_post",
+        indexes=[
+            Index("fts_post_title", "title", search_analyzer=FTS_PLAIN_LOWER, highlights=True),
+            Index("fts_post_body", "body", search_analyzer=FTS_PLAIN_LOWER),
+        ],
+    )
+
+
+#: Issue #304's analyzer, then the same name lower-casing.
+FTS_P = Analyzer("fts_p", ["blank"], ["ascii"])
+FTS_P_LOWER = Analyzer("fts_p", ["blank"], ["lowercase", "ascii"])
+
+
+class FtsMemo(BaseSurrealModel):
+    """Issue #304's model: one full-text index holding ``FTS_P``."""
+
+    model_config = SurrealConfigDict(table_name="fts_memo", indexes=[Index("fts_memo_text", "text", search_analyzer=FTS_P)])
+
+    id: str | None = None
+    text: str = ""
+
+
+class FtsMemoLower(FtsMemo):
+    """``FtsMemo`` with the same index, its analyzer redeclared lower-casing and ``HIGHLIGHTS`` added."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_memo", indexes=[Index("fts_memo_text", "text", search_analyzer=FTS_P_LOWER, highlights=True)]
+    )
+
+
 _INFO_POST = "INFO FOR TABLE `fts_post`;"
 _INFO_PAGE = "INFO FOR TABLE `fts_page`;"
 _REBUILD_POST = "REBUILD INDEX `fts_post_title` ON `fts_post`;"
@@ -3308,6 +3496,43 @@ class TestAnalyzerChangeE2E:
         assert again == []
         assert _redefinitions(caplog) == [
             "Analyzer 'fts_plain' redefined; 2 index(es) rebuilt: fts_page.fts_page_title, fts_post.fts_post_title"
+        ]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_redefined_with_its_analyzer_is_named_in_the_warning(
+        self, kind: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Issue #304: the analyzer and the index that uses it both change (filters, ``highlights=True`` added). The
+        ``DEFINE INDEX OVERWRITE`` rebuilds the index, so the warning names it — never an empty list after the
+        colon — and the search tokenised the new way finds the record indexed before."""
+        async with _fts_models(kind) as client:
+            line = await _keyword_line(client)
+            await FtsMemo.define_indexes()
+            await _apply_ddl(client, "CREATE fts_memo:m1 SET text = 'Physics Rocks';")
+            caplog.set_level(logging.WARNING, logger="surreal_orm_lite.search")
+            applied = await FtsMemoLower.define_indexes()
+            found = await _found(client, "fts_memo", "text")
+        assert applied == FtsMemoLower.index_ddl(line=line)
+        assert found == ["fts_memo:m1"]
+        assert _redefinitions(caplog) == ["Analyzer 'fts_p' redefined; 1 index(es) rebuilt: fts_memo.fts_memo_text"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_warning_names_the_indexes_in_the_order_applied(
+        self, kind: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The other tables' rebuilds, then the model's redefined indexes, then its unchanged ones rebuilt: the order
+        the statements are applied in, which the warning follows."""
+        async with _fts_models(kind) as client:
+            line = await _keyword_line(client)
+            await FtsPostBoth.define_indexes()
+            await FtsPage.define_indexes()
+            caplog.set_level(logging.WARNING, logger="surreal_orm_lite.search")
+            applied = await FtsPostBothLower.define_indexes()
+        title = FtsPostBothLower.index_ddl(line=line)[1]
+        assert applied == [FTS_PLAIN_LOWER.ddl(), _REBUILD_PAGE, title, "REBUILD INDEX `fts_post_body` ON `fts_post`;"]
+        assert _redefinitions(caplog) == [
+            "Analyzer 'fts_plain' redefined; 3 index(es) rebuilt: fts_page.fts_page_title, fts_post.fts_post_title, "
+            "fts_post.fts_post_body"
         ]
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -4640,6 +4865,13 @@ _PART_NEEDLES_36 = {
         "`define_analyzer(tx=…)`",
         "`remove_analyzer(tx=…)`",
         "sees the transaction's writes",
+        "do not index the records a transaction wrote before the index was defined",
+        "It is a server defect ([surrealdb/surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618) on 3.x, "
+        "the same on 2.x); only the embedded engine indexes them.",
+        "already written records to the model's table",
+        "The refusal does not fail the block.",
+        "a raw `tx.add()` is not tracked",
+        "a retryable `SurrealDbConflictError` that a retry meets again",
     ),
     "Live queries": (
         "`live()` and `watch()` refuse `search()`",
@@ -4721,6 +4953,28 @@ _EMBEDDED_SEARCH_ROW = [
     "defined in the transaction that defines its analyzer sees it, which `define_indexes(tx=…)` refuses all the same",
     "3.x writes `FULLTEXT ANALYZER`, scores such a term `0.0`, keeps BM25 statistics exact and refuses that removal",
     "v0.35.0",
+]
+#: Issue #304: the sentence v0.35.3 adds to the 2.x/3.x table's intro, its row there and its row in the embedded
+#: engine's table, cell by cell — what ``test_an_index_defined_in_a_transaction_that_writes_to_its_table`` and the
+#: refusal tests pin.
+_HEADER_SENTENCE_353 = (
+    "The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
+    "identical on 3.1.5."
+)
+_TX_WRITE_ROW = [
+    "`define_indexes(tx=)` in a block that writes to the model's table (an ORM write before the index, a write after it)",
+    "a write before it: refused (left out of the index); a write after it, to a table holding records, fails the commit "
+    "with a retryable `SurrealDbConflictError`, again on retry",
+    "a write before it: refused (left out of the index, "
+    "[surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618)); a write after it is committed and indexed",
+    "v0.35.3",
+]
+_EMBEDDED_TX_WRITE_ROW = [
+    "`define_indexes(tx=)` in a block that writes to the model's table",
+    "an ORM write before it: refused all the same, although this engine indexes its records; a write after it is "
+    "committed and indexed",
+    "refused (left out of the index); on 2.x a write after it, to a table holding records, fails the commit",
+    "v0.35.3",
 ]
 _FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
 _ROADMAP_ROWS_36 = [
@@ -4846,6 +5100,13 @@ class TestReadmeSection36:
     def test_embedded_table_row(self) -> None:
         """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
         assert_embedded_rows([_EMBEDDED_SEARCH_ROW])
+
+    def test_transaction_write_rows(self) -> None:
+        """Issue #304: v0.35.3's one row in each behaviour table, cell by cell and in version order (the 3.x cell
+        links surrealdb/surrealdb#7618), and its sentence in the 2.x/3.x table's intro; widths kept."""
+        assert_server_rows([_TX_WRITE_ROW])
+        assert_server_header_sentence(_HEADER_SENTENCE_353)
+        assert_embedded_rows([_EMBEDDED_TX_WRITE_ROW])
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]

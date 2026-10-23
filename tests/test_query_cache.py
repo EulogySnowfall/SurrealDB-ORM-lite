@@ -1365,6 +1365,17 @@ class _Tx:
         self.noted.append(tables)
 
 
+class _RecordTx(_Tx):
+    """A transaction that also notes the tables written with records (issue #304)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[frozenset[str] | None] = []
+
+    def _note_record_write(self, tables: frozenset[str] | None) -> None:
+        self.records.append(tables)
+
+
 class TestWriting:
     async def test_in_flight_inside_invalidated_after(self) -> None:
         QueryCache.set("k", 1, "t")
@@ -1495,6 +1506,12 @@ class _Writer:
     @classmethod
     @cache.invalidates("cls")
     async def signup(cls, data: Any) -> Any:
+        return _in_flight()
+
+    @classmethod
+    @cache.invalidates("cls", records=False)
+    async def define_ddl(cls, tx: Any = None) -> Any:
+        """Apply a definition: no record written."""
         return _in_flight()
 
 
@@ -1632,6 +1649,24 @@ class TestInvalidatesDecorator:
         assert _Writer.define.__doc__ == "Define the table."
         assert str(inspect.signature(_Writer.define)) == "(tx: Any = None) -> Any"
         assert isinstance(inspect.getattr_static(_Writer, "define"), classmethod)
+
+    async def test_records_are_noted_apart_from_definitions(self) -> None:
+        """Issue #304: a write of records notes its tables as records written too; a method marked ``records=False``
+        (a definition) notes them for the query cache only; a resolver that raises notes every table (``None``);
+        ``"table"`` runs outside the transaction and notes nothing. A transaction without ``_note_record_write`` is
+        left as it is (``_Tx``)."""
+        tx = _RecordTx()
+        await _Writer().save(tx=tx)
+        assert await _Writer.define_ddl(tx=tx) == ({}, 0)
+        await _Qs("q", tx).bulk_delete()
+        await _Qs("q", tx).delete_table()
+        await _Writer().relate("bad", None, tx)
+        assert tx.noted == [frozenset({"w"}), frozenset({"w"}), frozenset({"q", EDGES}), None]
+        assert tx.records == [frozenset({"w"}), frozenset({"q", EDGES}), None]
+        assert await _Writer.define_ddl() == ({"w": 1}, 0)
+        plain = _Tx()
+        await _Writer().save(tx=plain)
+        assert plain.noted == [frozenset({"w"})]
 
     def test_an_unknown_resolver_is_refused(self) -> None:
         with pytest.raises(ValueError, match="invalidates"):
@@ -1787,6 +1822,24 @@ class TestTransactionBookkeeping:
         assert _in_flight() == ({}, 0)
         assert QueryCache.stats()["entries"] == 0
         assert tx._cache_written() == frozenset()
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_record_writes_are_noted_apart(self, strategy: str) -> None:
+        """Issue #304: the tables written with records, which ``define_indexes(tx=…)`` reads, are noted apart from the
+        query cache's (``writing()`` notes the cache's only); ``None`` once a write noted every table."""
+        tx = await _transaction(strategy, _TxClient())
+        assert tx._records_written() == frozenset()
+        async with cache.writing({"t"}, tx=tx):
+            pass
+        assert tx._records_written() == frozenset()
+        tx._note_record_write({"u"})
+        tx._note_record_write(["v"])
+        assert tx._records_written() == frozenset({"u", "v"})
+        assert tx._cache_written() == frozenset({"t"})
+        tx._note_record_write(None)
+        assert tx._records_written() is None
+        tx._note_record_write({"w"})
+        assert tx._records_written() is None
 
     @pytest.mark.parametrize("strategy", _STRATEGIES)
     async def test_none_through_writing(self, strategy: str) -> None:
@@ -2325,6 +2378,17 @@ _CLASS_METHOD_WRITES = {
     (SurrealDBConnectionManager, "signup"),
 }
 
+#: The invalidating writes that apply definitions and write no record: ``invalidates(records=False)`` — issue #304, a
+#: transaction that ran them may still define an index (``define_indexes(tx=…)``).
+_DEFINITION_WRITES = {
+    (BaseSurrealModel, "define_computed_fields"),
+    (BaseSurrealModel, "define_view"),
+    (BaseSurrealModel, "remove_view"),
+    (BaseSurrealModel, "define_table"),
+    (BaseSurrealModel, "remove_index"),
+    (AuthenticatedUserMixin, "define_access"),
+}
+
 
 def _defined(cls: type, name: str) -> Any:
     """The function *cls* defines as *name*, class and static methods unwrapped."""
@@ -2359,6 +2423,15 @@ class TestExhaustiveness:
             for name in names:
                 wrapped = getattr(_defined(cls, name), "__surreal_cache_writes__", False) is True
                 assert wrapped is (group == "invalidating writes"), f"{cls.__name__}.{name}"
+
+    @pytest.mark.parametrize("cls", list(_INVALIDATING_WRITES), ids=_ids(_INVALIDATING_WRITES))
+    def test_only_the_definitions_write_no_record(self, cls: type) -> None:
+        """Issue #304: ``__surreal_record_writes__`` is ``False`` for exactly the writes that apply definitions, so a
+        ``remove_index(tx=…)`` or ``define_view(tx=…)`` does not make ``define_indexes(tx=…)`` refuse, and ``True`` for
+        every other invalidating write."""
+        for name in _INVALIDATING_WRITES[cls]:
+            records = getattr(_defined(cls, name), "__surreal_record_writes__", None)
+            assert records is ((cls, name) not in _DEFINITION_WRITES), f"{cls.__name__}.{name}"
 
     def test_save_naming_is_wrapped(self) -> None:
         """The create of ``get_or_create()``/``update_or_create()`` and of ``relate(EdgeModel, …)``."""
