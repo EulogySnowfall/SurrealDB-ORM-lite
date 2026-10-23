@@ -128,9 +128,21 @@ dimension refuses the vector before any request. ``TestTransactionsE2E``: in an 
 over WebSocket) the vector search sees the transaction's write, and a read refused for its dimension fails the commit,
 caused by the ORM's error; in a buffered one (HTTP, SurrealDB 2.x, the embedded engine) a read raises, as every read
 does there.
+
+The engines' own answers to KNN statements the ORM does not send, pinned with raw statements on six records
+(``TestLinePinsE2E``), each test naming the README row or sentence it backs, each line's answer asserted: ``<|K|>`` on
+an HNSW index (SurrealDB 3.x refuses it, 2.x and the embedded engine answer no record); an ``EF`` below ``K`` (2.x
+and the embedded engine return at most ``EF`` records, 3.x ``K`` in most index builds); two KNN operators; a field
+without a vector index (no record; 3.1 every record, with no distance); a function call, a condition on an indexed
+field, one through a record link and a full-text match next to the KNN (right on 3.x; too few records, none, or every
+matching one on 2.x and the embedded engine), each right when its records are selected first in a ``LET``; writes
+whose ``WHERE`` holds the KNN (2.x's exact scan writes every record; next to a range on an indexed field no record is
+written, on any engine); a search score in the ``LET`` form (``None`` below 3, an error on 3.x); a live query whose
+condition holds the KNN, which never notifies.
 """
 
 import ast
+import asyncio
 import contextlib
 import copy
 import math
@@ -159,6 +171,7 @@ from surreal_orm_lite import (
     GeoDistance,
     Index,
     IndexState,
+    LiveAction,
     PointField,
     Q,
     QueryCache,
@@ -4430,3 +4443,355 @@ class TestTransactionsE2E:
         )
         assert commit.value.__cause__ is read.value
         assert stored == ["d1", "d2", "d3", "d4", "d5", "d6"]
+
+
+# === Pinned line facts ==============================================================================================
+
+#: The README rows the line pins back (with ``_VECTOR_INDEX_ROW`` above).
+_ROW_EF = "README row '`similar_to()` with `ef` below `limit`'"
+_ROW_CONDITIONS = "README row '`similar_to()` with other conditions (`filter()`, `Q`, `nearby()`, `search()`)'"
+_ROW_SEARCH = "README row '`similar_to()` and `search()` in one queryset'"
+_ROW_WRITES = "README row '`bulk_update()`, `bulk_delete()`, `patch()` with `similar_to()`'"
+_ROW_LINKED = "README row '`similar_to(dist=…)` with a condition on a linked record's field'"
+_ROW_NO_INDEX = "README row '`similar_to()` on a field without a vector index'"
+
+#: The raw statements of the pins, each a literal string, every value bound (``$q`` the query vector).
+_PIN_K_ONLY = "SELECT VALUE id FROM vec_doc WHERE embedding <|2|> $q;"
+_PIN_EF_BELOW_K = "SELECT VALUE id FROM vec_doc WHERE embedding <|4,3|> $q;"
+_PIN_TWO_KNN = "SELECT VALUE id FROM vec_doc WHERE embedding <|2,100|> $q AND embedding <|2,100|> $p;"
+_PIN_NO_INDEX = "SELECT id, vector::distance::knn() AS d FROM vec_loose WHERE embedding <|2,100|> $q;"
+_PIN_FUNCTION = "SELECT VALUE id FROM vec_doc WHERE string::starts_with(title, $p) AND embedding <|2,100|> $q;"
+_PIN_LINKED = "SELECT VALUE id FROM vec_owned WHERE owner.team = $t AND embedding <|2,COSINE|> $q;"
+_PIN_RANGE = "SELECT VALUE id FROM vec_ranked WHERE n > $a AND embedding <|2,100|> $q;"
+_PIN_RANGE_COUNT = "SELECT count() FROM vec_ranked WHERE n > $a AND embedding <|2,100|> $q GROUP ALL;"
+_PIN_EQUAL_EXACT = "SELECT VALUE id FROM vec_ranked WHERE category = $c AND embedding <|2,COSINE|> $q;"
+_PIN_RANGE_LET = (
+    "{ LET $s = (SELECT VALUE id FROM vec_ranked WHERE n > $a); "
+    "(SELECT VALUE id FROM vec_ranked WHERE id IN $s AND embedding <|2,100|> $q) };"
+)
+_PIN_RANGE_COUNT_LET = (
+    "{ LET $s = (SELECT VALUE id FROM vec_ranked WHERE n > $a); "
+    "(SELECT count() FROM vec_ranked WHERE id IN $s AND embedding <|2,100|> $q GROUP ALL) };"
+)
+_PIN_EQUAL_EXACT_LET = (
+    "{ LET $s = (SELECT VALUE id FROM vec_ranked WHERE category = $c); "
+    "(SELECT VALUE id FROM vec_ranked WHERE id IN $s AND embedding <|2,COSINE|> $q) };"
+)
+_PIN_MATCH = "SELECT id, vector::distance::knn() AS d FROM vec_doc WHERE title @0@ $t AND embedding <|2,100|> $q;"
+_PIN_MATCH_EXACT = "SELECT VALUE id FROM vec_doc WHERE title @0@ $t AND embedding <|2,COSINE|> $q;"
+_PIN_MATCH_LET = (
+    "{ LET $s = (SELECT VALUE id FROM vec_doc WHERE title @0@ $t); "
+    "(SELECT VALUE id FROM vec_doc WHERE id IN $s AND embedding <|2,100|> $q) };"
+)
+_PIN_SCORE_LET = (
+    "{ LET $s = (SELECT VALUE id FROM vec_doc WHERE title @0@ $t); "
+    "(SELECT VALUE search::score(0) FROM vec_doc WHERE id IN $s AND embedding <|2,100|> $q) };"
+)
+
+#: The scratch tables of the write pins: ``vec_pin_w`` with its vector index only, ``vec_pin_r`` with an index on ``n``
+#: too; the writes in the ``UPDATE`` form only, and what they wrote.
+_PIN_WRITE_DDL = (
+    "DEFINE INDEX vec_pin_w_e ON vec_pin_w FIELDS embedding HNSW DIMENSION 3 DIST COSINE TYPE F32 EFC 150 M 12; "
+    "DEFINE INDEX vec_pin_r_e ON vec_pin_r FIELDS embedding HNSW DIMENSION 3 DIST COSINE TYPE F32 EFC 150 M 12; "
+    "DEFINE INDEX vec_pin_r_n ON vec_pin_r FIELDS n;"
+)
+_PIN_W_UPDATE = "UPDATE vec_pin_w SET hit = true WHERE embedding <|2,COSINE|> $q;"
+_PIN_W_HITS = "SELECT VALUE id FROM vec_pin_w WHERE hit = true;"
+_PIN_R_UPDATE = "UPDATE vec_pin_r SET hit = true WHERE n > $a AND embedding <|2,100|> $q;"
+_PIN_R_HITS = "SELECT VALUE id FROM vec_pin_r WHERE hit = true;"
+_PIN_R_SELECT = "SELECT VALUE id FROM vec_pin_r WHERE n > $a AND embedding <|2,100|> $q;"
+
+#: A live query whose condition holds the KNN (a literal vector: SurrealDB 2.x carries no bound value into a live
+#: query), and one on the whole table.
+_LIVE_KNN = "LIVE SELECT * FROM vec_doc WHERE embedding <|2,100|> [1.0, 0.0, 0.0];"
+_LIVE_ALL = "LIVE SELECT * FROM vec_doc;"
+
+#: The six records' keys.
+_SIX = ["d1", "d2", "d3", "d4", "d5", "d6"]
+
+
+async def _keys(client: Any, statement: str, **variables: Any) -> list[str]:
+    """The keys of the record ids *statement* (a ``SELECT VALUE id`` constant of these pins) answers, sorted."""
+    rows = await client.query(statement, variables)
+    return sorted(str(row.id) for row in rows)
+
+
+@pytest.fixture
+def _live_registry() -> Iterator[None]:
+    """The live module's per-loop registries emptied after the test, as ``tests/test_live_queryset.py`` does."""
+    from surreal_orm_lite import live
+
+    yield
+    live._SUBSCRIBERS.clear()
+    live._RECENTLY_KILLED.clear()
+
+
+async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
+    """The next *count* items of *stream*, failing after *timeout* seconds (``tests/test_live_queryset.py``)."""
+
+    async def _read() -> list[Any]:
+        seen: list[Any] = []
+        async for item in stream:
+            seen.append(item)
+            if len(seen) >= count:
+                break
+        return seen
+
+    return await asyncio.wait_for(_read(), timeout=timeout)
+
+
+async def _assert_silent(stream: Any, wait: float = 0.5) -> None:
+    """Nothing more arrives (``tests/test_live_queryset.py``)."""
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(stream.__anext__(), timeout=wait)
+
+
+class TestLinePinsE2E:
+    """What each engine answers to KNN statements the ORM never sends, pinned with raw statements on six records, on
+    every engine (the line under test over WebSocket and HTTP, and the embedded engine), each test naming the README
+    row or sentence it backs. They are why the ORM writes ``<|K,EF|>`` with ``EF`` raised to ``K`` and one KNN operator
+    per statement, keeps the other conditions next to the KNN on SurrealDB 3.x and selects their records first in a
+    ``LET`` below 3, makes its bulk writes by the ids of the nearest, and refuses search annotations next to
+    ``similar_to()`` below 3 and a live query holding the KNN. Each line's answer is asserted, 3.1's where it differs.
+    """
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_operator_without_ef(self, kind: str) -> None:
+        """README row "Vector index (``Index(hnsw=True)``, ``define_indexes()``)": ``<|K|>`` is the operator of the
+        ``MTREE`` index ``similar_to()`` does not use. On an HNSW index SurrealDB 3.x refuses it, naming ``<|k, EF|>``;
+        2.x and the embedded engine answer no record. The ORM writes ``<|K,EF|>`` on every line."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            refused: pytest.ExceptionInfo[ServerError] | None = None
+            answered: list[str] | None = None
+            if major >= 3:
+                with pytest.raises(ServerError) as refused:
+                    await client.query(_PIN_K_ONLY, {"q": _Q})
+            else:
+                answered = await _keys(client, _PIN_K_ONLY, q=_Q)
+        if major >= 3:
+            assert refused is not None
+            assert "Use `<|k, EF|>` against an HNSW index" in str(refused.value), (
+                f"{_VECTOR_INDEX_ROW}: SurrealDB 3.x refuses the MTREE operator"
+            )
+        else:
+            assert answered == [], f"{_VECTOR_INDEX_ROW}: 2.x and the embedded engine answer no record from HNSW"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_ef_below_k(self, kind: str) -> None:
+        """README row "``similar_to()`` with ``ef`` below ``limit``": with ``K`` 4 and ``EF`` 3, 2.x and the embedded
+        engine return at most ``EF`` records, the three nearest, in every index build; SurrealDB 3.x returns the four
+        nearest in most builds, and 3.3 the three nearest in a few (SurrealDB draws the HNSW levels at random, so the
+        answer depends on the build). The ORM writes ``ef`` raised to ``limit``: the four nearest on every line."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            raw = await _keys(client, _PIN_EF_BELOW_K, q=_Q)
+            docs = await VecDoc.objects().similar_to("embedding", _Q, 4, ef=3).exec()
+        if major >= 3:
+            assert raw in (["d1", "d2", "d4", "d6"], ["d1", "d2", "d6"]), (
+                f"{_ROW_EF}: SurrealDB 3.x returns K records, or at most EF in some index builds"
+            )
+        else:
+            assert raw == ["d1", "d2", "d6"], f"{_ROW_EF}: 2.x and the embedded engine return at most EF records"
+        assert _ids(docs) == ["d1", "d2", "d6", "d4"], f"{_ROW_EF}: the ORM writes ef raised to limit"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_two_knn_operators(self, kind: str) -> None:
+        """README row "``similar_to()`` with other conditions (``filter()``, ``Q``, ``nearby()``, ``search()``)": a
+        second KNN operator next to the first is no condition SurrealDB applies — 3.x returns the first operator's
+        neighbours, 2.x and the embedded engine no record. The ORM writes one KNN operator per statement: a second
+        ``similar_to()`` replaces the first."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            keys = await _keys(client, _PIN_TWO_KNN, q=_Q, p=_Q2)
+        if major >= 3:
+            assert keys == ["d1", "d2"], f"{_ROW_CONDITIONS}: SurrealDB 3.x returns the first operator's neighbours"
+        else:
+            assert keys == [], f"{_ROW_CONDITIONS}: 2.x and the embedded engine answer no record"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_field_without_a_vector_index(self, kind: str) -> None:
+        """README row "``similar_to()`` on a field without a vector index" and section 37's ``_S37_NO_INDEX``: no
+        record and no error on SurrealDB 3.3, 2.x and the embedded engine, through the ORM too; 3.1 answers every
+        record, with no distance. ``dist=`` is an exact scan that needs no index: the two nearest on every line."""
+        async with _vec_models(kind) as client:
+            await _apply_ddl(client, _seed_statements("vec_loose"))
+            line = await _line(client)
+            raw = await client.query(_PIN_NO_INDEX, {"q": _Q})
+            docs = await VecLoose.objects().similar_to("embedding", _Q, 2).exec()
+            exact = await VecLoose.objects().similar_to("embedding", _Q, 2, dist="cosine").exec()
+        if line == (3, 1):
+            assert {str(row["id"].id): row["d"] for row in raw} == dict.fromkeys(_SIX), (
+                f"{_ROW_NO_INDEX}: 3.1 answers every record, with no distance"
+            )
+            assert sorted(_ids(docs)) == _SIX, f"{_ROW_NO_INDEX}: 3.1 answers every record"
+            assert _distances(docs) == [None] * 6, f"{_ROW_NO_INDEX}: 3.1 answers no distance"
+        else:
+            assert raw == [], f"{_ROW_NO_INDEX}: no record, no error"
+            assert docs == [], f"{_ROW_NO_INDEX}: no record, no error"
+        assert _ids(exact) == ["d1", "d2"], "README section 37, _S37_NO_INDEX: dist= needs no index"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_function_call_next_to_the_knn(self, kind: str) -> None:
+        """README row "``similar_to()`` with other conditions (``filter()``, ``Q``, ``nearby()``, ``search()``)": next
+        to a condition holding a function call (``string::starts_with()``, what ``title__startswith`` writes), an HNSW
+        search answers the two nearest matching records on SurrealDB 3.x, too few or none on 2.x and the embedded
+        engine. The ORM, which selects those records first below 3, answers the two on every line."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            raw = await _keys(client, _PIN_FUNCTION, p="Cats", q=_Q)
+            docs = await VecDoc.objects().filter(title__startswith="Cats").similar_to("embedding", _Q, 2).exec()
+        if major >= 3:
+            assert raw == ["d1", "d2"], f"{_ROW_CONDITIONS}: SurrealDB 3.x applies the function during the index search"
+        else:
+            assert set(raw) < {"d1", "d2"}, f"{_ROW_CONDITIONS}: 2.x and the embedded engine answer too few records or none"
+        assert _ids(docs) == ["d1", "d2"], f"{_ROW_CONDITIONS}: the ORM's answer, the same on every line"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_condition_on_an_indexed_field(self, kind: str) -> None:
+        """README row "``similar_to()`` with other conditions (``filter()``, ``Q``, ``nearby()``, ``search()``)", "an
+        indexed field's included": next to a range on the indexed ``n``, an HNSW search answers the two nearest on
+        SurrealDB 3.x and no record on 2.x and the embedded engine, whose ``count()`` then ignores ``K`` (4); next to a
+        comparison on the indexed ``category``, the exact scan answers the two nearest on 3.x and no record on 2.x and
+        the embedded engine. The same records selected first in a ``LET`` are right on every engine."""
+        async with _vec_models(kind) as client:
+            await _seed_ranked(client)
+            major = await _major(client)
+            ranged = await _keys(client, _PIN_RANGE, a=2, q=_Q)
+            counted = await client.query(_PIN_RANGE_COUNT, {"a": 2, "q": _Q})
+            exact = await _keys(client, _PIN_EQUAL_EXACT, c="tech", q=_Q)
+            ranged_first = await _keys(client, _PIN_RANGE_LET, a=2, q=_Q)
+            counted_first = await client.query(_PIN_RANGE_COUNT_LET, {"a": 2, "q": _Q})
+            exact_first = await _keys(client, _PIN_EQUAL_EXACT_LET, c="tech", q=_Q)
+        if major >= 3:
+            assert (ranged, counted, exact) == (["d4", "d6"], [{"count": 2}], ["d3", "d4"]), (
+                f"{_ROW_CONDITIONS}: SurrealDB 3.x applies a condition on an indexed field during the search"
+            )
+        else:
+            assert ranged == [], f"{_ROW_CONDITIONS}: 2.x answers no record next to a range on an indexed field"
+            assert counted == [{"count": 4}], f"{_ROW_CONDITIONS}: 2.x counts more records than K there"
+            assert exact == [], f"{_ROW_CONDITIONS}: 2.x's exact scan answers no record next to an indexed field"
+        assert (ranged_first, counted_first, exact_first) == (["d4", "d6"], [{"count": 2}], ["d3", "d4"]), (
+            f"{_ROW_CONDITIONS}: the records selected first in a LET, right on every engine"
+        )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_condition_through_a_record_link(self, kind: str) -> None:
+        """README row "``similar_to(dist=…)`` with a condition on a linked record's field": next to ``owner.team``,
+        the exact scan answers the two nearest records of the team on SurrealDB 3.x, and every record of the team,
+        ``K`` ignored, on 2.x and the embedded engine."""
+        async with _vec_models(kind) as client:
+            await _seed_owned(client)
+            major = await _major(client)
+            keys = await _keys(client, _PIN_LINKED, t="x", q=_Q)
+        if major >= 3:
+            assert keys == ["d1", "d2"], f"{_ROW_LINKED}: SurrealDB 3.x keeps the condition next to the KNN operator"
+        else:
+            assert keys == ["d1", "d2", "d3", "d5"], f"{_ROW_LINKED}: 2.x's exact scan returns every matching record"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_writes_whose_where_holds_the_knn(self, kind: str) -> None:
+        """README row "``bulk_update()``, ``bulk_delete()``, ``patch()`` with ``similar_to()``": an ``UPDATE`` whose
+        ``WHERE`` holds the exact scan writes the two nearest on SurrealDB 3.x and every record on 2.x and the embedded
+        engine, while it returns two records everywhere; next to a range on the indexed ``n``, an ``UPDATE`` writes no
+        record on any engine, while on 3.x the same ``SELECT`` answers the two nearest. The 3.x half is strict: it
+        fails the day SurrealDB 3.x writes those records, when that row is to be rewritten."""
+        async with _vec(kind) as client:
+            await _apply_ddl(client, _PIN_WRITE_DDL)
+            await _apply_ddl(client, _seed_statements("vec_pin_w", numbered=True))
+            await _apply_ddl(client, _seed_statements("vec_pin_r", numbered=True))
+            major = await _major(client)
+            returned = await client.query(_PIN_W_UPDATE, {"q": _Q})
+            written = await _keys(client, _PIN_W_HITS)
+            ranged = await client.query(_PIN_R_UPDATE, {"a": 2, "q": _Q})
+            ranged_written = await _keys(client, _PIN_R_HITS)
+            selected = await _keys(client, _PIN_R_SELECT, a=2, q=_Q)
+        assert sorted(str(row["id"].id) for row in returned) == ["d1", "d2"], f"{_ROW_WRITES}: the K nearest returned"
+        if major >= 3:
+            assert written == ["d1", "d2"], f"{_ROW_WRITES}: SurrealDB 3.x writes the K nearest"
+            assert selected == ["d4", "d6"], f"{_ROW_WRITES}: SurrealDB 3.x selects the K nearest of the range"
+            assert (ranged, ranged_written) == ([], []), (
+                f"{_ROW_WRITES}: SurrealDB 3.x now writes the records a range on an indexed field selects next to the "
+                "KNN operator: rewrite that row's 3.x cell"
+            )
+        else:
+            assert written == _SIX, f"{_ROW_WRITES}: 2.x's exact scan in a write acts on every matching record"
+            assert (ranged, ranged_written, selected) == ([], [], []), f"{_ROW_WRITES}: 2.x writes no record there"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_full_text_match_next_to_the_knn(self, kind: str) -> None:
+        """README row "``similar_to()`` and ``search()`` in one queryset": next to ``title @0@ 'cats'``, the HNSW
+        search answers the two nearest matches on SurrealDB 3.3 — 3.1 every match, with no distance — and no record on
+        2.x and the embedded engine; the exact scan, the two nearest on 3.x and no record below 3. The matches
+        selected first in a ``LET`` are right on every engine."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            line = await _line(client)
+            indexed = await client.query(_PIN_MATCH, {"t": "cats", "q": _Q2})
+            exact = await _keys(client, _PIN_MATCH_EXACT, t="cats", q=_Q2)
+            matched_first = await _keys(client, _PIN_MATCH_LET, t="cats", q=_Q2)
+        found = {str(row["id"].id): row["d"] for row in indexed}
+        if line == (3, 1):
+            assert found == {"d1": None, "d2": None, "d6": None}, f"{_ROW_SEARCH}: 3.1 answers every match, no distance"
+        elif line[0] >= 3:
+            assert found == {key: pytest.approx(_cosine(key, _Q2), rel=1e-5) for key in ("d2", "d6")}, (
+                f"{_ROW_SEARCH}: SurrealDB 3.x keeps the match next to the KNN operator"
+            )
+        else:
+            assert found == {}, f"{_ROW_SEARCH}: 2.x and the embedded engine answer no record next to a full-text match"
+        if line[0] >= 3:
+            assert exact == ["d2", "d6"], f"{_ROW_SEARCH}: SurrealDB 3.x keeps the match next to the exact scan"
+        else:
+            assert exact == [], f"{_ROW_SEARCH}: 2.x and the embedded engine answer no record next to a full-text match"
+        assert matched_first == ["d2", "d6"], f"{_ROW_SEARCH}: the matches selected first in a LET, right everywhere"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_search_score_in_the_let_form(self, kind: str) -> None:
+        """README row "``similar_to()`` and ``search()`` in one queryset", "search annotations are refused": with the
+        matches of ``'programming'`` selected first in a ``LET``, the vector search holds no match to score — 2.x and
+        the embedded engine answer ``None`` for each of the two records, silently, and SurrealDB 3.x refuses the
+        statement ("no MATCHES clause found in WHERE condition"). Below 3 the ORM therefore refuses search annotations
+        next to ``similar_to()``."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            refused: pytest.ExceptionInfo[ServerError] | None = None
+            scores: list[Any] | None = None
+            if major >= 3:
+                with pytest.raises(ServerError) as refused:
+                    await client.query(_PIN_SCORE_LET, {"t": "programming", "q": _Q2})
+            else:
+                scores = await client.query(_PIN_SCORE_LET, {"t": "programming", "q": _Q2})
+        if major >= 3:
+            assert refused is not None
+            assert "no MATCHES clause found in WHERE condition" in str(refused.value), (
+                f"{_ROW_SEARCH}: SurrealDB 3.x refuses a search score with no match in the statement"
+            )
+        else:
+            assert scores == [None, None], f"{_ROW_SEARCH}: 2.x and the embedded engine score no record, silently"
+
+    @pytest.mark.usefixtures("_live_registry")
+    async def test_a_live_query_whose_condition_holds_the_knn(self) -> None:
+        """README section 37, *Not supported* (``live()`` and ``watch()`` with ``similar_to()``, the reason the ORM's
+        refusal gives): SurrealDB accepts a live query whose condition holds the KNN operator and never notifies it —
+        not even the create of a record nearest the query vector, which a live query on the whole table reports. Over
+        WebSocket, on every server line (the embedded engine has no live queries)."""
+        async with _vec_models("ws") as client:
+            await _seed(client)
+            nearest_id = await client.query(_LIVE_KNN, {})
+            every_id = await client.query(_LIVE_ALL, {})
+            try:
+                nearest = SurrealDBConnectionManager.subscribe_live(nearest_id)
+                every = SurrealDBConnectionManager.subscribe_live(every_id)
+                await VecDoc(id="d7", title="Cats and mice", category="pets", embedding=[1.0, 0.0, 0.0]).save()
+                [created] = await _take(every, 1)
+                await _assert_silent(nearest)
+            finally:
+                await SurrealDBConnectionManager.kill(nearest_id)
+                await SurrealDBConnectionManager.kill(every_id)
+        assert created["action"] == LiveAction.CREATE
+        assert created["result"]["title"] == "Cats and mice"
