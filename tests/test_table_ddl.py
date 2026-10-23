@@ -7538,8 +7538,8 @@ _PART_NEEDLES_35 = {
         "SurrealDB's [documentation of `FLEXIBLE`]"
         "(https://surrealdb.com/docs/reference/query-language/statements/define/field#flexible-data-types) says every "
         "object of a `SCHEMAFULL` table, an item of a list included, accepts only the keys defined for it unless its "
-        "field is `FLEXIBLE`: 3.x departs from it in a list whose items define a field, so a later 3.x may refuse such "
-        "a key there too: do not rely on it.",
+        "field is `FLEXIBLE`: 3.x departs from it in a list whose items define a field. This is fixed in SurrealDB 3.4 "
+        "(nightly at the time of writing), which refuses such a key there too: do not rely on it.",
         "`table_ddl()`, which needs no connection, writes the 3.x form",
         "the item definition `TYPE any` (`bag.*`) on every line",
         "refused on 3.x and dropped on 2.x and the embedded engine",
@@ -7686,8 +7686,8 @@ _TABLE_DDL_ROWS = [
         "A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records "
         "predating `SCHEMAFULL`)",
         "the field is dropped, silently; kept in the items of a list `define_table()` writes `FLEXIBLE` (a 2.x limitation)",
-        "the write is refused (`no such field exists`), except in the items of a list whose items define a field (every "
-        "list of sub-models `define_table()` writes), which keep it",
+        "refused (`no such field exists`); kept in the items of a list whose items define a field (every list of "
+        "sub-models), a gap fixed in SurrealDB 3.4 (nightly at the time of writing)",
         "v0.34.0",
     ],
 ]
