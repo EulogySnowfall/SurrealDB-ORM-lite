@@ -31,14 +31,19 @@ def _connect() -> None:
 
 
 async def _setup():
-    """Connect and clear the fixtures' tables; return the client.
+    """Connect, define and clear the fixtures' tables; return the client.
 
     Per-test connect/close (no fixture) — matches the rest of the suite and avoids the
     module-scoped-fixture-loop vs WS-singleton clash.
+
+    The tables are defined first: SurrealDB 3.x raises ``NotFoundError`` when a ``SELECT``
+    reads a table that does not exist, so a test whose only write is rolled back would fail
+    on a fresh server. ``IF NOT EXISTS`` leaves an existing definition untouched.
     """
     _connect()
     client = await SurrealDBConnectionManager.get_client()
     for table in TABLES:
+        await client.query(f"DEFINE TABLE IF NOT EXISTS {table};", {})
         with contextlib.suppress(Exception):
             await client.query(f"DELETE {table};", {})
     return client
