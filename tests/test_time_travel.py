@@ -36,6 +36,7 @@ from surreal_orm_lite import (
     AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
+    BufferedTransaction,
     Count,
     Duration,
     GeoDistance,
@@ -1639,6 +1640,110 @@ class TestSnapshotWritesE2E:
             assert calls == []
             assert writes == []
             assert [bought.quantity for bought in await SnapBought.objects().exec()] == [1]
+
+
+class SnapServerOwned(BaseSurrealModel):
+    """``Snap`` with a server-owned field: ``_save_naming()`` naming it takes its own branch, past ``save()``."""
+
+    model_config = SurrealConfigDict(table_name="Snap", server_fields=["g"])
+
+    id: str | None = None
+    n: int = 0
+    g: str = ""
+
+
+#: #315: the edge's own writes on a snapshot edge (*e*), as T9 names them; ``_save_naming()`` is named ``save()``.
+_SNAPSHOT_EDGE_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    ("save", "save()", lambda e, tx: e.save(tx=tx)),
+    ("update", "update()", lambda e, tx: e.update(tx=tx)),
+    ("merge", "merge()", lambda e, tx: e.merge(tx=tx, quantity=3)),
+    ("delete", "delete()", lambda e, tx: e.delete(tx=tx)),
+    ("_save_naming", "save()", lambda e, tx: e._save_naming(["quantity"], tx=tx)),
+]
+
+#: #315: :data:`_SNAPSHOT_WRITES` and ``_save_naming()``, which T9 names ``save()``.
+_SNAPSHOT_TX_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    *_SNAPSHOT_WRITES,
+    ("_save_naming", "save()", lambda s, tx: s._save_naming(["n"], tx=tx)),
+]
+
+
+@pytest.fixture
+def no_client(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every ``get_client()`` call from now on, each one failing the call: a refused write asks for no client."""
+    requests: list[str] = []
+
+    async def get_client(*args: Any, **kwargs: Any) -> Any:
+        requests.append("get_client")
+        raise AssertionError("get_client() was called")
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+    return requests
+
+
+def _assert_untouched(tx: BufferedTransaction) -> None:
+    """#315: no statement, no table written with records (``define_indexes(tx=…)``'s #304 check reads them) and no
+    table for the query cache to drop at the commit."""
+    assert (tx.statements, tx.variables) == ([], {})
+    assert tx._records_written() == frozenset()
+    assert tx._cache_written() == frozenset()
+
+
+class TestSnapshotWriteLeavesTheTransaction:
+    """#315: with a real transaction object, a snapshot's write is refused (T9) before the write's tables are noted on
+    the transaction, which is left as it was — for every instance write, an edge's own writes and ``_save_naming()``
+    (the create branch of ``get_or_create()``/``update_or_create()`` and of ``relate(EdgeModel, …)``), each named as the
+    public method."""
+
+    @pytest.mark.parametrize(("name", "method", "write"), _SNAPSHOT_TX_WRITES, ids=[row[0] for row in _SNAPSHOT_TX_WRITES])
+    async def test_every_write(
+        self, no_client: list[str], name: str, method: str, write: Callable[[Any, Any], Awaitable[Any]]
+    ) -> None:
+        snapshot = QuerySet._mark_snapshots(Snap(id="a", n=10), M2021)
+        tx = BufferedTransaction(client=None)
+        with _pre_signals(Snap) as fired, pytest.raises(SurrealDbError) as info:
+            await write(snapshot, tx)
+        assert str(info.value) == time_travel.snapshot_write_refused("Snap", method, M2021)
+        assert fired == []
+        assert no_client == []
+        _assert_untouched(tx)
+
+    @pytest.mark.parametrize(("name", "method", "write"), _SNAPSHOT_EDGE_WRITES, ids=[row[0] for row in _SNAPSHOT_EDGE_WRITES])
+    async def test_an_edge(
+        self, no_client: list[str], name: str, method: str, write: Callable[[Any, Any], Awaitable[Any]]
+    ) -> None:
+        edge = SnapBought(id="b1", in_=RecordID("SnapAuthor", "alice"), out=RecordID("SnapAuthor", "widget"))
+        snapshot = QuerySet._mark_snapshots(edge, MAX_MOMENT)
+        tx = BufferedTransaction(client=None)
+        with _pre_signals(SnapBought) as fired, pytest.raises(SurrealDbError) as info:
+            await write(snapshot, tx)
+        assert str(info.value) == time_travel.snapshot_write_refused("SnapBought", method, MAX_MOMENT)
+        assert fired == []
+        assert no_client == []
+        _assert_untouched(tx)
+
+    async def test_save_naming_a_server_field(self, no_client: list[str]) -> None:
+        """``_save_naming()`` writing a ``server_fields`` field never went through ``save()``: it refuses a snapshot as
+        ``save()`` does, with or without a transaction."""
+        snapshot = QuerySet._mark_snapshots(SnapServerOwned(id="a", n=10, g="x"), M2021)
+        tx = BufferedTransaction(client=None)
+        for given in (None, tx):
+            with pytest.raises(SurrealDbError) as info:
+                await snapshot._save_naming(["g"], tx=given)
+            assert str(info.value) == time_travel.snapshot_write_refused("SnapServerOwned", "save()", M2021)
+        assert no_client == []
+        _assert_untouched(tx)
+
+    async def test_the_transaction_still_takes_a_write(self, no_client: list[str]) -> None:
+        """The refusal does not spoil the transaction: the current record's write joins it and notes its table."""
+        snapshot = QuerySet._mark_snapshots(Snap(id="a", n=10), M2021)
+        tx = BufferedTransaction(client=None)
+        with pytest.raises(SurrealDbError):
+            await snapshot.update(tx=tx)
+        await Snap(id="a", n=11).update(tx=tx)
+        assert len(tx.statements) == 1
+        assert tx._records_written() == frozenset({"Snap"})
+        assert tx._cache_written() == frozenset({"Snap"})
 
 
 # --- fetch() under as_of(), dispatched by line (AC-10, D6) ---------------------------------------------

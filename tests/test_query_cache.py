@@ -1541,6 +1541,30 @@ class _Qs:
         return _in_flight()
 
 
+class _Guarded(_Writer):
+    """A model whose writes run their own refusals through ``invalidates(refuse=)`` (#315): *refusal* is the
+    ``TypeError`` they raise (``None``: none); *calls* records the refusals run and the bodies entered."""
+
+    def __init__(self, refusal: str | None = None, calls: list[str] | None = None) -> None:
+        self.refusal = refusal
+        self.calls = calls if calls is not None else []
+
+    def _refuse(self) -> None:
+        self.calls.append("refuse")
+        if self.refusal is not None:
+            raise TypeError(self.refusal)
+
+    @cache.invalidates("self", refuse=lambda writer: writer._refuse())
+    async def save(self, tx: Any = None) -> Any:
+        self.calls.append("body")
+        return _in_flight()
+
+    @cache.invalidates("edge", refuse=lambda writer: writer._refuse())
+    async def relate(self, edge: Any, to: Any = None, tx: Any = None) -> Any:
+        self.calls.append("body")
+        return _in_flight()
+
+
 class _Manager:
     @classmethod
     @cache.invalidates("all")
@@ -1667,6 +1691,59 @@ class TestInvalidatesDecorator:
         plain = _Tx()
         await _Writer().save(tx=plain)
         assert plain.noted == [frozenset({"w"})]
+
+    async def test_a_refusal_comes_before_any_note_or_flight(self) -> None:
+        """#315: ``refuse`` runs the method's own refusals, with its first argument, before the tables are noted on
+        the transaction (written with records, and for the query cache) or put in flight: a write it refuses leaves
+        the transaction and the cache as they were, with a transaction or without, and enters no body."""
+        QueryCache.set("k", 1, "w")
+        QueryCache.set("e", 2, "likes")
+        tx = _RecordTx()
+        guarded = _Guarded("refused")
+        for write in (
+            lambda: guarded.save(tx=tx),
+            lambda: guarded.save(),
+            lambda: guarded.relate("likes", None, tx),
+            lambda: guarded.relate("bad", None, tx),  # a resolver that raises would note every table
+            lambda: guarded.relate("likes"),
+        ):
+            with pytest.raises(TypeError, match="^refused$"):
+                await write()
+        assert (tx.noted, tx.records) == ([], [])
+        assert (QueryCache.get("k"), QueryCache.get("e")) == (1, 2)
+        assert _in_flight() == ({}, 0)
+        assert guarded.calls == ["refuse"] * 5
+
+    async def test_a_write_the_refusals_let_through(self) -> None:
+        tx = _RecordTx()
+        guarded = _Guarded()
+        assert await guarded.save(tx=tx) == ({}, 0)
+        assert await guarded.save() == ({"w": 1}, 0)
+        assert await guarded.relate("likes", None, tx) == ({}, 0)
+        assert guarded.calls == ["refuse", "body"] * 3
+        assert tx.noted == [frozenset({"w"}), frozenset({"likes"})]
+        assert tx.records == [frozenset({"w"}), frozenset({"likes"})]
+
+    async def test_the_refusals_come_after_the_connection_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#315: ``routing.check_transaction()`` (a transaction of another connection) first, then the method's own
+        refusals; without a transaction, the refusals alone."""
+        calls: list[str] = []
+
+        def check_transaction(model: type, tx: object, operation: str) -> None:
+            calls.append(f"check {operation}")
+
+        monkeypatch.setattr(cache._routing, "check_transaction", check_transaction)
+        guarded = _Guarded(calls=calls)
+        await guarded.save(tx=_Tx())
+        await guarded.save()
+        assert calls == ["check _Guarded.save()", "refuse", "body", "refuse", "body"]
+
+    async def test_a_bind_error_runs_no_refusal(self) -> None:
+        guarded = _Guarded("refused")
+        with pytest.raises(TypeError) as raised:
+            await guarded.save(1, 2, 3)
+        assert str(raised.value) != "refused"
+        assert guarded.calls == []
 
     def test_an_unknown_resolver_is_refused(self) -> None:
         with pytest.raises(ValueError, match="invalidates"):

@@ -27,7 +27,7 @@ from .connection_manager import SurrealDBConnectionManager
 from .define_parser import parse_define_table
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc
-from .model_base import BaseSurrealModel, _own_annotation_names
+from .model_base import BaseSurrealModel, _own_annotation_names, _write_refusals
 from .schema import (
     TableClauses,
     read_table_definitions,
@@ -454,7 +454,7 @@ class BaseSurrealEdge(BaseSurrealModel):
         """``in_``/``out``: SurrealDB ignores a change to an existing edge's endpoints."""
         return _ENDPOINT_FIELDS
 
-    @_cache.invalidates("self")
+    @_cache.invalidates("self", refuse=_write_refusals("save()"))
     async def save(
         self,
         tx: Transaction | None = None,
@@ -489,8 +489,9 @@ class BaseSurrealEdge(BaseSurrealModel):
                 buffered one the edge is written at commit and ``id`` stays ``None``.
 
         Raises:
-            SurrealDbError: ``server_values``/``extra_vars`` given (before any call), a duplicate
-                id, a refused or rejected write.
+            SurrealDbError: the edge was read with ``as_of()`` (a snapshot) — before its table is noted
+                on the transaction (#315); ``server_values``/``extra_vars`` given (before any call); a
+                duplicate id, a refused or rejected write.
             SurrealDbNotFoundError: an ``ENFORCED`` endpoint that does not exist.
             ValueError: an id that is a ``RecordID`` of another table, or a ``bool``.
         """

@@ -1291,6 +1291,13 @@ _VIEW_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
 
 _WRITE_IDS = [row[0] for row in _VIEW_WRITES]
 
+#: #315: the instance writes of :data:`_VIEW_WRITES` (the first 13 rows) and ``_save_naming()``, which W1 names
+#: ``save()``.
+_INSTANCE_TX_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    *_VIEW_WRITES[:13],
+    ("_save_naming", "save()", lambda s, tx: s._save_naming(["status"], tx=tx)),
+]
+
 
 class _UntouchableTx:
     """A transaction a refused write must never reach: any use of it fails the test."""
@@ -1379,6 +1386,43 @@ class TestWriteGuard:
         assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
         assert str(raised.value).startswith("Cannot modify materialized view 'order_stats'")
         assert fired == []
+        assert client_requests == []
+
+    @pytest.mark.parametrize(("name", "call", "write"), _INSTANCE_TX_WRITES, ids=[row[0] for row in _INSTANCE_TX_WRITES])
+    async def test_a_refused_instance_write_leaves_the_transaction_as_it_was(
+        self,
+        client_requests: list[str],
+        name: str,
+        call: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        """#315: with a real transaction, W1 refuses an instance write before the wrapper notes its table on the
+        transaction — no statement, no table written with records (which ``define_indexes(tx=…)`` reads, #304), no
+        table for the query cache at the commit —, naming the public method (``save()`` for ``_save_naming()``)."""
+        tx = BufferedTransaction(client=None)
+        with _pre_signals(OrderStats) as fired, pytest.raises(TypeError) as raised:
+            await write(_stats(), tx)
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
+        assert fired == []
+        assert client_requests == []
+        assert (tx.statements, tx.variables) == ([], {})
+        assert tx._records_written() == frozenset()
+        assert tx._cache_written() == frozenset()
+
+    async def test_save_naming_a_server_field_is_refused(self, client_requests: list[str]) -> None:
+        """#315: ``_save_naming()`` (the create branch of ``get_or_create()``/``update_or_create()`` and of
+        ``relate(EdgeModel, …)``) writing a ``server_fields`` field skips ``save()``: it refuses a view model as
+        ``save()`` does, with or without a transaction, which it leaves as it was."""
+
+        class ServerStats(OrderStats):
+            model_config = SurrealConfigDict(table_name="server_stats", server_fields=["revenue"])
+
+        for tx in (None, BufferedTransaction(client=None)):
+            with pytest.raises(TypeError) as raised:
+                await _stats(ServerStats, "server_stats")._save_naming(["revenue"], tx=tx)
+            assert str(raised.value) == _w1("server_stats", "ServerStats.save()")
+            if tx is not None:
+                assert (tx.statements, tx._records_written(), tx._cache_written()) == ([], frozenset(), frozenset())
         assert client_requests == []
 
     @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
