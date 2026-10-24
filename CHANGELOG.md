@@ -11,8 +11,8 @@ Hybrid search: a queryset fuses the records nearest to a query vector, as `simil
 them, and the best matches of a text, as `search()` ranks them, into one ranking by Reciprocal
 Rank Fusion, with the full SurrealDB-ORM's `hybrid_search()`. SurrealDB 3.x fuses the two lists
 with `search::rrf()`; SurrealDB 2.x and the embedded engine have no such function, so the ORM
-fuses them with the same formula: the same records, scores and order on every line. The third and
-last minor of Tier 3's search phase.
+fuses them with the same formula: the same two lists give the same records, scores and order on
+every line. The third and last minor of Tier 3's search phase.
 
 ### Added
 
@@ -29,7 +29,7 @@ last minor of Tier 3's search phase.
   `cache()`, `objects(tx=)` and named connections apply as for `exec()`; the full ORM ignores them.
 - README section 38, "Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)" (search, with the
   queryset, what SurrealDB decides, what is not supported, a note for users of the full
-  SurrealDB-ORM), three rows of the "ORM behaviour: SurrealDB 2.x vs 3.x" table and one of the
+  SurrealDB-ORM), four rows of the "ORM behaviour: SurrealDB 2.x vs 3.x" table and one of the
   embedded engine's, and the example notebook `examples/v0.37.0_hybrid_search.ipynb`.
 
   ```python
@@ -45,12 +45,18 @@ last minor of Tier 3's search phase.
 
 - **SurrealDB 3.x fuses with `search::rrf()`**, given both lists in one statement; **SurrealDB
   2.x and the embedded engine get the same fusion from the ORM**: the same records, scores and
-  order. The line is read from `client.version()`, as for `search()`'s index keyword. Other
-  conditions apply to both lists; on SurrealDB 2.x and the embedded engine the vector list selects
-  the records matching them first, as `similar_to()` does.
+  order for the same two lists. The line is read from `client.version()`, as for `search()`'s
+  index keyword. Other conditions apply to both lists; on SurrealDB 2.x and the embedded engine
+  the vector list selects the records matching them first, as `similar_to()` does.
 - **Equal fused scores come in a fixed order**: the vector list's first, then the full-text list's
   for the records it alone found, on every line (SurrealDB's `search::rrf()` alone returns them in
-  no fixed order), so a page never changes between two identical calls.
+  no fixed order), so the same two lists always give the same page. Each list is SurrealDB's own:
+  BM25 scores depend on the line (a term found in more than half the documents scores `0.0` on 3.x
+  and below zero on 2.x and the embedded engine), and on SurrealDB 2.x and the embedded engine an
+  exact scan (`dist=`) picks among records at an equal distance at the `vector_limit`-th place in
+  no fixed order, as `similar_to()`'s does since v0.36.0: the vector list, and a page of the fused
+  records, can then change between two identical calls. The HNSW index, and SurrealDB 3.x's exact
+  scan, return the same list on every call.
 - **Checked before any request**: both fields, the vector, `vector_limit` and `text_limit` (1 to
   10 000), `rrf_k` (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.
 - **Refused before any request**: `order_by()`, `annotate()`, `values()`, `search()` and

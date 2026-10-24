@@ -45,6 +45,10 @@ What each line answers to ``search::rrf()`` (``TestHybridLinePinsE2E``), pinned 
 engines: SurrealDB 3.x has the function, 2.x and the embedded engine refuse it; its score is the sum of 1/(k + rank)
 over the lists, bit for bit, the records, scores and order the ORM's fusion gives the same lists.
 
+Records at an equal distance at the ``vector_limit``-th place (``TestExactScanTiesE2E``), on the same engines: the
+HNSW index, and SurrealDB 3.x's exact scan, give identical calls one answer; SurrealDB 2.x's and the embedded engine's
+exact scan (``dist=``, in ``hybrid_search()`` as in ``similar_to()``) picks among the tied records in no fixed order.
+
 The documentation (``TestReadmeSection38``, ``TestRoadmap37``), with no server: README section 38 — its place, its
 examples run as written on the embedded engine, each printed line equal to its comment, its texts word for word —, the
 bullets of sections 36 and 37 that point to it, the rows v0.37.0 adds to the features, roadmap, comparison and both
@@ -2946,6 +2950,91 @@ class TestHybridLinePinsE2E:
             assert _NO_RRF in str(refused.value), f"{_ROW_FUSION}: SurrealDB 2.x has no search::rrf()"
 
 
+# === E2E: an exact scan with records at an equal distance at the last place, on each line ===========================
+
+#: The README row the tie pins back.
+_ROW_TIES = (
+    "README row 'An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at "
+    "the last place'"
+)
+
+#: The records ``d2`` to ``d8``: one and the same embedding, at one cosine distance (0.4) from ``_TIE_VECTOR``.
+_TIED = [f"d{number}" for number in range(2, 9)]
+
+#: The tie corpus, in ``hy_doc``: ``d1`` alone nearest to ``_TIE_VECTOR`` and the only title holding "news", then the
+#: seven tied records, so the three nearest are ``d1`` and two of the seven.
+_TIE_CORPUS = "CREATE hy_doc:d1 SET title = 'news one', category = 'tie', n = 1, embedding = [1.0, 0.0, 0.0]; " + " ".join(
+    f"CREATE hy_doc:{key} SET title = 'other', category = 'tie', n = {number}, embedding = [0.6, 0.8, 0.0];"
+    for number, key in enumerate(_TIED, start=2)
+)
+
+_TIE_VECTOR = [1.0, 0.0, 0.0]
+
+#: Identical calls of each search. SurrealDB 2.x's and the embedded engine's exact scan picks two of the seven tied
+#: records in no fixed order — measured on 60 calls: 20 of the 21 pairs, none above one call in eight —, so twelve
+#: calls giving a single answer would happen far less than once in 10^9 runs.
+_TIE_CALLS = 12
+
+
+async def _tie_answers(dist: str | None) -> tuple[list[tuple[str, ...]], list[frozenset[str]]]:
+    """``_TIE_CALLS`` identical calls of ``hybrid_search()`` (three nearest, the one match of "news") and of
+    ``similar_to()`` (three nearest), with *dist* (an exact scan) or the HNSW index: each fused answer's ids in order,
+    after checking that the two tied records it holds come at one distance; each ``similar_to()`` answer's ids."""
+    fused: list[tuple[str, ...]] = []
+    nearest: list[frozenset[str]] = []
+    for _ in range(_TIE_CALLS):
+        rows = await HyDoc.objects().hybrid_search(
+            vector_field="embedding",
+            vector=_TIE_VECTOR,
+            vector_limit=3,
+            text_field="title",
+            text_query="news",
+            text_limit=1,
+            dist=dist,
+        )
+        assert len(rows) == 3 and rows[1]["_knn_distance"] == rows[2]["_knn_distance"], rows
+        fused.append(tuple(row["id"].id for row in rows))
+        records = await HyDoc.objects().similar_to("embedding", _TIE_VECTOR, 3, dist=dist).exec()
+        nearest.append(frozenset(str(record.id) for record in records))
+    return fused, nearest
+
+
+class TestExactScanTiesE2E:
+    """Records at an equal distance at the ``vector_limit``-th place, pinned on every engine (the line under test over
+    WebSocket and HTTP, and the embedded engine), the test naming the README row it backs: every answer holds the
+    nearest record and two of the tied ones, the fused records in the ORM's order (distance, then id); the HNSW index
+    gives one answer to identical calls on every line, and so does SurrealDB 3.x's exact scan, while SurrealDB 2.x's
+    and the embedded engine's pick among the tied records in no fixed order. The keys of ``similar_to()``'s answers
+    are compared as sets: it orders by distance only."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_exact_scan_picks_among_ties_in_no_fixed_order_below_3(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            major = await _major(client)
+            await HyDoc.define_table()
+            await HyDoc.define_indexes()
+            await _apply_ddl(client, _TIE_CORPUS)
+            exact_fused, exact_nearest = await _tie_answers("cosine")
+            index_fused, index_nearest = await _tie_answers(None)
+        for answer in exact_fused + index_fused:
+            assert answer[0] == "d1" and set(answer[1:]) <= set(_TIED) and list(answer[1:]) == sorted(answer[1:]), (
+                f"{_ROW_TIES}: the nearest record, then two tied ones by id: {answer}"
+            )
+        for keys in exact_nearest + index_nearest:
+            assert len(keys) == 3 and "d1" in keys and keys - {"d1"} <= set(_TIED), f"{_ROW_TIES}: {sorted(keys)}"
+        assert len(set(index_fused)) == 1 and len(set(index_nearest)) == 1, (
+            f"{_ROW_TIES}: the HNSW index returns the same records on every call"
+        )
+        if major >= 3:
+            assert len(set(exact_fused)) == 1 and len(set(exact_nearest)) == 1, (
+                f"{_ROW_TIES}: SurrealDB 3.x's exact scan returns the same records on every call"
+            )
+        else:
+            assert len(set(exact_fused)) > 1 and len(set(exact_nearest)) > 1, (
+                f"{_ROW_TIES}: below 3 the exact scan picks among the tied records in no fixed order"
+            )
+
+
 # === README: section 38, the behaviour tables, the features, roadmap and comparison rows; docs/ROADMAP.md ===========
 
 _SECTION_36 = "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
@@ -2966,9 +3055,9 @@ _INTRO_38 = (
     "`search()` ranks them by BM25 score "
     "([section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)), are fused into one ranking "
     "by Reciprocal Rank Fusion. SurrealDB 3.x fuses the two lists with its `search::rrf()`; SurrealDB 2.x and the "
-    "embedded engine have no such function, so the ORM fuses them with the same formula: the same records, scores and "
-    "order on every line. Each record comes back as a dict, as in the full ORM. The examples assume a configured "
-    "connection: they run as written, in order, on the embedded engine (`mem://`)."
+    "embedded engine have no such function, so the ORM fuses them with the same formula: the same two lists give the "
+    "same records, scores and order on every line. Each record comes back as a dict, as in the full ORM. The examples "
+    "assume a configured connection: they run as written, in order, on the embedded engine (`mem://`)."
 )
 #: The four ``python`` blocks of section 38, in order, word for word: one opens each part but "Coming from".
 _BLOCK_SEARCH_38 = """from surreal_orm_lite import Analyzer, BaseSurrealModel, Index, SurrealConfigDict, SurrealDbError, VectorField
@@ -3087,7 +3176,15 @@ _PROSE_38 = {"Search": _S38_RANKS, "With the queryset": _S38_QUERYSET}
 _BULLETS_38 = {
     "What SurrealDB decides": [
         "Each list is SurrealDB's own: the vector list as `similar_to()` finds it — HNSW is approximate (section 37) — "
-        "and the full-text list as `search()` ranks it, with section 36's BM25 scores.",
+        "and the full-text list as `search()` ranks it, with section 36's BM25 scores. Those depend on the line: a term "
+        "found in more than half the documents scores `0.0` on SurrealDB 3.x and below zero on 2.x and the embedded "
+        "engine ([2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x)), so the full-text list, and the fused ranking with "
+        "it, can differ between lines.",
+        "**An exact scan (`dist=`) on SurrealDB 2.x and the embedded engine** picks among records at an equal distance "
+        "at the `vector_limit`-th place in no fixed order, as `similar_to()`'s does: the vector list, and the fused "
+        "records with it, can change between two identical calls, and a page read with `offset()` and `limit()` can "
+        "then skip or repeat a record. The HNSW index (no `dist=`), and SurrealDB 3.x's exact scan, return the same "
+        "list on every call.",
         "Each search needs its index. Without a full-text index on `text_field`, SurrealDB 3.3, 2.x and the embedded "
         "engine refuse the search, and `hybrid_search()` raises `SurrealDbError` naming the field, as above; SurrealDB "
         "3.1 and 3.2 match nothing, so the vector list alone is fused.",
@@ -3119,8 +3216,9 @@ _BULLETS_38 = {
         "**SurrealDB's `search::rrf()` fuses the lists on 3.x**, given both lists in one statement, and the ORM fuses "
         "them on 2.x and the embedded engine; the full ORM calls `search::rrf()` with arguments SurrealDB 3.3 refuses, "
         "and runs on 3.x only.",
-        "**Equal fused scores have a fixed order** (the vector list's first), so a page never changes between two "
-        "identical calls.",
+        "**Equal fused scores have a fixed order** (the vector list's first), so the same two lists always give the "
+        "same page; on SurrealDB 2.x and the embedded engine, an exact scan (`dist=`) can change the vector list itself "
+        "between two identical calls, as above.",
         "**Checked before any request**: both fields, the vector, `vector_limit` and `text_limit` (1 to 10 000), "
         "`rrf_k` (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.",
         "**Reciprocal Rank Fusion only**: `search::linear()` (weights and score normalisation) is not offered yet.",
@@ -3140,12 +3238,13 @@ _HEADER_SENTENCE_37 = (
     "Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where "
     "they differ from 3.3.4."
 )
-#: Exactly the three rows v0.37.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
+#: Exactly the four rows v0.37.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths: the last
+#: documents ``similar_to(dist=…)`` too, whose behaviour is older (v0.36.0).
 _HYBRID_ROWS = [
     [
         "`hybrid_search()`: the fusion",
         "the ORM fuses the two lists with `search::rrf()`'s formula, which SurrealDB 2.x does not have: the same records, "
-        "scores and order",
+        "scores and order for the same two lists",
         "SurrealDB's `search::rrf()` fuses them; the ORM orders equal scores, which SurrealDB returns in no fixed order",
         "v0.37.0",
     ],
@@ -3163,13 +3262,21 @@ _HYBRID_ROWS = [
         "match no record for the text",
         "v0.37.0",
     ],
+    [
+        "An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at the last place",
+        "the scan picks among them in no fixed order: the records, and a page of them, can change between two identical "
+        "calls; the HNSW index (no `dist=`) returns the same ones",
+        "the same records on every call, as with the HNSW index",
+        "pre-existing (documented in v0.37.0)",
+    ],
 ]
 #: The row v0.37.0 adds to the embedded engine's table, cell by cell.
 _EMBEDDED_HYBRID_ROW = [
     "Hybrid search (v0.37.0)",
     "as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, "
-    "and the vector list selects the other conditions first (a `LET`)",
-    "3.x fuses them with `search::rrf()`, each list applying the conditions: the same records, scores and order",
+    "and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) picks among records at "
+    "an equal distance at the `vector_limit`-th place in no fixed order, as `similar_to(dist=…)` does",
+    "3.x fuses with `search::rrf()`, each list applying the conditions; its exact scan returns the same list",
     "v0.37.0",
 ]
 _FEATURES_ROW_38 = ["Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)", "✅"]
@@ -3290,18 +3397,21 @@ class TestReadmeSection38:
 
     @pytest.mark.parametrize("heading", list(_BULLETS_38))
     def test_the_bullets_word_for_word(self, heading: str) -> None:
-        """ "What SurrealDB decides" (three bullets), "Not supported" (three) and "Coming from the full
+        """ "What SurrealDB decides" (four bullets), "Not supported" (three) and "Coming from the full
         SurrealDB-ORM" (seven): each bullet exactly, in order, and nothing else but the part's block."""
         part = _part_38(heading)
         bullets = _BULLETS_38[heading]
-        assert len(bullets) == {"What SurrealDB decides": 3, "Not supported": 3}.get(heading, 7)
+        assert len(bullets) == {"What SurrealDB decides": 4, "Not supported": 3}.get(heading, 7)
         assert _readme_bullets(part) == [f"- {bullet}" for bullet in bullets]
         assert _prose(part) == _normalised(" ".join([f"#### {heading}", *(f"- {bullet}" for bullet in bullets)]))
 
     def test_the_pins_name_section_38(self) -> None:
-        """The README row and sentence the line pins of this module name are the first row and the "Search" prose."""
+        """The README rows and sentence the line pins of this module name are the first and last rows and the "Search"
+        prose."""
         row = _ROW_FUSION.removeprefix("README row '").removesuffix("'")
         assert row == _HYBRID_ROWS[0][0], row
+        ties = _ROW_TIES.removeprefix("README row '").removesuffix("'")
+        assert ties == _HYBRID_ROWS[-1][0], ties
         quoted = _S38_FORMULA.split(", '", 1)[1].removesuffix("'")
         assert _S38_RANKS.startswith(quoted), quoted
 
@@ -3333,15 +3443,19 @@ class TestReadmeSection38:
         assert re.findall(r"(?<![(\w])#\d+", section) == []
 
     def test_links_resolve(self) -> None:
-        """Every in-page link of section 38 names a heading: sections 37 and 36."""
+        """Every in-page link of section 38 names a heading: sections 37 and 36, then the 2.x/3.x table."""
         anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
         links = re.findall(r"\]\(#([^)]+)\)", _section_38())
-        assert links == [_anchor(_SECTION_37.lstrip("# ")), _anchor(_SECTION_36.lstrip("# "))], links
+        assert links == [
+            _anchor(_SECTION_37.lstrip("# ")),
+            _anchor(_SECTION_36.lstrip("# ")),
+            _anchor("ORM behaviour: SurrealDB 2.x vs 3.x"),
+        ], links
         assert [link for link in links if link not in anchors] == []
 
     def test_server_behaviour_rows(self) -> None:
-        """Exactly three rows, Since v0.37.0, together and in version order before the table's last row; the table
-        keeps its widths."""
+        """Exactly four rows, Since v0.37.0 (the last pre-existing, documented in v0.37.0), together and in version
+        order before the table's last row; the table keeps its widths."""
         assert_server_rows(_HYBRID_ROWS)
 
     def test_server_behaviour_header_sentence(self) -> None:

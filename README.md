@@ -6470,8 +6470,8 @@ records nearest to a query vector, as `similar_to()` finds them
 ranks them by BM25 score ([section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)), are
 fused into one ranking by Reciprocal Rank Fusion. SurrealDB 3.x fuses the two lists with its `search::rrf()`;
 SurrealDB 2.x and the embedded engine have no such function, so the ORM fuses them with the same formula: the same
-records, scores and order on every line. Each record comes back as a dict, as in the full ORM. The examples assume a
-configured connection: they run as written, in order, on the embedded engine (`mem://`).
+two lists give the same records, scores and order on every line. Each record comes back as a dict, as in the full
+ORM. The examples assume a configured connection: they run as written, in order, on the embedded engine (`mem://`).
 
 #### Search
 
@@ -6566,7 +6566,14 @@ except SurrealDbError as error:
 ```
 
 - Each list is SurrealDB's own: the vector list as `similar_to()` finds it — HNSW is approximate (section 37) — and
-  the full-text list as `search()` ranks it, with section 36's BM25 scores.
+  the full-text list as `search()` ranks it, with section 36's BM25 scores. Those depend on the line: a term found in
+  more than half the documents scores `0.0` on SurrealDB 3.x and below zero on 2.x and the embedded engine
+  ([2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x)), so the full-text list, and the fused ranking with it, can
+  differ between lines.
+- **An exact scan (`dist=`) on SurrealDB 2.x and the embedded engine** picks among records at an equal distance at the
+  `vector_limit`-th place in no fixed order, as `similar_to()`'s does: the vector list, and the fused records with it,
+  can change between two identical calls, and a page read with `offset()` and `limit()` can then skip or repeat a
+  record. The HNSW index (no `dist=`), and SurrealDB 3.x's exact scan, return the same list on every call.
 - Each search needs its index. Without a full-text index on `text_field`, SurrealDB 3.3, 2.x and the embedded engine
   refuse the search, and `hybrid_search()` raises `SurrealDbError` naming the field, as above; SurrealDB 3.1 and 3.2
   match nothing, so the vector list alone is fused.
@@ -6608,8 +6615,9 @@ except ValueError as error:
 - **SurrealDB's `search::rrf()` fuses the lists on 3.x**, given both lists in one statement, and the ORM fuses them on
   2.x and the embedded engine; the full ORM calls `search::rrf()` with arguments SurrealDB 3.3 refuses, and runs on
   3.x only.
-- **Equal fused scores have a fixed order** (the vector list's first), so a page never changes between two identical
-  calls.
+- **Equal fused scores have a fixed order** (the vector list's first), so the same two lists always give the same
+  page; on SurrealDB 2.x and the embedded engine, an exact scan (`dist=`) can change the vector list itself between
+  two identical calls, as above.
 - **Checked before any request**: both fields, the vector, `vector_limit` and `text_limit` (1 to 10 000), `rrf_k`
   (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.
 - **Reciprocal Rank Fusion only**: `search::linear()` (weights and score normalisation) is not offered yet.
@@ -6897,9 +6905,10 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `similar_to(dist=…)` with a condition on a linked record's field                                                                       | the ORM selects the matching records first (a `LET`): 2.x's exact scan would return every matching record, ignoring `limit`                                                   | the condition stays next to the KNN operator                                                                                                                                        | v0.36.0                              |
 | `similar_to()` on a field without a vector index                                                                                       | no record                                                                                                                                                                     | no record; 3.1 answers every record, with no distance                                                                                                                               | v0.36.0                              |
 | `remove_index(tx=)` then `define_indexes(tx=)` in one block, the index stored before the block                                         | on a table holding records, the commit fails with a retryable `SurrealDbConflictError`, again on retry: nothing committed, the index kept; on an empty table, defined again   | the index is defined again after its removal and committed, serving the records committed before the block                                                                          | v0.36.2                              |
-| `hybrid_search()`: the fusion                                                                                                          | the ORM fuses the two lists with `search::rrf()`'s formula, which SurrealDB 2.x does not have: the same records, scores and order                                             | SurrealDB's `search::rrf()` fuses them; the ORM orders equal scores, which SurrealDB returns in no fixed order                                                                      | v0.37.0                              |
+| `hybrid_search()`: the fusion                                                                                                          | the ORM fuses the two lists with `search::rrf()`'s formula, which SurrealDB 2.x does not have: the same records, scores and order for the same two lists                      | SurrealDB's `search::rrf()` fuses them; the ORM orders equal scores, which SurrealDB returns in no fixed order                                                                      | v0.37.0                              |
 | `hybrid_search()` with other conditions                                                                                                | applied to both lists; the vector list selects the records first (a `LET`), as `similar_to()` does                                                                            | applied to both lists, during each search                                                                                                                                           | v0.37.0                              |
 | `hybrid_search()` on a field without a vector or full-text index                                                                       | no vector index: the vector list is empty, so the full-text ranking alone is fused; no full-text index: `SurrealDbError` naming the field                                     | the same; 3.1 and 3.2 put the first `vector_limit` records by id in the vector list, with no distance, and match no record for the text                                             | v0.37.0                              |
+| An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at the last place                      | the scan picks among them in no fixed order: the records, and a page of them, can change between two identical calls; the HNSW index (no `dist=`) returns the same ones       | the same records on every call, as with the HNSW index                                                                                                                              | pre-existing (documented in v0.37.0) |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -6940,7 +6949,7 @@ Capabilities not listed behave as on a 2.x server.
 | `define_indexes(tx=)` in a block that writes to the model's table   | an ORM write before it: refused all the same, although this engine indexes its records; a write after it is committed and indexed                                                                                                                                                                                                                     | refused (left out of the index); on 2.x a write after it, to a table holding records, fails the commit          | v0.35.3 |
 | Vector search (v0.36.0)                                             | as on a 2.x server: `MTREE` accepted, at most `ef` records returned (the ORM raises `ef` to `limit`), other conditions selected first in a `LET` (search annotations refused), writes made by the ids of the nearest, fewer records with a selective condition; an index without `TYPE` is `F64` (servers: `F32`), so the ORM always writes `TYPE`    | 3.x refuses `MTREE`, applies the conditions during the index search and keeps search annotations                | v0.36.0 |
 | `remove_index(tx=)` then `define_indexes(tx=)` in one block         | the index is defined again after its removal and committed, on a table holding records too                                                                                                                                                                                                                                                            | the same on 3.x; on 2.x, on a table holding records, the commit fails with a retryable conflict                 | v0.36.2 |
-| Hybrid search (v0.37.0)                                             | as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, and the vector list selects the other conditions first (a `LET`)                                                                                                                                                                      | 3.x fuses them with `search::rrf()`, each list applying the conditions: the same records, scores and order      | v0.37.0 |
+| Hybrid search (v0.37.0)                                             | as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) picks among records at an equal distance at the `vector_limit`-th place in no fixed order, as `similar_to(dist=…)` does                     | 3.x fuses with `search::rrf()`, each list applying the conditions; its exact scan returns the same list         | v0.37.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
