@@ -20,17 +20,26 @@ lists in ``LET``s, the block's value both lists, for the ORM to fuse. The querys
 naming a reserved column left out) and ``fetch()`` apply to both lists; the queryset itself, its link heads included,
 is never changed. Pure: the statements are compiled, never sent.
 
-The method (``TestHybridSearchChecks``, ``TestHybridRows``): ``hybrid_search()``'s signature, and every refusal of its
-arguments and of the queryset it is called on, each with its exact class and text, in a fixed order, before any client
-is acquired, the queryset unchanged; the dicts it returns, built from the rows of either line — the record's columns
-keyed by their Python names, ``_rrf_score``, ``_knn_distance`` and ``_search_score``, never SurrealDB's ``rrf_score``
-nor the ORM's positions.
+The method (``TestHybridSearchChecks``, ``TestHybridRows``, ``TestHybridServerErrors``): ``hybrid_search()``'s
+signature, and every refusal of its arguments and of the queryset it is called on, each with its exact class and text,
+in a fixed order, before any client is acquired, the queryset unchanged; the dicts it returns, built from the rows of
+either line — the record's columns keyed by their Python names, ``_rrf_score``, ``_knn_distance`` and
+``_search_score``, never SurrealDB's ``rrf_score`` nor the ORM's positions; SurrealDB's refusals after the request — no
+full-text index, a vector of another length than its index's dimension — naming ``hybrid_search()``, in a transaction
+too, read from a client and a transaction that fail every read.
 
 On a server (``TestHybridSearchE2E``, ``TestHybridDispatchE2E``), over WebSocket and HTTP on the line under test and on
 the embedded engine: the cases of an eight-record corpus fuse to the same records, order and scores on every line —
 equal scores in the vector list's order, then the full-text list's, every time —, each distance and score the one
 ``similar_to()`` and ``search()`` give the same record; SurrealDB 3.x fuses with ``search::rrf()``, the ORM below 3,
 the line read once per client.
+
+With the rest of the queryset and what the server decides (``TestHybridCompositionE2E``,
+``TestHybridReservedColumnsE2E``, ``TestHybridErrorsE2E``, ``TestHybridTransactionsE2E``), on the same engines:
+``select()``, ``fetch()``, a ``Subquery`` filter, ``variables()``, named connections, ``using()`` and ``cache()``;
+records storing columns named as the method's own values answering as records without them; a field without its
+full-text or vector index, a vector of another length than its index's dimension and a table that does not exist, per
+line; an interactive transaction's own writes, and a buffered transaction's refusal before anything is sent.
 """
 
 import ast
@@ -42,14 +51,14 @@ import os
 import re
 import typing
 import warnings
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import Field
-from surrealdb import InternalError, RecordID
+from surrealdb import InternalError, RecordID, ServerError
 
 from surreal_orm_lite import (
     Analyzer,
@@ -58,6 +67,7 @@ from surreal_orm_lite import (
     Count,
     Index,
     Q,
+    QueryCache,
     SearchScore,
     Subquery,
     SurrealConfigDict,
@@ -1868,13 +1878,127 @@ class TestHybridRows:
         assert HyDoc.objects()._hybrid_rows([]) == []
 
 
+# --- the errors after the request: HS1, HD1 ---------------------------------------------------------------------------
+
+#: HS1 for ``title``: SurrealDB refused the match, the field has no full-text index.
+_HS1_TITLE = f"hybrid_search(): no full-text index on field 'title'. {_SI1_ADVICE}"
+
+#: HD1 for ``embedding``: SurrealDB refused a vector of two numbers, the vector index's dimension is 3.
+_HD1 = "hybrid_search(): the vector has 2 dimensions; the vector index on field 'embedding' expects 3."
+
+
+class _RefusingClient:
+    """A client on SurrealDB 3.3 whose every query fails with *error*: records what it was sent."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.sent: list[str] = []
+
+    async def version(self) -> str:
+        return "surrealdb-3.3.4"
+
+    async def query(self, statement: str, variables: Any = None) -> Any:
+        self.sent.append(statement)
+        raise self.error
+
+
+class _RefusingTx:
+    """A transaction whose every read fails with *error*, noted among its failures as a transaction notes the error of a
+    statement run in it."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.failures: list[BaseException] = []
+
+    @property
+    def is_interactive(self) -> bool:
+        return True
+
+    async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        self.failures.append(self.error)
+        raise self.error
+
+    def _absorb_failure(self, error: BaseException) -> None:
+        self.failures = [failure for failure in self.failures if failure is not error]
+
+    def _note_failure(self, error: BaseException) -> None:
+        self.failures.append(error)
+
+
+def _refusing_client(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> _RefusingClient:
+    """Every client acquired is one :class:`_RefusingClient` failing with *error*, returned."""
+    client = _RefusingClient(error)
+
+    async def get_client(*args: Any, **kwargs: Any) -> Any:
+        return client
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+    return client
+
+
+class TestHybridServerErrors:
+    """SurrealDB's refusals after the request, read without a server: a match on a field without a full-text index
+    (HS1, raised ``from None``) and a vector of another length than its vector index's dimension (HD1, raised ``from``
+    the server's error) name ``hybrid_search()``, outside a transaction and inside one — where the ORM's error replaces
+    the server's among the transaction's failures —; ``search()`` and ``similar_to()`` keep their own names."""
+
+    async def test_hs1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _refusing_client(monkeypatch, InternalError("Internal", _NO_INDEX))
+        with pytest.raises(SurrealDbError) as raised:
+            await HyDoc.objects().hybrid_search(**_ARGS)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _HS1_TITLE
+        assert raised.value.__cause__ is None
+        assert raised.value.__suppress_context__
+        assert len(client.sent) == 1
+
+    async def test_hd1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _refusing_client(monkeypatch, InternalError("Internal", _DIMENSION_ERROR))
+        with pytest.raises(SurrealDbError) as raised:
+            await HyIndexed.objects().hybrid_search(**_ARGS)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _HD1
+        assert raised.value.__cause__ is client.error
+        assert len(client.sent) == 1
+
+    @pytest.mark.parametrize(
+        ("message", "text", "caused"),
+        [
+            pytest.param(_NO_INDEX, _HS1_TITLE, False, id="HS1"),
+            pytest.param(_DIMENSION_ERROR, _HD1, True, id="HD1"),
+        ],
+    )
+    async def test_in_a_transaction(self, monkeypatch: pytest.MonkeyPatch, message: str, text: str, caused: bool) -> None:
+        client = _refusing_client(monkeypatch, InternalError("Internal", "never sent"))
+        tx = _RefusingTx(InternalError("Internal", message))
+        with pytest.raises(SurrealDbError) as raised:
+            await HyIndexed.objects(tx=tx).hybrid_search(**_ARGS)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == text
+        assert raised.value.__cause__ is (tx.error if caused else None)
+        assert tx.failures == [raised.value]
+        assert client.sent == []
+
+    async def test_search_and_similar_to_keep_their_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _refusing_client(monkeypatch, InternalError("Internal", _NO_INDEX))
+        with pytest.raises(SurrealDbError) as searched:
+            await HyDoc.objects().search(title="programming").exec()
+        _refusing_client(monkeypatch, InternalError("Internal", _DIMENSION_ERROR))
+        with pytest.raises(SurrealDbError) as near:
+            await HyIndexed.objects().similar_to("embedding", [0.0, 1.0, 0.0], 4).exec()
+        assert str(searched.value) == f"search(): no full-text index on field 'title'. {_SI1_ADVICE}"
+        assert str(near.value) == (
+            "similar_to(): the vector has 2 dimensions; the vector index on field 'embedding' expects 3."
+        )
+
+
 # === E2E: the connection "hy" on the database hy_db, over WebSocket and HTTP, and mem:// ============================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
 _KINDS = ["ws", "http", "mem"]
 
-#: The reset before each E2E test, in one query, of the database ``hy_db``.
-_HY_RESET = "REMOVE DATABASE IF EXISTS hy_db; DEFINE DATABASE hy_db;"
+#: The reset before each E2E test, in one query, of a database of these tests (``hy_db``, ``hy_db_two``).
+_HY_RESET = "REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};"
 
 
 def _url(kind: str) -> str:
@@ -1895,24 +2019,24 @@ async def _apply_ddl(client: Any, ddl: str) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _hy(kind: str) -> AsyncIterator[Any]:
-    """The connection ``"hy"`` on *kind*, its database ``hy_db`` reset in one query; removed, then unregistered, on
-    exit."""
+async def _hy(kind: str, name: str = "hy", database: str = "hy_db") -> AsyncIterator[Any]:
+    """The connection *name* on *kind*, its *database* (a constant of these tests) reset in one query; removed, then
+    unregistered, on exit."""
     if kind == "mem":
-        SurrealDBConnectionManager.add_connection("hy", url="mem://", namespace="ns", database="hy_db")
+        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database=database)
     else:
         SurrealDBConnectionManager.add_connection(
-            "hy", url=_url(kind), user="root", password="root", namespace="ns", database="hy_db"
+            name, url=_url(kind), user="root", password="root", namespace="ns", database=database
         )
-    client = await SurrealDBConnectionManager.get_client("hy")
-    await _apply_ddl(client, _HY_RESET)
+    client = await SurrealDBConnectionManager.get_client(name)
+    await _apply_ddl(client, _HY_RESET.format(database=database))
     try:
         yield client
     finally:
         with contextlib.suppress(Exception):
-            cleanup = await SurrealDBConnectionManager.get_client("hy")
-            await cleanup.query("REMOVE DATABASE IF EXISTS hy_db;", {})
-        await SurrealDBConnectionManager.remove_connection("hy")
+            cleanup = await SurrealDBConnectionManager.get_client(name)
+            await cleanup.query(f"REMOVE DATABASE IF EXISTS {database};", {})
+        await SurrealDBConnectionManager.remove_connection(name)
 
 
 @contextlib.asynccontextmanager
@@ -2065,13 +2189,14 @@ async def _run_case(case: str, model: type[BaseSurrealModel] = HyDoc) -> list[di
 async def _references(case: str, model: type[BaseSurrealModel] = HyDoc) -> tuple[dict[str, Any], dict[str, Any]]:
     """The distance ``similar_to()`` and the score ``search()`` with ``SearchScore(0)`` give each record of *case*'s
     queryset on the same engine, by id."""
-    args = _E2E_CASES[case][3]
-    near = (
-        await _case_queryset(case, model, paged=False).similar_to("embedding", args["vector"], 8, dist=args.get("dist")).exec()
-    )
-    found = (
-        await _case_queryset(case, model, paged=False).search(title=args["text_query"]).annotate(score=SearchScore(0)).exec()
-    )
+    return await _references_of(lambda: _case_queryset(case, model, paged=False), _E2E_CASES[case][3])
+
+
+async def _references_of(make: Callable[[], QuerySet], args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The distance ``similar_to()`` and the score ``search()`` of ``title`` with ``SearchScore(0)`` give each record of
+    the queryset *make* builds, for the vector, the text and the distance of *args*, on the same engine, by id."""
+    near = await make().similar_to("embedding", args["vector"], 8, dist=args.get("dist")).exec()
+    found = await make().search(title=args["text_query"]).annotate(score=SearchScore(0)).exec()
     return {doc.id: doc._knn_distance for doc in near}, {doc.id: doc.score for doc in found}
 
 
@@ -2231,3 +2356,493 @@ class TestHybridDispatchE2E:
             )
             assert "WHERE category = $_f2 AND title @0@ $_f3 ORDER BY _search_score DESC, id LIMIT 3);" in statement
             assert statement.endswith("([$_sq1, $_sq2]) };")
+
+
+# === E2E: composition, stored reserved columns, the errors after the request, transactions ===========================
+
+
+class HyNov(BaseSurrealModel):
+    """``HyDoc``'s fields with a full-text index on ``title`` and no vector index on ``embedding``."""
+
+    model_config = SurrealConfigDict(table_name="hy_nov", indexes=[Index("hy_nov_title", "title", search_analyzer=HY_PLAIN)])
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+
+
+class HySl(BaseSurrealModel):
+    """``HyDoc``'s fields and indexes on a SCHEMALESS table (the model declares no ``schema_mode``), whose records also
+    store columns the model does not declare, named as the seven names ``hybrid_search()`` uses for its own values."""
+
+    model_config = SurrealConfigDict(
+        table_name="hy_sl",
+        indexes=[
+            Index("hy_sl_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("hy_sl_title", "title", search_analyzer=HY_PLAIN),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+
+
+class HyBare(BaseSurrealModel):
+    """A model that declares no dimension for ``embedding`` — a plain list, no vector ``Index`` —: its table's indexes
+    are defined by hand, so only SurrealDB knows the vector index's dimension."""
+
+    model_config = SurrealConfigDict(table_name="hy_bare")
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: list[float] | None = None
+
+
+class HyMissing(BaseSurrealModel):
+    """``HyDoc``'s fields on a table that is never defined."""
+
+    model_config = SurrealConfigDict(table_name="hy_missing")
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+
+
+class HyRouted(BaseSurrealModel):
+    """``HyDoc``'s fields and indexes on the connection ``"hy"`` (``SurrealConfigDict(connection=…)``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="hy_routed",
+        connection="hy",
+        indexes=[
+            Index("hy_routed_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("hy_routed_title", "title", search_analyzer=HY_PLAIN),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+
+
+#: The columns of every ``HySl`` record named as the seven names ``hybrid_search()`` uses for its own values, with
+#: their stored values: a literal statement, the model declares none of them.
+_SL_UPDATE = (
+    "UPDATE hy_sl SET rrf_score = 500.0, _rrf_score = 400.0, _knn_distance = 900.0, _search_score = 700.0, "
+    "_hybrid_pos = -5, _hybrid_vec_pos = -3, _hybrid_text_pos = -4;"
+)
+
+#: The values ``_SL_UPDATE`` stores, by column.
+_SL_STORED = {
+    "rrf_score": 500.0,
+    "_rrf_score": 400.0,
+    "_knn_distance": 900.0,
+    "_search_score": 700.0,
+    "_hybrid_pos": -5,
+    "_hybrid_vec_pos": -3,
+    "_hybrid_text_pos": -4,
+}
+
+#: The stored distance and score: no value ``hybrid_search()`` returns is either.
+_SL_DISTANCE_AND_SCORE = (900.0, 700.0)
+
+#: The keys of a dict ``hybrid_search()`` returns for ``HyDoc``'s records, without ``select()``.
+_DOC_KEYS = {"id", "title", "category", "n", "embedding", "_rrf_score", "_knn_distance", "_search_score"}
+
+#: HS1 for ``category``, which has no full-text index.
+_HS1_CATEGORY = f"hybrid_search(): no full-text index on field 'category'. {_SI1_ADVICE}"
+
+#: C1's call on the records numbered above 3 (d4 to d8): the vector list d4, d7, d6, d8, the full-text list d4, d7.
+_ABOVE_3 = [
+    ("d4", 1 / 61 + 1 / 61, True, True),
+    ("d7", 1 / 62 + 1 / 62, True, True),
+    ("d6", 1 / 63, True, False),
+    ("d8", 1 / 64, True, False),
+]
+
+#: C8 — ``HyNov``, C2's call — on SurrealDB 3.3, 2.x and the embedded engine: the vector search finds nothing without
+#: its index, so the full-text ranking alone is fused.
+_C8_NO_VECTOR_LIST = [("d3", 1 / 61, False, True), ("d4", 1 / 62, False, True), ("d7", 1 / 63, False, True)]
+
+#: C8 on SurrealDB 3.1 and 3.2: the vector list holds the first three records by id, with no distance.
+_C8_NO_DISTANCE = [
+    ("d3", 1 / 63 + 1 / 61, False, True),
+    ("d1", 1 / 61, False, False),
+    ("d2", 1 / 62, False, False),
+    ("d4", 1 / 62, False, True),
+    ("d7", 1 / 63, False, True),
+]
+
+#: C9 — ``HyDoc``, C1's call with ``text_field="category"`` (no full-text index) — on SurrealDB 3.1 and 3.2, which match
+#: nothing: the vector list alone is fused.
+_C9_NO_MATCH = [
+    ("d3", 1 / 61, True, False),
+    ("d4", 1 / 62, True, False),
+    ("d7", 1 / 63, True, False),
+    ("d6", 1 / 64, True, False),
+]
+
+#: The existing refusal of a read inside a buffered transaction.
+_BUFFERED_READ = (
+    "Reads inside a transaction require a WebSocket connection to SurrealDB 3.x (native interactive transactions); "
+    "the current transaction is buffered (HTTP or SurrealDB 2.6.x)."
+)
+
+#: The commit's error once a statement of the transaction failed.
+_COMMIT_FAILED = "The transaction was cancelled: a statement in it failed; nothing was committed (SurrealDbError)"
+
+
+@pytest.fixture
+def empty_cache() -> Iterator[None]:
+    """An empty query cache around the test."""
+    QueryCache.clear()
+    yield
+    QueryCache.clear()
+
+
+def _expected(case: str) -> list[tuple[str, float]]:
+    """*case*'s records and fused scores, in order."""
+    return [(key, score) for key, score, _, _ in _E2E_CASES[case][4]]
+
+
+def _is_31_or_32(line: tuple[int, int]) -> bool:
+    """Whether *line* is SurrealDB 3.1 or 3.2, which answer a search on a field without its index with no error."""
+    return (3, 0) <= line < (3, 3)
+
+
+def _bare_ddl(major: int) -> str:
+    """``HyBare``'s indexes, by hand, in this order: the analyzer, the full-text index on ``title`` (``FULLTEXT`` on
+    SurrealDB 3.x, ``SEARCH`` below), then the vector index on ``embedding``, of dimension 3."""
+    full_text = "FULLTEXT" if major >= 3 else "SEARCH"
+    return (
+        "DEFINE ANALYZER hy_plain TOKENIZERS blank FILTERS lowercase; "
+        f"DEFINE INDEX hy_bare_title ON hy_bare FIELDS title {full_text} ANALYZER hy_plain; "
+        "DEFINE INDEX hy_bare_embedding ON hy_bare FIELDS embedding HNSW DIMENSION 3 DIST COSINE TYPE F32;"
+    )
+
+
+async def _setup_sl(client: Any) -> None:
+    """``HySl`` set up as ``HyDoc``, then every record given the stored columns of ``_SL_UPDATE``, checked."""
+    await _setup(client, HySl)
+    await _apply_ddl(client, _SL_UPDATE)
+    stored = await client.query("SELECT * FROM hy_sl;", {})
+    assert len(stored) == 8
+    for row in stored:
+        assert {column: row.get(column) for column in _SL_STORED} == _SL_STORED, row
+
+
+def _check_as(case: str, rows: list[dict[str, Any]], reference: list[dict[str, Any]], table: str) -> None:
+    """*rows* (of *table*) are *reference* (``HyDoc``'s answer on the same engine): the same records in the same order,
+    each fused score equal, each distance and score ``None`` where *reference*'s is and equal to it elsewhere, the same
+    keys; no value is a stored distance or score."""
+    assert _ranking(rows) == _ranking(reference), case
+    for row, expected in zip(rows, reference, strict=True):
+        key = expected["id"].id
+        assert row["id"] == RecordID(table, key), (case, key)
+        assert set(row) == set(expected) == _DOC_KEYS, (case, key)
+        for value in ("_knn_distance", "_search_score"):
+            if expected[value] is None:
+                assert row[value] is None, (case, key, value)
+            else:
+                assert row[value] == pytest.approx(expected[value], rel=1e-9), (case, key, value)
+        assert not [value for value in row.values() if value in _SL_DISTANCE_AND_SCORE], (case, key)
+
+
+async def _native_transactions(kind: str, client: Any) -> bool:
+    """Whether ``transaction()`` on *kind* is interactive: WebSocket on SurrealDB 3.x."""
+    return kind == "ws" and await _major(client) >= 3
+
+
+class _Rollback(Exception):
+    """Raised inside a transaction's block so that nothing is committed."""
+
+
+class TestHybridCompositionE2E:
+    """``hybrid_search()`` with the rest of the queryset, on every engine: ``select()`` reads the fields named in both
+    lists — an item naming a reserved column left out, so the answer is the same —, each dict keyed by the fields'
+    Python names; ``fetch()`` resolves the link in both lists' records; a ``Subquery`` filter, a condition and a
+    ``Var()`` bound by ``variables()`` select the records of both lists alike; a model's named connection and
+    ``using()`` route the read; ``cache()`` answers an identical call without a request until a write to the table."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_select(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            plain = await HyDoc.objects().select("title").hybrid_search(**_ARGS)
+            named = await HyDoc.objects().select("title", "_knn_distance").hybrid_search(**_ARGS)
+            distances, scores = await _references("C1")
+        _check_answer("C1", plain, _E2E_CASES["C1"][4], distances, scores)
+        for row in plain:
+            assert set(row) == {"id", "title", "_rrf_score", "_knn_distance", "_search_score"}
+            assert row["title"] == _TITLES[row["id"].id]
+        # The item naming the distance is left out of both lists: the vector list is still ordered by distance.
+        assert named == plain
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_aliased_field_is_keyed_by_its_python_name(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await HyAliased.define_table()
+            await HyAliased.define_indexes()
+            await _apply_ddl(client, _corpus_statements("hy_aliased", lambda number: f", label_text = 'Label {number}'"))
+            rows = await HyAliased.objects().hybrid_search(**_ARGS)
+            selected = await HyAliased.objects().select("title", "label").hybrid_search(**_ARGS)
+        assert _ranking(rows) == _expected("C1")
+        assert _ranking(selected) == _expected("C1")
+        for row in rows:
+            assert set(row) == _DOC_KEYS | {"label"}
+            assert row["label"] == f"Label {row['n']}"
+        for row in selected:
+            assert set(row) == {"id", "title", "label", "_rrf_score", "_knn_distance", "_search_score"}
+            assert row["label"] == f"Label {row['id'].id[1:]}"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_fetch(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup_linked(client)
+            both = await HyLinked.objects().fetch("author").hybrid_search(**_ARGS)
+            alone = await HyLinked.objects().fetch("author").hybrid_search(**{**_ARGS, **_E2E_CASES["C7"][3]})
+        assert _ranking(both) == _expected("C1")
+        # C7: records found by the vector list alone (d3, d4) and by the full-text list alone (d1, d2, d6).
+        assert _ranking(alone) == _expected("C7")
+        for row in [*both, *alone]:
+            key = "ann" if row["n"] % 2 else "bob"
+            assert type(row["author"]) is dict, row["id"]
+            assert row["author"] == {"id": RecordID("hy_author", key), "name": key.capitalize()}, row["id"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_subquery_filter_a_condition_and_a_variable(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            querysets = {
+                "Subquery": HyDoc.objects().filter(id__in=Subquery(HyDoc.objects().filter(n__gt=3))),
+                "filter": HyDoc.objects().filter(n__gt=3),
+                "Var": HyDoc.objects().filter(n__gt=Var("lo")).variables(lo=3),
+            }
+            answers = {name: await queryset.hybrid_search(**_ARGS) for name, queryset in querysets.items()}
+            distances, scores = await _references_of(lambda: HyDoc.objects().filter(n__gt=3), _ARGS)
+        for name, rows in answers.items():
+            _check_answer(name, rows, _ABOVE_3, distances, scores)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_named_connection_and_using(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _hy(kind) as client, _hy(kind, "hy_two", "hy_db_two") as other:
+            await HyRouted.define_table()
+            await HyRouted.define_indexes()
+            await _apply_ddl(client, _corpus_statements("hy_routed"))
+            routed = await HyRouted.objects().hybrid_search(**_ARGS)
+            async with SurrealDBConnectionManager.using("hy_two"):
+                await _setup(other)
+                calls = _spy(monkeypatch, client)
+                rows = await HyDoc.objects().hybrid_search(**_ARGS)
+                sent = _calls(calls)
+                monkeypatch.undo()
+        assert _ranking(routed) == _expected("C1")
+        assert {row["id"].table_name for row in routed} == {"hy_routed"}
+        assert _ranking(rows) == _expected("C1")
+        assert {row["id"].table_name for row in rows} == {"hy_doc"}
+        assert sent == [], "the read inside using() never reaches the connection 'hy'"
+
+    @pytest.mark.usefixtures("empty_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_cache(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+
+            async def cached() -> list[dict[str, Any]]:
+                rows: list[dict[str, Any]] = await HyDoc.objects().cache(ttl=30).hybrid_search(**_ARGS)
+                return rows
+
+            calls = _spy(monkeypatch, client)
+            first = await cached()
+            sent_first = _calls(calls)
+            embedding = list(first[0]["embedding"])
+            first[0]["embedding"].append(9.0)
+            del calls[:]
+            second = await cached()
+            sent_second = _calls(calls)
+            await HyDoc(id="d9", title="Knitting", embedding=[0.0, 0.0, 1.0]).save()
+            del calls[:]
+            third = await cached()
+            sent_third = _calls(calls)
+            monkeypatch.undo()
+        statements = [statement for method, statement in sent_first if method == "query"]
+        assert len(statements) == 1
+        assert sent_second == [], "the cache answers the identical call"
+        assert [statement for method, statement in sent_third if method == "query"] == statements
+        assert _ranking(first) == _ranking(second) == _ranking(third) == _expected("C1")
+        # A dict handed out never changes the cache.
+        assert second[0]["embedding"] == embedding
+        first[0]["embedding"] = embedding
+        assert second == first
+
+
+class TestHybridReservedColumnsE2E:
+    """Records that store columns named as the names ``hybrid_search()`` uses for its own values — a SCHEMALESS table's
+    undeclared columns —, on every engine: the answer is the one of the same records without them — the same records,
+    order and fused scores, each distance and score the lists computed, never a stored one —, five times in a row the
+    same, and no dict holds SurrealDB's ``rrf_score`` nor the ORM's positions."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_c1_and_c2_as_without_the_stored_columns(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            await _setup_sl(client)
+            answers = {case: (await _run_case(case), await _run_case(case, HySl)) for case in ("C1", "C2")}
+        for case, (clean, stored) in answers.items():
+            assert _ranking(clean) == _expected(case), case
+            _check_as(case, stored, clean, "hy_sl")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_c2_five_times_in_a_row(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            await _setup_sl(client)
+            clean = await _run_case("C2")
+            runs = [await _run_case("C2", HySl) for _ in range(5)]
+        assert _ranking(clean) == _expected("C2")
+        for run, rows in enumerate(runs):
+            assert _ranking(rows) == _ranking(clean), f"run {run}"
+            stored = [(row["id"].id, value) for row in rows for value in row.values() if value in _SL_DISTANCE_AND_SCORE]
+            assert stored == [], f"run {run}"
+
+
+class TestHybridErrorsE2E:
+    """What the server decides, after the request, on each line: a full-text field without its index (SurrealDB 3.3,
+    2.x and the embedded engine refuse the match, ``SurrealDbError`` naming the field; 3.1 and 3.2 match nothing); a
+    vector of another length than its vector index's dimension on a model that does not declare it (every engine,
+    ``SurrealDbError`` naming the field and both lengths, from the server's error); a table that does not exist (no
+    records); a vector field without its vector index (3.3, 2.x and the embedded engine find nothing; 3.1 and 3.2 list
+    records with no distance)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_text_field_without_a_full_text_index(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            line = await _line(client)
+            if _is_31_or_32(line):
+                rows = await HyDoc.objects().hybrid_search(**{**_ARGS, "text_field": "category"})
+                distances, scores = await _references("C1")
+                _check_answer("C9: SurrealDB 3.1 and 3.2 match nothing", rows, _C9_NO_MATCH, distances, scores)
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await HyDoc.objects().hybrid_search(**{**_ARGS, "text_field": "category"})
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _HS1_CATEGORY
+        assert raised.value.__cause__ is None
+        assert raised.value.__suppress_context__
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_vector_of_another_length_than_its_index(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _apply_ddl(client, _bare_ddl(await _major(client)))
+            await _apply_ddl(client, _corpus_statements("hy_bare"))
+            with pytest.raises(SurrealDbError) as raised:
+                await HyBare.objects().hybrid_search(**{**_ARGS, "vector": [0.0, 1.0]})
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _HD1
+        assert isinstance(raised.value.__cause__, ServerError)
+        assert _DIMENSION_ERROR in str(raised.value.__cause__)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_table_that_does_not_exist(self, kind: str) -> None:
+        async with _hy_models(kind):
+            plain = await HyMissing.objects().hybrid_search(**_ARGS)
+            inner = HyMissing.objects().filter(n__gt=0)
+            filtered = await HyMissing.objects().filter(id__in=Subquery(inner)).hybrid_search(**_ARGS)
+        assert plain == []
+        assert filtered == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_vector_field_without_a_vector_index(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client, HyNov)
+            line = await _line(client)
+            rows = await _run_case("C2", HyNov)
+            _, scores = await _references("C2", HyNov)
+        expected = _C8_NO_DISTANCE if _is_31_or_32(line) else _C8_NO_VECTOR_LIST
+        _check_answer("C8", rows, expected, {}, scores, table="hy_nov")
+
+
+class TestHybridTransactionsE2E:
+    """``hybrid_search()`` in a transaction, on every engine: in an interactive one (SurrealDB 3.x over WebSocket) both
+    lists see the transaction's own write, gone once it rolls back, and a field without a full-text index (SurrealDB
+    3.3) fails the commit, caused by the ORM's error; in a buffered one (HTTP, SurrealDB 2.x, the embedded engine) the
+    read is refused before any statement is sent, as every read is there."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_search_sees_the_transaction_s_write(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        args = {"vector_field": "embedding", "text_field": "title", **_E2E_CASES["C2"][3]}
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            interactive = await _native_transactions(kind, client)
+            inside: list[dict[str, Any]] = []
+            refused: pytest.ExceptionInfo[SurrealDbError] | None = None
+            sent: list[tuple[str, object]] = []
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("hy") as tx:
+                    await HyDoc(id="d9", title="Go programming", embedding=[0.95, 0.05, 0.0]).save(tx=tx)
+                    if interactive:
+                        inside = await HyDoc.objects(tx=tx).hybrid_search(**args)
+                    else:
+                        calls = _spy(monkeypatch, client)
+                        with pytest.raises(SurrealDbError) as refused:
+                            await HyDoc.objects(tx=tx).hybrid_search(**args)
+                        sent = _calls(calls)
+                        monkeypatch.undo()
+                    raise _Rollback
+            after = await _run_case("C2")
+        assert _ranking(after) == _expected("C2"), "rolled back: nothing of the transaction remains"
+        if interactive:
+            # d9 is second nearest (after d1), and "Go programming" scores as "Rust programming" and "Python
+            # programming": equal scores by id, it is third of the full-text list (d3, d4, d9), which keeps three.
+            assert _ranking(inside) == [
+                ("d9", 1 / 62 + 1 / 63),
+                ("d1", 1 / 61),
+                ("d3", 1 / 61),
+                ("d4", 1 / 62),
+                ("d2", 1 / 63),
+            ]
+            written = inside[0]
+            assert written["_knn_distance"] is not None
+            assert written["_search_score"] is not None
+            assert written["_search_score"] == inside[2]["_search_score"]
+        else:
+            assert refused is not None
+            assert type(refused.value) is SurrealDbError
+            assert str(refused.value) == _BUFFERED_READ
+            assert [method for method, _ in sent if method != "version"] == [], "nothing sent"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_text_field_without_a_full_text_index_fails_the_commit(self, kind: str) -> None:
+        """The read raises the ORM's error; the block that catches it and ends normally gets the commit's error,
+        caused by that very error, and nothing is committed."""
+        async with _hy_models(kind) as client:
+            if not await _native_transactions(kind, client):
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            if _is_31_or_32(await _line(client)):
+                pytest.skip("SurrealDB 3.1 and 3.2 match nothing on a field without a full-text index")
+            await _setup(client)
+            read: pytest.ExceptionInfo[SurrealDbError] | None = None
+            with pytest.raises(SurrealDbError) as commit:
+                async with SurrealDBConnectionManager.transaction("hy") as tx:
+                    with pytest.raises(SurrealDbError) as read:
+                        await HyDoc.objects(tx=tx).hybrid_search(**{**_ARGS, "text_field": "category"})
+                    await HyDoc(id="d9", title="Go programming", embedding=[0.95, 0.05, 0.0]).save(tx=tx)
+            stored = await client.query("SELECT VALUE id FROM hy_doc;", {})
+        assert read is not None
+        assert type(read.value) is SurrealDbError
+        assert str(read.value) == _HS1_CATEGORY
+        assert str(commit.value) == _COMMIT_FAILED
+        assert commit.value.__cause__ is read.value
+        assert sorted(record.id for record in stored) == [f"d{number}" for number in range(1, 9)]

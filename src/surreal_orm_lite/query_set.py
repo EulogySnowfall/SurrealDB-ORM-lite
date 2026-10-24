@@ -1706,6 +1706,9 @@ class QuerySet:
         a read, and a write by filter outside a transaction — its ``LET`` selects the nearest records' ids. In a
         transaction that error replaces the SDK's in the transaction's failures, as above.
 
+        Both errors name ``search()`` and ``similar_to()``, or the method that set ``_refusal_subject`` on this
+        queryset (``hybrid_search()``'s private copy, v0.37.0).
+
         Args:
             query: the statement.
             variables: its bound values (the queryset's ``variables()`` when ``None``).
@@ -1728,6 +1731,8 @@ class QuerySet:
         vars_ = variables if variables is not None else self._variables
         columns = searched if searched is not None else self._searched_columns()
         vectors = knn_fields if knn_fields is not None else self._knn_columns()
+        # Each refusal's own subject (search(), similar_to()) unless this queryset names its caller (v0.37.0).
+        subject = {} if self._refusal_subject is None else {"subject": self._refusal_subject}
         if self._tx is not None:
             try:
                 return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
@@ -1742,13 +1747,13 @@ class QuerySet:
                 if empty:
                     self._tx._absorb_failure(exc)
                     return []
-                refusal = _search.missing_index_refusal(exc, columns)
+                refusal = _search.missing_index_refusal(exc, columns, **subject)
                 if refusal is not None:
                     # The transaction still fails as a whole, with the ORM's error as its cause, never the server's.
                     self._tx._absorb_failure(exc)
                     self._tx._note_failure(refusal)
                     raise refusal from None
-                refusal = _vector.dimension_refusal(exc, vectors)
+                refusal = _vector.dimension_refusal(exc, vectors, **subject)
                 if refusal is not None:
                     self._tx._absorb_failure(exc)
                     self._tx._note_failure(refusal)
@@ -1760,10 +1765,10 @@ class QuerySet:
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
-            refusal = _search.missing_index_refusal(exc, columns)
+            refusal = _search.missing_index_refusal(exc, columns, **subject)
             if refusal is not None:
                 raise refusal from None
-            refusal = _vector.dimension_refusal(exc, vectors)
+            refusal = _vector.dimension_refusal(exc, vectors, **subject)
             if refusal is not None:
                 raise refusal from exc
             if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
