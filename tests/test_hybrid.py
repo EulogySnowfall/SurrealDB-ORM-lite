@@ -19,24 +19,49 @@ list leaving out the other list's value (``OMIT``), the ORM ordering and paging 
 lists in ``LET``s, the block's value both lists, for the ORM to fuse. The queryset's conditions, ``select()`` (an item
 naming a reserved column left out) and ``fetch()`` apply to both lists; the queryset itself, its link heads included,
 is never changed. Pure: the statements are compiled, never sent.
+
+The method (``TestHybridSearchChecks``, ``TestHybridRows``): ``hybrid_search()``'s signature, and every refusal of its
+arguments and of the queryset it is called on, each with its exact class and text, in a fixed order, before any client
+is acquired, the queryset unchanged; the dicts it returns, built from the rows of either line — the record's columns
+keyed by their Python names, ``_rrf_score``, ``_knn_distance`` and ``_search_score``, never SurrealDB's ``rrf_score``
+nor the ORM's positions.
+
+On a server (``TestHybridSearchE2E``, ``TestHybridDispatchE2E``), over WebSocket and HTTP on the line under test and on
+the embedded engine: the cases of an eight-record corpus fuse to the same records, order and scores on every line —
+equal scores in the vector list's order, then the full-text list's, every time —, each distance and score the one
+``similar_to()`` and ``search()`` give the same record; SurrealDB 3.x fuses with ``search::rrf()``, the ORM below 3,
+the line read once per client.
 """
 
 import ast
+import contextlib
 import copy
+import inspect
+import math
+import os
+import re
+import typing
 import warnings
+from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import Field
 from surrealdb import InternalError, RecordID
 
 from surreal_orm_lite import (
     Analyzer,
+    BaseSurrealEdge,
     BaseSurrealModel,
+    Count,
     Index,
     Q,
+    SearchScore,
     Subquery,
     SurrealConfigDict,
+    SurrealDBConnectionManager,
     SurrealDbError,
     Var,
     VectorField,
@@ -1172,3 +1197,1037 @@ class TestCompileHybrid:
             assert "WHERE author.name = $_f2 AND title @0@ $_f3 " in query
             assert runner._link_heads == {"author"}
             assert queryset._link_heads == set()
+
+
+# --- hybrid_search(): the checks, before any request ------------------------------------------------------------------
+
+
+class HyScored(BaseSurrealModel):
+    """``HyDoc``'s fields and ``score``, stored as ``rrf_score`` — SurrealDB's key for the fused score."""
+
+    model_config = SurrealConfigDict(table_name="hy_scored")
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+    score: float = Field(default=0.0, alias="rrf_score")
+
+
+class HyRelevance(BaseSurrealModel):
+    """``HyDoc``'s fields and ``relevance``, stored as ``_search_score`` — the key of a record's BM25 score."""
+
+    model_config = SurrealConfigDict(table_name="hy_relevance")
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+    relevance: float = Field(default=0.0, alias="_search_score")
+
+
+class HyRrfField(BaseSurrealModel):
+    """``HyDoc``'s fields and a field named ``rrf_score``."""
+
+    model_config = SurrealConfigDict(table_name="hy_rrf_field")
+
+    id: str | None = None
+    title: str
+    embedding: VectorField[3]
+    rrf_score: float = 0.0
+
+
+class HyBoth(BaseSurrealModel):
+    """Two fields stored under reserved names: ``relevance`` (``_search_score``) declared before ``score``
+    (``rrf_score``)."""
+
+    model_config = SurrealConfigDict(table_name="hy_both")
+
+    id: str | None = None
+    title: str
+    embedding: VectorField[3]
+    relevance: float = Field(default=0.0, alias="_search_score")
+    score: float = Field(default=0.0, alias="rrf_score")
+
+
+class HyShadow(BaseSurrealModel):
+    """A model defining a private attribute ``_search_score``: no field is stored under that name."""
+
+    model_config = SurrealConfigDict(table_name="hy_shadow")
+
+    id: str | None = None
+    title: str
+    embedding: VectorField[3]
+    _search_score: float = 0.0
+
+
+class HyIndexed(BaseSurrealModel):
+    """A vector index of dimension 3 (``EUCLIDEAN``, the default) on a field declared without ``VectorField``."""
+
+    model_config = SurrealConfigDict(
+        table_name="hy_indexed",
+        indexes=[
+            Index("hy_indexed_embedding", "embedding", hnsw=True, dimension=3),
+            Index("hy_indexed_title", "title", search_analyzer=HY_PLAIN),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    embedding: list[float] | None = None
+
+
+class HyEdge(BaseSurrealEdge):
+    """An edge model: its endpoints are neither vector nor text fields."""
+
+    model_config = SurrealConfigDict(table_name="hy_edge")
+
+    title: str = ""
+    embedding: VectorField[3]
+
+
+class HyAliased(BaseSurrealModel):
+    """``HyDoc``'s fields and indexes and ``label``, stored as ``label_text``: a dict keys it ``label``."""
+
+    model_config = SurrealConfigDict(
+        table_name="hy_aliased",
+        indexes=[
+            Index("hy_aliased_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("hy_aliased_title", "title", search_analyzer=HY_PLAIN),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+    label: str = Field(default="", alias="label_text")
+
+
+#: An absolute moment for ``as_of()``: refused by ``hybrid_search()`` before it is ever resolved.
+_MOMENT = datetime(2026, 1, 1, tzinfo=UTC)
+
+#: HY1, the refusal of the queryset's clauses, for the offenders named.
+_HY1 = (
+    "hybrid_search() cannot be combined with {}: it runs its own vector and full-text searches and orders the records "
+    "by their fused score. Remove them from the queryset."
+)
+
+#: HY2, the refusal of ``as_of()``.
+_HY2 = (
+    "hybrid_search() cannot be combined with as_of(): the vector and full-text indexes hold the records' current "
+    "values, so a time-travel read would rank the records by their values now. Run it without as_of()."
+)
+
+#: HY4, the refusal of a model whose field (its Python name) is stored under a reserved name.
+_HY4 = (
+    "hybrid_search() cannot read {}: its field {!r} is stored as {}, a name hybrid_search() uses for its own values, "
+    "which would replace it. Store it under another name (Field(alias=...))."
+)
+
+#: HV9, both ``ef`` and ``dist``.
+_HV9 = "hybrid_search() takes ef= (the HNSW index's search) or dist= (an exact scan without an index), not both."
+
+#: HV11, a zero vector with ``COSINE``.
+_HV11 = "hybrid_search(): a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance."
+
+
+async def _forbidden_client(*args: Any, **kwargs: Any) -> Any:
+    pytest.fail("a client was acquired")
+
+
+@pytest.fixture
+def _no_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No client may be acquired: a refusal comes before any request."""
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+
+
+def _snapshot(queryset: QuerySet) -> tuple[dict[str, Any], tuple[str, dict[str, Any]]]:
+    """Every attribute of *queryset* (its containers copied), then the statement it compiles — on a copy holding its
+    own set of link heads, so that compiling it changes nothing."""
+    attributes = {
+        name: copy.copy(value) if isinstance(value, list | set | dict) else value for name, value in vars(queryset).items()
+    }
+    probe = copy.copy(queryset)
+    probe._link_heads = set(queryset._link_heads)
+    return attributes, probe._compile_query(None if queryset._as_of is None else _MOMENT)
+
+
+async def _refused(error: type[Exception], queryset: QuerySet, **args: Any) -> str:
+    """The text of the *error* ``queryset.hybrid_search(**_ARGS, **args)`` raises, its class checked exactly; the
+    queryset is checked unchanged after it, its link heads included."""
+    before = _snapshot(queryset)
+    with pytest.raises(error) as raised:
+        await queryset.hybrid_search(**{**_ARGS, **args})
+    assert type(raised.value) is error
+    assert _snapshot(queryset) == before
+    return str(raised.value)
+
+
+async def _reaches_the_request(queryset: QuerySet, **args: Any) -> None:
+    """``queryset.hybrid_search(**_ARGS, **args)`` passes every check: it goes on to acquire a client, which
+    ``_no_client`` forbids."""
+    before = _snapshot(queryset)
+    with pytest.raises(pytest.fail.Exception, match="a client was acquired"):
+        await queryset.hybrid_search(**{**_ARGS, **args})
+    assert _snapshot(queryset) == before
+
+
+def _invalid_name(field: str, arg: str) -> str:
+    """``validate_field_name()``'s text for *field*, given as ``hybrid_search()``'s *arg*."""
+    return _raised(ValueError, validate_field_name, field, f"hybrid_search {arg}")
+
+
+@pytest.mark.usefixtures("_no_client")
+class TestHybridSearchChecks:
+    """``hybrid_search()``'s signature — the full SurrealDB-ORM's names, keyword-only, its defaults, a coroutine
+    returning ``list[dict[str, Any]]`` — and its checks, in a fixed order: the queryset's clauses (HY1), ``as_of()``
+    (HY2), a field stored under a reserved name (HY4), ``vector_field`` (HV1–HV3), the vector (HV4, HV5),
+    ``vector_limit`` (HV7), ``ef`` (HV8), ``ef`` with ``dist`` (HV9), ``dist`` (HV10), the declared dimension (HV6), a
+    zero vector with ``COSINE`` (HV11), ``text_field`` (HT1–HT3), ``text_query`` (HT4), ``text_limit`` (HT5), ``rrf_k``
+    (HK1). Each refusal with its exact class and text, before any client is acquired, the queryset unchanged."""
+
+    def test_the_signature(self) -> None:
+        parameters = list(inspect.signature(QuerySet.hybrid_search).parameters.values())[1:]
+        empty = inspect.Parameter.empty
+        assert [(parameter.name, parameter.default) for parameter in parameters] == [
+            ("vector_field", empty),
+            ("vector", empty),
+            ("vector_limit", 20),
+            ("text_field", empty),
+            ("text_query", empty),
+            ("text_limit", 20),
+            ("rrf_k", 60),
+            ("ef", None),
+            ("dist", None),
+        ]
+        assert {parameter.kind for parameter in parameters} == {inspect.Parameter.KEYWORD_ONLY}
+        assert typing.get_type_hints(QuerySet.hybrid_search)["return"] == list[dict[str, Any]]
+        assert inspect.iscoroutinefunction(QuerySet.hybrid_search)
+
+    async def test_every_check_passed_goes_on_to_the_request(self) -> None:
+        await _reaches_the_request(HyDoc.objects())
+        await _reaches_the_request(HyDoc.objects().filter(category="tech").select("title").fetch("x").offset(1).limit(2))
+        await _reaches_the_request(HyDoc.objects(), dist="euclidean", text_query="")
+
+    # --- the queryset: HY1, HY2, HY4 --------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("clause", "make"),
+        [
+            ("annotate()", lambda: HyDoc.objects().annotate(count=Count())),
+            ("order_by()", lambda: HyDoc.objects().order_by("-title")),
+            ("search()", lambda: HyDoc.objects().search(title="rust")),
+            ("similar_to()", lambda: HyDoc.objects().similar_to("embedding", _VECTOR, 2)),
+            ("values()", lambda: HyDoc.objects().values("category")),
+        ],
+    )
+    async def test_hy1_a_clause_the_method_cannot_honour(self, clause: str, make: Callable[[], QuerySet]) -> None:
+        assert await _refused(ValueError, make()) == _HY1.format(clause)
+
+    async def test_hy1_names_every_offender_sorted(self) -> None:
+        both = HyDoc.objects().search(title="rust").order_by("title")
+        assert await _refused(ValueError, both) == _HY1.format("order_by(), search()")
+        every = (
+            HyDoc.objects()
+            .values("category")
+            .annotate(count=Count())
+            .order_by("title")
+            .similar_to("embedding", _VECTOR, 2)
+            .search(title="rust")
+        )
+        assert await _refused(ValueError, every) == _HY1.format("annotate(), order_by(), search(), similar_to(), values()")
+
+    async def test_hy2_as_of(self) -> None:
+        assert await _refused(SurrealDbError, HyDoc.objects().as_of(_MOMENT)) == _HY2
+
+    @pytest.mark.parametrize(
+        ("model", "field", "column"),
+        [(HyScored, "score", "rrf_score"), (HyRelevance, "relevance", "_search_score"), (HyRrfField, "rrf_score", "rrf_score")],
+    )
+    async def test_hy4_a_field_stored_under_a_reserved_name(
+        self, model: type[BaseSurrealModel], field: str, column: str
+    ) -> None:
+        assert await _refused(ValueError, model.objects()) == _HY4.format(model.__name__, field, column)
+
+    async def test_hy4_names_the_first_offender_in_declaration_order(self) -> None:
+        assert await _refused(ValueError, HyBoth.objects()) == _HY4.format("HyBoth", "relevance", "_search_score")
+
+    async def test_a_private_attribute_named_as_a_reserved_column_is_not_refused(self) -> None:
+        await _reaches_the_request(HyShadow.objects())
+
+    # --- vector_field and text_field: HV1–HV3, HT1–HT3 --------------------------------------------------------------
+
+    @pytest.mark.parametrize(("field", "kind"), [(3, "int"), (None, "NoneType"), (b"embedding", "bytes")])
+    async def test_hv1_ht1_a_field_that_is_not_a_str(self, field: object, kind: str) -> None:
+        assert await _refused(TypeError, HyDoc.objects(), vector_field=field) == (
+            f"hybrid_search() takes vector_field as a field name (str), not {kind}."
+        )
+        assert await _refused(TypeError, HyDoc.objects(), text_field=field) == (
+            f"hybrid_search() takes text_field as a field name (str), not {kind}."
+        )
+
+    @pytest.mark.parametrize("field", ["a b", "meta..vec", "1embedding", "embedding;", "", " "])
+    async def test_hv2_ht2_a_field_that_is_not_a_name(self, field: str) -> None:
+        refused = await _refused(ValueError, HyDoc.objects(), vector_field=field)
+        assert refused == _invalid_name(field, "vector_field")
+        assert "hybrid_search vector_field name " in refused
+        refused = await _refused(ValueError, HyDoc.objects(), text_field=field)
+        assert refused == _invalid_name(field, "text_field")
+        assert "hybrid_search text_field name " in refused
+
+    async def test_hv2_ht2_the_name_is_matched_in_full(self) -> None:
+        # validate_field_name()'s pattern accepts a trailing newline; hybrid_search() refuses it with the same text.
+        rule = (
+            "must contain only alphanumeric characters, underscores, and dots (for nested fields), and start with a "
+            "letter or underscore"
+        )
+        assert await _refused(ValueError, HyDoc.objects(), vector_field="embedding\n") == (
+            f"Invalid hybrid_search vector_field name 'embedding\n': {rule}"
+        )
+        assert await _refused(ValueError, HyDoc.objects(), text_field="title\n") == (
+            f"Invalid hybrid_search text_field name 'title\n': {rule}"
+        )
+
+    async def test_hv3_ht3_the_record_id(self) -> None:
+        assert await _refused(ValueError, HyDoc.objects(), vector_field="id") == (
+            "hybrid_search() compares vectors: 'id' is the record id, not a vector field."
+        )
+        assert await _refused(ValueError, HyDoc.objects(), text_field="id") == (
+            "hybrid_search() matches text: 'id' is the record id, not a text field."
+        )
+
+    @pytest.mark.parametrize("field", ["in_", "in", "out"])
+    async def test_hv3_ht3_an_edge_endpoint(self, field: str) -> None:
+        assert await _refused(ValueError, HyEdge.objects(), vector_field=field) == (
+            f"hybrid_search() compares vectors: {field!r} is an edge endpoint, not a vector field."
+        )
+        assert await _refused(ValueError, HyEdge.objects(), text_field=field) == (
+            f"hybrid_search() matches text: {field!r} is an edge endpoint, not a text field."
+        )
+
+    async def test_an_aliased_or_dotted_field_is_accepted(self) -> None:
+        await _reaches_the_request(HyAliased.objects(), text_field="label")
+        await _reaches_the_request(HyDoc.objects(), vector_field="meta.vec", text_field="meta.headline")
+
+    # --- the vector: HV4, HV5 ---------------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("value", "error", "text"),
+        [
+            (
+                {"x": 1.0},
+                TypeError,
+                "hybrid_search() takes the vector as a list or tuple of numbers, got dict; convert an array with .tolist().",
+            ),
+            (
+                "1,0,0",
+                TypeError,
+                "hybrid_search() takes the vector as a list or tuple of numbers, got str; convert an array with .tolist().",
+            ),
+            (
+                None,
+                TypeError,
+                "hybrid_search() takes the vector as a list or tuple of numbers, got NoneType; convert an array with "
+                ".tolist().",
+            ),
+            ([True, 0.0, 0.0], TypeError, "hybrid_search(): vector item 0 is bool, not a number."),
+            ([1.0, "0", 0.0], TypeError, "hybrid_search(): vector item 1 is str, not a number."),
+            ([], ValueError, "hybrid_search(): the vector is empty."),
+            ((), ValueError, "hybrid_search(): the vector is empty."),
+            ([1.0, math.nan, 0.0], ValueError, "hybrid_search(): vector item 1 is not finite (nan)."),
+            ([1.0, 0.0, math.inf], ValueError, "hybrid_search(): vector item 2 is not finite (inf)."),
+        ],
+    )
+    async def test_hv4_hv5_the_vector_and_its_items(self, value: object, error: type[Exception], text: str) -> None:
+        assert await _refused(error, HyDoc.objects(), vector=value) == text
+
+    async def test_a_tuple_of_real_numbers_is_accepted(self) -> None:
+        await _reaches_the_request(HyDoc.objects(), vector=(0, 1, 0.5))
+
+    # --- the limits, ef and dist: HV7–HV10, HT5 ---------------------------------------------------------------------
+
+    @pytest.mark.parametrize(("value", "kind"), [(True, "bool"), ("3", "str"), (2.0, "float"), (None, "NoneType")])
+    async def test_hv7_ht5_a_limit_that_is_not_an_int(self, value: object, kind: str) -> None:
+        assert await _refused(TypeError, HyDoc.objects(), vector_limit=value) == (
+            f"hybrid_search() vector_limit must be an int, got {kind}."
+        )
+        assert await _refused(TypeError, HyDoc.objects(), text_limit=value) == (
+            f"hybrid_search() text_limit must be an int, got {kind}."
+        )
+
+    @pytest.mark.parametrize("value", [0, -1, 10_001, 2**32])
+    async def test_hv7_ht5_a_limit_out_of_range(self, value: int) -> None:
+        assert await _refused(ValueError, HyDoc.objects(), vector_limit=value) == (
+            f"hybrid_search() vector_limit must be between 1 and 10000, got {value!r}."
+        )
+        assert await _refused(ValueError, HyDoc.objects(), text_limit=value) == (
+            f"hybrid_search() text_limit must be between 1 and 10000, got {value!r}."
+        )
+
+    @pytest.mark.parametrize(("value", "kind"), [(True, "bool"), ("40", "str"), (40.0, "float")])
+    async def test_hv8_an_ef_that_is_not_an_int(self, value: object, kind: str) -> None:
+        assert await _refused(TypeError, HyDoc.objects(), ef=value) == f"hybrid_search() ef must be an int or None, got {kind}."
+
+    @pytest.mark.parametrize("value", [0, -1, 10_001, 2**32])
+    async def test_hv8_an_ef_out_of_range(self, value: int) -> None:
+        assert await _refused(ValueError, HyDoc.objects(), ef=value) == (
+            f"hybrid_search() ef must be between 1 and 10000, got {value!r}."
+        )
+
+    async def test_the_bounds_of_the_limits_and_ef_are_accepted(self) -> None:
+        await _reaches_the_request(HyDoc.objects(), vector_limit=1, text_limit=1, ef=1)
+        await _reaches_the_request(HyDoc.objects(), vector_limit=10_000, text_limit=10_000, ef=10_000)
+
+    async def test_hv9_ef_and_dist(self) -> None:
+        assert await _refused(ValueError, HyDoc.objects(), ef=40, dist="cosine") == _HV9
+
+    @pytest.mark.parametrize(
+        ("dist", "error", "text"),
+        [
+            (3, TypeError, "hybrid_search(): dist= must be a str, got int."),
+            (
+                "hamming2",
+                ValueError,
+                "hybrid_search(): unknown distance 'hamming2'; the ORM's are EUCLIDEAN, COSINE, MANHATTAN, CHEBYSHEV and "
+                "HAMMING.",
+            ),
+            (
+                "minkowski",
+                ValueError,
+                "hybrid_search(): MINKOWSKI needs its order, which this version does not write; use EUCLIDEAN (order 2) "
+                "or MANHATTAN (order 1).",
+            ),
+            (
+                "Jaccard",
+                ValueError,
+                "hybrid_search(): JACCARD is not a distance SurrealDB ranks by: identical vectors are not the nearest "
+                "with it. Use COSINE.",
+            ),
+            (
+                "PEARSON",
+                ValueError,
+                "hybrid_search(): PEARSON is not a distance SurrealDB ranks by: identical vectors are not the nearest "
+                "with it. Use COSINE.",
+            ),
+        ],
+    )
+    async def test_hv10_a_distance_the_orm_does_not_write(self, dist: object, error: type[Exception], text: str) -> None:
+        assert await _refused(error, HyDoc.objects(), dist=dist) == text
+
+    # --- the declared dimension and a zero vector: HV6, HV11 --------------------------------------------------------
+
+    async def test_hv6_the_dimension_vectorfield_declares(self) -> None:
+        assert await _refused(ValueError, HyDoc.objects(), vector=[1.0, 0.0]) == (
+            "hybrid_search(): the vector has 2 dimensions; field 'embedding' holds vectors of 3 (VectorField[3])."
+        )
+
+    async def test_hv6_the_dimension_a_vector_index_declares(self) -> None:
+        assert await _refused(ValueError, HyIndexed.objects(), vector=[1.0, 0.0, 0.0, 0.0]) == (
+            "hybrid_search(): the vector has 4 dimensions; field 'embedding' holds vectors of 3 (index 'hy_indexed_embedding')."
+        )
+
+    async def test_hv11_a_zero_vector_with_the_cosine_index(self) -> None:
+        assert await _refused(ValueError, HyDoc.objects(), vector=[0.0, 0.0, 0.0]) == _HV11
+
+    async def test_hv11_a_zero_vector_with_dist_cosine(self) -> None:
+        assert await _refused(ValueError, HyIndexed.objects(), vector=[0, 0, 0], dist="cosine") == _HV11
+        # Another distance measures a zero vector.
+        await _reaches_the_request(HyIndexed.objects(), vector=[0, 0, 0])
+        await _reaches_the_request(HyDoc.objects(), vector=[0, 0, 0], dist="euclidean")
+
+    # --- text_query, rrf_k: HT4, HK1 --------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(("value", "kind"), [(3, "int"), (None, "NoneType"), (b"rust", "bytes")])
+    async def test_ht4_a_text_that_is_not_a_str(self, value: object, kind: str) -> None:
+        assert await _refused(TypeError, HyDoc.objects(), text_query=value) == (
+            f"hybrid_search() takes a str to match in 'title', got {kind}."
+        )
+
+    @pytest.mark.parametrize(("value", "kind"), [(True, "bool"), ("60", "str"), (60.0, "float"), (None, "NoneType")])
+    async def test_hk1_an_rrf_k_that_is_not_an_int(self, value: object, kind: str) -> None:
+        assert await _refused(TypeError, HyDoc.objects(), rrf_k=value) == f"hybrid_search() rrf_k must be an int, got {kind}."
+
+    @pytest.mark.parametrize("value", [-1, 10_001, 2**63])
+    async def test_hk1_an_rrf_k_out_of_range(self, value: int) -> None:
+        assert await _refused(ValueError, HyDoc.objects(), rrf_k=value) == (
+            f"hybrid_search() rrf_k must be between 0 and 10000, got {value!r}."
+        )
+
+    @pytest.mark.parametrize("value", [0, 10_000])
+    async def test_the_bounds_of_rrf_k_are_accepted(self, value: int) -> None:
+        await _reaches_the_request(HyDoc.objects(), rrf_k=value)
+
+    # --- the order: of two faults, the earlier check's refusal ------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("make", "args", "error", "text"),
+        [
+            pytest.param(
+                lambda: HyDoc.objects().order_by("title").as_of(_MOMENT),
+                {},
+                ValueError,
+                _HY1.format("order_by()"),
+                id="HY1-before-HY2",
+            ),
+            pytest.param(lambda: HyScored.objects().as_of(_MOMENT), {}, SurrealDbError, _HY2, id="HY2-before-HY4"),
+            pytest.param(
+                lambda: HyScored.objects(),
+                {"vector_field": 3},
+                ValueError,
+                _HY4.format("HyScored", "score", "rrf_score"),
+                id="HY4-before-HV1",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"vector_field": "id", "vector": "x"},
+                ValueError,
+                "hybrid_search() compares vectors: 'id' is the record id, not a vector field.",
+                id="HV3-before-HV4",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"vector": [], "vector_limit": 0},
+                ValueError,
+                "hybrid_search(): the vector is empty.",
+                id="HV5-before-HV7",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"vector_limit": 0, "ef": 0},
+                ValueError,
+                "hybrid_search() vector_limit must be between 1 and 10000, got 0.",
+                id="HV7-before-HV8",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"ef": 0, "dist": "cosine"},
+                ValueError,
+                "hybrid_search() ef must be between 1 and 10000, got 0.",
+                id="HV8-before-HV9",
+            ),
+            pytest.param(lambda: HyDoc.objects(), {"ef": 40, "dist": "jaccard"}, ValueError, _HV9, id="HV9-before-HV10"),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"dist": 3, "vector": [1.0, 0.0]},
+                TypeError,
+                "hybrid_search(): dist= must be a str, got int.",
+                id="HV10-before-HV6",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"vector": [0.0, 0.0]},
+                ValueError,
+                "hybrid_search(): the vector has 2 dimensions; field 'embedding' holds vectors of 3 (VectorField[3]).",
+                id="HV6-before-HV11",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(), {"vector": [0.0, 0.0, 0.0], "text_field": 3}, ValueError, _HV11, id="HV11-before-HT1"
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"text_field": "id", "text_query": 3},
+                ValueError,
+                "hybrid_search() matches text: 'id' is the record id, not a text field.",
+                id="HT3-before-HT4",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"text_query": 3, "text_limit": 0},
+                TypeError,
+                "hybrid_search() takes a str to match in 'title', got int.",
+                id="HT4-before-HT5",
+            ),
+            pytest.param(
+                lambda: HyDoc.objects(),
+                {"text_limit": 0, "rrf_k": -1},
+                ValueError,
+                "hybrid_search() text_limit must be between 1 and 10000, got 0.",
+                id="HT5-before-HK1",
+            ),
+        ],
+    )
+    async def test_the_first_fault_wins(
+        self, make: Callable[[], QuerySet], args: dict[str, Any], error: type[Exception], text: str
+    ) -> None:
+        assert await _refused(error, make(), **args) == text
+
+    async def test_a_refusal_after_a_dotted_field_leaves_the_link_heads(self) -> None:
+        # A condition through a link names its head when it compiles, and the fields' heads are the runner's: a refusal
+        # leaves the queryset's set as it was, empty.
+        queryset = HyLinked.objects().filter(Q(**{"author.name": "Ann"}))
+        assert await _refused(TypeError, queryset, vector_field="author.vec", text_field=3) == (
+            "hybrid_search() takes text_field as a field name (str), not int."
+        )
+        assert await _refused(TypeError, queryset, text_field="author.bio", text_query=3) == (
+            "hybrid_search() takes a str to match in 'author.bio', got int."
+        )
+        assert queryset._link_heads == set()
+
+
+class TestHybridRows:
+    """The dicts ``hybrid_search()`` returns, built from the rows of either line (``_hybrid_rows()``): the record's
+    columns keyed by their Python names, ``_rrf_score`` (SurrealDB's ``rrf_score``), ``_knn_distance`` and
+    ``_search_score`` (``None`` when the list that computes it did not find the record); never ``rrf_score`` nor the
+    ORM's positions; a row that is not an object skipped; the rows given never changed."""
+
+    def test_the_rows_of_the_3x_statement(self) -> None:
+        rows = [
+            {
+                "id": _rid("d1"),
+                "title": "Cats and dogs",
+                "label_text": "one",
+                "_knn_distance": 0.0,
+                "_hybrid_vec_pos": 0,
+                "rrf_score": 1 / 61,
+                "_hybrid_pos": 0,
+            },
+            {
+                "id": _rid("d3"),
+                "title": "Rust programming",
+                "label_text": "three",
+                "_search_score": 0.48,
+                "_hybrid_text_pos": 0,
+                "rrf_score": 1 / 61,
+                "_hybrid_pos": 3,
+            },
+            {
+                "id": _rid("d2"),
+                "title": "Cats at home",
+                "label_text": "two",
+                "_knn_distance": 0.006,
+                "_search_score": 0.36,
+                "_hybrid_vec_pos": 1,
+                "_hybrid_text_pos": 2,
+                "rrf_score": 1 / 62 + 1 / 63,
+                "_hybrid_pos": 1,
+            },
+        ]
+        before = copy.deepcopy(rows)
+        assert HyAliased.objects()._hybrid_rows(rows) == [
+            {
+                "id": _rid("d1"),
+                "title": "Cats and dogs",
+                "label": "one",
+                "_knn_distance": 0.0,
+                "_search_score": None,
+                "_rrf_score": 1 / 61,
+            },
+            {
+                "id": _rid("d3"),
+                "title": "Rust programming",
+                "label": "three",
+                "_knn_distance": None,
+                "_search_score": 0.48,
+                "_rrf_score": 1 / 61,
+            },
+            {
+                "id": _rid("d2"),
+                "title": "Cats at home",
+                "label": "two",
+                "_knn_distance": 0.006,
+                "_search_score": 0.36,
+                "_rrf_score": 1 / 62 + 1 / 63,
+            },
+        ]
+        assert rows == before
+
+    def test_the_rows_the_orm_fuses_below_3(self) -> None:
+        lists = [
+            [{"id": _rid("d1"), "label_text": "one", "_knn_distance": 0.0}],
+            [{"id": _rid("d3"), "label_text": "three", "_search_score": 0.48}],
+        ]
+        rows = hybrid.fuse(lists, k=60, vector_limit=1)
+        before = copy.deepcopy(rows)
+        assert HyAliased.objects()._hybrid_rows(rows) == [
+            {"id": _rid("d1"), "label": "one", "_knn_distance": 0.0, "_search_score": None, "_rrf_score": 1 / 61},
+            {"id": _rid("d3"), "label": "three", "_knn_distance": None, "_search_score": 0.48, "_rrf_score": 1 / 61},
+        ]
+        assert rows == before
+
+    def test_the_built_dicts_never_hold_the_server_s_key_nor_a_position(self) -> None:
+        row = {
+            "id": _rid("d1"),
+            "rrf_score": 0.5,
+            "_rrf_score": 400.0,
+            "_hybrid_pos": -5,
+            "_hybrid_vec_pos": -3,
+            "_hybrid_text_pos": -4,
+        }
+        (built,) = HyDoc.objects()._hybrid_rows([row])
+        assert built == {"id": _rid("d1"), "_rrf_score": 0.5, "_knn_distance": None, "_search_score": None}
+
+    def test_a_row_that_is_not_an_object_is_skipped(self) -> None:
+        rows: list[Any] = [None, "hy_doc:d1", 3, [{"id": _rid("d1")}], {"id": _rid("d2"), "rrf_score": 1 / 61}]
+        assert HyDoc.objects()._hybrid_rows(rows) == [
+            {"id": _rid("d2"), "_rrf_score": 1 / 61, "_knn_distance": None, "_search_score": None}
+        ]
+        assert HyDoc.objects()._hybrid_rows([]) == []
+
+
+# === E2E: the connection "hy" on the database hy_db, over WebSocket and HTTP, and mem:// ============================
+
+#: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
+_KINDS = ["ws", "http", "mem"]
+
+#: The reset before each E2E test, in one query, of the database ``hy_db``.
+_HY_RESET = "REMOVE DATABASE IF EXISTS hy_db; DEFINE DATABASE hy_db;"
+
+
+def _url(kind: str) -> str:
+    """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
+    if kind == "mem":
+        return "mem://"
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+async def _apply_ddl(client: Any, ddl: str) -> None:
+    """Run *ddl* and check every statement: ``query()`` checks only the first one."""
+    response = await client.query_raw(ddl, {})
+    assert "error" not in response, response["error"]
+    refused = [result for result in response["result"] if result["status"] != "OK"]
+    assert response["result"] and not refused, refused
+
+
+@contextlib.asynccontextmanager
+async def _hy(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"hy"`` on *kind*, its database ``hy_db`` reset in one query; removed, then unregistered, on
+    exit."""
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection("hy", url="mem://", namespace="ns", database="hy_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            "hy", url=_url(kind), user="root", password="root", namespace="ns", database="hy_db"
+        )
+    client = await SurrealDBConnectionManager.get_client("hy")
+    await _apply_ddl(client, _HY_RESET)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("hy")
+            await cleanup.query("REMOVE DATABASE IF EXISTS hy_db;", {})
+        await SurrealDBConnectionManager.remove_connection("hy")
+
+
+@contextlib.asynccontextmanager
+async def _hy_models(kind: str) -> AsyncIterator[Any]:
+    """:func:`_hy`, the models routed to the connection ``"hy"`` for the block (``using("hy")``)."""
+    async with _hy(kind) as client, SurrealDBConnectionManager.using("hy"):
+        yield client
+
+
+async def _line(client: Any) -> tuple[int, int]:
+    """``(major, minor)`` of the engine *client* talks to: ``"surrealdb-3.1.5"`` → ``(3, 1)``; ``mem://`` →
+    ``(2, 0)`` (the SDK's version, whose core is 2.x)."""
+    match = re.search(r"(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _major(client: Any) -> int:
+    """The major version of the engine *client* talks to: ``"surrealdb-3.3.4"`` → 3; ``mem://`` → 2."""
+    return (await _line(client))[0]
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
+    through) — v0.31.0's spy."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+def _calls(calls: list[tuple[str, tuple[object, ...]]]) -> list[tuple[str, object]]:
+    """What *calls* (:func:`_spy`'s) sent: each method with its first argument (``None`` for ``version()``)."""
+    return [(method, args[0] if args else None) for method, args in calls]
+
+
+def _query(statement: str) -> list[tuple[str, object]]:
+    """The calls of one ``client.query(statement, …)``: the SDK's ``query()`` sends it through ``query_raw()``."""
+    return [("query", statement), ("query_raw", statement)]
+
+
+def _sent(statements: list[str]) -> list[tuple[str, object]]:
+    """The calls of ``client.query(statement, …)`` for each of *statements*, in order."""
+    return [call for statement in statements for call in _query(statement)]
+
+
+#: The corpus: id, title, category and embedding of each record; ``n`` is its number, 1 to 8.
+_CORPUS = [
+    ("d1", "Cats and dogs", "pets", [1.0, 0.0, 0.0]),
+    ("d2", "Cats at home", "pets", [0.9, 0.1, 0.0]),
+    ("d3", "Rust programming", "tech", [0.0, 1.0, 0.0]),
+    ("d4", "Python programming", "tech", [0.1, 0.9, 0.0]),
+    ("d5", "Gardening", "home", [0.0, 0.0, 1.0]),
+    ("d6", "Cats and code", "news", [0.5, 0.5, 0.0]),
+    ("d7", "Rust and Python programming", "tech", [0.2, 0.8, 0.0]),
+    ("d8", "Cooking", "home", [0.0, 0.2, 0.8]),
+]
+
+
+def _corpus_statements(table: str, extra: Callable[[int], str] | None = None) -> str:
+    """The ``CREATE`` of the eight records in *table* (a constant of these tests), each with the columns *extra* gives
+    its number (a literal ``, column = value`` text) too."""
+    return " ".join(
+        f"CREATE {table}:{key} SET title = '{title}', category = '{category}', n = {number}, embedding = {embedding}"
+        f"{'' if extra is None else extra(number)};"
+        for number, (key, title, category, embedding) in enumerate(_CORPUS, start=1)
+    )
+
+
+async def _setup(client: Any, model: type[BaseSurrealModel] = HyDoc) -> None:
+    """*model*'s table and fields (``define_table()``), its indexes — the analyzer first — (``define_indexes()``), then
+    the eight records."""
+    await model.define_table()
+    await model.define_indexes()
+    await _apply_ddl(client, _corpus_statements(model.get_table_name()))
+
+
+async def _setup_linked(client: Any) -> None:
+    """``HyLinked`` set up as ``HyDoc``, each record linked to an author: ``Ann`` for the odd numbers, ``Bob`` for the
+    even ones."""
+    await HyAuthor.define_table()
+    await HyLinked.define_table()
+    await HyLinked.define_indexes()
+    await _apply_ddl(client, "CREATE hy_author:ann SET name = 'Ann'; CREATE hy_author:bob SET name = 'Bob';")
+    await _apply_ddl(
+        client, _corpus_statements("hy_linked", lambda number: f", author = hy_author:{'ann' if number % 2 else 'bob'}")
+    )
+
+
+#: The query vectors of the cases.
+_V = [1.0, 0.0, 0.0]
+_Q2 = [0.0, 1.0, 0.0]
+
+#: The cases on a server: the queryset's filter, its limit() and offset(), the call's arguments (with
+#: ``vector_field="embedding"`` and ``text_field="title"``) and the answer — the records ``TestFuse``'s cases fuse to,
+#: ``(id, fused score, distance present, score present)``, the score the Python expression ``search::rrf()`` computes.
+_E2E_CASES: dict[str, tuple[dict[str, Any], int | None, int | None, dict[str, Any], list[tuple[str, float, bool, bool]]]] = {
+    "C1": ({}, None, None, {"vector": _Q2, "text_query": "programming", "vector_limit": 4, "text_limit": 4}, _CASES["C1"][3]),
+    "C2": ({}, None, None, {"vector": _V, "text_query": "programming", "vector_limit": 3, "text_limit": 3}, _CASES["C2"][3]),
+    "C3": ({}, 3, None, {"vector": _V, "text_query": "programming", "vector_limit": 3, "text_limit": 3}, _CASES["C2"][3][:3]),
+    "C4": ({}, 2, 1, {"vector": _V, "text_query": "programming", "vector_limit": 3, "text_limit": 3}, _CASES["C2"][3][1:3]),
+    "C5": (
+        {"category": "tech"},
+        None,
+        None,
+        {"vector": _Q2, "text_query": "programming", "vector_limit": 3, "text_limit": 3},
+        _CASES["C5"][3],
+    ),
+    "C6": (
+        {},
+        None,
+        None,
+        {"vector": _V, "text_query": "cats", "vector_limit": 2, "text_limit": 2, "dist": "cosine"},
+        _CASES["C6"][3],
+    ),
+    "C7": ({}, None, None, {"vector": _Q2, "text_query": "cats", "vector_limit": 2, "text_limit": 3}, _CASES["C7"][3]),
+}
+
+
+def _case_queryset(case: str, model: type[BaseSurrealModel] = HyDoc, *, paged: bool = True) -> QuerySet:
+    """*model*'s queryset of *case*: its filter, and with *paged* its ``limit()`` and ``offset()``."""
+    filters, limit, offset, _, _ = _E2E_CASES[case]
+    queryset = model.objects().filter(**filters) if filters else model.objects()
+    if paged and limit is not None:
+        queryset = queryset.limit(limit)
+    if paged and offset is not None:
+        queryset = queryset.offset(offset)
+    return queryset
+
+
+async def _run_case(case: str, model: type[BaseSurrealModel] = HyDoc) -> list[dict[str, Any]]:
+    """``hybrid_search()`` of *case* on *model*."""
+    args = _E2E_CASES[case][3]
+    rows: list[dict[str, Any]] = await _case_queryset(case, model).hybrid_search(
+        vector_field="embedding", text_field="title", **args
+    )
+    return rows
+
+
+async def _references(case: str, model: type[BaseSurrealModel] = HyDoc) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The distance ``similar_to()`` and the score ``search()`` with ``SearchScore(0)`` give each record of *case*'s
+    queryset on the same engine, by id."""
+    args = _E2E_CASES[case][3]
+    near = (
+        await _case_queryset(case, model, paged=False).similar_to("embedding", args["vector"], 8, dist=args.get("dist")).exec()
+    )
+    found = (
+        await _case_queryset(case, model, paged=False).search(title=args["text_query"]).annotate(score=SearchScore(0)).exec()
+    )
+    return {doc.id: doc._knn_distance for doc in near}, {doc.id: doc.score for doc in found}
+
+
+def _ranking(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
+    """Each fused record's id and score, in order."""
+    return [(row["id"].id, row["_rrf_score"]) for row in rows]
+
+
+def _check_answer(
+    case: str,
+    rows: Any,
+    expected: list[tuple[str, float, bool, bool]],
+    distances: dict[str, Any],
+    scores: dict[str, Any],
+    table: str = "hy_doc",
+) -> None:
+    """*rows* is *expected*: dicts in its order, each ``_rrf_score`` equal to its score, each ``_knn_distance`` and
+    ``_search_score`` the one ``similar_to()`` and ``search()`` gave the record (*distances*, *scores*), else ``None``."""
+    assert type(rows) is list, case
+    assert all(type(row) is dict for row in rows), case
+    assert _ranking(rows) == [(key, score) for key, score, _, _ in expected], case
+    for row, (key, _, has_distance, has_score) in zip(rows, expected, strict=True):
+        assert row["id"] == RecordID(table, key), (case, key)
+        assert type(row["_rrf_score"]) is float, (case, key)
+        if has_distance:
+            assert row["_knn_distance"] == pytest.approx(distances[key], rel=1e-9), (case, key)
+        else:
+            assert row["_knn_distance"] is None, (case, key)
+        if has_score:
+            assert row["_search_score"] == pytest.approx(scores[key], rel=1e-9), (case, key)
+        else:
+            assert row["_search_score"] is None, (case, key)
+
+
+class TestHybridSearchE2E:
+    """``hybrid_search()`` on the eight-record corpus, on every engine (the line under test over WebSocket and HTTP,
+    and the embedded engine): each case fuses to the same records, order and scores — the expression SurrealDB 3.x's
+    ``search::rrf()`` computes, the ORM's fusion below 3 equal to it —, equal scores in the vector list's order then
+    the full-text list's, five times in a row the same; each record a dict of its columns and the three values, its
+    distance and score those ``similar_to()`` and ``search()`` give it; the queryset unchanged, its link heads
+    included."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_cases_of_the_corpus(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            for case, (_, _, _, _, expected) in _E2E_CASES.items():
+                rows = await _run_case(case)
+                distances, scores = await _references(case)
+                _check_answer(case, rows, expected, distances, scores)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_equal_scores_keep_one_order_every_time(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            for case in ("C2", "C3", "C4"):
+                expected = [(key, score) for key, score, _, _ in _E2E_CASES[case][4]]
+                for run in range(5):
+                    assert _ranking(await _run_case(case)) == expected, (case, run)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_each_record_is_a_dict_of_its_columns_and_the_three_values(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            rows = await HyDoc.objects().hybrid_search(**_ARGS)
+        assert type(rows) is list and len(rows) == 4
+        for row in rows:
+            assert type(row) is dict
+            assert not isinstance(row, BaseSurrealModel)
+            assert set(row) == {"id", "title", "category", "n", "embedding", "_rrf_score", "_knn_distance", "_search_score"}
+            assert type(row["id"]) is RecordID
+            assert type(row["_rrf_score"]) is float
+        by_id = {row["id"].id: row for row in rows}
+        assert (by_id["d3"]["title"], by_id["d3"]["category"], by_id["d3"]["n"]) == ("Rust programming", "tech", 3)
+        assert by_id["d3"]["embedding"] == [0.0, 1.0, 0.0]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_queryset_is_unchanged_its_link_heads_included(self, kind: str) -> None:
+        async with _hy_models(kind) as client:
+            await _setup_linked(client)
+            # A condition through a link, never compiled before: the queryset has recorded no link head.
+            queryset = HyLinked.objects().filter(Q(**{"author.name": "Ann"}))
+            before = _snapshot(queryset)
+            rows = await queryset.hybrid_search(**{**_ARGS, "vector_limit": 2})
+            assert _snapshot(queryset) == before
+            assert queryset._link_heads == set()
+            again = await queryset.hybrid_search(**{**_ARGS, "vector_limit": 2})
+        assert _ranking(rows) == [("d3", 1 / 61 + 1 / 61), ("d7", 1 / 62 + 1 / 62)]
+        assert [row["author"] for row in rows] == [RecordID("hy_author", "ann"), RecordID("hy_author", "ann")]
+        assert again == rows
+
+
+class TestHybridDispatchE2E:
+    """What ``hybrid_search()`` sends on each line, one request per call: on SurrealDB 3.x the ``SELECT`` that fuses the
+    two lists inline in ``search::rrf()``, each list with its ``OMIT``, ordered by fused score then position; below 3
+    the two lists in ``LET``s, without ``OMIT``, which the ORM fuses — the vector list's other conditions selected
+    first, as ``similar_to()`` does. The line is read once per client."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_statement_of_each_line(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            first = await HyDoc.objects().hybrid_search(**_ARGS)
+            second = await HyDoc.objects().hybrid_search(**_ARGS)
+            sent = _calls(calls)
+            monkeypatch.undo()
+        statements = [statement for method, statement in sent if method == "query"]
+        assert [call for call in sent if call[0] != "version"] == _sent(statements)
+        assert len([call for call in sent if call[0] == "version"]) <= 1
+        assert first == second
+        assert _ranking(first) == [(key, score) for key, score, _, _ in _CASES["C1"][3]]
+        markers = [
+            "search::rrf([(SELECT ",
+            "AS _knn_distance OMIT _search_score FROM",
+            "AS _search_score OMIT _knn_distance, _hybrid_vec_pos FROM",
+            "ORDER BY rrf_score DESC, _hybrid_pos",
+        ]
+        for statement in statements:
+            assert "ORDER BY _knn_distance, id LIMIT 4)" in statement
+            if major >= 3:
+                assert statement == _G1
+                assert statement.startswith("SELECT *, IF _hybrid_vec_pos")
+                assert all(marker in statement for marker in markers)
+                assert "LET" not in statement
+            else:
+                assert statement == _G4
+                assert not statement.startswith("SELECT *, IF _hybrid_vec_pos")
+                assert not any(marker in statement for marker in markers)
+                assert "OMIT" not in statement
+                assert "([$_sq" in statement
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_condition_next_to_the_vector_search(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            rows = await _run_case("C5")
+            sent = _calls(calls)
+            monkeypatch.undo()
+        (statement,) = [statement for method, statement in sent if method == "query"]
+        assert isinstance(statement, str)
+        assert _ranking(rows) == [(key, score) for key, score, _, _ in _CASES["C5"][3]]
+        assert "ORDER BY _knn_distance, id LIMIT 3)" in statement
+        if major >= 3:
+            assert "WHERE category = $_f0 AND embedding <|3,100|> $_f1 ORDER BY _knn_distance, id LIMIT 3)" in statement
+            assert "WHERE category = $_f2 AND title @0@ $_f3 ORDER BY _search_score DESC, id LIMIT 3)" in statement
+            assert "LET" not in statement
+        else:
+            # v0.36.0's pre-filter in the vector list only; the full-text list keeps its condition inline.
+            assert statement.startswith(
+                "{ LET $_sq0 = (SELECT VALUE id FROM hy_doc WHERE category = $_f0); LET $_sq1 = (SELECT *, "
+                "vector::distance::knn() AS _knn_distance FROM hy_doc WHERE id IN $_sq0 AND embedding <|3,100|> $_f1 "
+                "ORDER BY _knn_distance, id LIMIT 3); "
+            )
+            assert "WHERE category = $_f2 AND title @0@ $_f3 ORDER BY _search_score DESC, id LIMIT 3);" in statement
+            assert statement.endswith("([$_sq1, $_sq2]) };")
