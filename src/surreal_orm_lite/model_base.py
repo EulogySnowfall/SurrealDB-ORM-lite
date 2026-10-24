@@ -107,6 +107,7 @@ from .utils import (
     format_record_id,
     merge_extra_vars,
     replace_content,
+    user_namespace,
     user_stacklevel,
     validate_alias_name,
     validate_edge_name,
@@ -879,10 +880,12 @@ class BaseSurrealModel(BaseModel):
     """
 
     __surreal_checks_pending__: typing.ClassVar[bool] = False
-    """``True`` on a model Pydantic could not complete at its ``class`` statement, until it does (issue #327).
+    """``True`` on a model Pydantic could not complete at its ``class`` statement, until it does and the vector checks
+    accept it (issue #327).
 
     Set by ``__pydantic_init_subclass__`` when a field is still a forward reference: its vector checks then wait for
-    ``__pydantic_on_complete__``. Read from the class's own ``__dict__`` only, never inherited: a subclass is
+    ``__pydantic_on_complete__``, and the ORM completes the model before it reads its fields or its indexes
+    (``_complete_pending_checks()``). Read from the class's own ``__dict__`` only, never inherited: a subclass is
     completed, and checked, on its own.
     """
 
@@ -1076,15 +1079,15 @@ class BaseSurrealModel(BaseModel):
         there (issue #327).
 
         A field annotated with a forward reference (``e: "Later" = None``) has no ``Vector`` marker until Pydantic
-        resolves the name, at ``model_rebuild()`` or at the model's first instantiation or validation; Pydantic calls
-        this hook then. ``_check_vectors_and_indexes()`` runs again on every field, with the refusals of the field
-        written directly, raised from ``model_rebuild()`` or from the call that completed the model. A model complete
-        at its ``class`` statement is checked there only: Pydantic calls this hook first, before
+        resolves the name and completes the model: at ``model_rebuild()``, at the model's first instantiation,
+        validation or JSON schema, or when the ORM first reads its fields or its indexes
+        (``_complete_pending_checks()``); Pydantic calls this hook then. ``_check_vectors_and_indexes()`` runs again on
+        every field, with the refusals of the field written directly, raised from the call that completed the model.
+        A model complete at its ``class`` statement is checked there only: Pydantic calls this hook first, before
         ``__pydantic_init_subclass__``, which has not asked for it (``__surreal_checks_pending__``).
 
         Pydantic marks the model complete before it calls this hook, so a refusal puts the model back as it was,
-        incomplete: a second ``model_rebuild()``, an instantiation or a validation completes it again and raises the
-        same error. The refusal is never lost.
+        incomplete: each of these calls completes it again and raises the same error. The refusal is never lost.
         """
         super().__pydantic_on_complete__()
         if not cls.__dict__.get("__surreal_checks_pending__", False):
@@ -1099,6 +1102,26 @@ class BaseSurrealModel(BaseModel):
             set_model_mocks(cls)
             raise
         cls.__surreal_checks_pending__ = False
+
+    @classmethod
+    def _complete_pending_checks(cls) -> None:
+        """Complete a model whose vector checks still wait for Pydantic (issue #327), before the ORM reads its fields
+        or its indexes: ``_table_ddl()`` and ``_table_columns()`` (behind ``table_ddl()``, ``define_table()``),
+        ``get_indexes()`` (behind ``index_ddl()``, ``define_indexes()``, ``similar_to()``) and ``QuerySet()`` (every
+        queryset) call it first.
+
+        Pydantic completes a model that a forward reference left incomplete at its ``class`` statement at
+        ``model_rebuild()`` or at its first instantiation, validation or JSON schema, never when the ORM writes its DDL
+        or builds a query: ``define_table()`` would write the field's column ``any`` and ``define_indexes()`` a vector
+        index its field contradicts, unchecked. So the model is rebuilt here as Pydantic's first instantiation rebuilds
+        it — the names of the model's module and the local names of the first caller outside the ORM
+        (``utils.user_namespace()``) — and ``__pydantic_on_complete__()`` runs the checks: a refusal raises from here,
+        at every call, the model staying incomplete. A name still undefined leaves the model incomplete, read as
+        before, without an error; the next call tries again. A complete model costs one attribute read.
+        """
+        if cls.__pydantic_complete__ or not cls.__dict__.get("__surreal_checks_pending__", False):
+            return
+        cls.model_rebuild(raise_errors=False, _types_namespace=user_namespace())
 
     @classmethod
     def get_computed_fields(cls) -> dict[str, str]:
@@ -1379,7 +1402,12 @@ class BaseSurrealModel(BaseModel):
         A tuple; ``()`` when the model declares none. A subclass inherits its parent's indexes unless it sets
         ``indexes`` itself (``indexes=[]`` drops them); a subclass with another table defines the same indexes on its
         own table.
+
+        A model a forward reference left incomplete at its ``class`` statement is completed first, and checked as the
+        ``class`` statement checks a vector field (issue #327): its refusal raises here, as from :meth:`index_ddl`,
+        :meth:`define_indexes` and ``similar_to()``.
         """
+        cls._complete_pending_checks()
         indexes = cls.model_config.get("indexes")
         # Checked at the class statement: a list or tuple of Index, or None.
         return tuple(indexes) if isinstance(indexes, (list, tuple)) else ()
@@ -2025,8 +2053,11 @@ class BaseSurrealModel(BaseModel):
 
         Raises:
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
-                SurrealQL the ORM can embed; ``server_fields`` names a field the model does not declare.
+                SurrealQL the ORM can embed; ``server_fields`` names a field the model does not declare. Before them, a
+                model a forward reference left incomplete at its ``class`` statement is completed, and its vector
+                checks may refuse it (issue #327, ``_complete_pending_checks()``).
         """
+        cls._complete_pending_checks()
         computed = cls.get_computed_fields()
         endpoints = {cls.to_py_field(column) for column in cls._endpoint_columns()}
         flexible = cls.model_config.get("flexible_fields")
@@ -2052,6 +2083,7 @@ class BaseSurrealModel(BaseModel):
                 that ``Field(exclude=True)`` keeps out of ``model_dump()`` (SG1, #296, #299).
             ValueError: see :meth:`_table_columns`.
         """
+        cls._complete_pending_checks()
         if cls._is_view():
             return [cls.view_ddl(overwrite=overwrite)]
         table = cls.get_table_name()
@@ -2116,7 +2148,8 @@ class BaseSurrealModel(BaseModel):
                 and ``signin()`` refuse the model too; remove ``exclude=True`` and pass ``exclude=`` to
                 ``model_dump()`` where you serialise the model.
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
-                SurrealQL the ORM can embed.
+                SurrealQL the ORM can embed; the refusals of a vector field declared through a forward reference, the
+                ``class`` statement's, checked once the name resolves (issue #327, :meth:`get_indexes`).
 
         Example:
             >>> print("\\n".join(Person.table_ddl()))
@@ -2294,7 +2327,8 @@ class BaseSurrealModel(BaseModel):
                 with a field SIGNUP writes that ``Field(exclude=True)`` keeps out of ``model_dump()``, whatever its
                 schema mode (see :meth:`table_ddl`) — before any request.
             ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
-                SurrealQL the ORM can embed — before any request.
+                SurrealQL the ORM can embed; the refusals of a vector field declared through a forward reference
+                (:meth:`table_ddl`) — before any request.
             SurrealDbError: *tx* belongs to another connection — before any request; the table is a materialized view
                 or a relation table, or a table or field definition cannot be read back or carried — before any DDL;
                 the server refused a statement (``Can't apply table definition: …``, ``Can't apply field definition:

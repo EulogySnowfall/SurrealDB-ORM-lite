@@ -6175,8 +6175,10 @@ the default —, `I64`, `I32` or `I16`). An `Index` with `hnsw=True` is a vector
 [section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index). Its attributes hold what was
 declared (`None` for an option not given). When the class is defined, two vector indexes on one column are refused,
 and so is a vector index whose dimension or storage type differs from its field's `VectorField`. A field annotated
-with a name defined after the class (a forward reference) is checked when Pydantic resolves it, at `model_rebuild()`
-or the model's first use, with the same error; once refused, the model raises it at every use.
+with a name defined after the class (a forward reference) is checked once the name resolves, with the same error: at
+`model_rebuild()`, at the model's first instantiation, validation or JSON schema, and before `table_ddl()`,
+`define_table()`, `index_ddl()`, `define_indexes()`, `get_indexes()` or a queryset (`similar_to()` included) reads the
+model. Once refused, each of these raises it again.
 
 ```python
 from surreal_orm_lite import (
