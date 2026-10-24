@@ -6082,7 +6082,9 @@ print(await NoteV2.objects().search(text="physics").count())
   block that removes an index of a table that held records and defines it again, where the index stands as before.
   Nothing of such a block is committed. On an empty table both commit, as on 3.x. On SurrealDB 3.x, a block that
   defines an index and then removes it fails the commit the same way, whatever the table holds; 2.x and the embedded
-  engine commit it.
+  engine commit it when the index was not stored before the block. An index stored before the block, redefined by
+  `define_indexes(tx=…)` and then removed, fails the commit the same way on 2.x too when the table held records, where
+  the index stands as before; the embedded engine commits it.
 - `remove_analyzer(tx=…)` (on SurrealDB 2.x and the embedded engine; 3.x checks in the transaction itself) and
   `define_analyzer(tx=…)` read committed state to find the indexes that use the analyzer. An index `remove_index(tx=…)`
   removed earlier in the block no longer counts, although committed state still holds it: once the block has removed the

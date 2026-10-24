@@ -96,7 +96,8 @@ defined, with their analyzer (``TestIndexDefinitionNote``, ``TestIndexesDefinedI
 ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` of that analyzer are refused before any DDL on every engine,
 SurrealDB 3.x included, without failing the block; an index defined then removed in the block, or defined again with
 another analyzer, no longer counts for it. Pinned (README section 36, Transactions): SurrealDB 3.x fails the commit of a
-block that defines an index and then removes it with a retryable conflict.
+block that defines an index and then removes it with a retryable conflict, and SurrealDB 2.x one that redefines an index
+stored before it and then removes it, on a table that held records.
 
 ``search()`` (``TestSearchCompile``, ``TestSearchRefusals``): each field compiles ``<column> @<ref>@ $_f<N>``, AND-ed
 after the filters, ``Q`` and ``nearby()``, its text bound (data, whatever it holds), the references in call order
@@ -3462,6 +3463,13 @@ _DEFINED_REMOVED_PIN_3X = (
     "If this fails, 3.x commits it now: the README sentence and the row can be reconsidered."
 )
 
+#: The assertion message of the pin of an index stored before the block, redefined then removed in it, on 2.x.
+_STORED_REDEFINED_REMOVED_PIN_2X = (
+    "README section 36, Transactions (issue #329): SurrealDB 2.x fails the commit of a block that redefines an index "
+    "stored before it and then removes it, on a table that held records, with a retryable conflict that a retry meets "
+    "again. If this fails, 2.x commits it now: the README sentence can be reconsidered."
+)
+
 #: The assertion message of the materialized-view pin on SurrealDB 3.x.
 _VIEW_PIN_3X = (
     "README section 36, Not supported (_S36_VIEWS): SurrealDB 3.x does not index the records a view gains after the "
@@ -5202,6 +5210,56 @@ class TestIndexesDefinedInTheBlockE2E:
         assert created == []
         assert kept == (2 if table == "table-holding-a-record" else 1)
 
+    @pytest.mark.parametrize("table", ["empty-table", "table-holding-a-record"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_stored_before_the_block_redefined_then_removed_in_it(self, kind: str, table: str) -> None:
+        """README section 36, Transactions: ``fts_post_title`` stored before the block with ``fts_plain``;
+        ``FtsPostP.define_indexes(tx=…)`` redefines it with ``fts_p``, then ``remove_index(tx=…)`` removes it. The
+        embedded engine commits the block, whatever the table holds, and so does SurrealDB 2.x on an empty table: the
+        index is absent after the commit. SurrealDB 2.x on a table that held records, and 3.x whatever the table holds,
+        fail the commit with a retryable conflict that a retry meets again: nothing committed, the index stands as
+        before and serves the records committed before the block. Either way the table takes writes."""
+        async with _fts_models(kind) as client:
+            server = None if kind == "mem" else await _major(client)
+            line = await _keyword_line(client)
+            held = table == "table-holding-a-record"
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            await SurrealDBConnectionManager.define_analyzer(FTS_P)
+            await FtsPost.define_indexes()
+            if held:
+                await FtsPost(id="p1", title="Physics Rocks").save()
+            seen: dict[str, Any] = {}
+
+            async def block() -> SurrealDbError | None:
+                try:
+                    async with SurrealDBConnectionManager.transaction("fts") as tx:
+                        seen["defined"] = await FtsPostP.define_indexes(tx=tx)
+                        seen["removed"] = await FtsPost.remove_index("fts_post_title", tx=tx)
+                except SurrealDbError as error:
+                    return error
+                return None
+
+            failed = await block()
+            retried = await block() if failed is not None else None
+            indexes = await _indexes(client, "fts_post")
+            found = await FtsPost.objects().search(title="Physics").count() if indexes else None
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+            kept = await FtsPost.objects().count()
+        assert seen["defined"] == FtsPostP.index_ddl(line=line)[1:]
+        assert seen["removed"] == "REMOVE INDEX IF EXISTS `fts_post_title` ON `fts_post`;"
+        if server == 3 or (server == 2 and held):
+            pin = _DEFINED_REMOVED_PIN_3X if server == 3 else _STORED_REDEFINED_REMOVED_PIN_2X
+            assert type(failed) is SurrealDbConflictError, pin
+            assert type(retried) is SurrealDbConflictError, pin
+            state = indexes["fts_post_title"]
+            assert state is not None and state.search_analyzer == "fts_plain"
+            assert found == (1 if held else 0)
+        else:
+            assert failed is None, "README section 36, Transactions: 2.x on an empty table and the embedded engine commit it"
+            assert indexes == {}
+        assert created == []
+        assert kept == (2 if held else 1)
+
     @_ANALYZER_DDL
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_index_the_block_defined_again_with_another_analyzer(self, kind: str, ddl: str) -> None:
@@ -6378,9 +6436,13 @@ _PART_NEEDLES_36 = {
         "so does a block that removes an index of a table that held records and defines it again, where the index stands "
         "as before",
         "On an empty table both commit, as on 3.x.",
-        # Issue #329: pinned by test_the_analyzer_ddl_joins_once_the_block_removed_the_index_it_defined.
+        # Issue #329: pinned by test_the_analyzer_ddl_joins_once_the_block_removed_the_index_it_defined and
+        # test_an_index_defined_then_removed_in_the_block (an index not stored before the block), and by
+        # test_an_index_stored_before_the_block_redefined_then_removed_in_it (one stored before it).
         "On SurrealDB 3.x, a block that defines an index and then removes it fails the commit the same way, whatever the "
-        "table holds; 2.x and the embedded engine commit it.",
+        "table holds; 2.x and the embedded engine commit it when the index was not stored before the block.",
+        "An index stored before the block, redefined by `define_indexes(tx=…)` and then removed, fails the commit the same "
+        "way on 2.x too when the table held records, where the index stands as before; the embedded engine commits it.",
         # Issue #323: the analyzer DDL leaves out an index removed earlier in the block.
         "`remove_analyzer(tx=…)` (on SurrealDB 2.x and the embedded engine; 3.x checks in the transaction itself) and "
         "`define_analyzer(tx=…)` read committed state to find the indexes that use the analyzer.",

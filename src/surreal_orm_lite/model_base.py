@@ -1582,7 +1582,9 @@ class BaseSurrealModel(BaseModel):
         table that held records, such a block fails the commit with a retryable ``SurrealDbConflictError`` that a retry
         meets again, and nothing of it is committed. On SurrealDB 3.x, the reverse — a block that defines an index
         (:meth:`define_indexes`) and then removes it — fails the commit the same way, whatever the table holds; 2.x and
-        the embedded engine commit it. ``SurrealDBConnectionManager.remove_analyzer(tx=…)`` and
+        the embedded engine commit it when the index was not stored before the block. When it was, and the block
+        redefined it before removing it, 2.x fails the commit the same way on a table that held records, the index
+        standing as before, and the embedded engine commits it. ``SurrealDBConnectionManager.remove_analyzer(tx=…)`` and
         ``define_analyzer(tx=…)`` read the note too: the removed index no longer counts as one using the analyzer (issue
         #323); once the block has removed or redefined that analyzer, :meth:`define_indexes` refuses to define the index
         again in it. A raw ``tx.add("REMOVE INDEX …")`` is not noted.

@@ -40,12 +40,15 @@ that `define_indexes(tx=…)` defined earlier in the same block. No new public A
 - **Behaviour table**: a new row for `define_indexes(tx=)` then `remove_index(tx=)` in one block,
   the index not stored before the block. SurrealDB 3.x fails the commit with a retryable
   `SurrealDbConflictError` whatever the table holds, and nothing is committed; 2.x and the
-  embedded engine commit it, the index absent afterwards. Measured on 2.7.0 and 3.3.4, over
-  WebSocket and HTTP, and on the embedded engine, identical on 3.1.5.
+  embedded engine commit it, the index absent afterwards. An index stored before the block,
+  redefined and then removed in it, fails the commit the same way on 2.x too when the table held
+  records, the index standing as before; the embedded engine commits it (README section 36,
+  Transactions). Measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded
+  engine, identical on 3.1.5.
 - **Docs**: README section 36 (Transactions) and the docstrings of `define_indexes()`,
   `remove_index()`, `define_analyzer()` and `remove_analyzer()` describe the guarded orders.
-- **Tests**: 69 new tests in `tests/test_search.py`: 18 unit tests of the transaction's notes and
-  51 end-to-end tests over WebSocket, HTTP and the embedded engine, in interactive and buffered
+- **Tests**: 75 new tests in `tests/test_search.py`: 18 unit tests of the transaction's notes and
+  57 end-to-end tests over WebSocket, HTTP and the embedded engine, in interactive and buffered
   blocks.
 - Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
   plus 3.1.5 for backward compatibility.
