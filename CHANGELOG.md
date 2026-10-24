@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.1] - 2026-10-24
+
+Follow-ups to the review of v0.36.3 (#327): a `Literal[None]` member of a vector field's union
+reads as `None`, and a vector field declared through a forward reference gets the vector checks
+of the `class` statement once its name resolves. No new public API.
+
+### Fixed
+
+- **`VectorField[d] | Literal[None]` is read as a vector field** (#327). Since v0.36.3 a
+  `Literal[None]` union member counted as a type other than `None`: `get_vector_info()` and
+  `is_vector_field()` raised `ValueError` for that annotation and the `class` statement refused
+  the field, although `Literal[None]` admits only `None` and `define_table()` already read it as
+  `None`. Such a member now counts as `None`: the annotation gives `(d, 'F32')` wherever
+  `VectorField[d] | None` does (`get_vector_info()`, `is_vector_field()`, the `class`-statement
+  checks of a vector index, `similar_to()`, and `define_table()` with
+  `option<array<float, d>>`). A `Literal` holding another value (`Literal[None, "x"]`) next to a
+  marker is still refused.
+- **A vector field declared through a forward reference is checked once its name resolves**
+  (#327). A field annotated with a name defined after the class (`e: "Later" = None`, then
+  `Later = VectorField[3]`) has no `Vector` marker at the `class` statement, so since v0.36.0 the
+  vector checks skipped it: a vector index of another dimension or storage type, or an ambiguous
+  annotation such as `Later = VectorField[3] | str`, was accepted once `model_rebuild()` or the
+  model's first use resolved the name. Until then, `table_ddl()` and `define_table()` wrote the
+  column as `any`, `define_indexes()` defined the index unchecked and `similar_to()` accepted a
+  query vector of any length, without an error. The checks now run again when Pydantic completes
+  the model (at `model_rebuild()`, or at its first instantiation, validation or JSON schema), and
+  the ORM completes such a model before `table_ddl()`, `define_table()`, `index_ddl()`,
+  `define_indexes()`, `get_indexes()` or a queryset (`similar_to()` included) reads it, resolving
+  the name as Pydantic's first instantiation does (the model's module, then the caller's local
+  names). The refusals are those of the field written directly, naming the model, the index and
+  the field, raised before anything is sent; a refused model stays incomplete, so each of these
+  calls raises the same error again. A matching index is accepted, and `similar_to()` checks the
+  query vector against the field's dimension. A name still undefined leaves the model incomplete
+  and read as before. A model complete at its `class` statement is checked there only, in the same
+  order and with the same messages.
+
+### Notes
+
+- **CHANGELOG correction**: the `### Changed` bullet of `## [0.36.3]` said that every spelling
+  v0.36.2 read as a vector field gives the same result. A field with two different `Vector`
+  markers, which v0.36.2 read by its first marker, is refused since v0.36.3: the sentence now
+  reads "Every spelling with a single `Vector` marker that v0.36.2 read as a vector field gives
+  the same result."
+- **Docs**: README section 37 (Vector search) says that `get_vector_info()` and
+  `is_vector_field()` raise `ValueError` for a field or annotation with no single dimension (code
+  that scans the fields of a plain Pydantic model has no `class`-statement check, so it gets the
+  exception where v0.36.2 returned `False`), that a `Literal[None]` member counts as `None`, and
+  which calls check a field declared through a forward reference.
+- The fixes are in the ORM's model checks, built on Pydantic's `__pydantic_on_complete__` hook
+  (available in the supported `pydantic>=2.13.4`): the behaviour is the same on SurrealDB 2.x and
+  3.x and on the embedded engine. Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.36.5] - 2026-10-24
 
 Follow-up to v0.36.1 (#315): a queryset write that the ORM refuses, and an instance write
