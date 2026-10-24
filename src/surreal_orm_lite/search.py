@@ -1534,15 +1534,15 @@ def checked_search_field(field: str) -> None:
         )
 
 
-def text_refused(field: str, text: object) -> str:
-    """The refusal of a ``search()`` text that is not a ``str``: *text* given for *field*."""
-    return f"search() takes a str to match in {field!r}, got {type(text).__name__}."
+def text_refused(field: str, text: object, *, subject: str = "search()") -> str:
+    """The refusal of a ``search()`` (or *subject*) text that is not a ``str``: *text* given for *field*."""
+    return f"{subject} takes a str to match in {field!r}, got {type(text).__name__}."
 
 
-def field_refused(field: str, *, endpoint: bool) -> str:
-    """The refusal of ``search()`` on *field*, the record id — or an edge endpoint when *endpoint*."""
+def field_refused(field: str, *, endpoint: bool, subject: str = "search()") -> str:
+    """The refusal of ``search()`` (or *subject*) on *field*, the record id — or an edge endpoint when *endpoint*."""
     what = "an edge endpoint" if endpoint else "the record id"
-    return f"search() matches text: {field!r} is {what}, not a text field."
+    return f"{subject} matches text: {field!r} is {what}, not a text field."
 
 
 def too_many_fields() -> str:
@@ -1570,17 +1570,17 @@ def live_refused() -> str:
     )
 
 
-def search_index_refused(fields: Sequence[str]) -> str:
+def search_index_refused(fields: Sequence[str], *, subject: str = "search()") -> str:
     """The refusal of a search on a field without a full-text index. *fields*: the field whose column the server named
     — or, when that column cannot be read, every field the statement searches; one is named alone, several as "one of
-    the fields"."""
+    the fields". *subject* starts it."""
     advice = (
         "SurrealDB matches only a field with a FULLTEXT (3.x) or SEARCH (2.x) index: declare "
         "Index(..., search_analyzer=...) on the model and apply define_indexes()."
     )
     if len(fields) == 1:
-        return f"search(): no full-text index on field {fields[0]!r}. {advice}"
-    return f"search(): no full-text index on one of the fields {', '.join(repr(field) for field in fields)}. {advice}"
+        return f"{subject}: no full-text index on field {fields[0]!r}. {advice}"
+    return f"{subject}: no full-text index on one of the fields {', '.join(repr(field) for field in fields)}. {advice}"
 
 
 def is_missing_index_error(error: BaseException) -> bool:
@@ -1606,23 +1606,25 @@ def missing_index_column(error: BaseException) -> str | None:
     return ".".join(_unquoted_segment(segment) for segment in found[1].split("."))
 
 
-def missing_index_refusal(error: BaseException, searched: Mapping[str, str]) -> SurrealDbError | None:
+def missing_index_refusal(
+    error: BaseException, searched: Mapping[str, str], *, subject: str = "search()"
+) -> SurrealDbError | None:
     """The ORM's error for SurrealDB's missing-index *error*, not raised; ``None`` for any other error.
 
     *searched* maps each column the statement searches to its field as given (the queryset's and its subqueries'). The
     error names the field whose column the server names, else that column; when the column cannot be read, every
     field of *searched*. Never the server's text, which on SurrealDB 3.x quotes the search text: the caller raises it
-    ``from None``.
+    ``from None``. *subject* starts the error (``search_index_refused()``).
     """
     if not is_missing_index_error(error):
         return None
     column = missing_index_column(error)
     if column is not None:
-        return SurrealDbError(search_index_refused([searched.get(column, column)]))
+        return SurrealDbError(search_index_refused([searched.get(column, column)], subject=subject))
     fields = list(dict.fromkeys(searched.values()))
     if not fields:
         return None
-    return SurrealDbError(search_index_refused(fields))
+    return SurrealDbError(search_index_refused(fields, subject=subject))
 
 
 def live_index_probe(table: str, column: str) -> str:
