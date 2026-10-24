@@ -6248,6 +6248,14 @@ print(get_vector_info(Document.model_fields["embedding"]), is_vector_field(Passa
 # (3, 'F32') False
 ```
 
+`VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or
+`Optional[VectorField[d]]`, its `None` default sits inside a union member, where Pydantic ignores it with an
+`UnsupportedFieldAttributeWarning`: write `= None`, or the field is required. The ORM reads these spellings, and
+`Annotated[list[float], Vector(d)] | None`, like the plain ones: the same column, the same checks of the vector index
+when the class is defined, the same dimension for `similar_to()`, the same answer from `get_vector_info()`. A union
+that holds a vector next to a type other than `None`, or two different `Vector` markers, has no single dimension: the
+class statement refuses it, naming the field.
+
 #### Find the nearest
 
 `similar_to(field, vector, limit=10, *, ef=None, dist=None)` keeps the `limit` records whose `field` vector is nearest

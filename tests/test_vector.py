@@ -148,7 +148,7 @@ condition holds the KNN, which never notifies.
 
 The documentation (``TestReadmeSection37``): README section 37 — its place after section 36, its seven subsections,
 its examples (run on ``mem://`` as written, each printed line equal to its comment; the search annotations' block
-printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences and thirteen "Coming from"
+printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences, the paragraph on the union spellings and thirteen "Coming from"
 bullets word for word —, the eight rows of the 2.x/3.x table and the row of the embedded engine's, cell by cell within
 the tables' widths, the header sentence, and the features, roadmap and comparison rows. ``TestRoadmap36``:
 ``docs/ROADMAP.md`` records v0.36.0 as planned, or — once its Phase G row carries ✅ — as released.
@@ -5202,6 +5202,16 @@ _S37_PRECISION = (
     "Distances are computed in the index's `vector_type` (`F32` by default: single precision), so they can differ "
     "from Python's in the last digits; `dist=` computes in double precision."
 )
+#: What *Type checkers* says of the union spellings of a vector field (issue #318).
+_S37_UNION = (
+    "`VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or "
+    "`Optional[VectorField[d]]`, its `None` default sits inside a union member, where Pydantic ignores it with an "
+    "`UnsupportedFieldAttributeWarning`: write `= None`, or the field is required. The ORM reads these spellings, and "
+    "`Annotated[list[float], Vector(d)] | None`, like the plain ones: the same column, the same checks of the vector "
+    "index when the class is defined, the same dimension for `similar_to()`, the same answer from `get_vector_info()`. "
+    "A union that holds a vector next to a type other than `None`, or two different `Vector` markers, has no single "
+    "dimension: the class statement refuses it, naming the field."
+)
 #: The nine sentences section 37 says word for word (whitespace normalised), with their subsection.
 _SENTENCES_37 = [
     ("Declare and apply", _S37_TYPE),
@@ -5521,6 +5531,12 @@ class TestReadmeSection37:
         assert len(_SENTENCES_37) == 9
         assert _normalised(_part_37(heading)).count(sentence) == 1, sentence
         assert _normalised(_section_37()).count(sentence) == 1, sentence
+
+    def test_the_union_spellings(self) -> None:
+        """*Type checkers* says once, word for word, that ``VectorField[d]`` is already optional, what ``| None`` asks
+        for, and that the union spellings are read like the plain ones (issue #318)."""
+        assert _normalised(_part_37("Type checkers")).count(_S37_UNION) == 1
+        assert _normalised(_section_37()).count(_S37_UNION) == 1
 
     def test_coming_from_the_full_orm(self) -> None:
         """Thirteen bullets, each word for word, a bold lead and one key phrase each, in order."""
