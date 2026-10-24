@@ -1946,7 +1946,7 @@ _NO_ID = (SurrealDbError, "^atomic operations require an explicit id")
 _ONE = SurrealFunc("1")
 
 #: #320: each write the ORM refuses for one of its arguments, without a request: (test id, the tables the write
-#: would note, the call made with the transaction *tx*, the error, its message as a pattern). v0.36.2 and before
+#: would note, the call made with the transaction *tx*, the error, its message as a pattern). v0.36.4 and before
 #: checked them in the method's body, after the wrapper had noted the tables on the transaction (outside one: put
 #: them in flight, dropping their cached reads at the end).
 _ARGUMENT_REFUSALS: list[tuple[str, frozenset[str], Callable[[Any], Awaitable[Any]], type[Exception], str]] = [

@@ -1326,7 +1326,7 @@ _ATOMIC_ARGUMENT_ERROR = (
 )
 
 #: #320: the QuerySet writes of :data:`_VIEW_WRITES`. ``bulk_create()``, ``bulk_update()``, ``bulk_delete()`` and
-#: ``patch()`` ran W1 in their body, after the wrapper had noted the table on the transaction (v0.36.2 and before);
+#: ``patch()`` ran W1 in their body, after the wrapper had noted the table on the transaction (v0.36.4 and before);
 #: ``update_or_create()``, ``get_or_create()`` and ``delete_table()`` never noted it.
 _QUERYSET_TX_WRITES = _VIEW_WRITES[13:]
 
