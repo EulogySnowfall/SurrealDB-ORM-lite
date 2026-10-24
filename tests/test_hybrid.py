@@ -40,6 +40,10 @@ With the rest of the queryset and what the server decides (``TestHybridCompositi
 records storing columns named as the method's own values answering as records without them; a field without its
 full-text or vector index, a vector of another length than its index's dimension and a table that does not exist, per
 line; an interactive transaction's own writes, and a buffered transaction's refusal before anything is sent.
+
+What each line answers to ``search::rrf()`` (``TestHybridLinePinsE2E``), pinned with literal statements on the same
+engines: SurrealDB 3.x has the function, 2.x and the embedded engine refuse it; its score is the sum of 1/(k + rank)
+over the lists, bit for bit, the records, scores and order the ORM's fusion gives the same lists.
 """
 
 import ast
@@ -2846,3 +2850,84 @@ class TestHybridTransactionsE2E:
         assert str(commit.value) == _COMMIT_FAILED
         assert commit.value.__cause__ is read.value
         assert sorted(record.id for record in stored) == [f"d{number}" for number in range(1, 9)]
+
+
+# === E2E: what each line answers to search::rrf(), pinned with literal statements ===================================
+
+#: The README row the first pin backs.
+_ROW_FUSION = "README row '`hybrid_search()`: the fusion'"
+
+#: The README sentence the second pin backs (section 38, "Search").
+_S38_FORMULA = "README section 38, 'Each record gets 1 / (`rrf_k` + rank) from each list it is in, its rank counted from 1'"
+
+#: Two lists of one record each, fused: both records score 1/61.
+_PIN_RRF = "RETURN search::rrf([[{id: 1}], [{id: 2}]], 2, 60);"
+
+#: Two lists sharing the record 2 (rank 2 in the first, rank 1 in the second), fused.
+_PIN_RRF_FORMULA = "RETURN search::rrf([[{id: 1}, {id: 2}], [{id: 2}, {id: 3}]], 3, 60);"
+
+#: ``_PIN_RRF_FORMULA``'s lists, as the ORM fuses them below 3.
+_FORMULA_LISTS = [[{"id": 1}, {"id": 2}], [{"id": 2}, {"id": 3}]]
+
+#: ``_PIN_RRF_FORMULA``'s answer: each record, its fused score Σ 1/(60 + rank) summed in list order, best first.
+_FORMULA_ANSWER = [(2, 1 / 62 + 1 / 61), (1, 1 / 61), (3, 1 / 62)]
+
+#: What SurrealDB 2.x and the embedded engine answer to a statement calling ``search::rrf()``.
+_NO_RRF = "Invalid function/constant path"
+
+
+class TestHybridLinePinsE2E:
+    """What each engine answers to ``search::rrf()``, pinned with literal statements on every engine (the line under
+    test over WebSocket and HTTP, and the embedded engine), each test naming the README row or sentence it backs: the
+    function exists on SurrealDB 3.x only, which is why the ORM fuses the two lists itself below 3, and its score is
+    the sum of 1/(k + rank) over the lists, bit for bit as the ORM computes it. Equal scores are never compared in the
+    server's order, which is not fixed."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_search_rrf_exists_on_3x_only(self, kind: str) -> None:
+        """README row "``hybrid_search()``: the fusion": SurrealDB 3.x answers ``search::rrf()`` — here two records
+        scoring 1/61 each —; SurrealDB 2.x and the embedded engine have no such function and refuse the statement."""
+        async with _hy(kind) as client:
+            major = await _major(client)
+            rows: list[dict[str, Any]] | None = None
+            refused: pytest.ExceptionInfo[Exception] | None = None
+            if major >= 3:
+                rows = await client.query(_PIN_RRF, {})
+            else:
+                with pytest.raises((InternalError, RuntimeError)) as refused:
+                    await client.query(_PIN_RRF, {})
+        if major >= 3:
+            assert rows is not None
+            assert sorted((row["id"], row["rrf_score"]) for row in rows) == [(1, 1 / 61), (2, 1 / 61)], (
+                f"{_ROW_FUSION}: SurrealDB 3.x fuses the lists with search::rrf()"
+            )
+        else:
+            assert refused is not None
+            assert _NO_RRF in str(refused.value), f"{_ROW_FUSION}: SurrealDB 2.x has no search::rrf()"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_fused_score_is_the_sum_of_1_over_k_plus_rank(self, kind: str) -> None:
+        """README section 38, "Search": each record gets 1 / (``rrf_k`` + rank) from each list it is in, its rank
+        counted from 1. SurrealDB 3.x's ``search::rrf()`` gives the record of both lists 1/62 + 1/61, bit for bit, and
+        the records the ORM fuses itself below 3, the same records, scores and order; 2.x and the embedded engine refuse
+        the function."""
+        fused = hybrid.fuse(_FORMULA_LISTS, k=60, vector_limit=2)
+        async with _hy(kind) as client:
+            major = await _major(client)
+            rows: list[dict[str, Any]] | None = None
+            refused: pytest.ExceptionInfo[Exception] | None = None
+            if major >= 3:
+                rows = await client.query(_PIN_RRF_FORMULA, {})
+            else:
+                with pytest.raises((InternalError, RuntimeError)) as refused:
+                    await client.query(_PIN_RRF_FORMULA, {})
+        assert [(row["id"], row["rrf_score"]) for row in fused] == _FORMULA_ANSWER, f"{_S38_FORMULA}: the ORM's fusion"
+        if major >= 3:
+            assert rows is not None
+            assert [(row["id"], row["rrf_score"]) for row in rows] == _FORMULA_ANSWER, (
+                f"{_S38_FORMULA}: SurrealDB 3.x's search::rrf()"
+            )
+            assert rows == fused, f"{_S38_FORMULA}: the same records, scores and order as the ORM's fusion"
+        else:
+            assert refused is not None
+            assert _NO_RRF in str(refused.value), f"{_ROW_FUSION}: SurrealDB 2.x has no search::rrf()"
