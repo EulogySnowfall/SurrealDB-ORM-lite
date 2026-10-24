@@ -16,7 +16,11 @@ The marker (``TestVectorMarker``): ``Vector(dimension, vector_type="F32")`` hold
 upper case, equal and hashed by both, with the ``repr`` ``Vector(3, 'F32')``, read-only, copied and pickled as an
 equal marker; its arguments are checked with exact texts. ``get_vector_info()`` reads ``(dimension, type)`` from a
 model field of either spelling or from an ``Annotated`` annotation, ``None`` from anything else;
-``is_vector_field()`` tells which.
+``is_vector_field()`` tells which. Both read a union of either spelling with ``None`` (``VectorField[3] | None``,
+``Optional[VectorField[3]]``, ``Annotated[list[float], Vector(3)] | None``: issue #318) as the plain spelling, never
+the vectors a container holds (``list[VectorField[3]]``), and refuse with an exact text a field or an annotation holding
+two different markers, or a marker next to a type other than ``None``. ``VectorField[3] | None`` needs its ``= None``
+(Pydantic ignores the default of a union member, with a warning), and checks its values as ``VectorField[3]`` does.
 
 The checks of the vector search's arguments (``TestCheckers``): the distances (``EUCLIDEAN``, ``COSINE``,
 ``MANHATTAN``, ``CHEBYSHEV``, ``HAMMING`` in any case; ``MINKOWSKI``, ``JACCARD`` and ``PEARSON`` each refused with its
@@ -43,12 +47,14 @@ The model's vector indexes (``TestClassChecks``): at the ``class`` statement, af
 indexes on one column (an aliased field counted under its column) are refused, then a vector index on a vector field
 whose dimension or storage type differs from the field's — the index's effective type compared, ``F32`` when it
 declares none —, each with its exact text, the first fault raising; a vector index on a field that is not a vector
-field is accepted, and an inherited index is checked again against the subclass's field.
+field is accepted, and an inherited index is checked again against the subclass's field. The same refusal applies to a
+vector field written as a union with ``None``; and before the indexes, on every model, a field whose ``Vector`` markers
+are ambiguous is refused with an exact text naming the model and the field, a subclass redeclaring it too.
 
-The table's vector columns (``TestFieldKind``, ``TestDefineTableE2E``): a vector field of either spelling is written
-``option<array<float, d>>`` by ``table_ddl()`` and ``define_table()``, whatever its storage type; on every engine the
-column reads back as written, so a second ``define_table()`` changes nothing, integers are stored as floats, and a
-vector of another length is refused.
+The table's vector columns (``TestFieldKind``, ``TestDefineTableE2E``): a vector field of either spelling, or its
+union with ``None``, is written ``option<array<float, d>>`` by ``table_ddl()`` and ``define_table()``, whatever its
+storage type; on every engine the column reads back as written, so a second ``define_table()`` changes nothing,
+integers are stored as floats, and a vector of another length is refused.
 
 The model's vector indexes applied (``TestDefineVectorIndexesE2E``), on every engine: ``define_indexes()`` applies the
 analyzer and every index of a fresh table, the full-text one with the line's keyword; called again it sends ``INFO FOR
@@ -142,7 +148,7 @@ condition holds the KNN, which never notifies.
 
 The documentation (``TestReadmeSection37``): README section 37 — its place after section 36, its seven subsections,
 its examples (run on ``mem://`` as written, each printed line equal to its comment; the search annotations' block
-printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences and thirteen "Coming from"
+printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences, the paragraph on the union spellings and thirteen "Coming from"
 bullets word for word —, the eight rows of the 2.x/3.x table and the row of the embedded engine's, cell by cell within
 the tables' widths, the header sentence, and the features, roadmap and comparison rows. ``TestRoadmap36``:
 ``docs/ROADMAP.md`` records v0.36.0 as planned, or — once its Phase G row carries ✅ — as released.
@@ -157,15 +163,17 @@ import math
 import os
 import pickle
 import re
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Optional, Union
 
 import pytest
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, create_model
+from pydantic.warnings import UnsupportedFieldAttributeWarning
 from surrealdb import InternalError, RecordID, ServerError
 
 import surreal_orm_lite
@@ -236,6 +244,82 @@ class VecAssigned(BaseSurrealModel):
     embedding: VectorField[3]
 
 
+with warnings.catch_warnings():
+    # ``VectorField[3] | None`` holds VectorField's ``Field(default=None)`` in a union member, where Pydantic ignores it
+    # with a warning (``test_a_union_with_none_needs_its_default``): each union field below writes its ``= None``.
+    warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+
+    class VecUnion(BaseSurrealModel):
+        """The union spellings of a vector field (issue #318), one aliased, none indexed; and vectors held in
+        containers, which are not vector fields."""
+
+        model_config = SurrealConfigDict(table_name="vec_union")
+
+        id: str | None = None
+        optional: VectorField[3] | None = None
+        legacy: Optional[VectorField[3]] = None  # noqa: UP045 - the spelling under test
+        typed: Annotated[list[float], Vector(3)] | None = None
+        wide: Annotated[list[float], Vector(3, "F64")] | None = None
+        aliased: Annotated[list[float], Vector(3)] | None = Field(default=None, alias="aliased_vec")
+        noted: Annotated[VectorField[3] | None, "a note"] = None
+        listed: list[VectorField[3]] = Field(default_factory=list)
+        keyed: dict[str, VectorField[3]] = Field(default_factory=dict)
+        maybe_listed: list[VectorField[3]] | None = None
+
+
+#: The union fields of ``VecUnion`` and the ``(dimension, storage type)`` each declares.
+_UNION_FIELDS = [
+    ("optional", (3, "F32")),
+    ("legacy", (3, "F32")),
+    ("typed", (3, "F32")),
+    ("wide", (3, "F64")),
+    ("aliased", (3, "F32")),
+    ("noted", (3, "F32")),
+]
+
+#: The refusal of a field or an annotation whose ``Vector`` markers are ambiguous: its subject, then what it holds.
+_AMBIGUOUS = (
+    "{} holds {}; a vector field holds one Vector marker, and None at most. Write VectorField[d] alone (it is already "
+    "optional) or Annotated[list[float] | None, Vector(d)]."
+)
+_NEXT_TO = "next to a type other than None"
+
+#: Annotations whose markers are ambiguous, and what the refusal says they hold.
+_AMBIGUOUS_ANNOTATIONS = [
+    (VectorField[3] | str, f"Vector(3, 'F32') {_NEXT_TO}"),
+    (VectorField[3] | Any, f"Vector(3, 'F32') {_NEXT_TO}"),
+    (Annotated[list[float], Vector(3)] | int | None, f"Vector(3, 'F32') {_NEXT_TO}"),
+    (Annotated[VectorField[3] | None, "a note"] | list[float], f"Vector(3, 'F32') {_NEXT_TO}"),
+    (VectorField[3] | VectorField[4], "Vector(3, 'F32') and Vector(4, 'F32')"),
+    (VectorField[3] | VectorField[3, "F64"] | None, "Vector(3, 'F32') and Vector(3, 'F64')"),
+    (VectorField[2] | VectorField[3] | VectorField[4], "Vector(2, 'F32'), Vector(3, 'F32') and Vector(4, 'F32')"),
+    (VectorField[2] | VectorField[3] | list[float], f"Vector(2, 'F32') and Vector(3, 'F32') {_NEXT_TO}"),
+    (Annotated[list[float] | None, Vector(3), Vector(4)], "Vector(3, 'F32') and Vector(4, 'F32')"),
+]
+_AMBIGUOUS_IDS = [
+    "str",
+    "any",
+    "typed-int-none",
+    "noted-list",
+    "two-dimensions",
+    "two-types",
+    "three-markers",
+    "two-and-a-type",
+    "two-in-one-annotated",
+]
+
+#: An ambiguous union as a name (a string in an annotation reads as a forward reference).
+_MIXED: Any = VectorField[3] | str
+
+
+def _model_of(name: str, base: type[BaseModel] = BaseSurrealModel, **fields: Any) -> type[BaseModel]:
+    """A model *name* of *base* built by ``create_model()`` with *fields* — its ``class`` statement —, Pydantic's warning
+    about a default in a union member silenced."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+        return create_model(name, __base__=base, **fields)
+
+
 # The field name each spelling is given under, for the refusals.
 _SPELLINGS = [("embedding", "embedding"), ("typed", "typed"), ("aliased_vec", "aliased_vec")]
 
@@ -274,6 +358,26 @@ class TestVectorField:
         for name in ("embedding", "typed", "aliased"):
             assert not VecField.model_fields[name].is_required(), name
             assert VecField.model_fields[name].default is None, name
+
+    def test_a_union_with_none_needs_its_default(self) -> None:
+        """``VectorField[3]`` is already optional. Written ``VectorField[3] | None``, its default sits in a union
+        member, which Pydantic ignores with an ``UnsupportedFieldAttributeWarning``: without ``= None`` the field is
+        required (what README section 37 says)."""
+        with pytest.warns(UnsupportedFieldAttributeWarning):
+            model = create_model("VecRequired", __base__=BaseSurrealModel, id=(str | None, None), e=VectorField[3] | None)
+        assert model.model_fields["e"].is_required()
+        with pytest.raises(ValidationError):
+            model()
+        for name, _ in _UNION_FIELDS:
+            assert not VecUnion.model_fields[name].is_required(), name
+        assert VecUnion().optional is None
+
+    @pytest.mark.parametrize(("name", "info"), _UNION_FIELDS)
+    def test_a_union_spelling_checks_its_values(self, name: str, info: tuple[int, str]) -> None:
+        assert getattr(VecUnion(**{name: (1, 2, Decimal("3.5"))}), name) == [1.0, 2.0, 3.5]
+        assert getattr(VecUnion(**{name: None}), name) is None
+        with pytest.raises(ValidationError):
+            VecUnion(**{name: [1.0, 2.0]})
 
     def test_ints_stored_as_floats(self) -> None:
         doc = VecField(embedding=[1, 2, 3], typed=[1, 2, 3], aliased_vec=[1, 2, 3])
@@ -552,6 +656,80 @@ class TestVectorMarker:
         assert is_vector_field(Annotated[list[float] | None, Vector(3)]) is True
         assert is_vector_field(fields["id"]) is False
         assert is_vector_field(list[float]) is False
+
+    @pytest.mark.parametrize(("name", "info"), _UNION_FIELDS)
+    def test_the_union_spellings_of_a_model_field(self, name: str, info: tuple[int, str]) -> None:
+        """The marker sits in a union member, not in the field's metadata: the helpers read the annotation."""
+        field = VecUnion.model_fields[name]
+        assert not any(isinstance(item, Vector) for item in field.metadata)
+        assert get_vector_info(field) == info
+        assert is_vector_field(field) is True
+
+    @pytest.mark.parametrize(
+        ("annotation", "info"),
+        [
+            (VectorField[3] | None, (3, "F32")),
+            (Optional[VectorField[3]], (3, "F32")),  # noqa: UP045 - the spelling under test
+            (Union[None, VectorField[3]], (3, "F32")),  # noqa: UP007 - the spelling under test
+            (VectorField[384, "i16"] | None, (384, "I16")),
+            (Annotated[list[float], Vector(3)] | None, (3, "F32")),
+            (Annotated[list[float], Vector(3, "F64")] | None, (3, "F64")),
+            (Annotated[list[float] | None, Vector(3)] | None, (3, "F32")),
+            (Annotated[VectorField[3] | None, "a note"], (3, "F32")),
+            (Annotated[list[float], Vector(2)] | Annotated[list[float] | None, Vector(2)], (2, "F32")),
+            (Annotated[VectorField[4] | None, Vector(3)], (3, "F32")),
+        ],
+        ids=[
+            "or-none",
+            "optional",
+            "union-none-first",
+            "i16",
+            "typed",
+            "typed-f64",
+            "typed-optional-or-none",
+            "noted",
+            "one-marker-twice",
+            "outer-marker",
+        ],
+    )
+    def test_the_union_spellings_of_an_annotation(self, annotation: Any, info: tuple[int, str]) -> None:
+        assert get_vector_info(annotation) == info
+        assert is_vector_field(annotation) is True
+
+    @pytest.mark.parametrize("name", ["listed", "keyed", "maybe_listed"])
+    def test_vectors_in_a_container_field_are_not_a_vector_field(self, name: str) -> None:
+        field = VecUnion.model_fields[name]
+        assert get_vector_info(field) is None
+        assert is_vector_field(field) is False
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            list[VectorField[3]],
+            dict[str, VectorField[3]],
+            list[VectorField[3]] | None,
+            tuple[VectorField[3], ...],
+            Annotated[list[VectorField[3]], "a note"],
+            list[float] | dict[str, VectorField[3]],
+        ],
+        ids=["list", "dict", "list-or-none", "tuple", "noted-list", "union-of-containers"],
+    )
+    def test_vectors_in_a_container_are_not_a_vector_field(self, annotation: Any) -> None:
+        assert get_vector_info(annotation) is None
+        assert is_vector_field(annotation) is False
+
+    @pytest.mark.parametrize(("annotation", "held"), _AMBIGUOUS_ANNOTATIONS, ids=_AMBIGUOUS_IDS)
+    def test_an_ambiguous_annotation_is_refused(self, annotation: Any, held: str) -> None:
+        text = _AMBIGUOUS.format("The annotation", held)
+        assert _raised(ValueError, get_vector_info, annotation) == text
+        assert _raised(ValueError, is_vector_field, annotation) == text
+
+    def test_an_ambiguous_field_of_a_pydantic_model_is_refused(self) -> None:
+        """A plain Pydantic model is not checked at its ``class`` statement: the helpers refuse its field."""
+        field = _model_of("VecPlain", BaseModel, mixed=(_MIXED, None)).model_fields["mixed"]
+        text = _AMBIGUOUS.format("The field", f"Vector(3, 'F32') {_NEXT_TO}")
+        assert _raised(ValueError, get_vector_info, field) == text
+        assert _raised(ValueError, is_vector_field, field) == text
 
 
 class TestCheckers:
@@ -1207,11 +1385,32 @@ def _hnsw(name: str, field: str, dimension: int = 3, **options: Any) -> Index:
     return Index(name, field, hnsw=True, dimension=dimension, **options)
 
 
+def _vec_union_bad(indexes: object) -> type[BaseSurrealModel]:
+    """A model ``VecUnionBad`` with ``indexes=`` *indexes*, built by its ``class`` statement: a vector field of each
+    union spelling (issue #318), one aliased."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+
+        class VecUnionBad(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_union_bad", indexes=indexes)  # type: ignore[typeddict-item]
+
+            id: str | None = None
+            optional: VectorField[3] | None = None
+            legacy: Optional[VectorField[3]] = None  # noqa: UP045 - the spelling under test
+            typed: Annotated[list[float], Vector(3)] | None = None
+            wide: Annotated[list[float], Vector(3, "F64")] | None = None
+            aliased: Annotated[list[float], Vector(3)] | None = Field(default=None, alias="aliased_vec")
+
+    return VecUnionBad
+
+
 class TestClassChecks:
     """``SurrealConfigDict(indexes=[...])`` with vector indexes, checked at the ``class`` statement after v0.35.0's
     checks: one vector index per column (an aliased field counted under its column), and a vector index on a vector
-    field of the same dimension and effective storage type (``F32`` when the index declares none). A vector index on a
-    field that is not a vector field is the application's choice."""
+    field of the same dimension and effective storage type (``F32`` when the index declares none), whichever spelling
+    declares the field — a union with ``None`` included. A vector index on a field that is not a vector field is the
+    application's choice. Before the indexes, on every model, a field whose ``Vector`` markers are ambiguous is
+    refused, naming it."""
 
     def test_the_golden_model_is_accepted(self) -> None:
         assert [index.name for index in VecDoc.get_indexes()] == ["vec_doc_embedding", "vec_doc_summary", "vec_doc_title"]
@@ -1340,6 +1539,106 @@ class TestClassChecks:
 
         assert str(raised.value) == _IC8.format("VecDocWide", "vec_doc_embedding", 3, "F32", "embedding", 4, "F32")
 
+    @pytest.mark.parametrize(
+        ("index", "text"),
+        [
+            (_hnsw("vec_a", "optional", dimension=4), _IC8.format("VecUnionBad", "vec_a", 4, "F32", "optional", 3, "F32")),
+            (
+                _hnsw("vec_a", "optional", vector_type="f64"),
+                _IC8.format("VecUnionBad", "vec_a", 3, "F64", "optional", 3, "F32"),
+            ),
+            (_hnsw("vec_a", "legacy", dimension=4), _IC8.format("VecUnionBad", "vec_a", 4, "F32", "legacy", 3, "F32")),
+            (
+                _hnsw("vec_a", "legacy", vector_type="i16"),
+                _IC8.format("VecUnionBad", "vec_a", 3, "I16", "legacy", 3, "F32"),
+            ),
+            (_hnsw("vec_a", "typed", dimension=2), _IC8.format("VecUnionBad", "vec_a", 2, "F32", "typed", 3, "F32")),
+            (
+                _hnsw("vec_a", "typed", vector_type="F64"),
+                _IC8.format("VecUnionBad", "vec_a", 3, "F64", "typed", 3, "F32"),
+            ),
+            (_hnsw("vec_a", "wide"), _IC8.format("VecUnionBad", "vec_a", 3, "F32", "wide", 3, "F64")),
+            (
+                _hnsw("vec_a", "wide", dimension=4, vector_type="f64"),
+                _IC8.format("VecUnionBad", "vec_a", 4, "F64", "wide", 3, "F64"),
+            ),
+            (
+                _hnsw("vec_a", "aliased_vec", dimension=4),
+                _IC8.format("VecUnionBad", "vec_a", 4, "F32", "aliased_vec", 3, "F32"),
+            ),
+            (
+                _hnsw("vec_a", "aliased", vector_type="i32"),
+                _IC8.format("VecUnionBad", "vec_a", 3, "I32", "aliased", 3, "F32"),
+            ),
+        ],
+        ids=[
+            "or-none-dimension",
+            "or-none-type",
+            "optional-dimension",
+            "optional-type",
+            "typed-dimension",
+            "typed-type",
+            "typed-f64-effective-type",
+            "typed-f64-dimension",
+            "alias-column",
+            "alias-name",
+        ],
+    )
+    def test_ic8_on_each_union_spelling(self, index: Index, text: str) -> None:
+        """The same refusal, word for word, as for ``VectorField[3]`` (issue #318)."""
+        assert _raised(ValueError, _vec_union_bad, [index]) == text
+
+    def test_matching_vector_indexes_on_union_spellings_accepted(self) -> None:
+        indexes = [
+            _hnsw("vec_a", "optional", dist="cosine"),
+            _hnsw("vec_b", "legacy"),
+            _hnsw("vec_c", "typed", vector_type="f32"),
+            _hnsw("vec_d", "wide", vector_type="F64", efc=100, m=8),
+            _hnsw("vec_e", "aliased_vec"),
+        ]
+        assert _vec_union_bad(indexes).get_indexes() == tuple(indexes)
+
+    def test_an_inherited_index_is_checked_against_a_union_spelling(self) -> None:
+        with pytest.raises(ValueError) as raised, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+
+            class VecDocUnion(VecDoc):
+                model_config = SurrealConfigDict(table_name="vec_doc_union")
+
+                embedding: _FOUR | None = None
+
+        assert str(raised.value) == _IC8.format("VecDocUnion", "vec_doc_embedding", 3, "F32", "embedding", 4, "F32")
+
+    @pytest.mark.parametrize(("annotation", "held"), _AMBIGUOUS_ANNOTATIONS, ids=_AMBIGUOUS_IDS)
+    def test_an_ambiguous_vector_field_is_refused_without_indexes(self, annotation: Any, held: str) -> None:
+        text = _raised(ValueError, _model_of, "VecAmbiguous", id=(str | None, None), mixed=(annotation, None))
+        assert text == _AMBIGUOUS.format("VecAmbiguous: field 'mixed'", held)
+
+    def test_an_ambiguous_vector_field_is_refused_before_the_indexes(self) -> None:
+        with pytest.raises(ValueError) as raised, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+
+            class VecMixed(BaseSurrealModel):
+                model_config = SurrealConfigDict(
+                    table_name="vec_mixed", indexes=[_hnsw("vec_a", "mixed", dimension=4), _hnsw("vec_b", "mixed")]
+                )
+
+                id: str | None = None
+                mixed: _MIXED = None
+
+        assert str(raised.value) == _AMBIGUOUS.format("VecMixed: field 'mixed'", f"Vector(3, 'F32') {_NEXT_TO}")
+
+    def test_a_field_redeclared_ambiguous_is_refused_naming_the_subclass(self) -> None:
+        with pytest.raises(ValueError) as raised, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+
+            class VecFieldMixed(VecField):
+                model_config = SurrealConfigDict(table_name="vec_field_mixed")
+
+                typed: _MIXED = None
+
+        assert str(raised.value) == _AMBIGUOUS.format("VecFieldMixed: field 'typed'", f"Vector(3, 'F32') {_NEXT_TO}")
+
 
 # === define_table(): the vector columns =============================================================================
 
@@ -1385,6 +1684,18 @@ class TestFieldKind:
         assert VecField.table_ddl()[1:] == [
             f"DEFINE FIELD OVERWRITE `{column}` ON `vec_t` TYPE option<array<float, 3>>;"
             for column in ("embedding", "typed", "aliased_vec")
+        ]
+
+    def test_the_union_spellings_write_the_same_column(self) -> None:
+        """The union spellings (issue #318) are written as the plain ones, and a container of vectors as before."""
+        assert VecUnion.table_ddl()[1:] == [
+            *(
+                f"DEFINE FIELD OVERWRITE `{column}` ON `vec_union` TYPE option<array<float, 3>>;"
+                for column in ("optional", "legacy", "typed", "wide", "aliased_vec", "noted")
+            ),
+            "DEFINE FIELD OVERWRITE `listed` ON `vec_union` TYPE array<option<array<float, 3>>>;",
+            "DEFINE FIELD OVERWRITE `keyed` ON `vec_union` TYPE object;",
+            "DEFINE FIELD OVERWRITE `maybe_listed` ON `vec_union` TYPE option<array<option<array<float, 3>>>>;",
         ]
 
 
@@ -2288,6 +2599,16 @@ class TestSimilarTo:
             "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE meta.vec <|10,100|> $_f0 ORDER BY "
             "_knn_distance;"
         )
+
+    @pytest.mark.parametrize(("field", "info"), _UNION_FIELDS)
+    def test_v6_a_union_spelling_declares_the_dimension(self, field: str, info: tuple[int, str]) -> None:
+        """No vector index on these fields (issue #318): the dimension comes from the union's marker."""
+        for value in ([1.0, 0.0, 0.0, 0.0], [1.0, 0.0]):
+            assert _raised(ValueError, VecUnion.objects().similar_to, field, value) == (
+                f"similar_to(): the vector has {len(value)} dimensions; field {field!r} holds vectors of 3 (VectorField[3])."
+            )
+        queryset = VecUnion.objects().similar_to(field, (1, 0, 0), 2, dist="euclidean")
+        assert queryset._compile_query()[1] == {"_f0": [1.0, 0.0, 0.0]}
 
     def test_the_limit_then_the_dimension_then_the_zero_vector(self) -> None:
         assert _refused_unchanged(ValueError, "embedding", [1.0], 0) == _V7_RANGE.format(0)
@@ -4881,6 +5202,16 @@ _S37_PRECISION = (
     "Distances are computed in the index's `vector_type` (`F32` by default: single precision), so they can differ "
     "from Python's in the last digits; `dist=` computes in double precision."
 )
+#: What *Type checkers* says of the union spellings of a vector field (issue #318).
+_S37_UNION = (
+    "`VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or "
+    "`Optional[VectorField[d]]`, its `None` default sits inside a union member, where Pydantic ignores it with an "
+    "`UnsupportedFieldAttributeWarning`: write `= None`, or the field is required. The ORM reads these spellings, and "
+    "`Annotated[list[float], Vector(d)] | None`, like the plain ones: the same column, the same checks of the vector "
+    "index when the class is defined, the same dimension for `similar_to()`, the same answer from `get_vector_info()`. "
+    "A union that holds a vector next to a type other than `None`, or two different `Vector` markers, has no single "
+    "dimension: the class statement refuses it, naming the field."
+)
 #: The nine sentences section 37 says word for word (whitespace normalised), with their subsection.
 _SENTENCES_37 = [
     ("Declare and apply", _S37_TYPE),
@@ -5200,6 +5531,12 @@ class TestReadmeSection37:
         assert len(_SENTENCES_37) == 9
         assert _normalised(_part_37(heading)).count(sentence) == 1, sentence
         assert _normalised(_section_37()).count(sentence) == 1, sentence
+
+    def test_the_union_spellings(self) -> None:
+        """*Type checkers* says once, word for word, that ``VectorField[d]`` is already optional, what ``| None`` asks
+        for, and that the union spellings are read like the plain ones (issue #318)."""
+        assert _normalised(_part_37("Type checkers")).count(_S37_UNION) == 1
+        assert _normalised(_section_37()).count(_S37_UNION) == 1
 
     def test_coming_from_the_full_orm(self) -> None:
         """Thirteen bullets, each word for word, a bold lead and one key phrase each, in order."""

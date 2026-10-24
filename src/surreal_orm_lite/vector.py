@@ -8,7 +8,11 @@ storage type is given (``F64``, ``F32``, ``I64``, ``I32`` or ``I16``, in any cas
 Pydantic reads the ``Vector`` marker exactly as ``VectorField[1536]``'s. Both spellings are one field: the same
 validation, the same column type (``option<array<float, 1536>>``), the same schema. ``get_vector_info()`` and
 ``is_vector_field()`` — the full ORM's helpers, under their names — read the marker of either spelling from a model
-field or an annotation.
+field or an annotation, and of their unions with ``None`` (``VectorField[1536] | None``,
+``Annotated[list[float], Vector(1536)] | None``), as ``define_table()`` reads them; never from inside a container
+(``list[VectorField[3]]``). A field or an annotation holding two different markers, or a marker next to a type other
+than ``None``, has no single dimension: the helpers refuse it, and a model's ``class`` statement refuses such a field
+(``declared_vectors()``).
 
 A value is ``None`` or a ``list``/``tuple`` of exactly ``d`` real numbers — ``int``, ``float``, any ``numbers.Real``,
 a ``decimal.Decimal`` (SurrealDB's decimals read back as ``Decimal``) —, never a ``bool`` nor a ``str``, each finite
@@ -50,7 +54,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from numbers import Real
-from typing import Annotated, Any, NoReturn, Self, TypedDict, get_args, get_origin
+from types import NoneType, UnionType
+from typing import Annotated, Any, NoReturn, Self, TypedDict, Union, get_args, get_origin
 
 from pydantic import Field, GetCoreSchemaHandler, GetJsonSchemaHandler
 from pydantic.fields import FieldInfo
@@ -292,36 +297,100 @@ class VectorField:
         return _ANNOTATED[list[float] | None, Vector(*checked), Field(default=None)]
 
 
-def _marker(annotation_or_field: Any) -> Vector | None:
-    """The first ``Vector`` of a ``FieldInfo``'s metadata or of an ``Annotated`` annotation's, else ``None``."""
+def _held(annotation: Any, metadata: Sequence[Any] = ()) -> tuple[tuple[Vector, ...], bool]:
+    """The distinct ``Vector`` markers that declare a field of *annotation* (with the field's own *metadata*), in order,
+    and whether the field also takes a type other than ``None`` next to them.
+
+    The ``Annotated`` layers are unwrapped and their metadata added to *metadata*: when it holds a ``Vector``, those
+    markers decide, whatever the type under them (a ``Vector`` validates the value itself). Otherwise ``None`` gives
+    neither; a union gives the markers and other types of its members, each read the same way; any other type is
+    another type — a container holding vectors (``list[VectorField[3]]``) included, whose arguments are never read.
+    This is the reading ``model_ddl`` gives the column its kind by, so the column and the checks agree.
+    """
+    while get_origin(annotation) is Annotated:
+        metadata = (*metadata, *annotation.__metadata__)
+        annotation = annotation.__origin__
+    markers = tuple(dict.fromkeys(item for item in metadata if isinstance(item, Vector)))
+    if markers:
+        return markers, False
+    if annotation is None or annotation is NoneType:
+        return (), False
+    origin = get_origin(annotation)
+    if origin is not Union and origin is not UnionType:
+        return (), True
+    members = [_held(member) for member in get_args(annotation)]
+    markers = tuple(dict.fromkeys(marker for held, _ in members for marker in held))
+    return markers, any(other for _, other in members)
+
+
+def ambiguous_marker_refused(subject: str, markers: Sequence[Vector], other: bool) -> str:
+    """The refusal of *subject* — a field, or an annotation —, which holds several different *markers*, or a marker and
+    a type other than ``None`` (*other*): a vector field of no single dimension and storage type."""
+    held = repr(markers[-1]) if len(markers) == 1 else f"{', '.join(map(repr, markers[:-1]))} and {markers[-1]!r}"
+    if other:
+        held += " next to a type other than None"
+    return (
+        f"{subject} holds {held}; a vector field holds one Vector marker, and None at most. Write VectorField[d] alone "
+        "(it is already optional) or Annotated[list[float] | None, Vector(d)]."
+    )
+
+
+def _marker(annotation_or_field: Any, *, subject: str | None = None) -> Vector | None:
+    """The ``Vector`` marker of a ``FieldInfo`` or of an annotation (``_held()``), ``None`` when it holds none.
+
+    Several different markers, or a marker next to a type other than ``None`` in a union, raise ``ValueError`` naming
+    *subject* (by default "The field" or "The annotation").
+    """
     if isinstance(annotation_or_field, FieldInfo):
-        metadata: Sequence[Any] = annotation_or_field.metadata
-    elif get_origin(annotation_or_field) is Annotated:
-        metadata = annotation_or_field.__metadata__
+        markers, other = _held(annotation_or_field.annotation, annotation_or_field.metadata)
+        default = "The field"
     else:
+        markers, other = _held(annotation_or_field)
+        default = "The annotation"
+    if not markers:
         return None
-    for item in metadata:
-        if isinstance(item, Vector):
-            return item
-    if isinstance(annotation_or_field, FieldInfo):
-        return None
-    return _marker(get_args(annotation_or_field)[0])
+    if len(markers) > 1 or other:
+        raise ValueError(ambiguous_marker_refused(subject or default, markers, other))
+    return markers[0]
 
 
 def get_vector_info(annotation_or_field: Any) -> tuple[int, str] | None:
     """The ``(dimension, storage type)`` of a vector field, or ``None`` when it is not one (the full ORM's helper).
 
     Takes a model field (``Model.model_fields["embedding"]``, a Pydantic ``FieldInfo``) or an annotation
-    (``VectorField[3]``, ``Annotated[list[float] | None, Vector(3)]``): both spellings give ``(3, "F32")``. Anything
-    without a ``Vector`` marker — ``list[float]``, another field — gives ``None``.
+    (``VectorField[3]``, ``Annotated[list[float] | None, Vector(3)]``): both spellings give ``(3, "F32")``, and so do
+    their unions with ``None`` (``VectorField[3] | None``, ``Optional[VectorField[3]]``,
+    ``Annotated[list[float], Vector(3)] | None``), read as ``define_table()`` reads them. Anything without a ``Vector``
+    marker — ``list[float]``, another field, vectors held in a container such as ``list[VectorField[3]]`` — gives
+    ``None``.
+
+    :raises ValueError: the field or annotation holds two different ``Vector`` markers, or a marker next to a type
+        other than ``None`` in a union (``VectorField[3] | str``): its dimension and storage type are not one. A
+        model's ``class`` statement refuses such a field already, naming it.
     """
     marker = _marker(annotation_or_field)
     return None if marker is None else (marker.dimension, marker.vector_type)
 
 
 def is_vector_field(annotation_or_field: Any) -> bool:
-    """Whether a model field or an annotation is a vector field, either spelling (the full ORM's helper)."""
+    """Whether a model field or an annotation is a vector field, any spelling — a union with ``None`` included — (the
+    full ORM's helper). Refuses what ``get_vector_info()`` refuses, with its ``ValueError``."""
     return _marker(annotation_or_field) is not None
+
+
+def declared_vectors(owner: str, fields: Mapping[str, FieldInfo]) -> dict[str, tuple[int, str]]:
+    """The ``(dimension, storage type)`` of each vector field among a model's *fields*, by field name, as
+    ``get_vector_info()`` reads them: what the model's ``class`` statement checks (issue #318).
+
+    A field whose ``Vector`` markers are ambiguous raises ``ValueError`` naming the model *owner* and the field, so the
+    ``class`` statement refuses it whether or not the model declares indexes.
+    """
+    declared: dict[str, tuple[int, str]] = {}
+    for name, field in fields.items():
+        marker = _marker(field, subject=f"{owner}: field {name!r}")
+        if marker is not None:
+            declared[name] = (marker.dimension, marker.vector_type)
+    return declared
 
 
 # --- the checks -----------------------------------------------------------------------------------------------------
