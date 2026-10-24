@@ -6064,6 +6064,13 @@ print(await NoteV2.objects().search(text="physics").count())
   last index that uses an analyzer, it can remove the analyzer, or redefine it without `REBUILD INDEX`, on every engine.
   An index removed then defined again in the block, or removed with a raw `tx.add("REMOVE INDEX …")`, still counts
   there, and an index queued earlier in a buffered block is not seen.
+- Once the block has removed or redefined an analyzer, an index that uses it can no longer be defined in the block,
+  whether the model declares the analyzer as an `Analyzer` or names it by `str`: `define_indexes(tx=…)` raises
+  `SurrealDbError` before any DDL. A removed analyzer counts as missing, although committed state still holds it — the
+  index would stand without it after the commit, and every write to the table would be refused. A redefined one would
+  not be followed: SurrealDB would build the index with the committed definition. The refusal does not fail the block.
+  To migrate an index to a new analyzer, call `define_analyzer()` without `tx=` first. `define_analyzer(tx=…)` after
+  `remove_analyzer(tx=…)` of the same name defines the analyzer again, after its removal.
 - A search in an interactive transaction sees the transaction's writes; in a buffered one, a read raises, as every
   read does there.
 - In a transaction, a search on a field without a full-text index raises the same `SurrealDbError`, which the

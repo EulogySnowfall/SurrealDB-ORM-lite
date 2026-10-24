@@ -37,6 +37,12 @@ Indexes removed (issue #312): ``remove_index(tx=…)`` notes the index it remove
 those that use the analyzer (issue #323). The commit and the cancel keep the note, like the tables written. A raw
 ``tx.add("REMOVE INDEX …")`` is not noted.
 
+Analyzers changed (issue #323): ``remove_analyzer(tx=…)`` notes the analyzer it removes (``_note_analyzer_removal``),
+``define_analyzer(tx=…)`` the one it defines or redefines (``_note_analyzer_definition``); the last change of a name
+wins. ``define_analyzer(tx=…)`` and ``define_indexes(tx=…)`` count a removed one as missing (``_analyzers_removed``),
+and ``define_indexes(tx=…)`` refuses an index whose analyzer the block redefined (``_analyzers_defined``): SurrealDB
+builds an index with the analyzers committed before the transaction began. The commit and the cancel keep the note.
+
 Errors (issue #278): the errors a failed transaction raises give the server's reason and the failed statement's
 position, without the server's excerpt of the statement; the server's own text stays reachable as their suppressed
 ``__context__``. A query the server or the embedded engine refuses at a buffered commit raises ``SurrealDbError`` on
@@ -242,6 +248,10 @@ class Transaction(ABC):
         # Issue #312: the indexes remove_index(tx=…) removed in this transaction, by table, until define_indexes(tx=…)
         # defines them again; kept until the transaction ends.
         self._removed_indexes: dict[str, set[str]] = {}
+        # Issue #323: the analyzers remove_analyzer(tx=…) removed and those define_analyzer(tx=…) defined or redefined
+        # in this transaction — the last change of a name wins; kept until the transaction ends.
+        self._removed_analyzers: set[str] = set()
+        self._defined_analyzers: set[str] = set()
         # Issue #268: the errors of the statements that failed in this transaction (interactive strategy).
         self._failures: list[BaseException] = []
 
@@ -324,6 +334,35 @@ class Transaction(ABC):
         removed = self._removed_indexes.get(table)
         if removed is not None:
             removed.difference_update(names)
+
+    def _note_analyzer_removal(self, name: str) -> None:
+        """Note that the analyzer *name* was removed in this transaction — issue #323.
+
+        ``remove_analyzer(tx=…)`` calls it once its ``REMOVE ANALYZER`` was applied (interactive) or queued (buffered).
+        ``define_analyzer(tx=…)`` and ``define_indexes(tx=…)``, which read committed state where the analyzer still
+        stands, count it as missing. A definition noted before for the same name is forgotten. Like the indexes
+        removed, the commit and the cancel keep it. A raw ``tx.add()`` is not noted.
+        """
+        self._defined_analyzers.discard(name)
+        self._removed_analyzers.add(name)
+
+    def _note_analyzer_definition(self, name: str) -> None:
+        """Note that the analyzer *name* was defined or redefined in this transaction — issue #323.
+
+        ``define_analyzer(tx=…)`` calls it once its ``DEFINE ANALYZER`` was applied or queued. ``define_indexes(tx=…)``
+        refuses to define an index that uses it: SurrealDB builds an index with the analyzers committed before the
+        transaction began. A removal noted before for the same name is forgotten. The commit and the cancel keep it.
+        """
+        self._removed_analyzers.discard(name)
+        self._defined_analyzers.add(name)
+
+    def _analyzers_removed(self) -> frozenset[str]:
+        """The analyzers removed in this transaction and not defined again since (issue #323)."""
+        return frozenset(self._removed_analyzers)
+
+    def _analyzers_defined(self) -> frozenset[str]:
+        """The analyzers defined or redefined in this transaction and not removed since (issue #323)."""
+        return frozenset(self._defined_analyzers)
 
     @property
     @abstractmethod
