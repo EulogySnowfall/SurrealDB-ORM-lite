@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import math
 import numbers
@@ -14,6 +15,7 @@ from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
+from . import hybrid as _hybrid
 from . import routing as _routing
 from . import search as _search
 from . import subquery as _subquery
@@ -177,6 +179,8 @@ class QuerySet:
         self._as_of: _time_travel.AsOf | None = None
         # cache() (v0.28.0): the oldest result this queryset's reads accept; None: no cache.
         self._cache: CacheRequest | None = None
+        # hybrid_search() (v0.37.0): the method this queryset's read errors name; set only on the private copy it runs.
+        self._refusal_subject: str | None = None
 
     def _manager(self) -> type[SurrealDBConnectionManager]:
         """The connection class the model's database calls use right now (v0.29.0, ``get_connection_name()``).
@@ -1419,6 +1423,122 @@ class QuerySet:
                 raise ValueError(_search.no_search_refused(annotation))
             if annotation.ref >= given:
                 raise ValueError(_search.reference_refused(annotation, given))
+
+    def _hybrid_runner(self, knn: _vector.KnnSearch, text_field: str, text_query: str) -> Self:
+        """The private copy of this queryset that runs ``hybrid_search()`` (v0.37.0), this queryset never changed.
+
+        A shallow copy holding the vector search *knn* as its ``similar_to()`` and the match of *text_query* in
+        *text_field* as its only ``search()`` condition, so the existing read path serves it: its ``_check_links()``,
+        the fields its missing-index and dimension errors name. It has its own set of link heads — the first segment of
+        each dotted path it names, the two fields' here and the ``Q`` objects' as they compile —, so this queryset's
+        set stays as it was; every other attribute is shared and only read. Its refusals name ``hybrid_search()``
+        (``_refusal_subject``).
+
+        Args:
+            knn: the vector search, its arguments checked.
+            text_field: the full-text field as the caller gave it, checked.
+            text_query: the text to match.
+        """
+        runner = copy.copy(self)
+        runner._link_heads = set(self._link_heads)
+        runner._refusal_subject = _hybrid.SUBJECT
+        runner._column(knn.field)
+        runner._similar = knn
+        runner._search = [(text_field, runner._column(text_field), text_query)]
+        return runner
+
+    def _compile_hybrid(
+        self, compiler: SubqueryCompiler, *, below_3: bool, text_limit: int, rrf_k: int
+    ) -> tuple[str, dict[str, Any]]:
+        """The statement of ``hybrid_search()`` and its variables (v0.37.0), compiled on its runner
+        (:meth:`_hybrid_runner`) with the statement's *compiler*.
+
+        Two lists of the queryset's records, each with the queryset's conditions (:meth:`_where_parts`, numbered on from
+        one list to the next; a ``Subquery`` filter bound once per list): the vector search's, ``(SELECT <projection>,
+        vector::distance::knn() AS _knn_distance FROM <table> WHERE <conditions AND> <knn> ORDER BY _knn_distance, id
+        LIMIT <vector_limit>)``, and the full-text search's, ``(SELECT <projection>, search::score(0) AS _search_score
+        FROM <table> WHERE <conditions AND> <column> @0@ $_f<n> ORDER BY _search_score DESC, id LIMIT <text_limit>)``,
+        each ending with ``FETCH`` under ``fetch()``. Each list is ordered by its value then by ``id``, so equal values
+        rank alike every time, and bounded by its ``LIMIT`` on every line. The projection is ``*``, or ``select()``'s
+        items without those naming a reserved column (``hybrid.reserved()``: its key holds the method's own value), with
+        ``id`` first when absent — the lists are fused by it.
+
+        On SurrealDB 3.x one ``SELECT`` fuses them: both lists written inline in ``search::rrf([…], <vector_limit +
+        text_limit>, <rrf_k>)``, so it never cuts, each list followed by a ``.map()`` putting its index on its rows and
+        leaving out the other list's value (``hybrid.KNN_OMITTED``, ``hybrid.TEXT_OMITTED`` in an ``OMIT``), so a
+        column a record stores under one of those names never replaces it; ``ORDER BY rrf_score DESC, _hybrid_pos``
+        ranks equal scores by position — the vector list's records first —, then ``limit()``/``offset()`` page. No list
+        is a ``LET``: inline, every 3.x line reports a vector of the wrong length and a missing table as errors the ORM
+        reads. Below 3 (SurrealDB 2.x, the embedded engine: no ``search::rrf()``) each list is a ``LET`` of the block,
+        named once its own conditions are compiled — the vector list's conditions selected first under
+        ``compiler.knn_prefilter``, as for ``similar_to()`` —, without ``OMIT``, and the block's value is both lists:
+        ``hybrid.fuse()`` fuses them, which drops the same keys, and the ORM pages.
+
+        The filter values' warnings are given once for the statement, as :meth:`_build_where` gives them. Every number
+        written is a checked ``int``; the vector and the text are bound.
+        """
+        knn = cast(_vector.KnnSearch, self._similar)
+        knn_view = copy.copy(self)
+        knn_view._search = []
+        text_view = copy.copy(self)
+        text_view._similar = None
+        if self.select_item:
+            items = [item for item in self.select_item if not _hybrid.reserved(item)]
+            projection = ", ".join(items if "id" in items or "*" in items else ["id", *items])
+        else:
+            projection = "*"
+        fetch = f" FETCH {', '.join(self._fetch_fields)}" if self._fetch_fields else ""
+        searches = (
+            (
+                knn_view,
+                f"vector::distance::knn() AS {_vector.DISTANCE_ALIAS}",
+                _hybrid.KNN_OMITTED,
+                _vector.DISTANCE_ALIAS,
+                knn.k,
+            ),
+            (
+                text_view,
+                f"search::score(0) AS {_hybrid.SEARCH_SCORE}",
+                _hybrid.TEXT_OMITTED,
+                f"{_hybrid.SEARCH_SCORE} DESC",
+                text_limit,
+            ),
+        )
+        lists: list[str] = []
+        variables: dict[str, Any] = {}
+        counter = 0
+        for view, value, omitted, order, limit in searches:
+            parts, values, counter = view._where_parts(counter, subqueries=compiler)
+            variables.update(values)
+            omit = "" if below_3 else f" OMIT {', '.join(omitted)}"
+            select = (
+                f"(SELECT {projection}, {value}{omit} FROM {self._model_table} WHERE {' AND '.join(parts)} "
+                f"ORDER BY {order}, id LIMIT {limit}{fetch})"
+            )
+            if below_3:
+                name = f"${_subquery.LET_PREFIX}{len(compiler.lets)}"
+                compiler.lets.append(f"LET {name} = {select};")
+                select = name
+            lists.append(select)
+        if compiler.warn:
+            warn_on_variable_names(compiler.variable_like, compiler.variables)
+        compiler.variable_like.clear()
+        if below_3:
+            statement = f"[{', '.join(lists)}];"
+        else:
+            vector_position, text_position = _hybrid.VECTOR_POSITION, _hybrid.TEXT_POSITION
+            statement = (
+                f"SELECT *, IF {vector_position} != NONE THEN {vector_position} ELSE {knn.k} + {text_position} END AS "
+                f"{_hybrid.POSITION} FROM search::rrf([{lists[0]}.map(|$r, $i| object::extend($r, {{{vector_position}: "
+                f"$i}})), {lists[1]}.map(|$r, $i| object::extend($r, {{{text_position}: $i}}))], {knn.k + text_limit}, "
+                f"{rrf_k}) ORDER BY {_hybrid.SERVER_SCORE} DESC, {_hybrid.POSITION}"
+            )
+            if self._limit is not None:
+                statement += f" LIMIT {self._limit}"
+            if self._offset is not None:
+                statement += f" START {self._offset}"
+            statement += ";"
+        return compiler.wrap(statement), {**compiler.variables, **variables}
 
     def _compile_aggregation_query(
         self,
