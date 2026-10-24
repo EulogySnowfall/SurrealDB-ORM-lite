@@ -739,12 +739,53 @@ class QuerySet:
             raise ValueError(_vector.field_refused(field, endpoint=column in endpoint_columns))
         if hasattr(self.model, _vector.DISTANCE_ALIAS):
             raise ValueError(_vector.distance_attribute_refused(self.model.__name__))
-        values = _vector.checked_query_vector(vector)
-        k = _vector.checked_limit(limit)
-        candidates = _vector.checked_ef(ef)
+        knn = self._knn_search(field, column, vector, limit, ef, dist)
+        if self._as_of is not None:
+            raise SurrealDbError(_vector.time_travel_refused())
+        self._column(field)
+        self._similar = knn
+        return self
+
+    def _knn_search(
+        self,
+        field: str,
+        column: str,
+        vector: Sequence[float],
+        limit: int,
+        ef: int | None,
+        dist: str | None,
+        *,
+        subject: str = "similar_to()",
+        limit_arg: str = "limit",
+    ) -> _vector.KnnSearch:
+        """The vector search of *field* (stored as *column*, already checked) by its arguments, each checked in a fixed
+        order — the vector, its ``limit``, ``ef``, ``ef`` with ``dist``, ``dist``, the declared dimension, a zero vector
+        with ``COSINE`` — for ``similar_to()`` (v0.36.0) and ``hybrid_search()`` (v0.37.0). Changes nothing: the caller
+        records *field*'s link head and keeps the search.
+
+        Args:
+            field: the field as the caller gave it, which the refusals name.
+            column: the column it is stored under.
+            vector: the query vector.
+            limit: ``K``, the number of nearest records.
+            ef: the HNSW search's candidate list, or ``None``.
+            dist: the distance of an exact scan, or ``None``.
+            subject: the method each refusal starts with.
+            limit_arg: the name the refusal of *limit* gives it.
+
+        Raises:
+            TypeError: ``vector`` is not a ``list`` or a ``tuple``, or holds an item that is not a number; *limit* or
+                *ef* is not an ``int`` (a ``bool`` included); *dist* is not a ``str``.
+            ValueError: ``vector`` is empty, holds an item that is not finite, or its length is not the field's
+                declared dimension; *limit* or *ef* is outside 1 to 10000; both *ef* and *dist*; a distance the ORM
+                does not write; a zero vector with ``COSINE`` (*dist*, or else the field's vector index).
+        """
+        values = _vector.checked_query_vector(vector, subject=subject)
+        k = _vector.checked_limit(limit, subject=subject, arg=limit_arg)
+        candidates = _vector.checked_ef(ef, subject=subject)
         if candidates is not None and dist is not None:
-            raise ValueError(_vector.ef_and_dist_refused())
-        distance = None if dist is None else _vector.checked_distance(dist, subject="similar_to()")
+            raise ValueError(_vector.ef_and_dist_refused(subject=subject))
+        distance = None if dist is None else _vector.checked_distance(dist, subject=subject)
         index = self._vector_index(column)
         info = self.model.model_fields.get(field)
         declared = None if info is None else _vector.get_vector_info(info)
@@ -755,14 +796,11 @@ class QuerySet:
         else:
             dimension, source = len(values), ""
         if len(values) != dimension:
-            raise ValueError(_vector.dimension_refused(field, len(values), dimension, source))
+            raise ValueError(_vector.dimension_refused(field, len(values), dimension, source, subject=subject))
         metric = distance if distance is not None or index is None else index._hnsw_options()[1]
         if metric == "COSINE" and all(item == 0.0 for item in values):
-            raise ValueError(_vector.zero_vector_refused())
-        if self._as_of is not None:
-            raise SurrealDbError(_vector.time_travel_refused())
-        self._similar = _vector.KnnSearch(field, self._column(field), tuple(values), k, candidates, distance)
-        return self
+            raise ValueError(_vector.zero_vector_refused(subject=subject))
+        return _vector.KnnSearch(field, column, tuple(values), k, candidates, distance)
 
     def _vector_index(self, column: str) -> _search.Index | None:
         """The vector index the model declares on *column*, or ``None`` (v0.36.0; at most one, checked when the class
@@ -2054,6 +2092,170 @@ class QuerySet:
             for alias, value in values.items():
                 object.__setattr__(instance, alias, value)
         return self._mark_snapshots(instances, moment)
+
+    async def hybrid_search(
+        self,
+        *,
+        vector_field: str,
+        vector: Sequence[float],
+        vector_limit: int = _hybrid.DEFAULT_LIMIT,
+        text_field: str,
+        text_query: str,
+        text_limit: int = _hybrid.DEFAULT_LIMIT,
+        rrf_k: int = _hybrid.DEFAULT_RRF_K,
+        ef: int | None = None,
+        dist: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fuse a vector search and a full-text search into one ranking by Reciprocal Rank Fusion (v0.37.0) — the full
+        SurrealDB-ORM's method.
+
+        ::
+
+            results = await Document.objects().hybrid_search(
+                vector_field="embedding", vector=query_vector, vector_limit=20,
+                text_field="content", text_query="machine learning", text_limit=20,
+            )
+            for row in results:
+                print(row["title"], row["_rrf_score"])
+
+        Two ranked lists of the queryset's records: the ``vector_limit`` nearest to ``vector`` by ``vector_field`` (as
+        ``similar_to()`` finds them: its HNSW index, or with ``dist=`` an exact scan), and the ``text_limit`` best
+        matches of ``text_query`` in ``text_field`` by BM25 score (as ``search()`` and ``SearchScore`` find them: its
+        full-text index). Each record gets the fused score Σ 1/(``rrf_k`` + rank) over the lists it is in, its rank
+        counted from 1, and the records come back best first; equal scores keep the vector list's order first, then
+        the full-text list's for the records it alone found. SurrealDB 3.x fuses the lists with its ``search::rrf()``;
+        SurrealDB 2.x and the embedded engine have no such function, so the ORM fuses them with the same formula: the
+        records, scores and order are the same on every line. The vector and the text are bound as query variables,
+        never written into the statement.
+
+        Each record is a dict — the full SurrealDB-ORM's result: its fields keyed by their Python names and
+        ``_rrf_score``, plus ``_knn_distance`` (its distance, ``None`` when only the full-text search found it) and
+        ``_search_score`` (its BM25 score, ``None`` when only the vector search found it).
+
+        Each search needs its index. Without a full-text index on ``text_field``, SurrealDB 3.3, 2.x and the embedded
+        engine refuse the search (``SurrealDbError`` naming the field), while SurrealDB 3.1 and 3.2 match nothing.
+        Without a vector index on ``vector_field``, the vector search finds nothing on SurrealDB 3.3, 2.x and the
+        embedded engine, and lists records with no distance on 3.1 and 3.2: pass ``dist=`` for an exact scan that needs
+        no index.
+
+        The queryset's conditions — ``filter()``, ``Q``, ``nearby()`` and a ``Subquery`` filter — select the records of
+        both lists; ``select()`` and ``fetch()`` apply to both (``id`` is always read: the lists are fused by it);
+        ``limit()`` and ``offset()`` page through the fused records, of which there are at most ``vector_limit +
+        text_limit``. ``cache()``, ``objects(tx=)`` (reads need an interactive transaction: SurrealDB 3.x over
+        WebSocket), named connections and ``variables()`` apply as for ``exec()``. ``order_by()``, ``annotate()``,
+        ``values()``, ``search()``, ``similar_to()`` and ``as_of()`` are refused: the method runs its own searches and
+        orders the records itself. The queryset is not changed.
+
+        Args:
+            vector_field: The vector field: a Python field name (an aliased field compiles its column) or a dotted path;
+                not the record id nor, on an edge model, an endpoint.
+            vector: The query vector: a ``list`` or ``tuple`` of real numbers (not a ``bool`` nor a ``str``), not empty,
+                each finite — a NumPy array with ``.tolist()``. When the model declares the field's dimension (a
+                ``VectorField[d]`` or ``Vector(d)`` on it, or a vector ``Index`` on its column), exactly ``d`` numbers.
+            vector_limit: ``K``, the number of nearest records the vector list holds: an ``int`` from 1 to 10000.
+            text_field: The full-text field, as ``vector_field``.
+            text_query: The text to match in ``text_field``; an empty text matches nothing, so the vector list alone is
+                fused.
+            text_limit: The number of best matches the full-text list holds: an ``int`` from 1 to 10000.
+            rrf_k: The constant added to each rank: an ``int`` from 0 to 10000.
+            ef: The HNSW search's candidate list: ``None`` (100) or an ``int`` from 1 to 10000, raised to
+                ``vector_limit``.
+            dist: An exact scan by this distance instead of the index's search: ``EUCLIDEAN``, ``COSINE``,
+                ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``.
+
+        Returns:
+            list[dict[str, Any]]: The fused records, best first, each a dict of its fields and ``_rrf_score``,
+            ``_knn_distance`` and ``_search_score``.
+
+        Raises:
+            TypeError: ``vector_field`` or ``text_field`` is not a ``str``; ``vector`` is not a ``list`` or a ``tuple``,
+                or holds an item that is not a number; ``vector_limit``, ``text_limit``, ``rrf_k`` or ``ef`` is not an
+                ``int`` (a ``bool`` included); ``dist`` or ``text_query`` is not a ``str``.
+            ValueError: the queryset holds ``annotate()``, ``order_by()``, ``search()``, ``similar_to()`` or
+                ``values()``; a model field is stored as ``rrf_score``, ``_rrf_score``, ``_knn_distance``,
+                ``_search_score``, ``_hybrid_pos``, ``_hybrid_vec_pos`` or ``_hybrid_text_pos``, names the method uses
+                for its own values; ``vector_field`` or ``text_field`` is not a field name or a dotted path, or is the
+                record id or an edge endpoint; ``vector`` is empty, holds an item that is not finite, or its length is
+                not the field's declared dimension; ``vector_limit``, ``text_limit`` or ``ef`` is outside 1 to 10000,
+                ``rrf_k`` outside 0 to 10000; both ``ef`` and ``dist``; a distance the ORM does not write; a zero vector
+                with ``COSINE`` (``dist="cosine"``, or no ``dist`` and the field's vector index is ``COSINE``). Each
+                raised before any request, the queryset left unchanged.
+            SurrealDbError: the queryset reads ``as_of()``, before any request. After the request: ``text_field`` has
+                no full-text index (SurrealDB 3.3, 2.x and the embedded engine); the model declares no dimension for
+                ``vector_field`` and the vector's length is not its vector index's — in a transaction, the commit then
+                fails with that error as its cause.
+        """
+        clauses = {
+            "annotate()": bool(self._annotations),
+            "order_by()": self._order_by is not None,
+            "search()": bool(self._search),
+            "similar_to()": self._similar is not None,
+            # values() is the only public setter of _group_by_fields.
+            "values()": bool(self._group_by_fields),
+        }
+        offenders = [name for name, present in clauses.items() if present]
+        if offenders:
+            raise ValueError(_hybrid.clauses_refused(offenders))
+        if self._as_of is not None:
+            raise SurrealDbError(_hybrid.time_travel_refused())
+        for name in self.model.model_fields:
+            stored = self.model.to_db_field(name)
+            if stored in _hybrid.RESERVED_COLUMNS:
+                raise ValueError(_hybrid.column_refused(self.model.__name__, name, stored))
+        # Every column is read with to_db_field(), never _column(), which records a dotted path's head on this queryset.
+        endpoint_columns = self.model._endpoint_columns()
+        _hybrid.checked_field(vector_field, "vector_field")
+        column = self.model.to_db_field(vector_field)
+        if column == RECORD_ID_COLUMN or column in endpoint_columns:
+            endpoint = column in endpoint_columns
+            raise ValueError(_vector.field_refused(vector_field, endpoint=endpoint, subject=_hybrid.SUBJECT))
+        knn = self._knn_search(
+            vector_field, column, vector, vector_limit, ef, dist, subject=_hybrid.SUBJECT, limit_arg="vector_limit"
+        )
+        _hybrid.checked_field(text_field, "text_field")
+        column = self.model.to_db_field(text_field)
+        if column == RECORD_ID_COLUMN or column in endpoint_columns:
+            endpoint = column in endpoint_columns
+            raise ValueError(_search.field_refused(text_field, endpoint=endpoint, subject=_hybrid.SUBJECT))
+        if not isinstance(text_query, str):
+            raise TypeError(_search.text_refused(text_field, text_query, subject=_hybrid.SUBJECT))
+        listed = _vector.checked_limit(text_limit, subject=_hybrid.SUBJECT, arg="text_limit")
+        constant = _hybrid.checked_rrf_k(rrf_k)
+        runner = self._hybrid_runner(knn, text_field, text_query)
+        below_3 = await _time_travel.cached_major(await runner._manager().get_client()) < 3
+        results = await runner._run_compiled(
+            lambda compiler: runner._compile_hybrid(compiler, below_3=below_3, text_limit=listed, rrf_k=constant)
+        )
+        rows = results if isinstance(results, list) else []
+        if below_3:
+            # No search::rrf() below SurrealDB 3: the ORM fuses the two lists, then pages the fused records.
+            fused = _hybrid.fuse(rows, k=constant, vector_limit=knn.k)
+            start = self._offset or 0
+            rows = fused[start:] if self._limit is None else fused[start : start + self._limit]
+        return runner._hybrid_rows(rows)
+
+    def _hybrid_rows(self, rows: Sequence[Any]) -> list[dict[str, Any]]:
+        """The dicts ``hybrid_search()`` returns (v0.37.0), built from the fused *rows* of either line — the 3.x
+        statement's, or ``hybrid.fuse()``'s below 3 —, which are never changed.
+
+        Each row that is an object gives a new dict: SurrealDB's ``rrf_score`` becomes ``_rrf_score`` (replacing a
+        stored one), the ORM's positions are dropped, ``_knn_distance`` and ``_search_score`` are ``None`` when the list
+        that computes them did not find the record, and the columns are keyed by their Python names, as ``exec()``'s
+        dict rows (:meth:`_py_keyed`). The values are SurrealDB's: no validation, no instance. Anything else is
+        skipped.
+        """
+        built: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            record = dict(row)
+            record[_hybrid.RRF_SCORE] = record.pop(_hybrid.SERVER_SCORE, None)
+            for position in (_hybrid.POSITION, _hybrid.VECTOR_POSITION, _hybrid.TEXT_POSITION):
+                record.pop(position, None)
+            record.setdefault(_vector.DISTANCE_ALIAS, None)
+            record.setdefault(_hybrid.SEARCH_SCORE, None)
+            built.append(cast(dict[str, Any], self._py_keyed(record)))
+        return built
 
     async def first(self) -> Any:
         """

@@ -2605,7 +2605,10 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
         "identity": frozenset({"signin", "authenticate", "refresh"}),
     },
     QuerySet: {
-        "cached reads": frozenset({"exec", "first", "get", "all", "count", "sum", "avg", "min", "max", "exists"}),
+        # v0.37.0: hybrid_search() reads through _run_compiled(), as exec() does, so cache() serves it.
+        "cached reads": frozenset(
+            {"exec", "first", "get", "all", "count", "sum", "avg", "min", "max", "exists", "hybrid_search"}
+        ),
         "invalidating writes": _INVALIDATING_WRITES[QuerySet],
         "writes through wrapped helpers": frozenset({"get_or_create", "update_or_create"}),
         "raw, refused or not cached": frozenset({"query"}),
