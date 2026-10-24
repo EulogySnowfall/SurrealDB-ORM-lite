@@ -12,17 +12,39 @@ texts of the refusals only ``hybrid_search()`` raises, the reserved names a ``se
 ``search::rrf()``: the two lists each case of the corpus gets on 2.7.0, written as literals, fuse to the records,
 order and scores SurrealDB 3.x's ``search::rrf()`` answers; each record keeps only the per-list value of the lists that
 found it, whatever columns the records store; the input rows are never changed. Pure too.
+
+The statement (``TestCompileHybrid``): what ``hybrid_search()`` sends, compiled on a private copy of the queryset that
+holds both searches — on SurrealDB 3.x one ``SELECT`` fusing the two lists written inline in ``search::rrf()``, each
+list leaving out the other list's value (``OMIT``), the ORM ordering and paging the fused records; below 3 the two
+lists in ``LET``s, the block's value both lists, for the ORM to fuse. The queryset's conditions, ``select()`` (an item
+naming a reserved column left out) and ``fetch()`` apply to both lists; the queryset itself, its link heads included,
+is never changed. Pure: the statements are compiled, never sent.
 """
 
 import ast
 import copy
+import warnings
 from pathlib import Path
 from typing import Any
 
 import pytest
 from surrealdb import InternalError, RecordID
 
-from surreal_orm_lite import SurrealDbError, hybrid, search, vector
+from surreal_orm_lite import (
+    Analyzer,
+    BaseSurrealModel,
+    Index,
+    Q,
+    Subquery,
+    SurrealConfigDict,
+    SurrealDbError,
+    Var,
+    VectorField,
+    hybrid,
+    search,
+    vector,
+)
+from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.utils import validate_field_name
 
 #: The subject ``hybrid_search()`` gives the shared refusal texts.
@@ -754,3 +776,399 @@ class TestFuse:
             ("d2", 1 / 62),
         ]
         assert (fused[0]["_knn_distance"], fused[0]["_search_score"]) == (_V_DISTANCES["d6"], 0.3)
+
+
+# --- the statement: _hybrid_runner() and _compile_hybrid() -----------------------------------------------------------
+
+#: The analyzer of the corpus's full-text indexes.
+HY_PLAIN = Analyzer("hy_plain", ["blank"], ["lowercase"])
+
+
+class HyDoc(BaseSurrealModel):
+    """The model of the statements and of the corpus: a ``COSINE`` vector index on ``embedding``, a full-text index on
+    ``title``."""
+
+    model_config = SurrealConfigDict(
+        table_name="hy_doc",
+        indexes=[
+            Index("hy_doc_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("hy_doc_title", "title", search_analyzer=HY_PLAIN),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+
+
+class HyAuthor(BaseSurrealModel):
+    """The record a ``HyLinked`` record links to."""
+
+    model_config = SurrealConfigDict(table_name="hy_author")
+
+    id: str | None = None
+    name: str = ""
+
+
+class HyLinked(BaseSurrealModel):
+    """``HyDoc``'s fields and indexes on a model with a record link, ``author``: ``fetch()`` and a condition through
+    the link."""
+
+    model_config = SurrealConfigDict(
+        table_name="hy_linked",
+        indexes=[
+            Index("hy_linked_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("hy_linked_title", "title", search_analyzer=HY_PLAIN),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    n: int = 0
+    embedding: VectorField[3]
+    author: HyAuthor | RecordID | None = None
+
+
+#: The arguments of the statements: the vector search's four nearest to ``[0, 1, 0]``, the four best "programming".
+_ARGS: dict[str, Any] = {
+    "vector_field": "embedding",
+    "vector": [0.0, 1.0, 0.0],
+    "vector_limit": 4,
+    "text_field": "title",
+    "text_query": "programming",
+    "text_limit": 4,
+}
+
+#: The query vector of ``_ARGS``, as it is bound.
+_VECTOR = [0.0, 1.0, 0.0]
+
+#: ``HyDoc.objects()`` on SurrealDB 3.x: both lists inline in ``search::rrf()``, each leaving out the other's value.
+_G1 = (
+    "SELECT *, IF _hybrid_vec_pos != NONE THEN _hybrid_vec_pos ELSE 4 + _hybrid_text_pos END AS _hybrid_pos FROM "
+    "search::rrf([(SELECT *, vector::distance::knn() AS _knn_distance OMIT _search_score FROM hy_doc WHERE embedding "
+    "<|4,100|> $_f0 ORDER BY _knn_distance, id LIMIT 4).map(|$r, $i| object::extend($r, {_hybrid_vec_pos: $i})), "
+    "(SELECT *, search::score(0) AS _search_score OMIT _knn_distance, _hybrid_vec_pos FROM hy_doc WHERE title @0@ $_f1 "
+    "ORDER BY _search_score DESC, id LIMIT 4).map(|$r, $i| object::extend($r, {_hybrid_text_pos: $i}))], 8, 60) ORDER "
+    "BY rrf_score DESC, _hybrid_pos;"
+)
+
+#: ``HyDoc.objects().filter(category="tech").offset(1).limit(2)`` on SurrealDB 3.x: the condition in both lists, the
+#: fused records paged.
+_G2 = (
+    "SELECT *, IF _hybrid_vec_pos != NONE THEN _hybrid_vec_pos ELSE 4 + _hybrid_text_pos END AS _hybrid_pos FROM "
+    "search::rrf([(SELECT *, vector::distance::knn() AS _knn_distance OMIT _search_score FROM hy_doc WHERE category = "
+    "$_f0 AND embedding <|4,100|> $_f1 ORDER BY _knn_distance, id LIMIT 4).map(|$r, $i| object::extend($r, "
+    "{_hybrid_vec_pos: $i})), (SELECT *, search::score(0) AS _search_score OMIT _knn_distance, _hybrid_vec_pos FROM "
+    "hy_doc WHERE category = $_f2 AND title @0@ $_f3 ORDER BY _search_score DESC, id LIMIT 4).map(|$r, $i| "
+    "object::extend($r, {_hybrid_text_pos: $i}))], 8, 60) ORDER BY rrf_score DESC, _hybrid_pos LIMIT 2 START 1;"
+)
+
+#: ``_G2``'s variables, on every line.
+_G2_VARIABLES = {"_f0": "tech", "_f1": _VECTOR, "_f2": "tech", "_f3": "programming"}
+
+#: ``_G2``'s queryset below SurrealDB 3: the KNN list's condition selected first, the lists in ``LET``s, no paging
+#: (the ORM pages once it fused them).
+_G3 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM hy_doc WHERE category = $_f0); LET $_sq1 = (SELECT *, vector::distance::knn() "
+    "AS _knn_distance FROM hy_doc WHERE id IN $_sq0 AND embedding <|4,100|> $_f1 ORDER BY _knn_distance, id LIMIT 4); "
+    "LET $_sq2 = (SELECT *, search::score(0) AS _search_score FROM hy_doc WHERE category = $_f2 AND title @0@ $_f3 ORDER "
+    "BY _search_score DESC, id LIMIT 4); ([$_sq1, $_sq2]) };"
+)
+
+#: ``_G1``'s queryset below SurrealDB 3: no condition, so no pre-filter.
+_G4 = (
+    "{ LET $_sq0 = (SELECT *, vector::distance::knn() AS _knn_distance FROM hy_doc WHERE embedding <|4,100|> $_f0 ORDER "
+    "BY _knn_distance, id LIMIT 4); LET $_sq1 = (SELECT *, search::score(0) AS _search_score FROM hy_doc WHERE title "
+    "@0@ $_f1 ORDER BY _search_score DESC, id LIMIT 4); ([$_sq0, $_sq1]) };"
+)
+
+#: ``HyLinked.objects().fetch("author")`` on SurrealDB 3.x: each list fetches the link, before its ``.map()``.
+_G6 = (
+    "SELECT *, IF _hybrid_vec_pos != NONE THEN _hybrid_vec_pos ELSE 4 + _hybrid_text_pos END AS _hybrid_pos FROM "
+    "search::rrf([(SELECT *, vector::distance::knn() AS _knn_distance OMIT _search_score FROM hy_linked WHERE embedding "
+    "<|4,100|> $_f0 ORDER BY _knn_distance, id LIMIT 4 FETCH author).map(|$r, $i| object::extend($r, {_hybrid_vec_pos: "
+    "$i})), (SELECT *, search::score(0) AS _search_score OMIT _knn_distance, _hybrid_vec_pos FROM hy_linked WHERE title "
+    "@0@ $_f1 ORDER BY _search_score DESC, id LIMIT 4 FETCH author).map(|$r, $i| object::extend($r, {_hybrid_text_pos: "
+    "$i}))], 8, 60) ORDER BY rrf_score DESC, _hybrid_pos;"
+)
+
+#: ``_G6``'s queryset below SurrealDB 3: each ``LET`` fetches the link.
+_G6_BELOW_3 = (
+    "{ LET $_sq0 = (SELECT *, vector::distance::knn() AS _knn_distance FROM hy_linked WHERE embedding <|4,100|> $_f0 "
+    "ORDER BY _knn_distance, id LIMIT 4 FETCH author); LET $_sq1 = (SELECT *, search::score(0) AS _search_score FROM "
+    "hy_linked WHERE title @0@ $_f1 ORDER BY _search_score DESC, id LIMIT 4 FETCH author); ([$_sq0, $_sq1]) };"
+)
+
+#: ``HyDoc.objects().filter(id__in=Subquery(HyDoc.objects().filter(n__gt=2)))`` on SurrealDB 3.x: the subquery bound
+#: once per list, the statement inside the block.
+_G7 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM hy_doc WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM hy_doc WHERE n > "
+    "$_f2); (SELECT *, IF _hybrid_vec_pos != NONE THEN _hybrid_vec_pos ELSE 4 + _hybrid_text_pos END AS _hybrid_pos "
+    "FROM search::rrf([(SELECT *, vector::distance::knn() AS _knn_distance OMIT _search_score FROM hy_doc WHERE id IN "
+    "$_sq0 AND embedding <|4,100|> $_f1 ORDER BY _knn_distance, id LIMIT 4).map(|$r, $i| object::extend($r, "
+    "{_hybrid_vec_pos: $i})), (SELECT *, search::score(0) AS _search_score OMIT _knn_distance, _hybrid_vec_pos FROM "
+    "hy_doc WHERE id IN $_sq1 AND title @0@ $_f3 ORDER BY _search_score DESC, id LIMIT 4).map(|$r, $i| "
+    "object::extend($r, {_hybrid_text_pos: $i}))], 8, 60) ORDER BY rrf_score DESC, _hybrid_pos) };"
+)
+
+#: ``_G7``'s queryset below SurrealDB 3: each list's ``LET`` after its subquery's; the id subquery stays next to the
+#: KNN, so no pre-filter.
+_G7_BELOW_3 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM hy_doc WHERE n > $_f0); LET $_sq1 = (SELECT *, vector::distance::knn() AS "
+    "_knn_distance FROM hy_doc WHERE id IN $_sq0 AND embedding <|4,100|> $_f1 ORDER BY _knn_distance, id LIMIT 4); LET "
+    "$_sq2 = (SELECT VALUE id FROM hy_doc WHERE n > $_f2); LET $_sq3 = (SELECT *, search::score(0) AS _search_score "
+    "FROM hy_doc WHERE id IN $_sq2 AND title @0@ $_f3 ORDER BY _search_score DESC, id LIMIT 4); ([$_sq1, $_sq3]) };"
+)
+
+#: ``_G7``'s variables, on every line.
+_G7_VARIABLES = {"_f0": 2, "_f1": _VECTOR, "_f2": 2, "_f3": "programming"}
+
+
+def _knn_of(queryset: QuerySet, **args: Any) -> vector.KnnSearch:
+    """The vector search ``hybrid_search(**_ARGS, **args)`` builds for *queryset* (its arguments taken as checked)."""
+    call = {**_ARGS, "ef": None, "dist": None, **args}
+    field = call["vector_field"]
+    column = queryset.model.to_db_field(field)
+    return vector.KnnSearch(field, column, tuple(call["vector"]), call["vector_limit"], call["ef"], call["dist"])
+
+
+def _runner(queryset: QuerySet, **args: Any) -> QuerySet:
+    """The private copy ``hybrid_search(**_ARGS, **args)`` runs for *queryset*."""
+    call = {**_ARGS, **args}
+    return queryset._hybrid_runner(_knn_of(queryset, **args), call["text_field"], call["text_query"])
+
+
+def _compiled(queryset: QuerySet, *, below_3: bool, knn_prefilter: bool = False, **args: Any) -> tuple[str, dict[str, Any]]:
+    """The statement and variables ``hybrid_search(**_ARGS, **args)`` sends for *queryset*, compiled on a fresh compiler
+    of its runner in the form for SurrealDB 3.x, or below 3 (*below_3*), the KNN's other conditions selected first when
+    *knn_prefilter*."""
+    call = {**_ARGS, "rrf_k": 60, **args}
+    runner = _runner(queryset, **args)
+    compiler = runner._subquery_compiler(knn_prefilter=knn_prefilter)
+    return runner._compile_hybrid(compiler, below_3=below_3, text_limit=call["text_limit"], rrf_k=call["rrf_k"])
+
+
+def _selected(statement: str, projection: str) -> str:
+    """*statement* (``_G1`` or ``_G4``) with each list's projection *projection* instead of ``*``."""
+    return statement.replace("SELECT *, vector::", f"SELECT {projection}, vector::").replace(
+        "SELECT *, search::", f"SELECT {projection}, search::"
+    )
+
+
+class TestCompileHybrid:
+    """The statement ``hybrid_search()`` sends, compiled on its runner — the queryset's private copy holding both
+    searches —, exactly: on SurrealDB 3.x the two lists inline in ``search::rrf()``, each with its ``OMIT``, the ORM's
+    order and paging; below 3 the lists in ``LET``s, without ``OMIT``, the block's value both lists. Each list's
+    ``LIMIT``, the queryset's conditions, ``select()`` (a reserved item left out, on both lines) and ``fetch()``; the
+    queryset unchanged, its link heads included."""
+
+    # --- the forms of each line -------------------------------------------------------------------------------------
+
+    def test_g1_both_lists_inline_on_3x(self) -> None:
+        assert _compiled(HyDoc.objects(), below_3=False) == (_G1, {"_f0": _VECTOR, "_f1": "programming"})
+
+    def test_g2_a_condition_in_both_lists_and_the_fused_records_paged_on_3x(self) -> None:
+        queryset = HyDoc.objects().filter(category="tech").offset(1).limit(2)
+        assert _compiled(queryset, below_3=False) == (_G2, _G2_VARIABLES)
+
+    def test_g3_the_knn_condition_selected_first_below_3(self) -> None:
+        queryset = HyDoc.objects().filter(category="tech").offset(1).limit(2)
+        assert _compiled(queryset, below_3=True, knn_prefilter=True) == (_G3, _G2_VARIABLES)
+
+    def test_g4_the_lists_in_lets_below_3(self) -> None:
+        expected = (_G4, {"_f0": _VECTOR, "_f1": "programming"})
+        assert _compiled(HyDoc.objects(), below_3=True) == expected
+        assert _compiled(HyDoc.objects(), below_3=True, knn_prefilter=True) == expected
+
+    def test_a_knn_next_to_a_condition_asks_for_the_line(self) -> None:
+        # The flag _run_uncached() and _run_cached() read the line by (the pre-filter below 3), as for similar_to().
+        for queryset, expected in [
+            (HyDoc.objects(), False),
+            (HyDoc.objects().filter(category="tech"), True),
+            (HyDoc.objects().filter(id__in=Subquery(HyDoc.objects().filter(n__gt=2))), False),
+        ]:
+            runner = _runner(queryset)
+            compiler = runner._subquery_compiler()
+            runner._compile_hybrid(compiler, below_3=False, text_limit=4, rrf_k=60)
+            assert compiler.knn_conditions is expected, queryset._filters
+
+    def test_a_fresh_compiler_compiles_the_same_statement_again(self) -> None:
+        runner = _runner(HyDoc.objects().filter(category="tech"))
+        for below_3 in (False, True):
+            first = runner._compile_hybrid(runner._subquery_compiler(), below_3=below_3, text_limit=4, rrf_k=60)
+            second = runner._compile_hybrid(runner._subquery_compiler(), below_3=below_3, text_limit=4, rrf_k=60)
+            assert first == second
+
+    # --- select(), the KNN's options, the limits and rrf_k ----------------------------------------------------------
+
+    def test_g5_select_reads_id_and_the_items_in_both_lists(self) -> None:
+        for statement, below_3 in [(_G1, False), (_G4, True)]:
+            assert _compiled(HyDoc.objects().select("title"), below_3=below_3)[0] == _selected(statement, "id, title")
+            assert _compiled(HyDoc.objects().select("id", "title"), below_3=below_3)[0] == _selected(statement, "id, title")
+            assert _compiled(HyDoc.objects().select("title", "id"), below_3=below_3)[0] == _selected(statement, "title, id")
+            assert _compiled(HyDoc.objects().select("*"), below_3=below_3)[0] == statement
+
+    def test_g5_on_3x_the_omit_follows_the_alias(self) -> None:
+        query = _compiled(HyDoc.objects().select("title"), below_3=False)[0]
+        assert "(SELECT id, title, vector::distance::knn() AS _knn_distance OMIT _search_score FROM hy_doc " in query
+        assert "(SELECT id, title, search::score(0) AS _search_score OMIT _knn_distance, _hybrid_vec_pos FROM " in query
+
+    def test_g5_an_item_naming_a_reserved_column_is_left_out_on_both_lines(self) -> None:
+        for below_3 in (False, True):
+            plain = _compiled(HyDoc.objects().select("title"), below_3=below_3)
+            for reserved in ["_knn_distance", "_search_score", "rrf_score", "_hybrid_vec_pos.x"]:
+                assert _compiled(HyDoc.objects().select("title", reserved), below_3=below_3) == plain, reserved
+            alone = _compiled(HyDoc.objects().select("_knn_distance"), below_3=below_3)[0]
+            assert alone == _selected(_G4 if below_3 else _G1, "id")
+
+    def test_g5_an_exact_scan(self) -> None:
+        cosine = vector.checked_distance("cosine", subject=_SUBJECT)
+        assert _compiled(HyDoc.objects(), below_3=False, dist=cosine)[0] == _G1.replace("<|4,100|>", "<|4,COSINE|>")
+        assert _compiled(HyDoc.objects(), below_3=True, dist=cosine)[0] == _G4.replace("<|4,100|>", "<|4,COSINE|>")
+
+    def test_g5_ef_raised_to_the_vector_limit(self) -> None:
+        query = _compiled(HyDoc.objects(), below_3=False, ef=40, vector_limit=50)[0]
+        assert query == (
+            _G1.replace("<|4,100|>", "<|50,50|>")
+            .replace("ELSE 4 + ", "ELSE 50 + ")
+            .replace("_knn_distance, id LIMIT 4)", "_knn_distance, id LIMIT 50)")
+            .replace("], 8, 60)", "], 54, 60)")
+        )
+        below = _compiled(HyDoc.objects(), below_3=True, ef=40, vector_limit=50)[0]
+        assert below == _G4.replace("<|4,100|>", "<|50,50|>").replace(
+            "_knn_distance, id LIMIT 4)", "_knn_distance, id LIMIT 50)"
+        )
+
+    def test_g5_rrf_k(self) -> None:
+        assert _compiled(HyDoc.objects(), below_3=False, rrf_k=0)[0] == _G1.replace("], 8, 60)", "], 8, 0)")
+        assert _compiled(HyDoc.objects(), below_3=False, rrf_k=10_000)[0] == _G1.replace("], 8, 60)", "], 8, 10000)")
+        # Below 3 the ORM fuses: rrf_k is not written.
+        assert _compiled(HyDoc.objects(), below_3=True, rrf_k=0)[0] == _G4
+
+    def test_g5_the_text_limit(self) -> None:
+        query = _compiled(HyDoc.objects(), below_3=False, text_limit=7)[0]
+        assert query == _G1.replace("DESC, id LIMIT 4)", "DESC, id LIMIT 7)").replace("], 8, 60)", "], 11, 60)")
+        assert "ELSE 4 + _hybrid_text_pos" in query
+        below = _compiled(HyDoc.objects(), below_3=True, text_limit=7)[0]
+        assert below == _G4.replace("DESC, id LIMIT 4)", "DESC, id LIMIT 7)")
+
+    def test_limit_and_offset_page_the_fused_records_on_3x_only(self) -> None:
+        assert _compiled(HyDoc.objects().limit(3), below_3=False)[0] == _G1.replace("_hybrid_pos;", "_hybrid_pos LIMIT 3;")
+        assert _compiled(HyDoc.objects().offset(2), below_3=False)[0] == _G1.replace("_hybrid_pos;", "_hybrid_pos START 2;")
+        assert _compiled(HyDoc.objects().limit(3).offset(2), below_3=True)[0] == _G4
+
+    # --- fetch() and a Subquery filter ------------------------------------------------------------------------------
+
+    def test_g6_fetch_in_both_lists(self) -> None:
+        variables = {"_f0": _VECTOR, "_f1": "programming"}
+        assert _compiled(HyLinked.objects().fetch("author"), below_3=False) == (_G6, variables)
+        assert _compiled(HyLinked.objects().fetch("author"), below_3=True) == (_G6_BELOW_3, variables)
+
+    def test_g7_a_subquery_filter_on_3x(self) -> None:
+        queryset = HyDoc.objects().filter(id__in=Subquery(HyDoc.objects().filter(n__gt=2)))
+        assert _compiled(queryset, below_3=False) == (_G7, _G7_VARIABLES)
+
+    def test_g7_a_subquery_filter_below_3(self) -> None:
+        queryset = HyDoc.objects().filter(id__in=Subquery(HyDoc.objects().filter(n__gt=2)))
+        assert _compiled(queryset, below_3=True, knn_prefilter=True) == (_G7_BELOW_3, _G7_VARIABLES)
+        assert _compiled(queryset, below_3=True) == (_G7_BELOW_3, _G7_VARIABLES)
+
+    def test_the_queryset_s_variables_are_bound(self) -> None:
+        queryset = HyDoc.objects().filter(n__gt=Var("lo")).variables(lo=3)
+        query, variables = _compiled(queryset, below_3=False)
+        assert "WHERE n > $lo AND embedding <|4,100|> $_f0 " in query
+        assert "WHERE n > $lo AND title @0@ $_f1 " in query
+        assert variables == {"lo": 3, "_f0": _VECTOR, "_f1": "programming"}
+
+    def test_the_filter_values_warn_once(self) -> None:
+        # "$lo" is the string, compared as data: the warning naming Var("lo") is given once, though both lists hold it.
+        queryset = HyDoc.objects().filter(category="$lo").variables(lo="tech")
+        runner = _runner(queryset)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            runner._compile_hybrid(runner._subquery_compiler(), below_3=False, text_limit=4, rrf_k=60)
+        assert [str(warning.message) for warning in caught] == [
+            "The filter value '$lo' is compared as the string '$lo', not with the variable lo given to variables(); to "
+            "reference the variable, use Var('lo')."
+        ]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            runner._compile_hybrid(runner._subquery_compiler(warn=False), below_3=False, text_limit=4, rrf_k=60)
+        assert caught == []
+
+    # --- the runner: the queryset's private copy --------------------------------------------------------------------
+
+    def test_the_runner_holds_both_searches_and_the_subject(self) -> None:
+        queryset = HyDoc.objects()
+        knn = _knn_of(queryset)
+        runner = queryset._hybrid_runner(knn, "title", "programming")
+        assert runner is not queryset
+        assert runner._similar is knn
+        assert runner._search == [("title", "title", "programming")]
+        assert runner._refusal_subject == "hybrid_search()"
+        assert queryset._refusal_subject is None
+        assert QuerySet(HyDoc)._refusal_subject is None
+
+    def test_the_queryset_is_never_changed(self) -> None:
+        queryset = HyLinked.objects().filter(category="tech").select("title").fetch("author").offset(1).limit(2)
+
+        def state() -> tuple[Any, ...]:
+            return (
+                queryset._compile_query(),
+                queryset._similar,
+                list(queryset._search),
+                queryset._limit,
+                queryset._offset,
+                set(queryset._link_heads),
+                queryset._refusal_subject,
+                list(queryset.select_item),
+                list(queryset._filters),
+                list(queryset._fetch_fields),
+                dict(queryset._variables),
+                sorted(vars(queryset)),
+            )
+
+        before = state()
+        for below_3 in (False, True):
+            _compiled(queryset, below_3=below_3, knn_prefilter=below_3)
+        assert state() == before
+        assert queryset._similar is None and queryset._search == []
+
+    def test_the_runner_has_its_own_link_heads(self) -> None:
+        queryset = HyLinked.objects().filter(**{"author.name": "Ann"})
+        assert queryset._link_heads == {"author"}
+        runner = _runner(queryset)
+        assert runner._link_heads is not queryset._link_heads
+        assert runner._link_heads == {"author"}
+        runner._link_heads.add("other")
+        assert queryset._link_heads == {"author"}
+
+    def test_a_dotted_vector_path_records_its_head_on_the_runner_only(self) -> None:
+        queryset = HyDoc.objects()
+        runner = queryset._hybrid_runner(vector.KnnSearch("meta.vec", "meta.vec", (1.0, 0.0), 2, None, None), "title", "x")
+        assert runner._link_heads == {"meta"}
+        assert queryset._link_heads == set()
+        assert runner._similar is not None and runner._similar.column == "meta.vec"
+
+    def test_a_dotted_text_path_records_its_head_on_the_runner_only(self) -> None:
+        queryset = HyDoc.objects()
+        runner = queryset._hybrid_runner(_knn_of(queryset), "info.headline", "x")
+        assert runner._link_heads == {"info"}
+        assert runner._search == [("info.headline", "info.headline", "x")]
+        assert queryset._link_heads == set()
+
+    def test_a_condition_through_a_link_records_its_head_on_the_runner_only(self) -> None:
+        # A Q object names its fields when it compiles: the queryset has recorded no link head yet.
+        queryset = HyLinked.objects().filter(Q(**{"author.name": "Ann"}))
+        assert queryset._link_heads == set()
+        for below_3 in (False, True):
+            runner = _runner(queryset)
+            assert runner._link_heads == set()
+            query = runner._compile_hybrid(runner._subquery_compiler(), below_3=below_3, text_limit=4, rrf_k=60)[0]
+            assert "WHERE author.name = $_f0 AND embedding <|4,100|> $_f1 " in query
+            assert "WHERE author.name = $_f2 AND title @0@ $_f3 " in query
+            assert runner._link_heads == {"author"}
+            assert queryset._link_heads == set()
