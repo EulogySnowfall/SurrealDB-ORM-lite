@@ -138,7 +138,8 @@ Follow-up to the review of v0.36.0 (#316): a vector field declared with `| None`
   whether or not it declares indexes. Until v0.36.2 such a model was accepted (the first of two
   markers decided the checks, a union with another type was not a vector field).
   `get_vector_info()` and `is_vector_field()` raise the same `ValueError` for such a field or
-  annotation. Every spelling that v0.36.2 read as a vector field gives the same result.
+  annotation. Every spelling with a single `Vector` marker that v0.36.2 read as a vector field
+  gives the same result.
 
 ### Notes
 
