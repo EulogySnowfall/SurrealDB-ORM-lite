@@ -1434,6 +1434,15 @@ class BaseSurrealModel(BaseModel):
         ``define_analyzer()`` redefined with the same *tx* is refused too, whether the model declares it or names it:
         SurrealDB would build it with the committed definition. Call ``define_analyzer()`` without *tx* first.
 
+        **The indexes defined in the transaction** (issue #329). With *tx*, the transaction notes each index this call
+        defines or redefines, with its analyzer, once the statements are applied or queued — nothing when the call
+        refuses or a statement is refused at once. ``remove_analyzer()`` and ``define_analyzer()`` with the same *tx*
+        count those indexes, although committed state does not hold them yet (or holds them with another analyzer):
+        removing or redefining their analyzer later in the block is refused before any DDL, on every engine. An index
+        :meth:`remove_index` then removes with the same *tx* no longer counts. Without *overwrite*, an index defined
+        with ``IF NOT EXISTS`` keeps the block's earlier definition — another model's on the same table, with another
+        analyzer — and so does the note: that index counts with the analyzer the block gave it first.
+
         Names are written in backticks, filters re-rendered from a closed grammar, numbers from Python numbers,
         comments as string literals. A refusal names the analyzer or the index and its table, never the statement:
         ``Can't apply index definition: 'post_title' on table 'post' -> <reason>``. Applying needs a session allowed to
@@ -1445,7 +1454,8 @@ class BaseSurrealModel(BaseModel):
                 what is missing (``IF NOT EXISTS``) and leaves what exists as it is.
             tx: optional transaction the index statements are applied with; the reads happen before anything is
                 queued. An index :meth:`remove_index` removed with it counts as missing, and so does an analyzer
-                ``remove_analyzer()`` removed with it.
+                ``remove_analyzer()`` removed with it. It notes the indexes defined, for ``remove_analyzer()`` and
+                ``define_analyzer()``.
 
         Raises:
             TypeError: *overwrite* is not a ``bool`` — before any request.
@@ -1544,8 +1554,13 @@ class BaseSurrealModel(BaseModel):
             classify=True,
             subjects=[index_subject(name, table) for name, _ in definitions],
         )
-        if removed and isinstance(tx, Transaction):
-            tx._forget_index_removals(table, (name for name, _ in definitions))
+        if isinstance(tx, Transaction):
+            # Noted once applied or queued: every refusal above notes nothing. Issue #312: an index defined again is no
+            # longer missing (its removal is forgotten). Issue #329: remove_analyzer(tx=…) and define_analyzer(tx=…)
+            # read committed state, which does not hold these definitions yet, or holds them with another analyzer.
+            # Without overwrite, each is a DEFINE INDEX IF NOT EXISTS: one this block defined earlier stays as it was.
+            for name, _ in definitions:
+                tx._note_index_definition(table, name, analyzer_of[name], if_not_exists=not overwrite)
         applied += await apply_rebuilds(client, tx, own_rebuilds)
         warn_redefined(redefine, [*other_rebuilds, *redefined_indexes, *own_rebuilds])
         return applied
@@ -1565,7 +1580,11 @@ class BaseSurrealModel(BaseModel):
         index as missing, although committed state still holds it, and defines it again after the removal when its
         model declares it — so removing an index and defining it again in one block keeps it. On SurrealDB 2.x, on a
         table that held records, such a block fails the commit with a retryable ``SurrealDbConflictError`` that a retry
-        meets again, and nothing of it is committed. ``SurrealDBConnectionManager.remove_analyzer(tx=…)`` and
+        meets again, and nothing of it is committed. On SurrealDB 3.x, the reverse — a block that defines an index
+        (:meth:`define_indexes`) and then removes it — fails the commit the same way, whatever the table holds; 2.x and
+        the embedded engine commit it when the index was not stored before the block. When it was, and the block
+        redefined it before removing it, 2.x fails the commit the same way on a table that held records, the index
+        standing as before, and the embedded engine commits it. ``SurrealDBConnectionManager.remove_analyzer(tx=…)`` and
         ``define_analyzer(tx=…)`` read the note too: the removed index no longer counts as one using the analyzer (issue
         #323); once the block has removed or redefined that analyzer, :meth:`define_indexes` refuses to define the index
         again in it. A raw ``tx.add("REMOVE INDEX …")`` is not noted.

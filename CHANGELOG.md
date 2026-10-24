@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.6] - 2026-10-24
+
+Follow-up to the review of v0.36.4 (#328): analyzer DDL in a transaction now counts the indexes
+that `define_indexes(tx=…)` defined earlier in the same block. No new public API.
+
+### Fixed
+
+- **`remove_analyzer(tx=…)` refuses an analyzer that an index defined in the block uses**
+  (#329). On SurrealDB 2.x and the embedded engine, it found the indexes that use the analyzer by
+  reading committed state, where an index that `define_indexes(tx=…)` defined earlier in the
+  block does not stand yet. Such a block committed and left the index without its analyzer: every
+  later write to the table was then refused ("The analyzer '…' does not exist"). On SurrealDB 3.x
+  the server refused the removal itself, which failed the block. The removal is now refused before
+  any DDL, with the existing "in use by index …" message, on every engine and line, and the
+  refusal does not fail the block. The transaction's note costs no request.
+- **`define_analyzer(…, overwrite=True, tx=…)` refuses a redefinition when an index defined in
+  the block uses the analyzer** (#329). The block committed without `REBUILD INDEX` on every
+  engine, so the index kept the tokens of the old definition and a search could miss records.
+  The redefinition is now refused as one with indexes to rebuild, with the existing message,
+  before any DDL. The v0.36.4 note "an index queued earlier in a buffered block is still not seen"
+  no longer holds for `define_indexes(tx=…)`: both orders are guarded, in interactive and
+  buffered blocks, over WebSocket, HTTP and the embedded engine.
+- **The last change of an index name in the block wins** (#329). An index defined then removed in
+  the block (`remove_index(tx=…)`) no longer counts. One that the block defined again with
+  another analyzer counts for that analyzer only, so the analyzer it held in committed state can
+  be removed or redefined in the block. An index defined with `IF NOT EXISTS`
+  (`define_indexes(overwrite=False, tx=…)`) keeps the block's earlier definition (another model's
+  on the same table) and counts with the analyzer that one gave it. A refused
+  `define_indexes(tx=…)` notes nothing. A raw `tx.add("DEFINE INDEX …")` is not tracked.
+
+### Notes
+
+- **Behaviour table**: a new row for `define_indexes(tx=)` then `remove_index(tx=)` in one block,
+  the index not stored before the block. SurrealDB 3.x fails the commit with a retryable
+  `SurrealDbConflictError` whatever the table holds, and nothing is committed; 2.x and the
+  embedded engine commit it, the index absent afterwards. An index stored before the block,
+  redefined and then removed in it, fails the commit the same way on 2.x too when the table held
+  records, the index standing as before; the embedded engine commits it (README section 36,
+  Transactions). Measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded
+  engine, identical on 3.1.5.
+- **Docs**: README section 36 (Transactions) and the docstrings of `define_indexes()`,
+  `remove_index()`, `define_analyzer()` and `remove_analyzer()` describe the guarded orders.
+- **Tests**: 75 new tests in `tests/test_search.py`: 18 unit tests of the transaction's notes and
+  57 end-to-end tests over WebSocket, HTTP and the embedded engine, in interactive and buffered
+  blocks.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.36.5] - 2026-10-24
 
 Follow-up to v0.36.1 (#315): a queryset write that the ORM refuses, and an instance write

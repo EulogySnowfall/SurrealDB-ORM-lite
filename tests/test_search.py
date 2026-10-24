@@ -90,7 +90,14 @@ block, one removed with a raw ``tx.add()``, or the call without ``tx=``. The tra
 removed or defined (``TestAnalyzerChangeNote``, ``TestAnalyzersChangedInTheBlock``): ``define_analyzer(tx=…)`` defines
 again one the block removed, and ``define_indexes(tx=…)`` refuses, before any DDL and on every engine, an index whose
 analyzer the block removed (counted as missing) or redefined (the servers would build it with the committed one),
-declared as an ``Analyzer`` or named by ``str``.
+declared as an ``Analyzer`` or named by ``str``. The transaction also notes the indexes ``define_indexes(tx=…)``
+defined, with their analyzer (``TestIndexDefinitionNote``, ``TestIndexesDefinedInTheBlock``,
+``TestIndexesDefinedInTheBlockE2E``, issue #329) — nothing when the call refuses or a statement is refused at once —:
+``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` of that analyzer are refused before any DDL on every engine,
+SurrealDB 3.x included, without failing the block; an index defined then removed in the block, or defined again with
+another analyzer, no longer counts for it. Pinned (README section 36, Transactions): SurrealDB 3.x fails the commit of a
+block that defines an index and then removes it with a retryable conflict, and SurrealDB 2.x one that redefines an index
+stored before it and then removes it, on a table that held records.
 
 ``search()`` (``TestSearchCompile``, ``TestSearchRefusals``): each field compiles ``<column> @<ref>@ $_f<N>``, AND-ed
 after the filters, ``Q`` and ``nearby()``, its text bound (data, whatever it holds), the references in call order
@@ -1651,6 +1658,76 @@ class TestAnalyzerChangeNote:
         assert empty._analyzers_defined() == frozenset({"b"})
 
 
+class TestIndexDefinitionNote:
+    """Issue #329: a transaction notes the indexes ``define_indexes(tx=…)`` defined, by table, each with its analyzer
+    (``""`` for none), for ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` to count them. The last change of an
+    index name wins: a definition replaces the note of an earlier one and forgets a removal, a removal drops the
+    definition. The commit and the cancel keep the note — on both strategies, without a server."""
+
+    def test_the_last_change_of_an_index_name_wins(self) -> None:
+        for tx in TestIndexRemovalNote._transactions():
+            assert tx._indexes_defined() == {}
+            tx._note_index_definition("t", "a", "fts_plain")
+            tx._note_index_definition("t", "b", "")
+            tx._note_index_definition("u", "a", "fts_other")
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}, "u": {"a": "fts_other"}}
+            # A second definition with another analyzer replaces the first.
+            tx._note_index_definition("t", "a", "fts_other")
+            assert tx._indexes_defined() == {"t": {"a": "fts_other", "b": ""}, "u": {"a": "fts_other"}}
+            # Remove after define: the definition is dropped — on its table only — and the removal noted.
+            tx._note_index_removal("t", "a")
+            assert tx._indexes_defined() == {"t": {"b": ""}, "u": {"a": "fts_other"}}
+            assert tx._indexes_removed("t") == frozenset({"a"})
+            tx._note_index_removal("u", "a")
+            assert tx._indexes_defined() == {"t": {"b": ""}}
+            # Define after remove: the removal is forgotten, the definition noted.
+            tx._note_index_definition("t", "a", "fts_plain")
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}}
+            assert tx._indexes_removed("t") == frozenset()
+            assert tx._indexes_removed("u") == frozenset({"a"})
+            # A write of records, a cache note or an analyzer change notes no index.
+            tx._note_record_write({"t"})
+            tx._note_cache_write({"t"})
+            tx._note_analyzer_removal("fts_plain")
+            tx._note_analyzer_definition("fts_other")
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}}
+            # The reader returns a copy.
+            copy = tx._indexes_defined()
+            copy["t"]["c"] = "fts_plain"
+            copy["v"] = {"a": "fts_plain"}
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}}
+
+    def test_an_index_defined_if_not_exists_keeps_the_earlier_definition(self) -> None:
+        """``define_indexes(overwrite=False, tx=…)`` defines with ``IF NOT EXISTS``, which leaves an index the block
+        defined earlier as it is: the definition noted for that name is kept. With no definition noted for the name on
+        its table — none yet, another table's, or one a removal dropped — the index is defined, and noted."""
+        for tx in TestIndexRemovalNote._transactions():
+            tx._note_index_definition("t", "a", "fts_plain")
+            tx._note_index_definition("t", "a", "fts_p", if_not_exists=True)
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain"}}
+            tx._note_index_definition("t", "b", "", if_not_exists=True)
+            tx._note_index_definition("u", "a", "fts_p", if_not_exists=True)
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}, "u": {"a": "fts_p"}}
+            # After a removal the index is missing: defined again, the removal forgotten.
+            tx._note_index_removal("t", "a")
+            tx._note_index_definition("t", "a", "fts_p", if_not_exists=True)
+            assert tx._indexes_defined() == {"t": {"a": "fts_p", "b": ""}, "u": {"a": "fts_p"}}
+            assert tx._indexes_removed("t") == frozenset()
+            # OVERWRITE replaces it, as before.
+            tx._note_index_definition("t", "a", "fts_plain")
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}, "u": {"a": "fts_p"}}
+
+    async def test_kept_by_the_commit_and_the_cancel(self) -> None:
+        for tx in TestIndexRemovalNote._transactions():
+            tx._note_index_definition("t", "a", "fts_plain")
+            await tx.cancel()
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain"}}
+        empty = transaction.BufferedTransaction()
+        empty._note_index_definition("t", "a", "")
+        await empty.commit()
+        assert empty._indexes_defined() == {"t": {"a": ""}}
+
+
 # --- the indexes a changed analyzer rebuilds; define_analyzer() and remove_analyzer() (no server) -------------------
 
 
@@ -2012,6 +2089,170 @@ class TestIndexesRemovedInTheBlock:
         rebuilds = [search.rebuild_index_statement(index, table) for table, index in _PLAIN_USES]
         assert applied == [FTS_PLAIN_LOWER.ddl(), *rebuilds]
         assert client.queries == ["INFO FOR DB;", *_USING_PLAIN_READS, *applied]
+
+
+#: The lines of ``remove_analyzer()``: SurrealDB 2.x and the embedded engine, which the ORM checks against committed
+#: state, and SurrealDB 3.x, which checks committed state itself.
+_ALL_LINES = pytest.mark.parametrize(
+    "line", ["surrealdb-2.7.0", "surrealdb-2.0.0", "surrealdb-3.3.4"], ids=["2x", "embedded", "3x"]
+)
+
+
+def _reads(line: str) -> list[str]:
+    """The reads of ``apply_analyzer_removal()`` on *line* with ``_plain_client()``: the line, then — below
+    SurrealDB 3 — ``INFO FOR DB`` and each table's ``INFO FOR TABLE``."""
+    return ["version"] if line.startswith("surrealdb-3") else ["version", "INFO FOR DB;", *_USING_PLAIN_READS]
+
+
+async def _defined_with_another_analyzer(tx: Transaction) -> None:
+    """Every index of ``_PLAIN_USES`` removed but ``fts_post_title``, which ``define_indexes(tx=…)`` defined again
+    with another analyzer."""
+    await _removed_all_but(("fts_post", "fts_post_title"))(tx)
+    tx._note_index_definition("fts_post", "fts_post_title", "fts_other")
+
+
+async def _defined_then_removed(tx: Transaction) -> None:
+    """Every index of ``_PLAIN_USES`` removed, and a new index using ``fts_plain`` defined, then removed, in the
+    block."""
+    await _removed_all(tx)
+    tx._note_index_definition("fts_new", "fts_new_title", "fts_plain")
+    tx._note_index_removal("fts_new", "fts_new_title")
+
+
+#: Issue #329: blocks after which no index uses ``fts_plain`` any more, although one did, or was defined, in them.
+_NO_LONGER_USED = [
+    ("another-analyzer", _defined_with_another_analyzer),
+    ("defined-then-removed", _defined_then_removed),
+]
+_NO_LONGER_USED_IDS = [case[0] for case in _NO_LONGER_USED]
+_NO_LONGER_USED_CASES = [case[1] for case in _NO_LONGER_USED]
+
+
+class TestIndexesDefinedInTheBlock:
+    """Issue #329: ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` count the indexes ``define_indexes(tx=…)``
+    defined earlier in the block, which committed state does not hold yet, with the analyzer the block gave them —
+    which replaces the committed one —; an index defined then removed in the block no longer counts. Each refusal comes
+    before any DDL, with the texts of before; ``remove_analyzer(tx=…)`` reads the note on every line, SurrealDB 3.x
+    included, with no request beyond the line there. Without a server."""
+
+    def test_the_indexes_using_the_analyzers_once_the_block_commits(self) -> None:
+        committed = _uses(_PLAIN_USES)
+        for tx in TestIndexRemovalNote._transactions():
+            assert search.indexes_using_once_committed(committed, {"fts_plain"}, tx) == committed
+            # Defined again with another analyzer: the block's analyzer replaces the committed one.
+            tx._note_index_definition("fts_post", "fts_post_title", "fts_other")
+            # A new index using the analyzer, on a table committed state holds and on one it does not.
+            tx._note_index_definition("fts_post", "fts_post_new", "fts_plain")
+            tx._note_index_definition("fts-a", "fts_a", "fts_plain")
+            # An index without analyzer never counts.
+            tx._note_index_definition("fts_post", "fts_post_slug", "")
+            # The same name on another table: fts_post's committed index still counts.
+            tx._note_index_definition("fts_page", "fts_post_body", "fts_other")
+            assert search.indexes_using_once_committed(committed, {"fts_plain"}, tx) == [
+                ("fts-a", "fts_a", "fts_plain"),
+                ("fts-u", "fts_u", "fts_plain"),
+                ("fts_page", "fts_page_title", "fts_plain"),
+                ("fts_post", "fts_post_body", "fts_plain"),
+                ("fts_post", "fts_post_new", "fts_plain"),
+            ]
+            # Without committed state (SurrealDB 3.x's removal), the block's indexes alone.
+            assert search.indexes_using_once_committed([], {"fts_plain", "fts_other"}, tx) == [
+                ("fts-a", "fts_a", "fts_plain"),
+                ("fts_page", "fts_post_body", "fts_other"),
+                ("fts_post", "fts_post_new", "fts_plain"),
+                ("fts_post", "fts_post_title", "fts_other"),
+            ]
+            assert search.indexes_using_once_committed([], {"fts_none"}, tx) == []
+        # No transaction, or anything else: committed state, sorted.
+        assert search.indexes_using_once_committed(list(reversed(committed)), {"fts_plain"}, None) == committed
+        assert search.indexes_using_once_committed(committed, {"fts_plain"}, object()) == committed
+
+    @_ALL_LINES
+    async def test_remove_analyzer_refused_for_an_index_the_block_defined(self, line: str) -> None:
+        """Every committed index using the analyzer removed in the block, then ``fts_post_title`` defined again: the
+        removal is refused, naming it, before any DDL — on SurrealDB 3.x too, which reads the line alone — and nothing
+        is noted."""
+        tx = transaction.BufferedTransaction()
+        await _removed_all(tx)
+        tx._note_index_definition("fts_post", "fts_post_title", "fts_plain")
+        client = _plain_client(line)
+        statement = search.remove_analyzer_statement("fts_plain", True)
+        with pytest.raises(SurrealDbError) as raised:
+            await search.apply_analyzer_removal(client, "fts_plain", statement, tx=tx)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == search.analyzer_in_use_refused("fts_plain", "fts_post_title", "fts_post")
+        assert tx.statements == []
+        assert tx._analyzers_removed() == frozenset()
+        assert client.queries == _reads(line)
+
+    @_CHECKED_LINES
+    async def test_remove_analyzer_names_the_first_index_committed_or_defined(self, line: str) -> None:
+        """Below SurrealDB 3, the committed indexes and the block's are one list, in table then index order: a committed
+        index on ``fts-u`` comes before one the block defined on ``fts_post``, and a new one on ``fts-a`` before both."""
+        for defined, named in [(("fts_post", "fts_post_new"), ("fts-u", "fts_u")), (("fts-a", "fts_a"), ("fts-a", "fts_a"))]:
+            tx = transaction.BufferedTransaction()
+            await _removed_all_but(("fts-u", "fts_u"))(tx)
+            tx._note_index_definition(*defined, "fts_plain")
+            statement = search.remove_analyzer_statement("fts_plain", True)
+            with pytest.raises(SurrealDbError) as raised:
+                await search.apply_analyzer_removal(_plain_client(line), "fts_plain", statement, tx=tx)
+            assert str(raised.value) == search.analyzer_in_use_refused("fts_plain", named[1], named[0])
+            assert tx.statements == []
+
+    @pytest.mark.parametrize("note", _NO_LONGER_USED_CASES, ids=_NO_LONGER_USED_IDS)
+    @_ALL_LINES
+    async def test_remove_analyzer_joins_once_no_index_uses_it(
+        self, line: str, note: Callable[[Transaction], Awaitable[None]]
+    ) -> None:
+        """The index committed state holds with the analyzer was defined again with another one, or the index the
+        block defined was removed in it: the removal joins the transaction, and is noted."""
+        tx = transaction.BufferedTransaction()
+        await note(tx)
+        client = _plain_client(line)
+        statement = search.remove_analyzer_statement("fts_plain", True)
+        assert await search.apply_analyzer_removal(client, "fts_plain", statement, tx=tx) == statement
+        assert tx.statements == [statement]
+        assert tx._analyzers_removed() == frozenset({"fts_plain"})
+        assert client.queries == _reads(line)
+
+    async def test_define_analyzer_refused_for_an_index_the_block_defined(self) -> None:
+        """The refusal names every index to rebuild, the committed ones and the block's, in table then index order,
+        before any DDL; nothing is noted."""
+        tx = transaction.BufferedTransaction()
+        await _removed_all(tx)
+        tx._note_index_definition("fts_post", "fts_post_title", "fts_plain")
+        client = _plain_client()
+        with pytest.raises(SurrealDbError) as raised:
+            await search.apply_analyzer(client, FTS_PLAIN_LOWER, overwrite=True, tx=tx)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _DA2
+        assert client.queries == ["INFO FOR DB;", *_USING_PLAIN_READS]
+        # Nothing removed: the committed indexes and a new one on a table committed state does not hold.
+        other = transaction.BufferedTransaction()
+        other._note_index_definition("fts_new", "fts_new_title", "fts_plain")
+        with pytest.raises(SurrealDbError) as every:
+            await search.apply_analyzer(_plain_client(), FTS_PLAIN_LOWER, overwrite=True, tx=other)
+        expected = sorted([*_uses(_PLAIN_USES), ("fts_new", "fts_new_title", "fts_plain")])
+        assert str(every.value) == search.analyzer_redefinition_refused("fts_plain", expected)
+        for refused in (tx, other):
+            assert refused.statements == []
+            assert refused._analyzers_defined() == frozenset()
+
+    @pytest.mark.parametrize("note", _NO_LONGER_USED_CASES, ids=_NO_LONGER_USED_IDS)
+    async def test_define_analyzer_joins_once_no_index_uses_it(
+        self, note: Callable[[Transaction], Awaitable[None]], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The redefinition joins the transaction, without ``REBUILD INDEX``, and is noted."""
+        caplog.set_level(logging.WARNING, logger="surreal_orm_lite.search")
+        tx = transaction.BufferedTransaction()
+        await note(tx)
+        client = _plain_client()
+        applied = await search.apply_analyzer(client, FTS_PLAIN_LOWER, overwrite=True, tx=tx)
+        assert applied == [FTS_PLAIN_LOWER.ddl()]
+        assert tx.statements == applied
+        assert tx._analyzers_defined() == frozenset({"fts_plain"})
+        assert client.queries == ["INFO FOR DB;", *_USING_PLAIN_READS]
+        assert _redefinitions(caplog) == ["Analyzer 'fts_plain' redefined; 0 index(es) rebuilt: "]
 
 
 #: Issue #323: the refusal of ``define_indexes(tx=…)`` for an index whose analyzer the block redefined.
@@ -3213,6 +3454,20 @@ _REMOVED_AGAIN_PIN_2X = (
     "commit of a block that removes an index and defines it again, on a table holding records, with a retryable "
     "conflict that a retry meets again. If this fails, 2.x commits it now: the README sentence and the row can be "
     "reconsidered."
+)
+
+#: The assertion message of the pin of an index defined then removed in one transaction, on SurrealDB 3.x.
+_DEFINED_REMOVED_PIN_3X = (
+    "README section 36, Transactions, and the v0.36.6 row of the 2.x/3.x table (issue #329): SurrealDB 3.x fails the "
+    "commit of a block that defines an index and then removes it with a retryable conflict, whatever the table holds. "
+    "If this fails, 3.x commits it now: the README sentence and the row can be reconsidered."
+)
+
+#: The assertion message of the pin of an index stored before the block, redefined then removed in it, on 2.x.
+_STORED_REDEFINED_REMOVED_PIN_2X = (
+    "README section 36, Transactions (issue #329): SurrealDB 2.x fails the commit of a block that redefines an index "
+    "stored before it and then removes it, on a table that held records, with a retryable conflict that a retry meets "
+    "again. If this fails, 2.x commits it now: the README sentence can be reconsidered."
 )
 
 #: The assertion message of the materialized-view pin on SurrealDB 3.x.
@@ -4684,7 +4939,9 @@ class TestRemoveAnalyzerE2E:
         embedded engine the ORM refuses it at the call, naming that index, before any DDL; the block then commits the
         rest. On SurrealDB 3.x the server checks in the transaction: it refuses at the call (interactive) or at the
         commit (buffered), and nothing of the block is committed — but it sees a raw removal, and removes the analyzer.
-        The analyzer stands in every refused case."""
+        Issue #329: the index the block defined again is in the transaction's note, so the ORM refuses it at the call
+        on 3.x too, before any DDL, with the line alone read, and the block commits the rest. The analyzer stands in
+        every refused case."""
         async with _fts_models(kind) as client:
             major = await _major(client)
             tables = await _still_using_setup(case)
@@ -4707,12 +4964,14 @@ class TestRemoveAnalyzerE2E:
         in_use = f"The analyzer 'fts_plain' is in use by index '{index}' on table '{table}' and cannot be removed"
         # The transaction notes the removal once applied or queued, never a refused one, nor a call without tx=.
         assert noted == (frozenset() if "call" in errors or case == "no-tx" else frozenset({"fts_plain"}))
-        if major < 3 or case == "no-tx":
+        if major < 3 or case in ("no-tx", "defined-again"):
             assert list(errors) == ["call"], errors
             assert type(errors["call"]) is SurrealDbError
             assert str(errors["call"]) == search.analyzer_in_use_refused("fts_plain", index, table)
             if major < 3:
                 assert sent == [("version", None), *_query(_INFO_DB), *_sent(tables)]
+            elif case == "defined-again":
+                assert sent == [("version", None)]
             assert sorted(analyzers) == ["fts_plain"]
         elif case == "raw-remove":
             assert errors == {}
@@ -4743,6 +5002,414 @@ class TestRemoveAnalyzerE2E:
             assert len(created) == 1 and "The analyzer 'fts_english' does not exist" in created[0], (
                 f"README row 'Removing an analyzer an index uses': the next write fails, got {created}"
             )
+
+
+class FtsPostP(FtsPost):
+    """``FtsPost`` on the same table, the same index name, holding ``FTS_P`` instead of ``FTS_PLAIN`` (issue #329)."""
+
+    model_config = SurrealConfigDict(table_name="fts_post", indexes=[Index("fts_post_title", "title", search_analyzer=FTS_P)])
+
+
+#: Issue #329: the analyzer DDL of ``fts_plain`` in a block — its removal, or a changed definition.
+_ANALYZER_DDL = pytest.mark.parametrize("ddl", ["removal", "redefinition"])
+
+
+async def _analyzer_ddl(ddl: str, tx: Transaction) -> list[str]:
+    """``remove_analyzer("fts_plain", tx=tx)`` (*ddl* ``"removal"``) or ``define_analyzer(FTS_PLAIN_LOWER,
+    overwrite=True, tx=tx)``: the statements applied."""
+    if ddl == "removal":
+        return [await SurrealDBConnectionManager.remove_analyzer("fts_plain", tx=tx)]
+    return await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN_LOWER, overwrite=True, tx=tx)
+
+
+async def _write_post(tx: Transaction) -> None:
+    """A record of ``FtsPost``'s table written in the block (issue #304)."""
+    await FtsPost(id="p9", title="Physics").save(tx=tx)
+
+
+async def _remove_plain(tx: Transaction) -> None:
+    """``fts_plain`` removed in the block, which no index uses yet (issue #323)."""
+    await SurrealDBConnectionManager.remove_analyzer("fts_plain", tx=tx)
+
+
+async def _redefine_plain(tx: Transaction) -> None:
+    """``fts_plain`` redefined in the block, which no index uses yet (issue #323)."""
+    await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN_LOWER, overwrite=True, tx=tx)
+
+
+class TestIndexesDefinedInTheBlockE2E:
+    """Issue #329, on every engine — SurrealDB 3.x and 2.x over WebSocket and HTTP (interactive on 3.x over WebSocket,
+    buffered otherwise) and the embedded engine: ``define_indexes(tx=…)`` notes the indexes it defines, with their
+    analyzer, and nothing when it refuses. ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` then count them,
+    although committed state does not hold them yet: the removal or the redefinition of their analyzer is refused before
+    any DDL, with the texts of before, and the block commits the rest — the block used to commit and leave the index
+    without its analyzer (SurrealDB 2.x, the embedded engine), or with the tokens of the old definition (every engine).
+    An index defined then removed in the block, or defined again with another analyzer, no longer counts."""
+
+    @pytest.mark.parametrize("held", [True, False], ids=["table-holding-a-record", "no-table"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_remove_analyzer_refused_once_the_block_defined_an_index_using_it(
+        self, kind: str, held: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``FTS_PLAIN`` committed, ``fts_post_title`` not yet defined: ``define_indexes(tx=…)``, then
+        ``remove_analyzer("fts_plain", tx=…)``. Refused at the call before any DDL, on every line — on SurrealDB 3.x
+        too, where the server's own refusal used to fail the block — with the line alone read there; the block commits
+        the index, with its analyzer, and the table takes writes."""
+        async with _fts_models(kind) as client:
+            major = await _major(client)
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            if held:
+                await FtsPost(id="p1", title="Physics Rocks").save()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                defined = await FtsPost.define_indexes(tx=tx)
+                queued = list(getattr(tx, "statements", []))
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as refused:
+                    await SurrealDBConnectionManager.remove_analyzer("fts_plain", tx=tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                still = list(getattr(tx, "statements", []))
+                noted = tx._analyzers_removed()
+            analyzers = await _stored_analyzers(client)
+            indexes = await _indexes(client, "fts_post")
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+            found = await FtsPost.objects().search(title="Physics").count()
+        assert defined == FtsPost.index_ddl(line=2 if major < 3 else 3)[1:]
+        assert type(refused.value) is SurrealDbError
+        assert str(refused.value) == search.analyzer_in_use_refused("fts_plain", "fts_post_title", "fts_post")
+        if major >= 3:
+            assert sent == [("version", None)]
+        else:
+            assert sent == [("version", None), *_query(_INFO_DB), *(_query(_INFO_POST) if held else [])]
+        assert still == queued
+        assert noted == frozenset()
+        assert sorted(analyzers) == ["fts_plain"]
+        assert list(indexes) == ["fts_post_title"]
+        assert created == []
+        assert found == (2 if held else 1)
+
+    @pytest.mark.parametrize("held", [True, False], ids=["table-holding-a-record", "no-table"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_analyzer_refused_once_the_block_defined_an_index_using_it(
+        self, kind: str, held: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``FTS_PLAIN`` committed: ``define_indexes(tx=…)``, then ``define_analyzer(FTS_PLAIN_LOWER, overwrite=True,
+        tx=…)``. Refused before any DDL as a redefinition with an index to rebuild (DA2), on every engine; the block
+        commits the index with the committed analyzer, so a search finds the record — it used to commit the
+        redefinition without ``REBUILD INDEX``, and the search to miss it."""
+        async with _fts_models(kind) as client:
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            if held:
+                await FtsPost(id="p1", title="Physics Rocks").save()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsPost.define_indexes(tx=tx)
+                queued = list(getattr(tx, "statements", []))
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as refused:
+                    await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN_LOWER, overwrite=True, tx=tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                still = list(getattr(tx, "statements", []))
+                noted = tx._analyzers_defined()
+            analyzers = await _stored_analyzers(client)
+            indexes = await _indexes(client, "fts_post")
+            found = await FtsPost.objects().search(title="Physics").count()
+        assert type(refused.value) is SurrealDbError
+        assert str(refused.value) == _DA2
+        assert sent == [*_query(_INFO_DB), *(_query(_INFO_POST) if held else [])]
+        assert still == queued
+        assert noted == frozenset()
+        assert search.analyzer_matches(FTS_PLAIN, analyzers["fts_plain"])
+        assert list(indexes) == ["fts_post_title"]
+        assert found == (1 if held else 0)
+
+    @pytest.mark.parametrize("ddl", ["removal", "redefinition", "none"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_analyzer_ddl_joins_once_the_block_removed_the_index_it_defined(
+        self, kind: str, ddl: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``define_indexes(tx=…)``, ``remove_index(tx=…)`` of that index, then the removal or redefinition of its
+        analyzer: the index no longer counts, so the analyzer DDL joins the transaction — without ``REBUILD INDEX`` —
+        on every engine. On SurrealDB 2.x and the embedded engine the block commits: the index is gone and the table
+        takes writes. Pinned (README section 36, Transactions): SurrealDB 3.x fails the commit of a block that defines
+        an index and then removes it with a retryable conflict, analyzer DDL or not (``none``) — nothing committed."""
+        async with _fts_models(kind) as client:
+            major = await _major(client)
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            conflict: SurrealDbConflictError | None = None
+            try:
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    await FtsPost.define_indexes(tx=tx)
+                    await FtsPost.remove_index("fts_post_title", tx=tx)
+                    defined = tx._indexes_defined()
+                    calls = _spy(monkeypatch, client)
+                    applied = [] if ddl == "none" else await _analyzer_ddl(ddl, tx)
+                    sent = _calls(calls)
+                    monkeypatch.undo()
+                    interactive = tx.is_interactive
+            except SurrealDbConflictError as error:
+                conflict = error
+            analyzers = await _stored_analyzers(client)
+            indexes = await _indexes(client, "fts_post")
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+        assert defined == {}
+        reads: list[tuple[str, object]] = []
+        if ddl == "removal":
+            assert applied == ["REMOVE ANALYZER IF EXISTS `fts_plain`;"]
+            reads = [("version", None)] if major >= 3 else [("version", None), *_query(_INFO_DB)]
+        elif ddl == "redefinition":
+            assert applied == [FTS_PLAIN_LOWER.ddl()]
+            reads = _query(_INFO_DB)
+        assert sent == ([*reads, *(("query_raw", statement) for statement in applied)] if interactive else reads)
+        if major >= 3:
+            assert conflict is not None, _DEFINED_REMOVED_PIN_3X
+            assert search.analyzer_matches(FTS_PLAIN, analyzers["fts_plain"])
+        else:
+            assert conflict is None
+            if ddl == "removal":
+                assert analyzers == {}
+            else:
+                analyzer = FTS_PLAIN_LOWER if ddl == "redefinition" else FTS_PLAIN
+                assert search.analyzer_matches(analyzer, analyzers["fts_plain"])
+        assert indexes == {}
+        assert created == []
+
+    @pytest.mark.parametrize("table", ["no-table", "empty-table", "table-holding-a-record"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_defined_then_removed_in_the_block(self, kind: str, table: str) -> None:
+        """The v0.36.6 row of the 2.x/3.x table: ``define_indexes(tx=…)``, then ``remove_index(tx=…)`` of that index,
+        not stored before the block. SurrealDB 2.x and the embedded engine commit the block: the index is absent
+        after the commit. SurrealDB 3.x fails the commit with a retryable conflict, whatever the table holds: nothing
+        committed. Either way no index is left, and the table takes writes."""
+        async with _fts_models(kind) as client:
+            server = None if kind == "mem" else await _major(client)
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            if table == "empty-table":
+                await _apply_ddl(client, "DEFINE TABLE `fts_post` SCHEMALESS;")
+            elif table == "table-holding-a-record":
+                await FtsPost(id="p1", title="Physics Rocks").save()
+            failed: SurrealDbError | None = None
+            try:
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    defined = await FtsPost.define_indexes(tx=tx)
+                    removed = await FtsPost.remove_index("fts_post_title", tx=tx)
+            except SurrealDbError as error:
+                failed = error
+            indexes = await _indexes(client, "fts_post")
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+            kept = await FtsPost.objects().count()
+        assert defined == FtsPost.index_ddl(line=2 if server != 3 else 3)[1:]
+        assert removed == "REMOVE INDEX IF EXISTS `fts_post_title` ON `fts_post`;"
+        if server == 3:
+            assert type(failed) is SurrealDbConflictError, _DEFINED_REMOVED_PIN_3X
+        else:
+            assert failed is None, (
+                "README row 'define_indexes(tx=) then remove_index(tx=)': 2.x and the embedded engine commit it"
+            )
+        assert indexes == {}
+        assert created == []
+        assert kept == (2 if table == "table-holding-a-record" else 1)
+
+    @pytest.mark.parametrize("table", ["empty-table", "table-holding-a-record"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_stored_before_the_block_redefined_then_removed_in_it(self, kind: str, table: str) -> None:
+        """README section 36, Transactions: ``fts_post_title`` stored before the block with ``fts_plain``;
+        ``FtsPostP.define_indexes(tx=…)`` redefines it with ``fts_p``, then ``remove_index(tx=…)`` removes it. The
+        embedded engine commits the block, whatever the table holds, and so does SurrealDB 2.x on an empty table: the
+        index is absent after the commit. SurrealDB 2.x on a table that held records, and 3.x whatever the table holds,
+        fail the commit with a retryable conflict that a retry meets again: nothing committed, the index stands as
+        before and serves the records committed before the block. Either way the table takes writes."""
+        async with _fts_models(kind) as client:
+            server = None if kind == "mem" else await _major(client)
+            line = await _keyword_line(client)
+            held = table == "table-holding-a-record"
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            await SurrealDBConnectionManager.define_analyzer(FTS_P)
+            await FtsPost.define_indexes()
+            if held:
+                await FtsPost(id="p1", title="Physics Rocks").save()
+            seen: dict[str, Any] = {}
+
+            async def block() -> SurrealDbError | None:
+                try:
+                    async with SurrealDBConnectionManager.transaction("fts") as tx:
+                        seen["defined"] = await FtsPostP.define_indexes(tx=tx)
+                        seen["removed"] = await FtsPost.remove_index("fts_post_title", tx=tx)
+                except SurrealDbError as error:
+                    return error
+                return None
+
+            failed = await block()
+            retried = await block() if failed is not None else None
+            indexes = await _indexes(client, "fts_post")
+            found = await FtsPost.objects().search(title="Physics").count() if indexes else None
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+            kept = await FtsPost.objects().count()
+        assert seen["defined"] == FtsPostP.index_ddl(line=line)[1:]
+        assert seen["removed"] == "REMOVE INDEX IF EXISTS `fts_post_title` ON `fts_post`;"
+        if server == 3 or (server == 2 and held):
+            pin = _DEFINED_REMOVED_PIN_3X if server == 3 else _STORED_REDEFINED_REMOVED_PIN_2X
+            assert type(failed) is SurrealDbConflictError, pin
+            assert type(retried) is SurrealDbConflictError, pin
+            state = indexes["fts_post_title"]
+            assert state is not None and state.search_analyzer == "fts_plain"
+            assert found == (1 if held else 0)
+        else:
+            assert failed is None, "README section 36, Transactions: 2.x on an empty table and the embedded engine commit it"
+            assert indexes == {}
+        assert created == []
+        assert kept == (2 if held else 1)
+
+    @_ANALYZER_DDL
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_the_block_defined_again_with_another_analyzer(self, kind: str, ddl: str) -> None:
+        """``fts_post_title`` committed with ``fts_plain``; ``define_indexes(tx=…)`` of ``FtsPostP`` defines it again
+        with ``fts_p``. The analyzer the block gave it replaces the committed one: removing ``fts_p`` is refused, while
+        the removal or redefinition of ``fts_plain`` joins the transaction, without ``REBUILD INDEX``, on every engine;
+        after the commit the index uses ``fts_p`` and the table takes writes."""
+        async with _fts_models(kind) as client:
+            line = await _keyword_line(client)
+            await SurrealDBConnectionManager.define_analyzer(FTS_P)
+            await FtsPost.define_indexes()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                defined = await FtsPostP.define_indexes(tx=tx)
+                noted = tx._indexes_defined()
+                with pytest.raises(SurrealDbError) as refused:
+                    await SurrealDBConnectionManager.remove_analyzer("fts_p", tx=tx)
+                applied = await _analyzer_ddl(ddl, tx)
+            analyzers = await _stored_analyzers(client)
+            indexes = await _indexes(client, "fts_post")
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+        assert defined == FtsPostP.index_ddl(line=line)[1:]
+        assert noted == {"fts_post": {"fts_post_title": "fts_p"}}
+        assert str(refused.value) == search.analyzer_in_use_refused("fts_p", "fts_post_title", "fts_post")
+        if ddl == "removal":
+            assert applied == ["REMOVE ANALYZER IF EXISTS `fts_plain`;"]
+            assert sorted(analyzers) == ["fts_p"]
+        else:
+            assert applied == [FTS_PLAIN_LOWER.ddl()]
+            assert search.analyzer_matches(FTS_PLAIN_LOWER, analyzers["fts_plain"])
+        state = indexes["fts_post_title"]
+        assert state is not None and state.search_analyzer == "fts_p"
+        assert created == []
+
+    @_ANALYZER_DDL
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_defined_if_not_exists_keeps_the_blocks_earlier_definition(
+        self, kind: str, ddl: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``FTS_PLAIN`` and ``FTS_P`` committed, a record of ``fts_post`` committed, ``fts_post_title`` not yet defined:
+        ``FtsPost.define_indexes(tx=…)``, then ``FtsPostP.define_indexes(overwrite=False, tx=…)``, whose ``DEFINE
+        INDEX IF NOT EXISTS`` leaves the block's earlier definition in place. The note keeps ``fts_plain``, so the
+        removal or redefinition of ``fts_plain`` is refused before any DDL, on every engine, and the block commits the
+        index with ``fts_plain``: a search finds the record. The second call used to note ``fts_p``, and the analyzer DDL
+        to join the transaction — leaving the index without its analyzer, or with the tokens of the old definition."""
+        async with _fts_models(kind) as client:
+            major = await _major(client)
+            line = await _keyword_line(client)
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            await SurrealDBConnectionManager.define_analyzer(FTS_P)
+            await FtsPost(id="p1", title="Physics Rocks").save()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsPost.define_indexes(tx=tx)
+                again = await FtsPostP.define_indexes(overwrite=False, tx=tx)
+                noted = tx._indexes_defined()
+                queued = list(getattr(tx, "statements", []))
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as refused:
+                    await _analyzer_ddl(ddl, tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                still = list(getattr(tx, "statements", []))
+                changed = (tx._analyzers_removed(), tx._analyzers_defined())
+            analyzers = await _stored_analyzers(client)
+            indexes = await _indexes(client, "fts_post")
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+            found = await FtsPost.objects().search(title="Physics").count()
+        assert again == FtsPostP.index_ddl(overwrite=False, line=line)[1:]
+        assert noted == {"fts_post": {"fts_post_title": "fts_plain"}}
+        assert type(refused.value) is SurrealDbError
+        if ddl == "removal":
+            assert str(refused.value) == search.analyzer_in_use_refused("fts_plain", "fts_post_title", "fts_post")
+            reads = [("version", None)] if major >= 3 else [("version", None), *_query(_INFO_DB), *_query(_INFO_POST)]
+        else:
+            assert str(refused.value) == _DA2
+            reads = [*_query(_INFO_DB), *_query(_INFO_POST)]
+        assert sent == reads
+        assert still == queued
+        assert changed == (frozenset(), frozenset())
+        assert sorted(analyzers) == ["fts_p", "fts_plain"]
+        assert search.analyzer_matches(FTS_PLAIN, analyzers["fts_plain"])
+        state = indexes["fts_post_title"]
+        assert state is not None and state.search_analyzer == "fts_plain"
+        assert created == []
+        assert found == 2
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_indexes_notes_the_indexes_it_defines(self, kind: str) -> None:
+        """Each index to define or redefine, with its analyzer — ``""`` for the ``UNIQUE`` one —; an index left as it
+        is, equal to committed state, is not noted (committed state holds it)."""
+        async with _fts_models(kind) as client:
+            await _apply_ddl(client, _A1)
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsArticle.define_indexes(tx=tx)
+                first = tx._indexes_defined()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsArticleV2.define_indexes(tx=tx)
+                second = tx._indexes_defined()
+        analyzers = dict.fromkeys(_ARTICLE_INDEXES, "fts_english")
+        assert first == {"fts_article": {**analyzers, "fts_article_slug": ""}}
+        assert second == {"fts_article": {"fts_article_title": "fts_english"}}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_indexes_notes_nothing_it_refuses(self, kind: str) -> None:
+        """Refused before any DDL — an analyzer to define in the transaction, one named by ``str`` that does not exist,
+        after the block wrote records to the table (issue #304), removed the analyzer or redefined it (issue #323):
+        nothing noted."""
+        notes: list[dict[str, dict[str, str]]] = []
+        async with _fts_models(kind):
+            for model in (FtsPost, FtsPostNamed):
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    with pytest.raises(SurrealDbError):
+                        await model.define_indexes(tx=tx)
+                    notes.append(tx._indexes_defined())
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            for step in (_write_post, _remove_plain, _redefine_plain):
+                with pytest.raises(_Rollback):
+                    async with SurrealDBConnectionManager.transaction("fts") as tx:
+                        await step(tx)
+                        with pytest.raises(SurrealDbError):
+                            await FtsPost.define_indexes(tx=tx)
+                        notes.append(tx._indexes_defined())
+                        raise _Rollback
+        assert notes == [{}] * 5
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_statement_refused_notes_nothing(self, kind: str) -> None:
+        """Two committed records share a slug, so the server refuses the ``UNIQUE`` index. In an interactive
+        transaction it refuses the statement at the call: nothing is noted, and the block fails. In a buffered one the
+        statements are only queued, and noted: the server refuses them at the commit, which fails the block."""
+        async with _fts_models(kind) as client:
+            await _apply_ddl(client, _A1)
+            for key in ("d1", "d2"):
+                await FtsArticle(id=key, title="Physics", slug="dup").save()
+            errors: list[str] = []
+            with pytest.raises(SurrealDbError):
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    interactive = tx.is_interactive
+                    try:
+                        await FtsArticle.define_indexes(tx=tx)
+                    except SurrealDbError as error:
+                        errors.append(str(error))
+                    noted = tx._indexes_defined()
+            indexes = await _indexes(client)
+        if interactive:
+            assert len(errors) == 1 and errors[0].startswith("Can't apply index definition: 'fts_article_slug'"), errors
+            assert noted == {}
+        else:
+            assert errors == []
+            assert sorted(noted["fts_article"]) == sorted(_ARTICLE_INDEXES)
+        assert indexes == {}
 
 
 # --- search() on the engines ----------------------------------------------------------------------------------------
@@ -5769,14 +6436,26 @@ _PART_NEEDLES_36 = {
         "so does a block that removes an index of a table that held records and defines it again, where the index stands "
         "as before",
         "On an empty table both commit, as on 3.x.",
-        # Issue #323: the analyzer DDL leaves out an index removed earlier in the block; a queued one is still unseen.
+        # Issue #329: pinned by test_the_analyzer_ddl_joins_once_the_block_removed_the_index_it_defined and
+        # test_an_index_defined_then_removed_in_the_block (an index not stored before the block), and by
+        # test_an_index_stored_before_the_block_redefined_then_removed_in_it (one stored before it).
+        "On SurrealDB 3.x, a block that defines an index and then removes it fails the commit the same way, whatever the "
+        "table holds; 2.x and the embedded engine commit it when the index was not stored before the block.",
+        "An index stored before the block, redefined by `define_indexes(tx=…)` and then removed, fails the commit the same "
+        "way on 2.x too when the table held records, where the index stands as before; the embedded engine commits it.",
+        # Issue #323: the analyzer DDL leaves out an index removed earlier in the block.
         "`remove_analyzer(tx=…)` (on SurrealDB 2.x and the embedded engine; 3.x checks in the transaction itself) and "
         "`define_analyzer(tx=…)` read committed state to find the indexes that use the analyzer.",
         "An index `remove_index(tx=…)` removed earlier in the block no longer counts",
         "it can remove the analyzer, or redefine it without `REBUILD INDEX`, on every engine",
         'An index removed then defined again in the block, or removed with a raw `tx.add("REMOVE INDEX …")`, still counts '
-        "there",
-        "an index queued earlier in a buffered block is not seen",
+        "there.",
+        # Issue #329: the analyzer DDL counts an index defined earlier in the block, on every engine.
+        "An index `define_indexes(tx=…)` defined earlier in the block counts too, with the analyzer the block gave it",
+        "raise `SurrealDbError` before any DDL, naming the index, on every engine — SurrealDB 3.x included",
+        "An index defined then removed in the block no longer counts, and one the block defined again with another analyzer "
+        "counts for that analyzer only.",
+        '`tx.add("DEFINE INDEX …")` is not tracked',
         # Issue #323: an index whose analyzer the block removed or redefined is refused, and the analyzer comes back.
         "Once the block has removed or redefined an analyzer, an index that uses it can no longer be defined in the block",
         "`define_indexes(tx=…)` raises `SurrealDbError` before any DDL. A removed analyzer counts as missing",
@@ -5905,6 +6584,19 @@ _EMBEDDED_REMOVED_AGAIN_ROW = [
     "the index is defined again after its removal and committed, on a table holding records too",
     "the same on 3.x; on 2.x, on a table holding records, the commit fails with a retryable conflict",
     "v0.36.2",
+]
+#: Issue #329: the sentence v0.36.6 adds to the 2.x/3.x table's intro and its row there, cell by cell — what
+#: ``test_an_index_defined_then_removed_in_the_block`` pins. The embedded engine's table has no row for it: the prose
+#: of section 36 describes that engine.
+_HEADER_SENTENCE_366 = (
+    "The row added in v0.36.6 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
+    "identical on 3.1.5."
+)
+_DEFINED_THEN_REMOVED_ROW = [
+    "`define_indexes(tx=)` then `remove_index(tx=)` in one block, the index not stored before the block",
+    "committed: the index absent after the commit, whatever the table holds",
+    "the commit fails with a retryable `SurrealDbConflictError`, whatever the table holds: nothing committed",
+    "v0.36.6",
 ]
 _FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
 #: The roadmap from v0.34.0: v0.36.0 ships vector search, so the planned range starts at v0.37.0.
@@ -6060,6 +6752,12 @@ class TestReadmeSection36:
         assert_server_rows([_REMOVED_AGAIN_ROW])
         assert_server_header_sentence(_HEADER_SENTENCE_362)
         assert_embedded_rows([_EMBEDDED_REMOVED_AGAIN_ROW])
+
+    def test_index_defined_then_removed_in_a_transaction_row(self) -> None:
+        """Issue #329: v0.36.6's one row in the 2.x/3.x table, cell by cell and in version order, and its sentence in
+        the table's intro; widths kept."""
+        assert_server_rows([_DEFINED_THEN_REMOVED_ROW])
+        assert_server_header_sentence(_HEADER_SENTENCE_366)
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]
