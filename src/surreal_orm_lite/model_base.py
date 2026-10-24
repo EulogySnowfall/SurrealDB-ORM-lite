@@ -878,6 +878,14 @@ class BaseSurrealModel(BaseModel):
     model from a node, so they need not import ``edge.py`` (which imports this module).
     """
 
+    __surreal_checks_pending__: typing.ClassVar[bool] = False
+    """``True`` on a model Pydantic could not complete at its ``class`` statement, until it does (issue #327).
+
+    Set by ``__pydantic_init_subclass__`` when a field is still a forward reference: its vector checks then wait for
+    ``__pydantic_on_complete__``. Read from the class's own ``__dict__`` only, never inherited: a subclass is
+    completed, and checked, on its own.
+    """
+
     _surreal_as_of: datetime | None = PrivateAttr(default=None)
     """The moment a time-travel read (``QuerySet.as_of()``) returned this instance at; ``None`` for a current record (v0.26.0).
 
@@ -980,8 +988,10 @@ class BaseSurrealModel(BaseModel):
         per column and one ``Analyzer`` definition per analyzer name, one vector index per column
         and, on a vector field of any spelling — a union with ``None`` included —, of its dimension
         and storage type (v0.36.0) — inherited values included, the messages naming the subclass.
-        So are the ``table_type``, ``relation_in``,
-        ``relation_out`` and ``enforced`` keys (v0.33.0), when any of them is not ``None``: a
+        These two (``_check_vectors_and_indexes()``) read the fields Pydantic could resolve: when a
+        field is still a forward reference, the model is incomplete and they run again once Pydantic
+        completes it (``__pydantic_on_complete__()``, issue #327). So are the ``table_type``,
+        ``relation_in``, ``relation_out`` and ``enforced`` keys (v0.33.0), when any of them is not ``None``: a
         ``TableType`` (``RELATION`` on an edge only), and the relation keys on an edge model only
         (``schema.check_relation_config()``). So are, on every model and after the relation keys,
         the ``schema_mode``, ``changefeed``, ``permissions``, ``comment`` and
@@ -1013,12 +1023,10 @@ class BaseSurrealModel(BaseModel):
                 user=issubclass(cls, AuthenticatedUserMixin),
                 computed=tuple(cls.__surreal_computed__),
             )
-        # Every model, with or without indexes: a field whose Vector markers are ambiguous is refused here.
-        declared = declared_vectors(cls.__name__, cls.model_fields)
-        indexes = cls.model_config.get("indexes")
-        if indexes is not None:
-            vectors = {cls.to_db_field(name): info for name, info in declared.items()}
-            check_indexes_config(cls, indexes, view=cls._is_view(), column=cls.to_db_field, vectors=vectors)
+        cls._check_vectors_and_indexes()
+        if not cls.__pydantic_complete__:
+            # A field still a forward reference has no Vector marker yet: checked again once the model is complete.
+            cls.__surreal_checks_pending__ = True
         relation = {key: cls.model_config.get(key) for key in ("table_type", "relation_in", "relation_out", "enforced")}
         if any(value is not None for value in relation.values()):
             check_relation_config(cls, edge=cls.__surreal_edge__, **relation)
@@ -1044,6 +1052,53 @@ class BaseSurrealModel(BaseModel):
             if isinstance(configured, str):
                 message += " table_name wins."
             warnings.warn(message, DeprecationWarning, stacklevel=user_stacklevel(also_skip=(_PYDANTIC_DIR,)))
+
+    @classmethod
+    def _check_vectors_and_indexes(cls) -> None:
+        """The vector checks of the ``class`` statement (v0.36.0; issues #318, #327), on the fields as Pydantic has
+        resolved them.
+
+        On every model, with or without indexes, the ``Vector`` markers of the fields (``vector.declared_vectors()``):
+        a field whose markers are ambiguous is refused, naming the model and the field. Then the ``indexes`` key
+        (``search.check_indexes_config()``), each vector index checked against its vector field's dimension and
+        storage type. Run by ``__pydantic_init_subclass__``, and again by ``__pydantic_on_complete__`` on a model that
+        a forward reference left incomplete there.
+        """
+        declared = declared_vectors(cls.__name__, cls.model_fields)
+        indexes = cls.model_config.get("indexes")
+        if indexes is not None:
+            vectors = {cls.to_db_field(name): info for name, info in declared.items()}
+            check_indexes_config(cls, indexes, view=cls._is_view(), column=cls.to_db_field, vectors=vectors)
+
+    @classmethod
+    def __pydantic_on_complete__(cls) -> None:
+        """Run the vector checks of the ``class`` statement once Pydantic completes a model it could not complete
+        there (issue #327).
+
+        A field annotated with a forward reference (``e: "Later" = None``) has no ``Vector`` marker until Pydantic
+        resolves the name, at ``model_rebuild()`` or at the model's first instantiation or validation; Pydantic calls
+        this hook then. ``_check_vectors_and_indexes()`` runs again on every field, with the refusals of the field
+        written directly, raised from ``model_rebuild()`` or from the call that completed the model. A model complete
+        at its ``class`` statement is checked there only: Pydantic calls this hook first, before
+        ``__pydantic_init_subclass__``, which has not asked for it (``__surreal_checks_pending__``).
+
+        Pydantic marks the model complete before it calls this hook, so a refusal puts the model back as it was,
+        incomplete: a second ``model_rebuild()``, an instantiation or a validation completes it again and raises the
+        same error. The refusal is never lost.
+        """
+        super().__pydantic_on_complete__()
+        if not cls.__dict__.get("__surreal_checks_pending__", False):
+            return
+        try:
+            cls._check_vectors_and_indexes()
+        except BaseException:
+            # Pydantic's own mocks for a model it could not complete: the next use rebuilds it, and so checks it again.
+            from pydantic._internal._mock_val_ser import set_model_mocks
+
+            cls.__pydantic_complete__ = False
+            set_model_mocks(cls)
+            raise
+        cls.__surreal_checks_pending__ = False
 
     @classmethod
     def get_computed_fields(cls) -> dict[str, str]:

@@ -830,7 +830,8 @@ def check_indexes_config(
     vectors: Mapping[str, tuple[int, str]],
 ) -> None:
     """The ``indexes`` key of a model's ``SurrealConfigDict``, checked when the class is defined (v0.35.0; the vector
-    indexes v0.36.0).
+    indexes v0.36.0), and again when Pydantic completes a model that a forward reference left incomplete at its
+    ``class`` statement, *vectors* then holding the fields it resolved (issue #327).
 
     ``None`` (no indexes) is not passed here. The first fault raises, in this order: *value* is not a ``list`` or a
     ``tuple``; an item is not an ``Index``; two indexes share a name (the second definition would replace the first);

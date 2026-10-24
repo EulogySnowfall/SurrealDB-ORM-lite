@@ -12,7 +12,8 @@ field or an annotation, and of their unions with ``None`` (``VectorField[1536] |
 ``Annotated[list[float], Vector(1536)] | None``, ``VectorField[1536] | Literal[None]``), as ``define_table()`` reads
 them; never from inside a container (``list[VectorField[3]]``). A field or an annotation holding two different markers,
 or a marker next to a type other than ``None``, has no single dimension: the helpers refuse it, and a model's ``class``
-statement refuses such a field (``declared_vectors()``).
+statement refuses such a field (``declared_vectors()``) — or, for a field declared through a forward reference, the
+completion of the model by Pydantic (``model_rebuild()``, or its first use).
 
 A value is ``None`` or a ``list``/``tuple`` of exactly ``d`` real numbers — ``int``, ``float``, any ``numbers.Real``,
 a ``decimal.Decimal`` (SurrealDB's decimals read back as ``Decimal``) —, never a ``bool`` nor a ``str``, each finite
@@ -368,7 +369,8 @@ def get_vector_info(annotation_or_field: Any) -> tuple[int, str] | None:
 
     :raises ValueError: the field or annotation holds two different ``Vector`` markers, or a marker next to a type
         other than ``None`` in a union (``VectorField[3] | str``, ``VectorField[3] | Literal[None, "x"]``): its
-        dimension and storage type are not one. A model's ``class`` statement refuses such a field already, naming it.
+        dimension and storage type are not one. A model's ``class`` statement refuses such a field already, naming it
+        (for a field declared through a forward reference, once Pydantic completes the model).
     """
     marker = _marker(annotation_or_field)
     return None if marker is None else (marker.dimension, marker.vector_type)
@@ -384,10 +386,12 @@ def is_vector_field(annotation_or_field: Any) -> bool:
 
 def declared_vectors(owner: str, fields: Mapping[str, FieldInfo]) -> dict[str, tuple[int, str]]:
     """The ``(dimension, storage type)`` of each vector field among a model's *fields*, by field name, as
-    ``get_vector_info()`` reads them: what the model's ``class`` statement checks (issue #318).
+    ``get_vector_info()`` reads them: what the model's ``class`` statement checks (issue #318), and checks again once
+    Pydantic completes a model a forward reference left incomplete there (issue #327).
 
     A field whose ``Vector`` markers are ambiguous raises ``ValueError`` naming the model *owner* and the field, so the
-    ``class`` statement refuses it whether or not the model declares indexes.
+    ``class`` statement refuses it whether or not the model declares indexes. A field still a forward reference has no
+    marker yet: it is not a vector field here.
     """
     declared: dict[str, tuple[int, str]] = {}
     for name, field in fields.items():
