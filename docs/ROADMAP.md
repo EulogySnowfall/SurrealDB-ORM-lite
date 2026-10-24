@@ -874,15 +874,17 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   records, and `cache()`, transactions and named connections apply as for `exec()`
 - The fusion follows the server line, read from `client.version()`: SurrealDB 3.x fuses the two
   lists with `search::rrf()`, given both in one statement; SurrealDB 2.x and the embedded engine
-  have no such function, so the ORM fuses them with the same formula — the same records, scores and
-  order on every line. Equal fused scores keep a fixed order (the vector list's first), where
-  `search::rrf()` alone returns them in no fixed order
+  have no such function, so the ORM fuses them with the same formula — the same two lists give the
+  same records, scores and order on every line. Equal fused scores keep a fixed order (the vector
+  list's first), where `search::rrf()` alone returns them in no fixed order
 - Measured differences: a text field without a full-text index is refused by SurrealDB 3.3, 2.x
   and the embedded engine (`SurrealDbError` naming the field) and matches nothing on 3.1 and 3.2;
   a vector field without a vector index gives an empty vector list (3.1 and 3.2: the first
   `vector_limit` records by id, with no distance); on 2.x and the embedded engine the vector list
-  selects the other conditions first, as `similar_to()` does. Same code on 2.7.0, 3.3.4 and the
-  embedded engine (3.1.5 retro; the rows also measured on 3.2.6)
+  selects the other conditions first, as `similar_to()` does, and an exact scan (`dist=`) picks
+  among records at an equal distance at the `vector_limit`-th place in no fixed order (3.x: the
+  same list on every call). Same code on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro; the
+  rows also measured on 3.2.6)
 - Refused before any request: `order_by()`, `annotate()`, `values()`, `search()`, `similar_to()`
   and `as_of()` on the queryset, and a model field stored under one of the seven names the method
   uses for its own values
