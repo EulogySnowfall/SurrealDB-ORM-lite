@@ -95,7 +95,7 @@ def _queryset_refusals(method: str) -> Callable[["QuerySet"], None]:
     does not repeat these checks.
     """
 
-    def refuse(queryset: QuerySet) -> None:
+    def refuse(queryset: "QuerySet") -> None:
         queryset.model._reject_view_write(f"objects().{method}")
         queryset._reject_time_travel(method)
 
