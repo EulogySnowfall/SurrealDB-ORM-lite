@@ -17,9 +17,10 @@ upper case, equal and hashed by both, with the ``repr`` ``Vector(3, 'F32')``, re
 equal marker; its arguments are checked with exact texts. ``get_vector_info()`` reads ``(dimension, type)`` from a
 model field of either spelling or from an ``Annotated`` annotation, ``None`` from anything else;
 ``is_vector_field()`` tells which. Both read a union of either spelling with ``None`` (``VectorField[3] | None``,
-``Optional[VectorField[3]]``, ``Annotated[list[float], Vector(3)] | None``: issue #318) as the plain spelling, never
-the vectors a container holds (``list[VectorField[3]]``), and refuse with an exact text a field or an annotation holding
-two different markers, or a marker next to a type other than ``None``. ``VectorField[3] | None`` needs its ``= None``
+``Optional[VectorField[3]]``, ``Annotated[list[float], Vector(3)] | None``: issue #318; ``VectorField[3] |
+Literal[None]``, a ``Literal`` of ``None`` only counting as ``None``: issue #327) as the plain spelling, never the vectors
+a container holds (``list[VectorField[3]]``), and refuse with an exact text a field or an annotation holding two
+different markers, or a marker next to a type other than ``None`` (a ``Literal`` holding another value included). ``VectorField[3] | None`` needs its ``= None``
 (Pydantic ignores the default of a union member, with a warning), and checks its values as ``VectorField[3]`` does.
 
 The checks of the vector search's arguments (``TestCheckers``): the distances (``EUCLIDEAN``, ``COSINE``,
@@ -50,6 +51,17 @@ declares none —, each with its exact text, the first fault raising; a vector i
 field is accepted, and an inherited index is checked again against the subclass's field. The same refusal applies to a
 vector field written as a union with ``None``; and before the indexes, on every model, a field whose ``Vector`` markers
 are ambiguous is refused with an exact text naming the model and the field, a subclass redeclaring it too.
+
+A vector field declared through a forward reference (``TestForwardReference``, issue #327): the model is incomplete at
+its ``class`` statement, and once ``model_rebuild()`` or its first instantiation or validation resolves the name, the
+same refusals apply word for word — a vector index of another dimension or storage type, an ambiguous marker —, a
+subclass refused under its own name; a refusal leaves the model incomplete, so every later attempt raises it again; a
+matching index is accepted, ``similar_to()`` checks the query vector against the field's dimension and ``table_ddl()``
+writes the vector column. Python 3.14's lazily evaluated annotations give the same result for an unquoted name. The
+ORM completes such a model before it reads it (``TestForwardReferenceOrm``): ``table_ddl()``, ``index_ddl()``,
+``get_indexes()``, ``define_table()``, ``define_indexes()`` and every queryset raise the same refusal — before a
+``model_rebuild()`` and after its refusal alike —, accept a matching index, and leave a model whose name is still
+undefined as it was.
 
 The table's vector columns (``TestFieldKind``, ``TestDefineTableE2E``): a vector field of either spelling, or its
 union with ``None``, is written ``option<array<float, d>>`` by ``table_ddl()`` and ``define_table()``, whatever its
@@ -166,6 +178,8 @@ import math
 import os
 import pickle
 import re
+import sys
+import types
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -194,6 +208,7 @@ from surreal_orm_lite import (
     PointField,
     Q,
     QueryCache,
+    QuerySet,
     SearchHighlight,
     SearchOffsets,
     SearchScore,
@@ -213,7 +228,7 @@ from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, p
 from surreal_orm_lite.schema import view_write_refused
 from surreal_orm_lite.subquery import TABLE_PROBE, SubqueryCompiler, _MissingSubqueryTable
 from surreal_orm_lite.testing import embedded_database
-from surreal_orm_lite.utils import validate_field_name
+from surreal_orm_lite.utils import user_namespace, validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
 from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
 from tests._readme_tables import normalised as _normalised
@@ -254,8 +269,8 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
 
     class VecUnion(BaseSurrealModel):
-        """The union spellings of a vector field (issue #318), one aliased, none indexed; and vectors held in
-        containers, which are not vector fields."""
+        """The union spellings of a vector field (issue #318), one aliased, one with a ``Literal[None]`` member (issue
+        #327), none indexed; and vectors held in containers, which are not vector fields."""
 
         model_config = SurrealConfigDict(table_name="vec_union")
 
@@ -266,6 +281,7 @@ with warnings.catch_warnings():
         wide: Annotated[list[float], Vector(3, "F64")] | None = None
         aliased: Annotated[list[float], Vector(3)] | None = Field(default=None, alias="aliased_vec")
         noted: Annotated[VectorField[3] | None, "a note"] = None
+        literal: VectorField[3] | Literal[None] = None
         listed: list[VectorField[3]] = Field(default_factory=list)
         keyed: dict[str, VectorField[3]] = Field(default_factory=dict)
         maybe_listed: list[VectorField[3]] | None = None
@@ -279,6 +295,7 @@ _UNION_FIELDS = [
     ("wide", (3, "F64")),
     ("aliased", (3, "F32")),
     ("noted", (3, "F32")),
+    ("literal", (3, "F32")),
 ]
 
 #: The refusal of a field or an annotation whose ``Vector`` markers are ambiguous: its subject, then what it holds.
@@ -299,6 +316,8 @@ _AMBIGUOUS_ANNOTATIONS = [
     (VectorField[2] | VectorField[3] | VectorField[4], "Vector(2, 'F32'), Vector(3, 'F32') and Vector(4, 'F32')"),
     (VectorField[2] | VectorField[3] | list[float], f"Vector(2, 'F32') and Vector(3, 'F32') {_NEXT_TO}"),
     (Annotated[list[float] | None, Vector(3), Vector(4)], "Vector(3, 'F32') and Vector(4, 'F32')"),
+    (VectorField[3] | Literal[None, "x"], f"Vector(3, 'F32') {_NEXT_TO}"),
+    (VectorField[3] | Literal["x"] | None, f"Vector(3, 'F32') {_NEXT_TO}"),
 ]
 _AMBIGUOUS_IDS = [
     "str",
@@ -310,6 +329,8 @@ _AMBIGUOUS_IDS = [
     "three-markers",
     "two-and-a-type",
     "two-in-one-annotated",
+    "literal-none-and-a-value",
+    "literal-value",
 ]
 
 #: An ambiguous union as a name (a string in an annotation reads as a forward reference).
@@ -682,6 +703,11 @@ class TestVectorMarker:
             (Annotated[VectorField[3] | None, "a note"], (3, "F32")),
             (Annotated[list[float], Vector(2)] | Annotated[list[float] | None, Vector(2)], (2, "F32")),
             (Annotated[VectorField[4] | None, Vector(3)], (3, "F32")),
+            (VectorField[3] | Literal[None], (3, "F32")),
+            (Literal[None] | VectorField[3, "F64"], (3, "F64")),
+            (Annotated[list[float], Vector(3)] | Literal[None], (3, "F32")),
+            (VectorField[3] | Literal[None] | None, (3, "F32")),
+            (Annotated[Literal[None], "a note"] | VectorField[3], (3, "F32")),
         ],
         ids=[
             "or-none",
@@ -694,6 +720,11 @@ class TestVectorMarker:
             "noted",
             "one-marker-twice",
             "outer-marker",
+            "literal-none",
+            "literal-none-first",
+            "typed-literal-none",
+            "literal-none-and-none",
+            "noted-literal-none",
         ],
     )
     def test_the_union_spellings_of_an_annotation(self, annotation: Any, info: tuple[int, str]) -> None:
@@ -1404,6 +1435,7 @@ def _vec_union_bad(indexes: object) -> type[BaseSurrealModel]:
             typed: Annotated[list[float], Vector(3)] | None = None
             wide: Annotated[list[float], Vector(3, "F64")] | None = None
             aliased: Annotated[list[float], Vector(3)] | None = Field(default=None, alias="aliased_vec")
+            literal: VectorField[3] | Literal[None] = None
 
     return VecUnionBad
 
@@ -1574,6 +1606,11 @@ class TestClassChecks:
                 _hnsw("vec_a", "aliased", vector_type="i32"),
                 _IC8.format("VecUnionBad", "vec_a", 3, "I32", "aliased", 3, "F32"),
             ),
+            (_hnsw("vec_a", "literal", dimension=4), _IC8.format("VecUnionBad", "vec_a", 4, "F32", "literal", 3, "F32")),
+            (
+                _hnsw("vec_a", "literal", vector_type="f64"),
+                _IC8.format("VecUnionBad", "vec_a", 3, "F64", "literal", 3, "F32"),
+            ),
         ],
         ids=[
             "or-none-dimension",
@@ -1586,6 +1623,8 @@ class TestClassChecks:
             "typed-f64-dimension",
             "alias-column",
             "alias-name",
+            "literal-none-dimension",
+            "literal-none-type",
         ],
     )
     def test_ic8_on_each_union_spelling(self, index: Index, text: str) -> None:
@@ -1599,6 +1638,7 @@ class TestClassChecks:
             _hnsw("vec_c", "typed", vector_type="f32"),
             _hnsw("vec_d", "wide", vector_type="F64", efc=100, m=8),
             _hnsw("vec_e", "aliased_vec"),
+            _hnsw("vec_f", "literal", dist="cosine"),
         ]
         assert _vec_union_bad(indexes).get_indexes() == tuple(indexes)
 
@@ -1644,6 +1684,440 @@ class TestClassChecks:
         assert str(raised.value) == _AMBIGUOUS.format("VecFieldMixed: field 'typed'", f"Vector(3, 'F32') {_NEXT_TO}")
 
 
+# === A vector field declared through a forward reference (issue #327) ===============================================
+
+#: A vector field ``e`` declared ``e: "Later" = None``, what ``Later`` resolves to, its vector index, and the refusal
+#: once Pydantic completes the model — the class statement's text, naming the model, the index and the field.
+_FWD_REFUSED = [
+    (VectorField[3], _hnsw("vec_fwd_e", "e", dimension=4), _IC8.format("VecFwd", "vec_fwd_e", 4, "F32", "e", 3, "F32")),
+    (VectorField[3, "F64"], _hnsw("vec_fwd_e", "e"), _IC8.format("VecFwd", "vec_fwd_e", 3, "F32", "e", 3, "F64")),
+    (
+        Annotated[list[float] | None, Vector(3)],
+        _hnsw("vec_fwd_e", "e", vector_type="i16"),
+        _IC8.format("VecFwd", "vec_fwd_e", 3, "I16", "e", 3, "F32"),
+    ),
+    (VectorField[3] | None, _hnsw("vec_fwd_e", "e", dimension=2), _IC8.format("VecFwd", "vec_fwd_e", 2, "F32", "e", 3, "F32")),
+    (
+        VectorField[3] | Literal[None],
+        _hnsw("vec_fwd_e", "e", dimension=4),
+        _IC8.format("VecFwd", "vec_fwd_e", 4, "F32", "e", 3, "F32"),
+    ),
+]
+_FWD_REFUSED_IDS = ["dimension", "type", "typed-form", "or-none", "literal-none"]
+
+#: What a forward-referenced field resolves to when its markers are ambiguous, and what the refusal says it holds.
+_FWD_AMBIGUOUS = [
+    (VectorField[3] | str, f"Vector(3, 'F32') {_NEXT_TO}"),
+    (VectorField[3] | VectorField[4], "Vector(3, 'F32') and Vector(4, 'F32')"),
+    (VectorField[3] | Literal[None, "x"], f"Vector(3, 'F32') {_NEXT_TO}"),
+]
+_FWD_AMBIGUOUS_IDS = ["str", "two-dimensions", "literal-none-and-a-value"]
+
+
+class TestForwardReference:
+    """A vector field whose annotation is a forward reference (``e: "Later" = None``, issue #327) has no ``Vector``
+    marker at the ``class`` statement, which checks it as it reads it: Pydantic leaves the model incomplete. Once
+    ``model_rebuild()``, or the first instantiation or validation, resolves the name and completes the model, the vector
+    checks of the ``class`` statement run again on every field — the same refusals word for word: a vector index of
+    another dimension or storage type, a field whose markers are ambiguous —, naming the model, the index and the field;
+    a subclass is checked under its own name. A refusal leaves the model incomplete: a second ``model_rebuild()``, an
+    instantiation and a validation raise it again. A matching index is accepted, and ``similar_to()`` checks the query
+    vector against the field's dimension, ``define_table()`` writes ``option<array<float, d>>``. The names are the test
+    functions' locals, which Pydantic reads from the caller's frame (a module's globals in an application)."""
+
+    @pytest.mark.parametrize(("annotation", "index", "text"), _FWD_REFUSED, ids=_FWD_REFUSED_IDS)
+    def test_refused_at_model_rebuild(self, annotation: Any, index: Index, text: str) -> None:
+        class VecFwd(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd", indexes=[index])
+
+            id: str | None = None
+            e: "Later" = None
+
+        assert VecFwd.__pydantic_complete__ is False
+        Later = annotation
+        with pytest.raises(ValueError) as raised, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+            VecFwd.model_rebuild()
+        assert type(raised.value) is ValueError
+        assert str(raised.value) == text
+
+    @pytest.mark.parametrize(("annotation", "held"), _FWD_AMBIGUOUS, ids=_FWD_AMBIGUOUS_IDS)
+    def test_an_ambiguous_marker_refused_at_model_rebuild(self, annotation: Any, held: str) -> None:
+        """The refusal of ``VectorField[3] | str`` written directly (``test_an_ambiguous_vector_field_is_refused_*``),
+        with or without indexes."""
+
+        class VecFwdMixed(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_mixed")
+
+            id: str | None = None
+            e: "Later" = None
+
+        class VecFwdMixedIndexed(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_mixed", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = annotation
+        for model in (VecFwdMixed, VecFwdMixedIndexed):
+            with pytest.raises(ValueError) as raised, warnings.catch_warnings():
+                warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+                model.model_rebuild()
+            assert str(raised.value) == _AMBIGUOUS.format(f"{model.__name__}: field 'e'", held)
+
+    def test_refused_at_the_first_instantiation(self) -> None:
+        """Pydantic completes the model on its first use, without ``model_rebuild()``."""
+
+        class VecFwdUsed(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_used", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3]
+        with pytest.raises(ValueError) as raised:
+            VecFwdUsed(e=[1.0, 2.0, 3.0])
+        assert str(raised.value) == _IC8.format("VecFwdUsed", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        assert get_vector_info(VecFwdUsed.model_fields["e"]) == (3, "F32")
+
+    def test_refused_at_the_first_validation(self) -> None:
+        class VecFwdRead(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_read")
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3] | str
+        with pytest.raises(ValueError) as raised, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+            VecFwdRead.model_validate({"id": "r1", "e": [1.0, 2.0, 3.0]})
+        assert str(raised.value) == _AMBIGUOUS.format("VecFwdRead: field 'e'", f"Vector(3, 'F32') {_NEXT_TO}")
+
+    def test_a_refusal_is_kept(self) -> None:
+        """The model stays incomplete after the refusal, as it was before: every later attempt to complete it checks
+        it again and raises the same error, never a model accepted on the second try."""
+
+        class VecFwdKept(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_kept", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3]
+        text = _IC8.format("VecFwdKept", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        with pytest.raises(ValueError) as raised:
+            VecFwdKept.model_rebuild()
+        assert str(raised.value) == text
+        assert VecFwdKept.__pydantic_complete__ is False
+        attempts = [
+            VecFwdKept.model_rebuild,
+            lambda: VecFwdKept(e=[1.0, 2.0, 3.0]),
+            lambda: VecFwdKept.model_validate({"id": "k1", "e": None}),
+            VecFwdKept.model_json_schema,
+            VecFwdKept.model_rebuild,
+        ]
+        for attempt in attempts:
+            assert _raised(ValueError, attempt) == text
+            assert VecFwdKept.__pydantic_complete__ is False
+
+    def test_a_subclass_is_checked_under_its_own_name(self) -> None:
+        """A subclass declared while the name is undefined is completed, and refused, apart from its base; one declared
+        once it resolves is complete at its ``class`` statement, which refuses it."""
+
+        class VecFwdBase(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_base", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        class VecFwdChild(VecFwdBase):
+            model_config = SurrealConfigDict(table_name="vec_fwd_child")
+
+        Later = VectorField[3]
+        with pytest.raises(ValueError) as raised:
+            VecFwdChild.model_rebuild()
+        assert str(raised.value) == _IC8.format("VecFwdChild", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        with pytest.raises(ValueError) as raised:
+            VecFwdBase.model_rebuild()
+        assert str(raised.value) == _IC8.format("VecFwdBase", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        with pytest.raises(ValueError) as raised:
+
+            class VecFwdLate(VecFwdBase):
+                model_config = SurrealConfigDict(table_name="vec_fwd_late")
+
+        assert str(raised.value) == _IC8.format("VecFwdLate", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+
+    def test_a_field_readable_at_the_class_statement_is_refused_there(self) -> None:
+        """Another field's forward reference does not defer the checks of the fields the class statement reads."""
+        with pytest.raises(ValueError) as raised:
+
+            class VecFwdDirect(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="vec_fwd_direct", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+                id: str | None = None
+                e: VectorField[3]
+                other: "Later" = None
+
+        assert str(raised.value) == _IC8.format("VecFwdDirect", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        Later = str  # the name the class above refers to: its class statement refuses it first
+
+    def test_a_matching_index_is_accepted(self) -> None:
+        class VecFwdOk(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_ok", indexes=[_hnsw("vec_fwd_e", "e", dist="cosine")])
+
+            id: str | None = None
+            e: "Later" = None
+            plain: "Plain" = None
+
+        Later = VectorField[3]
+        Plain = list[float] | None
+        assert VecFwdOk.model_rebuild() is True
+        assert VecFwdOk.__pydantic_complete__ is True
+        assert VecFwdOk.model_rebuild() is None
+        assert get_vector_info(VecFwdOk.model_fields["e"]) == (3, "F32")
+        assert get_vector_info(VecFwdOk.model_fields["plain"]) is None
+        assert VecFwdOk(e=(1, 2, 3)).e == [1.0, 2.0, 3.0]
+        for value in ([1.0, 0.0], [1.0, 0.0, 0.0, 0.0]):
+            assert _raised(ValueError, VecFwdOk.objects().similar_to, "e", value) == (
+                f"similar_to(): the vector has {len(value)} dimensions; field 'e' holds vectors of 3 (VectorField[3])."
+            )
+        assert VecFwdOk.objects().similar_to("e", (1, 0, 0), 2)._compile_query()[1] == {"_f0": [1.0, 0.0, 0.0]}
+        assert VecFwdOk.table_ddl()[1:] == [
+            "DEFINE FIELD OVERWRITE `e` ON `vec_fwd_ok` TYPE option<array<float, 3>>;",
+            "DEFINE FIELD OVERWRITE `plain` ON `vec_fwd_ok` TYPE option<array<float>>;",
+        ]
+
+    def test_accepted_at_the_first_instantiation(self) -> None:
+        class VecFwdFirst(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_first", indexes=[_hnsw("vec_fwd_e", "e", vector_type="f64")])
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = Annotated[list[float] | None, Vector(3, "F64")]
+        assert VecFwdFirst(e=[1, 2, 3]).e == [1.0, 2.0, 3.0]
+        assert VecFwdFirst.__pydantic_complete__ is True
+        assert _raised(ValueError, VecFwdFirst.objects().similar_to, "e", [1.0, 0.0]) == (
+            "similar_to(): the vector has 2 dimensions; field 'e' holds vectors of 3 (VectorField[3])."
+        )
+
+    def test_a_vector_index_on_a_field_that_is_not_a_vector_field_accepted(self) -> None:
+        class VecFwdPlain(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_plain", indexes=[_hnsw("vec_fwd_e", "e", dimension=8)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = list[float] | None
+        assert VecFwdPlain.model_rebuild() is True
+        assert VecFwdPlain(e=[1.0]).e == [1.0]
+
+    @pytest.mark.skipif(sys.version_info < (3, 14), reason="annotations are evaluated lazily from Python 3.14 (PEP 649)")
+    def test_an_unquoted_name_evaluated_lazily(self) -> None:
+        """Python 3.14 evaluates annotations lazily: an unquoted name defined after the class is a forward reference
+        too, checked the same way."""
+
+        class VecFwdLazy(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_lazy", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: Later = None  # noqa: F821 - defined below, read when Pydantic evaluates the annotation
+
+        assert VecFwdLazy.__pydantic_complete__ is False
+        Later = VectorField[3]  # noqa: F841 - read by the annotation above
+        with pytest.raises(ValueError) as raised:
+            VecFwdLazy.model_rebuild()
+        assert str(raised.value) == _IC8.format("VecFwdLazy", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+
+
+#: The ORM's calls that read a model's fields or indexes, each completing first a model a forward reference left
+#: incomplete at its ``class`` statement (issue #327).
+_FWD_ORM_CALLS = [
+    "table_ddl",
+    "index_ddl",
+    "get_indexes",
+    "objects",
+    "queryset",
+    "similar_to",
+    "define_table",
+    "define_indexes",
+]
+
+
+class TestForwardReferenceOrm:
+    """The ORM completes a model whose vector checks wait for Pydantic (issue #327) before it reads its fields or its
+    indexes: ``table_ddl()``, ``index_ddl()``, ``get_indexes()``, ``define_table()``, ``define_indexes()`` and every
+    queryset (``objects()``, ``QuerySet(model)``, so ``similar_to()``) — not only ``model_rebuild()`` and Pydantic's
+    first instantiation, validation or JSON schema. The refusal is the ``class`` statement's, raised before anything is
+    sent (the model's connection is never registered), and again at every later call: the model stays incomplete. A
+    matching index is accepted: the column and the query vector are checked against the resolved field. A name still
+    undefined leaves the model incomplete and read as before. Each call is made from the test function, whose locals
+    hold the name, as a module's globals hold it in an application (``test_a_model_of_a_module``)."""
+
+    @pytest.mark.parametrize("call", _FWD_ORM_CALLS)
+    async def test_refused_by_the_first_orm_call(self, call: str) -> None:
+        class VecFwdOrm(BaseSurrealModel):
+            model_config = SurrealConfigDict(
+                table_name="vec_fwd_orm", connection="vec_fwd_nowhere", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)]
+            )
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3]
+        text = _IC8.format("VecFwdOrm", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        for _ in range(2):
+            with pytest.raises(ValueError) as raised:
+                match call:
+                    case "table_ddl":
+                        VecFwdOrm.table_ddl()
+                    case "index_ddl":
+                        VecFwdOrm.index_ddl()
+                    case "get_indexes":
+                        VecFwdOrm.get_indexes()
+                    case "objects":
+                        VecFwdOrm.objects()
+                    case "queryset":
+                        QuerySet(VecFwdOrm)
+                    case "similar_to":
+                        VecFwdOrm.objects().similar_to("e", [1.0, 0.0, 0.0, 0.0])
+                    case "define_table":
+                        await VecFwdOrm.define_table()
+                    case "define_indexes":
+                        await VecFwdOrm.define_indexes()
+            assert type(raised.value) is ValueError
+            assert str(raised.value) == text
+            assert VecFwdOrm.__pydantic_complete__ is False
+
+    def test_an_ambiguous_marker_refused_by_the_orm(self) -> None:
+        """``Later = VectorField[3] | str`` on a model without indexes: refused as the ``class`` statement refuses the
+        field written directly."""
+
+        class VecFwdOrmMixed(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_orm_mixed")
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3] | str
+        text = _AMBIGUOUS.format("VecFwdOrmMixed: field 'e'", f"Vector(3, 'F32') {_NEXT_TO}")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+            with pytest.raises(ValueError) as raised:
+                VecFwdOrmMixed.table_ddl()
+            assert str(raised.value) == text
+            with pytest.raises(ValueError) as raised:
+                VecFwdOrmMixed.get_indexes()
+            assert str(raised.value) == text
+            with pytest.raises(ValueError) as raised:
+                VecFwdOrmMixed.objects()
+            assert str(raised.value) == text
+        assert VecFwdOrmMixed.__pydantic_complete__ is False
+
+    def test_after_a_refusal_at_model_rebuild(self) -> None:
+        """The refusal of ``model_rebuild()`` is raised again by every ORM call, never a column or an index written as
+        if the model had been accepted."""
+
+        class VecFwdOrmKept(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_orm_kept", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3]
+        text = _IC8.format("VecFwdOrmKept", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        with pytest.raises(ValueError) as raised:
+            VecFwdOrmKept.model_rebuild()
+        assert str(raised.value) == text
+        # The fields are resolved from now on: each call completes the model again, wherever it is made from.
+        for call in (VecFwdOrmKept.table_ddl, VecFwdOrmKept.index_ddl, VecFwdOrmKept.get_indexes, VecFwdOrmKept.objects):
+            assert _raised(ValueError, call) == text
+            assert VecFwdOrmKept.__pydantic_complete__ is False
+        assert _raised(ValueError, QuerySet, VecFwdOrmKept) == text
+        assert _raised(ValueError, VecFwdOrmKept.model_rebuild) == text
+        assert VecFwdOrmKept.__pydantic_complete__ is False
+
+    def test_a_matching_index_accepted_by_the_first_orm_call(self) -> None:
+        """No ``model_rebuild()``, no instance: ``table_ddl()`` writes the vector column and completes the model, and
+        ``similar_to()`` checks the query vector against the field's dimension."""
+
+        class VecFwdOrmOk(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_orm_ok", indexes=[_hnsw("vec_fwd_e", "e")])
+
+            id: str | None = None
+            e: "Later" = None
+
+        class VecFwdOrmQuery(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_orm_query")
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3] | Literal[None]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
+            assert VecFwdOrmOk.table_ddl()[1:] == [
+                "DEFINE FIELD OVERWRITE `e` ON `vec_fwd_orm_ok` TYPE option<array<float, 3>>;"
+            ]
+            assert VecFwdOrmOk.__pydantic_complete__ is True
+            assert VecFwdOrmOk.get_indexes() == (_hnsw("vec_fwd_e", "e"),)
+            assert VecFwdOrmQuery.__pydantic_complete__ is False
+            with pytest.raises(ValueError) as raised:
+                VecFwdOrmQuery.objects().similar_to("e", [1.0, 0.0])
+        assert str(raised.value) == "similar_to(): the vector has 2 dimensions; field 'e' holds vectors of 3 (VectorField[3])."
+        assert VecFwdOrmQuery.__pydantic_complete__ is True
+
+    def test_a_name_still_undefined(self) -> None:
+        """The model stays incomplete, read as before (the field's column ``any``), until the name resolves: the next
+        call checks it."""
+
+        class VecFwdOrmEarly(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_orm_early", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        assert VecFwdOrmEarly.table_ddl()[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_orm_early` TYPE any;"]
+        assert VecFwdOrmEarly.get_indexes() == (_hnsw("vec_fwd_e", "e", dimension=4),)
+        assert VecFwdOrmEarly.__pydantic_complete__ is False
+        Later = VectorField[3]
+        with pytest.raises(ValueError) as raised:
+            VecFwdOrmEarly.table_ddl()
+        assert str(raised.value) == _IC8.format("VecFwdOrmEarly", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+
+    def test_a_model_of_a_module(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An application's model, the name defined after the class in its module: the ORM resolves it there, whoever
+        calls."""
+        module = types.ModuleType("vec_fwd_module")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, Index, SurrealConfigDict, VectorField\n"
+            "class VecFwdModule(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(\n"
+            "        table_name='vec_fwd_module', indexes=[Index('vec_fwd_e', 'e', hnsw=True, dimension=4)]\n"
+            "    )\n"
+            "    id: str | None = None\n"
+            "    e: 'Later' = None\n"
+            "Later = VectorField[3]\n",
+            module.__dict__,
+        )
+        model = module.VecFwdModule
+        assert model.__pydantic_complete__ is False
+        text = _IC8.format("VecFwdModule", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        assert _raised(ValueError, model.table_ddl) == text
+        assert _raised(ValueError, model.get_indexes) == text
+
+    def test_the_callers_namespace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``utils.user_namespace()``: a copy of the local names of the first frame outside the ORM; ``{}`` without
+        frames (an interpreter without ``sys._getframe``)."""
+        marker = object()
+        namespace = user_namespace()
+        assert namespace["marker"] is marker
+        assert namespace is not user_namespace()
+        monkeypatch.setattr(surreal_orm_lite.utils.inspect, "currentframe", lambda: None)
+        assert user_namespace() == {}
+
+
 # === define_table(): the vector columns =============================================================================
 
 #: ``VecDoc.table_ddl()``: the two vector columns (the typed one under its alias) written ``option<array<float, 3>>``.
@@ -1672,8 +2146,20 @@ class TestFieldKind:
             (Annotated[list[float], Vector(2)], "option<array<float, 2>>"),
             (list[VectorField[3]], "array<option<array<float, 3>>>"),
             (list[float] | None, "option<array<float>>"),
+            (VectorField[3] | Literal[None], "option<array<float, 3>>"),
+            (Annotated[list[float], Vector(2, "F64")] | Literal[None], "option<array<float, 2>>"),
         ],
-        ids=["vector-field", "vector-field-i16", "typed", "typed-f64", "typed-not-optional", "list-of-vectors", "plain"],
+        ids=[
+            "vector-field",
+            "vector-field-i16",
+            "typed",
+            "typed-f64",
+            "typed-not-optional",
+            "list-of-vectors",
+            "plain",
+            "literal-none",
+            "typed-literal-none",
+        ],
     )
     def test_the_kind_of_an_annotation(self, annotation: Any, text: str) -> None:
         assert render_kind(model_ddl.field_kind(annotation)) == text
@@ -1695,7 +2181,7 @@ class TestFieldKind:
         assert VecUnion.table_ddl()[1:] == [
             *(
                 f"DEFINE FIELD OVERWRITE `{column}` ON `vec_union` TYPE option<array<float, 3>>;"
-                for column in ("optional", "legacy", "typed", "wide", "aliased_vec", "noted")
+                for column in ("optional", "legacy", "typed", "wide", "aliased_vec", "noted", "literal")
             ),
             "DEFINE FIELD OVERWRITE `listed` ON `vec_union` TYPE array<option<array<float, 3>>>;",
             "DEFINE FIELD OVERWRITE `keyed` ON `vec_union` TYPE object;",
@@ -5275,10 +5761,11 @@ _S37_UNION = (
     "`VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or "
     "`Optional[VectorField[d]]`, its `None` default sits inside a union member, where Pydantic ignores it with an "
     "`UnsupportedFieldAttributeWarning`: write `= None`, or the field is required. The ORM reads these spellings, and "
-    "`Annotated[list[float], Vector(d)] | None`, like the plain ones: the same column, the same checks of the vector "
-    "index when the class is defined, the same dimension for `similar_to()`, the same answer from `get_vector_info()`. "
-    "A union that holds a vector next to a type other than `None`, or two different `Vector` markers, has no single "
-    "dimension: the class statement refuses it, naming the field."
+    "`Annotated[list[float], Vector(d)] | None`, like the plain ones (a `Literal[None]` member counts as `None`): the "
+    "same column, the same checks of the vector index when the class is defined, the same dimension for "
+    "`similar_to()`, the same answer from `get_vector_info()`. A union that holds a vector next to a type other than "
+    "`None`, or two different `Vector` markers, has no single dimension: the class statement refuses it, naming the "
+    "field, and `get_vector_info()` and `is_vector_field()` raise `ValueError` for such a field or annotation."
 )
 #: The nine sentences section 37 says word for word (whitespace normalised), with their subsection.
 _SENTENCES_37 = [
@@ -5317,6 +5804,8 @@ _PART_NEEDLES_37 = {
         "`m=`",
         "`SurrealConfigDict(indexes=[...])`",
         "two vector indexes on one column are refused",
+        "(a forward reference) is checked once the name resolves, with the same error",
+        "`get_indexes()` or a queryset (`similar_to()` included) reads the model. Once refused, each of these raises it again.",
         "`define_table()`",
         "`define_indexes()`",
         "`index_ddl()`",

@@ -6173,7 +6173,11 @@ the default —, `I64`, `I32` or `I16`). An `Index` with `hnsw=True` is a vector
 `SurrealConfigDict(indexes=[...])` next to the full-text indexes of
 [section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index). Its attributes hold what was
 declared (`None` for an option not given). When the class is defined, two vector indexes on one column are refused,
-and so is a vector index whose dimension or storage type differs from its field's `VectorField`.
+and so is a vector index whose dimension or storage type differs from its field's `VectorField`. A field annotated
+with a name defined after the class (a forward reference) is checked once the name resolves, with the same error: at
+`model_rebuild()`, at the model's first instantiation, validation or JSON schema, and before `table_ddl()`,
+`define_table()`, `index_ddl()`, `define_indexes()`, `get_indexes()` or a queryset (`similar_to()` included) reads the
+model. Once refused, each of these raises it again.
 
 ```python
 from surreal_orm_lite import (
@@ -6285,10 +6289,11 @@ print(get_vector_info(Document.model_fields["embedding"]), is_vector_field(Passa
 `VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or
 `Optional[VectorField[d]]`, its `None` default sits inside a union member, where Pydantic ignores it with an
 `UnsupportedFieldAttributeWarning`: write `= None`, or the field is required. The ORM reads these spellings, and
-`Annotated[list[float], Vector(d)] | None`, like the plain ones: the same column, the same checks of the vector index
-when the class is defined, the same dimension for `similar_to()`, the same answer from `get_vector_info()`. A union
-that holds a vector next to a type other than `None`, or two different `Vector` markers, has no single dimension: the
-class statement refuses it, naming the field.
+`Annotated[list[float], Vector(d)] | None`, like the plain ones (a `Literal[None]` member counts as `None`): the same
+column, the same checks of the vector index when the class is defined, the same dimension for `similar_to()`, the same
+answer from `get_vector_info()`. A union that holds a vector next to a type other than `None`, or two different
+`Vector` markers, has no single dimension: the class statement refuses it, naming the field, and `get_vector_info()`
+and `is_vector_field()` raise `ValueError` for such a field or annotation.
 
 #### Find the nearest
 

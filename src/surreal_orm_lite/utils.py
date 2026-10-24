@@ -91,6 +91,27 @@ def user_stacklevel(*, also_skip: tuple[str, ...] = ()) -> int:
     return 2
 
 
+def user_namespace() -> dict[str, Any]:
+    """The local names of the first frame outside the ORM (its subpackages included); ``{}`` when there is none.
+
+    Pydantic completes a model that a forward reference left incomplete at its ``class`` statement, on its first
+    instantiation, with the names of the module the model is defined in and the local names of the caller's frame.
+    ``BaseSurrealModel._complete_pending_checks()`` completes such a model the same way before the ORM reads its fields
+    or its indexes (issue #327): the caller is the first frame outside the ORM, whatever the depth of the call.
+    """
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            directory = os.path.dirname(os.path.abspath(frame.f_code.co_filename))
+            if directory != _PACKAGE_DIR and not directory.startswith(_PACKAGE_DIR + os.sep):
+                return dict(frame.f_locals)
+            frame = frame.f_back
+        return {}
+    finally:
+        # A frame refers to its locals: dropping it here keeps no reference cycle alive.
+        del frame
+
+
 def split_statements(query: str) -> list[str]:
     """Split SurrealQL on the statement separator, ignoring ``;`` inside strings and comments.
 
