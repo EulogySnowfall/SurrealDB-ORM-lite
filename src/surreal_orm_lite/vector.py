@@ -13,7 +13,8 @@ field or an annotation, and of their unions with ``None`` (``VectorField[1536] |
 them; never from inside a container (``list[VectorField[3]]``). A field or an annotation holding two different markers,
 or a marker next to a type other than ``None``, has no single dimension: the helpers refuse it, and a model's ``class``
 statement refuses such a field (``declared_vectors()``) — or, for a field declared through a forward reference, the
-completion of the model by Pydantic (``model_rebuild()``, or its first use).
+completion of the model once the name resolves: ``model_rebuild()``, its first instantiation, validation or JSON schema,
+or the ORM's first DDL or queryset of the model (``BaseSurrealModel._complete_pending_checks()``).
 
 A value is ``None`` or a ``list``/``tuple`` of exactly ``d`` real numbers — ``int``, ``float``, any ``numbers.Real``,
 a ``decimal.Decimal`` (SurrealDB's decimals read back as ``Decimal``) —, never a ``bool`` nor a ``str``, each finite
