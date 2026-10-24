@@ -10,7 +10,7 @@ validation, the same column type (``option<array<float, 1536>>``), the same sche
 ``is_vector_field()`` — the full ORM's helpers, under their names — read the marker of either spelling from a model
 field or an annotation, and of their unions with ``None`` (``VectorField[1536] | None``,
 ``Annotated[list[float], Vector(1536)] | None``), as ``define_table()`` reads them; never from inside a container
-(``list[VectorField[3]]``). A field or an annotation holding two different markers, or a marker next to another type
+(``list[VectorField[3]]``). A field or an annotation holding two different markers, or a marker next to a type other
 than ``None``, has no single dimension: the helpers refuse it, and a model's ``class`` statement refuses such a field
 (``declared_vectors()``).
 
@@ -318,13 +318,9 @@ def _held(annotation: Any, metadata: Sequence[Any] = ()) -> tuple[tuple[Vector, 
     origin = get_origin(annotation)
     if origin is not Union and origin is not UnionType:
         return (), True
-    found: dict[Vector, None] = {}
-    other = False
-    for member in get_args(annotation):
-        member_markers, member_other = _held(member)
-        found.update(dict.fromkeys(member_markers))
-        other = other or member_other
-    return tuple(found), other
+    members = [_held(member) for member in get_args(annotation)]
+    markers = tuple(dict.fromkeys(marker for held, _ in members for marker in held))
+    return markers, any(other for _, other in members)
 
 
 def ambiguous_marker_refused(subject: str, markers: Sequence[Vector], other: bool) -> str:
