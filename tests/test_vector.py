@@ -64,7 +64,10 @@ same declaring ``dist="euclidean"`` each match the index the other defined; a mo
 indexes reads no line; an index of another kind stored under the declared name — an ``MTREE`` index on SurrealDB 2.x
 and the embedded engine, a plain one on every engine — is redefined ``HNSW``; ``remove_index()`` removes a vector index
 by name and the next ``define_indexes()`` defines only what is missing; with a transaction the vector index joins the
-block, and a block that raises applies none.
+block, and a block that raises applies none. An index stored before the block, removed with ``remove_index(tx=…)`` and
+defined again with ``define_indexes(tx=…)`` in it, stands after the commit and serves ``similar_to()``, on an empty
+table and on one holding a record — where SurrealDB 2.x fails the commit with a retryable conflict instead, the index
+kept (issues #312, #323).
 
 The engines' own vector DDL, pinned with raw statements (``TestVectorDdlPinsE2E``): an index without ``TYPE`` stores
 ``F64`` vectors on the embedded engine and ``F32`` on the servers, while the ORM's statement stores ``F32`` everywhere;
@@ -196,6 +199,7 @@ from surreal_orm_lite import (
     SearchScore,
     Subquery,
     SurrealConfigDict,
+    SurrealDbConflictError,
     SurrealDBConnectionManager,
     SurrealDbError,
     Vector,
@@ -2004,6 +2008,14 @@ _MTREE_ONLY = "DEFINE INDEX vec_only_embedding ON vec_only FIELDS embedding MTRE
 #: A plain index under ``VecOnly``'s index name.
 _PLAIN_ONLY = "DEFINE INDEX vec_only_embedding ON vec_only FIELDS embedding;"
 
+#: The assertion message of the pin of an index removed and defined again in one transaction, on SurrealDB 2.x.
+_REMOVED_AGAIN_PIN_2X = (
+    "README section 36, Transactions, and the v0.36.2 row of the 2.x/3.x table (issues #312, #323): SurrealDB 2.x fails "
+    "the commit of a block that removes an HNSW index and defines it again, on a table holding a record, with a "
+    "retryable conflict that a retry meets again. If this fails, 2.x commits it now: the README sentence and the row "
+    "can be reconsidered."
+)
+
 
 async def _indexes(client: Any, table: str) -> dict[str, IndexState | None]:
     """The indexes of *table*, as ``read_table_indexes()`` reads them."""
@@ -2225,6 +2237,62 @@ class TestDefineVectorIndexesE2E:
         assert before == {}
         assert sorted(after) == ["vec_only_embedding"]
         assert search.index_matches(VecOnly.get_indexes()[0], ["embedding"], after["vec_only_embedding"])
+
+    @pytest.mark.parametrize("held", [True, False], ids=["table-holding-a-record", "empty-table"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_vector_index_removed_in_the_block_is_defined_again(
+        self, kind: str, held: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #323 (v0.36.2's fix of #312, for an HNSW index): ``VecOnly``'s index stored before the block,
+        ``remove_index(tx=…)`` then ``define_indexes(tx=…)`` in it. The reads see committed state, where the index still
+        stands, but the transaction noted its removal: the index is defined again after it — applied at once in an
+        interactive transaction, queued after the removal in a buffered one — so the commit keeps it, and
+        ``similar_to()`` finds the record through it. On SurrealDB 2.x, on a table holding a record, the commit fails
+        instead with a retryable ``SurrealDbConflictError`` that a retry meets again: nothing of the block is committed
+        and the index stands as before (README, the v0.36.2 row of the 2.x/3.x table). Never lost."""
+        async with _vec_models(kind) as client:
+            server = None if kind == "mem" else await _major(client)
+            await VecOnly.define_indexes()
+            if held:
+                await VecOnly(id="o1", embedding=[1.0, 0.0, 0.0]).save()
+            seen: dict[str, Any] = {}
+
+            async def block() -> SurrealDbError | None:
+                try:
+                    async with SurrealDBConnectionManager.transaction("vec") as tx:
+                        seen["interactive"] = tx.is_interactive
+                        seen["removed"] = await VecOnly.remove_index("vec_only_embedding", tx=tx)
+                        calls = _spy(monkeypatch, client)
+                        seen["applied"] = await VecOnly.define_indexes(tx=tx)
+                        seen["sent"] = _calls(calls)
+                        monkeypatch.undo()
+                        seen["queued"] = getattr(tx, "statements", None)
+                except SurrealDbError as error:
+                    return error
+                return None
+
+            failed = await block()
+            retried = await block() if failed is not None else None
+            if not held:
+                await VecOnly(id="o1", embedding=[1.0, 0.0, 0.0]).save()
+            after = await _indexes(client, "vec_only")
+            nearest = await VecOnly.objects().similar_to("embedding", [1.0, 0.0, 0.0], 1).exec()
+        assert seen["removed"] == "REMOVE INDEX IF EXISTS `vec_only_embedding` ON `vec_only`;"
+        assert seen["applied"] == [_ONLY]
+        if seen["interactive"]:
+            assert seen["sent"] == [*_ONLY_READS, ("query_raw", _ONLY)]
+        else:
+            assert seen["sent"] == _ONLY_READS
+            assert seen["queued"] == [seen["removed"], _ONLY]
+        if server == 2 and held:
+            assert type(failed) is SurrealDbConflictError, _REMOVED_AGAIN_PIN_2X
+            assert type(retried) is SurrealDbConflictError, _REMOVED_AGAIN_PIN_2X
+        else:
+            assert failed is None
+        assert sorted(after) == ["vec_only_embedding"]
+        assert search.index_matches(VecOnly.get_indexes()[0], ["embedding"], after["vec_only_embedding"])
+        # Without the index, similar_to() answers no record (README section 37): the index serves it.
+        assert [doc.id for doc in nearest] == ["o1"]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_block_that_raises_applies_no_vector_index(self, kind: str) -> None:

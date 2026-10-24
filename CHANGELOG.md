@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.4] - 2026-10-24
+
+Follow-ups to the review of v0.36.2 (#322): an index that `remove_index(tx=…)` removed earlier
+in a transaction no longer blocks `remove_analyzer(tx=…)` or `define_analyzer(tx=…)` in the same
+block, `define_indexes(tx=…)` no longer defines an index with an analyzer the block removed or
+redefined, and the v0.36.2 fix is tested on vector (HNSW) indexes. No new public API.
+
+### Fixed
+
+- **`remove_analyzer(tx=…)` and `define_analyzer(tx=…)` no longer count an index the block
+  removed** (#323). Both find the indexes that use the analyzer by reading `INFO FOR TABLE`
+  outside the transaction, where an index that `remove_index(tx=…)` removed earlier in the block
+  still stands. Once a block had removed the last index using an analyzer, `remove_analyzer(tx=…)`
+  was refused on SurrealDB 2.x and the embedded engine ("in use by index …"), and
+  `define_analyzer(…, overwrite=True, tx=…)` was refused on every engine as a redefinition with
+  indexes to rebuild. Both now leave out the indexes the transaction noted as removed: the
+  analyzer can be removed, or redefined without `REBUILD INDEX`, in the same block, on SurrealDB
+  2.x and 3.x, over WebSocket and HTTP and on the embedded engine. An index still standing keeps
+  the refusal, with the same message: another table's, another index of the same table, one
+  removed then defined again in the block, one removed with a raw `tx.add("REMOVE INDEX …")`
+  (not tracked), or any index when no `tx=` is given. SurrealDB 3.x already accepted the removal,
+  since the server checks it in the transaction. An index queued earlier in a buffered block is
+  still not seen.
+- **`define_analyzer(tx=…)` after `remove_analyzer(tx=…)` of the same name defines the analyzer
+  again** (#323). It compared the analyzer with committed state, where the removed one still
+  stood, so an unchanged definition (or any definition without `overwrite=True`) applied nothing
+  and the commit left the database without the analyzer. The removed analyzer now counts as
+  missing: it is defined again after its removal, with no index read nor rebuilt.
+
+### Changed
+
+- **`define_indexes(tx=…)` refuses an index whose analyzer the block removed or redefined**
+  (#323), whether the model declares the analyzer as an `Analyzer` or names it by `str`. Until
+  v0.36.3 it read the analyzers from committed state only, so it defined such an index: after
+  `remove_analyzer(tx=…)`, the index stood without its analyzer once the block committed, and
+  every write to the table was then refused; after `define_analyzer(…, overwrite=True, tx=…)`,
+  SurrealDB built the index over the table's records with the committed definition, not the new
+  one (on SurrealDB 3.x a search then missed those records, without an error). A removed analyzer
+  now counts as missing (an `Analyzer` is refused as one to define in a transaction, a name as one
+  that does not exist), and an index whose analyzer the block redefined is refused with a new
+  message. Both refusals raise `SurrealDbError` before any DDL and do not fail the block. To
+  migrate an index to a new analyzer, call `define_analyzer()` without `tx=` first.
+
+### Notes
+
+- **Tests**: the v0.36.2 fix (#312) is now covered on a vector (HNSW) index: `remove_index(tx=…)`
+  then `define_indexes(tx=…)` in one block, over WebSocket, HTTP and the embedded engine, on an
+  empty table and on one holding a record. The index stands after the commit and serves
+  `similar_to()`; on SurrealDB 2.x, a table holding a record fails the commit with the retryable
+  `SurrealDbConflictError` and keeps the index, as the README's v0.36.2 row says.
+- **Docs**: README section 36 (Transactions) and the docstrings of `define_indexes()`,
+  `remove_index()`, `define_analyzer()` and `remove_analyzer()` describe these cases. No
+  behaviour-table row changes: for an index removed with `remove_index(tx=…)`, the analyzer
+  checks now give the same result on SurrealDB 2.x and 3.x and on the embedded engine.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.36.3] - 2026-10-24
 
 Follow-up to the review of v0.36.0 (#316): a vector field declared with `| None` keeps its

@@ -59,7 +59,11 @@ already read), ``apply_analyzers()`` and ``apply_rebuilds()`` apply the statemen
 warning per redefined analyzer. ``apply_analyzer()`` and ``apply_analyzer_removal()`` are the bodies of the connection
 manager's ``define_analyzer()`` and ``remove_analyzer()``; the latter refuses, below SurrealDB 3 (2.x, the embedded
 engine, which would remove it and then refuse every write to the table), an analyzer an index uses, with 3.x's own
-reason.
+reason. With a transaction, both leave out the indexes ``remove_index(tx=…)`` removed earlier in it, which committed
+state still holds (``indexes_removed_in()``, the transaction's note — issue #323), and note the analyzer they removed
+or defined (``note_analyzer_change()``): ``define_analyzer(tx=…)`` and ``define_indexes(tx=…)`` count one the block
+removed as missing (``analyzers_after_removals()``), and ``define_indexes(tx=…)`` refuses an index whose analyzer the
+block redefined (``transaction_redefined_analyzer_refused()``).
 
 **The query side.** ``QuerySet.search()`` checks its fields and texts with ``checked_search_field()`` and words its
 refusals with ``text_refused()``, ``field_refused()``, ``too_many_fields()``, ``time_travel_refused()`` (with
@@ -73,7 +77,8 @@ annotation whose match reference ``search()`` did not give it is refused with ``
 ``search()`` with ``no_search_refused()``.
 
 The module sits low in the package: it imports neither ``model_base``, ``query_set`` nor ``connection_manager``, so
-each of them can import it.
+each of them can import it; it imports ``transaction``, which imports none of them, for its note of the removed
+indexes.
 """
 
 import logging
@@ -92,6 +97,7 @@ from .schema import _comment_text, _identifier_name, _missing_clause, _overwrite
 from .schema_state import AnalyzerState, IndexState
 from .surql_literal import _identifier, _quoted
 from .time_travel import line_major
+from .transaction import Transaction
 from .utils import VALID_FIELD_PATTERN, _ddl_refusal_class, apply_ddl_statements, validate_field_name
 from .vector import (
     DEFAULTS,
@@ -1148,23 +1154,59 @@ def stored_indexes_using(
 
 
 async def indexes_using(
-    client: Any, tables: Iterable[str], analyzers: Collection[str], *, what: str, kind: str
+    client: Any,
+    tables: Iterable[str],
+    analyzers: Collection[str],
+    *,
+    what: str,
+    kind: str,
+    skip: Callable[[str], Collection[str]] | None = None,
 ) -> list[IndexUse]:
     """The indexes of *tables* whose analyzer is among *analyzers*, as ``(table, index, analyzer)``, sorted by table
     then index — one ``INFO FOR TABLE`` per table, in the order of *tables*, outside any transaction (committed state).
 
     *tables* are names ``INFO FOR DB`` gave (:func:`read_database_info`), each written in backticks, escaped. An index
-    the parser cannot read is left out (its analyzer is unknown).
+    the parser cannot read is left out (its analyzer is unknown), and so is one *skip* names for its table: *skip*
+    takes a table's name, as ``INFO FOR DB`` gives it, and returns the names of its indexes to leave out —
+    :func:`indexes_removed_in`'s, the indexes ``remove_index(tx=…)`` removed earlier in a transaction, which committed
+    state still holds (issue #323). Every table is read all the same.
 
     :param what: what the reads are for, for the message of a refusal (``"index"``, ``"analyzer"``).
     :param kind: ``"definition"``, ``"removal"`` or ``"rebuild"``, likewise.
+    :param skip: the indexes to leave out, by table; ``None`` (default) leaves none out.
     :raises SurrealDbAuthenticationError: the session may not read a table's definitions (a record user).
     :raises SurrealDbError: any other refusal of an ``INFO``.
     """
     found: list[IndexUse] = []
     for table in tables:
-        found.extend(stored_indexes_using(table, await _table_indexes(client, table, what=what, kind=kind), analyzers))
+        stored = await _table_indexes(client, table, what=what, kind=kind)
+        found.extend(stored_indexes_using(table, stored, analyzers, skip=skip(table) if skip is not None else ()))
     return sorted(found)
+
+
+def indexes_removed_in(tx: object) -> Callable[[str], frozenset[str]] | None:
+    """The indexes ``remove_index(tx=…)`` removed in *tx* and not defined again since, by table — *tx*'s
+    ``Transaction._indexes_removed`` — for :func:`indexes_using`'s *skip*; ``None`` when *tx* is not a ``Transaction``
+    (no transaction given). A raw ``tx.add("REMOVE INDEX …")`` is not noted (issue #323)."""
+    return tx._indexes_removed if isinstance(tx, Transaction) else None
+
+
+def analyzers_after_removals(stored: Mapping[str, AnalyzerState | None], tx: object) -> dict[str, AnalyzerState | None]:
+    """The analyzers *stored* holds (``INFO FOR DB``'s, committed state) without those ``remove_analyzer(tx=…)``
+    removed earlier in *tx* and did not define again since — *tx*'s ``Transaction._analyzers_removed`` (issue #323):
+    the analyzers in place once the transaction commits. *stored* as it is when *tx* is not a ``Transaction``. Pure."""
+    removed = tx._analyzers_removed() if isinstance(tx, Transaction) else frozenset()
+    return {name: state for name, state in stored.items() if name not in removed}
+
+
+def note_analyzer_change(tx: object, name: str, *, removed: bool) -> None:
+    """Note on *tx* that the analyzer *name* was removed (*removed*) or defined in it — once the statement is applied
+    or queued (issue #323); nothing when *tx* is not a ``Transaction``."""
+    if isinstance(tx, Transaction):
+        if removed:
+            tx._note_analyzer_removal(name)
+        else:
+            tx._note_analyzer_definition(name)
 
 
 # --- the appliers' plans --------------------------------------------------------------------------------------------
@@ -1234,6 +1276,37 @@ def transaction_analyzer_refused(model: str, name: str) -> str:
         "the analyzers committed before the transaction began. Call SurrealDBConnectionManager.define_analyzer() "
         "without tx= first, then define_indexes(tx=…)."
     )
+
+
+def transaction_redefined_analyzer_refused(model: str, index: str, table: str, analyzer: str) -> str:
+    """The refusal of ``define_indexes(tx=…)`` when the index *index* of *table* uses the analyzer *analyzer*, which
+    ``define_analyzer(tx=…)`` redefined earlier in the transaction (issue #323): the servers build an index with the
+    analyzers committed before the transaction began."""
+    return (
+        f"{model}.define_indexes(tx=…) cannot define index {index!r} on table {table!r} in a transaction that has "
+        f"redefined its analyzer {analyzer!r}: SurrealDB builds an index with the analyzers committed before the "
+        "transaction began, so the index would not follow the new definition. Call "
+        "SurrealDBConnectionManager.define_analyzer() without tx= first, then define_indexes(tx=…)."
+    )
+
+
+def check_analyzers_redefined_in(
+    tx: object, model: str, table: str, definitions: Iterable[tuple[str, str]], analyzer_of: Mapping[str, str]
+) -> None:
+    """Refuse, before any DDL, the first of *definitions* — ``(index name, statement)``, what ``define_indexes(tx=…)``
+    of the model *model* would define on *table* — whose analyzer (*analyzer_of*, by index name, ``""`` for none)
+    ``define_analyzer(tx=…)`` defined or redefined earlier in *tx* (``Transaction._analyzers_defined``, issue #323):
+    the servers build an index with the analyzers committed before the transaction began. Nothing to refuse when *tx*
+    is not a ``Transaction``.
+
+    :raises SurrealDbError: :func:`transaction_redefined_analyzer_refused`'s text.
+    """
+    if not isinstance(tx, Transaction):
+        return
+    defined = tx._analyzers_defined()
+    for name, _ in definitions:
+        if analyzer_of[name] in defined:
+            raise SurrealDbError(transaction_redefined_analyzer_refused(model, name, table, analyzer_of[name]))
 
 
 def transaction_write_refused(model: str, table: str) -> str:
@@ -1372,20 +1445,29 @@ async def apply_analyzer(client: Any, analyzer: Analyzer, *, overwrite: bool, tx
     (:func:`indexes_using`), then ``DEFINE ANALYZER OVERWRITE`` and ``REBUILD INDEX`` of each index using it — SurrealDB
     leaves the records indexed before with their old tokens — and the warning of :func:`warn_redefined`; nothing
     without *overwrite*. With *tx*, a redefinition with indexes to rebuild is refused before any DDL (the rebuild must
-    follow the committed definition); a new analyzer, or a redefinition no index uses, joins the transaction.
+    follow the committed definition); a new analyzer, or a redefinition no index uses, joins the transaction. An index
+    ``remove_index(tx=…)`` removed earlier in *tx* is not to rebuild, although committed state still holds it
+    (:func:`indexes_removed_in`, issue #323): a redefinition whose indexes the block all removed joins the transaction,
+    without ``REBUILD INDEX``. An analyzer ``remove_analyzer(tx=…)`` removed earlier in *tx* counts as missing
+    (:func:`analyzers_after_removals`): defined again after its removal, with no index read nor rebuilt. *tx* notes the
+    analyzer once defined or redefined (:func:`note_analyzer_change`), for ``define_indexes(tx=…)``.
 
     :raises SurrealDbError: *tx* is given and the redefinition has indexes to rebuild; a refused read or statement.
     :raises SurrealDbAuthenticationError: the session may not read the definitions or define the analyzer.
     """
     subject = repr(analyzer.name)
     stored, tables = await read_database_info(client, what="analyzer", kind="definition", subject=subject)
-    define, redefine = plan_analyzers([analyzer], stored, overwrite)
+    define, redefine = plan_analyzers([analyzer], analyzers_after_removals(stored, tx), overwrite)
     rebuilds: list[IndexUse] = []
     if redefine:
-        rebuilds = await indexes_using(client, tables, {analyzer.name}, what="analyzer", kind="definition")
+        rebuilds = await indexes_using(
+            client, tables, {analyzer.name}, what="analyzer", kind="definition", skip=indexes_removed_in(tx)
+        )
         if tx is not None and rebuilds:
             raise SurrealDbError(analyzer_redefinition_refused(analyzer.name, rebuilds))
     applied = await apply_analyzers(client, tx, define, redefine, overwrite)
+    if applied:
+        note_analyzer_change(tx, analyzer.name, removed=False)
     applied += await apply_rebuilds(client, tx, rebuilds)
     warn_redefined(redefine, rebuilds)
     return applied
@@ -1398,8 +1480,12 @@ async def apply_analyzer_removal(client: Any, name: str, statement: str, *, tx: 
     ``client.version()`` once. Below 3 (SurrealDB 2.x, the embedded engine), which accept the removal of an analyzer an
     index uses and then refuse every write to that table: ``INFO FOR DB``, then ``INFO FOR TABLE`` of every table
     (:func:`indexes_using`, committed state), and the first index using it, in table then index order, refused with
-    SurrealDB 3.x's own reason, before any DDL. From 3 on, the server refuses it itself, in the same words. Then the
-    statement, joining *tx* when given: ``Can't apply analyzer removal: '<name>' -> <reason>`` for a refusal.
+    SurrealDB 3.x's own reason, before any DDL. An index ``remove_index(tx=…)`` removed earlier in *tx* is left out,
+    although committed state still holds it (:func:`indexes_removed_in`, issue #323); an index queued earlier in a
+    buffered *tx* is not seen. From 3 on, the server refuses it itself, in the same words, in the transaction. Then the
+    statement, joining *tx* when given: ``Can't apply analyzer removal: '<name>' -> <reason>`` for a refusal. *tx*
+    notes the removal once applied or queued (:func:`note_analyzer_change`): ``define_analyzer(tx=…)`` and
+    ``define_indexes(tx=…)`` then count the analyzer as missing (issue #323).
 
     :raises SurrealDbError: an index uses the analyzer; a refused read or statement.
     :raises SurrealDbNotFoundError: ``REMOVE ANALYZER`` without ``IF EXISTS`` of a missing analyzer (outside a buffered
@@ -1408,13 +1494,14 @@ async def apply_analyzer_removal(client: Any, name: str, statement: str, *, tx: 
     """
     if line_major(await client.version()) < 3:
         _, tables = await read_database_info(client, what="analyzer", kind="removal", subject=repr(name))
-        using = await indexes_using(client, tables, {name}, what="analyzer", kind="removal")
+        using = await indexes_using(client, tables, {name}, what="analyzer", kind="removal", skip=indexes_removed_in(tx))
         if using:
             table, index, _ = using[0]
             raise SurrealDbError(analyzer_in_use_refused(name, index, table))
     await apply_ddl_statements(
         [statement], client=client, tx=tx, what="analyzer", kind="removal", classify=True, subjects=[repr(name)]
     )
+    note_analyzer_change(tx, name, removed=True)
     return statement
 
 
