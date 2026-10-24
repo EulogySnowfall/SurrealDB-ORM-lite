@@ -742,6 +742,22 @@ def vector_search_forms() -> None:
     assert_type(QuerySet(TypedVecDoc).similar_to("embedding", [1, 0, 0]).filter(title="x"), QuerySet)
 
 
+async def hybrid_search_forms() -> None:
+    """v0.37.0: ``hybrid_search()`` returns dicts, as the full ORM does, each holding ``_rrf_score``. ``objects()`` is
+    typed ``Any``, so the declared return is asserted on ``QuerySet(...)`` as well."""
+    rows: list[dict[str, Any]] = await TypedVecDoc.objects().hybrid_search(
+        vector_field="embedding", vector=[0.0, 1.0, 0.0], text_field="title", text_query="rust"
+    )
+    score: float | None = rows[0]["_rrf_score"]
+    assert_type(score, float | None)
+    assert_type(
+        await QuerySet(TypedVecDoc).hybrid_search(
+            vector_field="embedding", vector=(0.0, 1.0, 0.0), text_field="title", text_query="rust", rrf_k=0, ef=40
+        ),
+        list[dict[str, Any]],
+    )
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""

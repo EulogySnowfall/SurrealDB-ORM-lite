@@ -3334,7 +3334,7 @@ _COMPARISON_ROWS_34 = [
     ["Model table DDL", "✅ v0.34.0 (`define_table()`)", "✅"],
     ["Full-Text Search", "✅ v0.35.0 (`search()`)", "✅"],
     ["Vector Search (KNN/HNSW)", "✅ v0.36.0 (`similar_to()`)", "✅"],
-    ["Hybrid Search (RRF)", "v0.37.0", "✅"],
+    ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"],
     ["Migrations & CLI", "v0.38 – v0.39", "✅"],
     ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.40.0", "✅"],
     ["Retry, Logging, Metrics", "v0.41.0", "✅"],
@@ -3415,8 +3415,8 @@ class TestReadmeSection34:
     and the features, roadmap, comparison and both behaviour tables (spec §11.1)."""
 
     def test_section_34_follows_section_33(self) -> None:
-        """Right after section 33 (after its "Coming from" bullets), then section 35 (v0.34.0), section 36 (v0.35.0)
-        and section 37 (v0.36.0), and before the ``---`` of "Configuration Options"."""
+        """Right after section 33 (after its "Coming from" bullets), then section 35 (v0.34.0), section 36 (v0.35.0),
+        section 37 (v0.36.0) and section 38 (v0.37.0), and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_33 = text.index(f"\n{_SECTION_33}\n")
         start_34 = text.index(f"\n{_SECTION_34}\n")
@@ -3428,6 +3428,7 @@ class TestReadmeSection34:
             "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -3679,6 +3680,13 @@ def _released_36() -> bool:
     return rows[1][0] == "✅ v0.36.0"
 
 
+def _released_37() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.37.0 (hybrid search) as released: its Phase G row carries the ✅ the
+    release adds."""
+    rows = [cells for _, cells in _table_rows(_subsection("### 🔎 Phase G — Advanced search", _roadmap()))]
+    return rows[2][0] == "✅ v0.37.0"
+
+
 class TestRoadmapTableDdl:
     """Issue #292: ``docs/ROADMAP.md`` inserts the model table DDL (``define_table()``) as v0.34.0, before search, and
     moves the later versions up one (search v0.35.0–v0.37.0, tooling v0.38.0–v0.40.0, Beta v0.41.0). Issue #291: the
@@ -3686,14 +3694,15 @@ class TestRoadmapTableDdl:
 
     Each check accepts the planned form and the released one — v0.34.0 marked ✅ or ``Done`` everywhere, its entry
     moved to "Completed versions" — and the Phase F row decides which one the whole file must be in. The checks that
-    reach the search rows accept v0.35.0 and v0.36.0 released too, which their Phase G rows decide."""
+    reach the search rows accept v0.35.0, v0.36.0 and v0.37.0 released too, which their Phase G rows decide."""
 
     def test_next_planned_version_is_the_model_table_ddl(self) -> None:
         """Planned: v0.34.0 first, then search, tooling and fixtures. Released: the same without v0.34.0, without
-        v0.35.0 once full-text search is released, and without v0.36.0 once vector search is."""
+        v0.35.0 once full-text search is released, without v0.36.0 once vector search is, and without v0.37.0 once
+        hybrid search is."""
         planned = "\n".join(part for part in _roadmap().split("\n## ") if part.startswith("Planned"))
         rows = re.findall(r"^\|\s*(v\d+\.\d+\.\d+)\s*\|\s*([^|]+?)\s*\|", planned, re.MULTILINE)
-        released = 3 if _released_36() else 2 if _released_35() else 1 if _released_34() else 0
+        released = 4 if _released_37() else 3 if _released_36() else 2 if _released_35() else 1 if _released_34() else 0
         assert [row for row in rows if "✅" not in row[1]] == _PLANNED_ROWS[released:], rows
 
     def test_phase_f_ends_with_v0_34_0(self) -> None:
@@ -3735,7 +3744,10 @@ class TestRoadmapTableDdl:
             if _released_36():
                 assert overview[planned] == ["v0.36.0", "Tier 3 — Vector search", "Done"], overview
                 planned += 1
-            first = "v0.37.0" if _released_36() else "v0.36.0" if _released_35() else "v0.35.0"
+            if _released_37():
+                assert overview[planned] == ["v0.37.0", "Tier 3 — Hybrid search", "Done"], overview
+                planned += 1
+            first = "v0.38.0" if _released_37() else "v0.37.0" if _released_36() else "v0.36.0" if _released_35() else "v0.35.0"
             assert (overview[planned][0], overview[planned][2]) == (f"{first} – v0.40.0", "Planned"), overview
             assert overview[planned + 1] == ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"], overview
         else:
@@ -3750,8 +3762,8 @@ class TestRoadmapTableDdl:
 
     def test_sdk_and_comparison_tables(self) -> None:
         """The two tables that date every feature: the model table DDL gets its row (marked ✅ once released), the
-        later rows their new number; full-text search is marked ✅ once v0.35.0 is released, and vector search once
-        v0.36.0 is (the SDK table then names HNSW alone)."""
+        later rows their new number; full-text search is marked ✅ once v0.35.0 is released, vector search once
+        v0.36.0 is (the SDK table then names HNSW alone), and hybrid search once v0.37.0 is."""
         roadmap = _roadmap()
         mark = "✅ " if _released_34() else ""
         mark_35 = "✅ " if _released_35() else ""
@@ -3759,6 +3771,8 @@ class TestRoadmapTableDdl:
             ("Vector Search (KNN, HNSW)", "✅ v0.36.0") if _released_36() else ("Vector Search (KNN, HNSW/MTREE)", "v0.36.0")
         )
         mark_36 = "✅ " if _released_36() else ""
+        hybrid_37 = ("Hybrid Search (RRF)", "✅ v0.37.0") if _released_37() else ("Hybrid Search (RRF)", "v0.37.0")
+        mark_37 = "✅ " if _released_37() else ""
         unlocked = [
             cells for _, cells in _table_rows(_subsection("## 🆕 Everything unlocked by the official SDK 2.0", roadmap))
         ]
@@ -3767,7 +3781,7 @@ class TestRoadmapTableDdl:
             ("Model table DDL (`define_table()`)", f"{mark}v0.34.0"),
             ("Full-Text Search (BM25)", f"{mark_35}v0.35.0"),
             vector_36,
-            ("Hybrid Search (RRF)", "v0.37.0"),
+            hybrid_37,
             ("Migrations (makemigrations/migrate)", "v0.38.0"),
             ("CLI `surreal-orm-lite`", "v0.39.0"),
             ("Test fixtures & factories", "v0.40.0"),
@@ -3781,7 +3795,7 @@ class TestRoadmapTableDdl:
             ["Model table DDL", "yes", f"{mark}v0.34.0 (`define_table()`)"],
             ["Full-Text Search (BM25)", "yes", f"{mark_35}v0.35.0"],
             ["Vector Search (KNN/HNSW)", "yes", f"{mark_36}v0.36.0"],
-            ["Hybrid Search (RRF)", "yes", "v0.37.0"],
+            ["Hybrid Search (RRF)", "yes", f"{mark_37}v0.37.0"],
             ["Migrations & CLI", "yes", "v0.38 – v0.39"],
             ["Test fixtures & factories", "yes", "v0.25.0 + v0.40.0"],
             ["QueryLogger / profiling", "yes", "v0.41.0"],
