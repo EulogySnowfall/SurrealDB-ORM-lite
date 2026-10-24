@@ -220,6 +220,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Model table DDL (`define_table()`, `schema_mode`, `permissions`)              | ✅     |
 | Full-text search (`search()`, BM25 score and highlights)                      | ✅     |
 | Vector search (`similar_to()`, KNN, HNSW indexes)                             | ✅     |
+| Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)                     | ✅     |
 
 ### Supported Filter Lookups
 
@@ -6150,7 +6151,7 @@ print(await NoteV2.objects().search(text="physics").count())
   indexes (section 37).
 - **`filter(x__match=...)` stays a regular expression**: this library's `match` lookup, not SurrealDB's `@@`;
   `search()` is the full-text path.
-- **`hybrid_search()` comes in v0.37.0.**
+- **`hybrid_search()` fuses `search()`'s ranking with `similar_to()`'s** (section 38, v0.37.0).
 
 ### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)
 
@@ -6432,7 +6433,8 @@ except ValueError as error:
 
 - Search annotations with `similar_to()` on SurrealDB 2.x and the embedded engine, for the reads that return records
   (`exec()`, `first()`, `get()` without an id): `SurrealDbError` before the statement is sent. `search()` as a
-  condition stays available there, and `count()`, `exists()` and the aggregations answer.
+  condition stays available there, and `count()`, `exists()` and the aggregations answer. `hybrid_search()` gives each
+  record found by both searches its BM25 score and its distance, on every line.
 - `as_of()` ([section 27](#27-time-travel-as_of)): `similar_to()` with `as_of()` raises `SurrealDbError` before any
   request, in either order and in a subquery under it. The index holds the records' current vectors, so a time-travel
   read would pick its neighbours by their vectors now.
@@ -6469,11 +6471,163 @@ except ValueError as error:
 - **No `MTREE`, `MINKOWSKI`, `JACCARD` or `PEARSON`, and no `concurrently` yet**; the full ORM writes `MINKOWSKI`
   without its order, which SurrealDB refuses.
 - **Vector functions in `annotate()`** (`vector::similarity::cosine()`…) are not available yet; `hybrid_search()`
-  comes in v0.37.0.
+  (section 38) fuses this ranking with `search()`'s.
 - **`get_vector_info()` and `is_vector_field()` are imported from `surreal_orm_lite.vector`**: the full ORM has them
   in `surreal_orm.fields`, a module this library does not have.
 - **`generate_models_from_db()` does not write `VectorField` yet**, while the full ORM's generator writes it for a
   field with an HNSW index.
+
+### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)
+
+Since v0.37.0 a queryset fuses two rankings of its records with the full SurrealDB-ORM's `hybrid_search()`: the
+records nearest to a query vector, as `similar_to()` finds them
+([section 37](#37-vector-search-similar_to-vectorfield-indexhnswtrue)), and the best matches of a text, as `search()`
+ranks them by BM25 score ([section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)), are
+fused into one ranking by Reciprocal Rank Fusion. SurrealDB 3.x fuses the two lists with its `search::rrf()`;
+SurrealDB 2.x and the embedded engine have no such function, so the ORM fuses them with the same formula: the same
+records, scores and order on every line. Each record comes back as a dict, as in the full ORM. The examples assume a
+configured connection: they run as written, in order, on the embedded engine (`mem://`).
+
+#### Search
+
+```python
+from surreal_orm_lite import Analyzer, BaseSurrealModel, Index, SurrealConfigDict, SurrealDbError, VectorField
+
+WORDS = Analyzer("words", ["blank"], ["lowercase"])
+
+
+class Passage(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="passage",
+        indexes=[
+            Index("passage_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("passage_title", "title", search_analyzer=WORDS),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    topic: str = ""
+    embedding: VectorField[3]
+
+
+await Passage.define_table()
+await Passage.define_indexes()
+for key, title, topic, embedding in [
+    ("p1", "Cats and dogs", "pets", [1.0, 0.0, 0.0]),
+    ("p2", "Cats at home", "pets", [0.9, 0.1, 0.0]),
+    ("p3", "Rust programming", "tech", [0.0, 1.0, 0.0]),
+    ("p4", "Python programming", "tech", [0.1, 0.9, 0.0]),
+    ("p5", "Gardening", "home", [0.0, 0.0, 1.0]),
+    ("p6", "Cats and code", "news", [0.5, 0.5, 0.0]),
+    ("p7", "Rust and Python programming", "tech", [0.2, 0.8, 0.0]),
+    ("p8", "Cooking", "home", [0.0, 0.2, 0.8]),
+]:
+    await Passage(id=key, title=title, topic=topic, embedding=embedding).save()
+
+results = await Passage.objects().hybrid_search(
+    vector_field="embedding", vector=[1.0, 0.0, 0.0], vector_limit=3,
+    text_field="title", text_query="programming", text_limit=3,
+)
+for row in results:
+    print(row["id"], f"{row['_rrf_score']:.4f}", row["_knn_distance"] is not None, row["_search_score"] is not None)
+# passage:p1 0.0164 True False
+# passage:p3 0.0164 False True
+# passage:p2 0.0161 True False
+# passage:p4 0.0161 False True
+# passage:p6 0.0159 True False
+# passage:p7 0.0159 False True
+```
+
+Each record gets 1 / (`rrf_k` + rank) from each list it is in, its rank counted from 1 (`rrf_k` is 60 by default):
+`p1`, nearest, and `p3`, the best match, both score 1/61. Records with equal scores keep the vector list's order
+first, then the full-text list's for the records it alone found, on every line — SurrealDB's `search::rrf()` alone
+returns them in no fixed order. `_knn_distance` is `None` for a record only the full-text search found,
+`_search_score` for one only the vector search found.
+
+#### With the queryset
+
+```python
+tech = await Passage.objects().filter(topic="tech").limit(2).hybrid_search(
+    vector_field="embedding", vector=[0.0, 1.0, 0.0], vector_limit=4,
+    text_field="title", text_query="programming", text_limit=4,
+)
+for row in tech:
+    print(row["id"], f"{row['_rrf_score']:.4f}")
+# passage:p3 0.0328
+# passage:p4 0.0323
+page = await Passage.objects().offset(1).limit(2).hybrid_search(
+    vector_field="embedding", vector=[1.0, 0.0, 0.0], vector_limit=3,
+    text_field="title", text_query="programming", text_limit=3,
+)
+print([str(row["id"]) for row in page])
+# ['passage:p3', 'passage:p2']
+```
+
+The queryset's conditions select the records of both lists. `select()` and `fetch()` apply to both, `id` always read;
+`limit()` and `offset()` page through the fused records, of which there are at most `vector_limit + text_limit`.
+`cache()`, `objects(tx=)` and named connections apply as for `exec()`, and `dist=` scans exactly, as in section 37.
+
+#### What SurrealDB decides
+
+```python
+try:
+    await Passage.objects().hybrid_search(
+        vector_field="embedding", vector=[1.0, 0.0, 0.0], text_field="topic", text_query="tech",
+    )
+except SurrealDbError as error:
+    print(error)
+# hybrid_search(): no full-text index on field 'topic'. SurrealDB matches only a field with a FULLTEXT (3.x) or SEARCH (2.x) index: declare Index(..., search_analyzer=...) on the model and apply define_indexes().
+```
+
+- Each list is SurrealDB's own: the vector list as `similar_to()` finds it — HNSW is approximate (section 37) — and
+  the full-text list as `search()` ranks it, with section 36's BM25 scores.
+- Each search needs its index. Without a full-text index on `text_field`, SurrealDB 3.3, 2.x and the embedded engine
+  refuse the search, and `hybrid_search()` raises `SurrealDbError` naming the field, as above; SurrealDB 3.1 and 3.2
+  match nothing, so the vector list alone is fused.
+- Without a vector index on `vector_field`, the vector search finds nothing on SurrealDB 3.3, 2.x and the embedded
+  engine, so the full-text ranking alone is fused, every `_knn_distance` `None`; SurrealDB 3.1 and 3.2 list the first
+  `vector_limit` records by id, with no distance. Pass `dist=` for an exact scan that needs no index.
+
+#### Not supported
+
+```python
+try:
+    await Passage.objects().order_by("title").hybrid_search(
+        vector_field="embedding", vector=[1.0, 0.0, 0.0], text_field="title", text_query="cats",
+    )
+except ValueError as error:
+    print(error)
+# hybrid_search() cannot be combined with order_by(): it runs its own vector and full-text searches and orders the records by their fused score. Remove them from the queryset.
+```
+
+- `order_by()`, `annotate()`, `values()`, `search()` and `similar_to()` raise `ValueError` before any request, as
+  above; `as_of()` raises `SurrealDbError`: the indexes hold the records' current values.
+- Several full-text fields, weights and score normalisation (`search::linear()`), and the full-text side's highlights
+  are not available yet.
+- **A field stored under a name `hybrid_search()` uses for its own values** — `rrf_score`, `_rrf_score`,
+  `_knn_distance`, `_search_score`, `_hybrid_pos`, `_hybrid_vec_pos` or `_hybrid_text_pos` — raises `ValueError`
+  before any request: store it under another name (`Field(alias=...)`). On a SCHEMALESS table, a column with one of
+  these names that the model does not declare is not returned, on every line, even when `select()` names it.
+
+#### Coming from the full SurrealDB-ORM
+
+- **`hybrid_search()` keeps the full ORM's signature**: keyword-only `vector_field`, `vector`, `vector_limit=20`,
+  `text_field`, `text_query`, `text_limit=20`, `rrf_k=60`; `ef` is `None` for 100, so that `dist=` (an exact scan,
+  section 37) can be given instead.
+- **It returns dicts, as the full ORM does**: each holds the record's fields, keyed by their Python names as
+  `exec()`'s dict rows are, and `_rrf_score`, plus `_knn_distance` and `_search_score`, which the full ORM does not
+  return.
+- **It applies the queryset**: its conditions, `select()`, `fetch()`, `limit()`/`offset()`, `cache()`, transactions
+  and named connections; the full ORM ignores them.
+- **SurrealDB's `search::rrf()` fuses the lists on 3.x**, given both lists in one statement, and the ORM fuses them on
+  2.x and the embedded engine; the full ORM calls `search::rrf()` with arguments SurrealDB 3.3 refuses, and runs on
+  3.x only.
+- **Equal fused scores have a fixed order** (the vector list's first), so a page never changes between two identical
+  calls.
+- **Checked before any request**: both fields, the vector, `vector_limit` and `text_limit` (1 to 10 000), `rrf_k`
+  (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.
+- **Reciprocal Rank Fusion only**: `search::linear()` (weights and score normalisation) is not offered yet.
 
 ---
 
@@ -6597,7 +6751,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.36.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.36.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where they differ from 3.3.4.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -6758,6 +6912,9 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `similar_to(dist=…)` with a condition on a linked record's field                                                                       | the ORM selects the matching records first (a `LET`): 2.x's exact scan would return every matching record, ignoring `limit`                                                   | the condition stays next to the KNN operator                                                                                                                                        | v0.36.0                              |
 | `similar_to()` on a field without a vector index                                                                                       | no record                                                                                                                                                                     | no record; 3.1 answers every record, with no distance                                                                                                                               | v0.36.0                              |
 | `remove_index(tx=)` then `define_indexes(tx=)` in one block, the index stored before the block                                         | on a table holding records, the commit fails with a retryable `SurrealDbConflictError`, again on retry: nothing committed, the index kept; on an empty table, defined again   | the index is defined again after its removal and committed, serving the records committed before the block                                                                          | v0.36.2                              |
+| `hybrid_search()`: the fusion                                                                                                          | the ORM fuses the two lists with `search::rrf()`'s formula, which SurrealDB 2.x does not have: the same records, scores and order                                             | SurrealDB's `search::rrf()` fuses them; the ORM orders equal scores, which SurrealDB returns in no fixed order                                                                      | v0.37.0                              |
+| `hybrid_search()` with other conditions                                                                                                | applied to both lists; the vector list selects the records first (a `LET`), as `similar_to()` does                                                                            | applied to both lists, during each search                                                                                                                                           | v0.37.0                              |
+| `hybrid_search()` on a field without a vector or full-text index                                                                       | no vector index: the vector list is empty, so the full-text ranking alone is fused; no full-text index: `SurrealDbError` naming the field                                     | the same; 3.1 and 3.2 put the first `vector_limit` records by id in the vector list, with no distance, and match no record for the text                                             | v0.37.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -6798,6 +6955,7 @@ Capabilities not listed behave as on a 2.x server.
 | `define_indexes(tx=)` in a block that writes to the model's table   | an ORM write before it: refused all the same, although this engine indexes its records; a write after it is committed and indexed                                                                                                                                                                                                                     | refused (left out of the index); on 2.x a write after it, to a table holding records, fails the commit          | v0.35.3 |
 | Vector search (v0.36.0)                                             | as on a 2.x server: `MTREE` accepted, at most `ef` records returned (the ORM raises `ef` to `limit`), other conditions selected first in a `LET` (search annotations refused), writes made by the ids of the nearest, fewer records with a selective condition; an index without `TYPE` is `F64` (servers: `F32`), so the ORM always writes `TYPE`    | 3.x refuses `MTREE`, applies the conditions during the index search and keeps search annotations                | v0.36.0 |
 | `remove_index(tx=)` then `define_indexes(tx=)` in one block         | the index is defined again after its removal and committed, on a table holding records too                                                                                                                                                                                                                                                            | the same on 3.x; on 2.x, on a table holding records, the commit fails with a retryable conflict                 | v0.36.2 |
+| Hybrid search (v0.37.0)                                             | as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, and the vector list selects the other conditions first (a `LET`)                                                                                                                                                                      | 3.x fuses them with `search::rrf()`, each list applying the conditions: the same records, scores and order      | v0.37.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -6849,7 +7007,8 @@ Contributions are welcome! Please:
 | v0.34.0           | Tier 3 — Model table DDL                             | ✅ Released |
 | v0.35.0           | Tier 3 — Full-text search                            | ✅ Released |
 | v0.36.0           | Tier 3 — Vector search                               | ✅ Released |
-| v0.37.0 – v0.40.0 | Tier 3 — Advanced (hybrid search, migrations, CLI)   | 📋 Planned  |
+| v0.37.0           | Tier 3 — Hybrid search                               | ✅ Released |
+| v0.38.0 – v0.40.0 | Tier 3 — Advanced (migrations, CLI)                  | 📋 Planned  |
 | v0.41.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
@@ -6910,7 +7069,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Model table DDL               | ✅ v0.34.0 (`define_table()`)                                         | ✅                                        |
 | Full-Text Search              | ✅ v0.35.0 (`search()`)                                               | ✅                                        |
 | Vector Search (KNN/HNSW)      | ✅ v0.36.0 (`similar_to()`)                                           | ✅                                        |
-| Hybrid Search (RRF)           | v0.37.0                                                               | ✅                                        |
+| Hybrid Search (RRF)           | ✅ v0.37.0 (`hybrid_search()`)                                        | ✅                                        |
 | Migrations & CLI              | v0.38 – v0.39                                                         | ✅                                        |
 | Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.40.0                          | ✅                                        |
 | Retry, Logging, Metrics       | v0.41.0                                                               | ✅                                        |

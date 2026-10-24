@@ -7764,8 +7764,8 @@ class TestReadmeSection35:
     sections 16, 19, 31, 33 and 34; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_35_follows_section_34(self) -> None:
-        """Right after section 34 (after its "Coming from" bullets), then section 36 (v0.35.0) and section 37
-        (v0.36.0), and before the ``---`` of "Configuration Options"."""
+        """Right after section 34 (after its "Coming from" bullets), then section 36 (v0.35.0), section 37 (v0.36.0)
+        and section 38 (v0.37.0), and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_34 = text.index(f"\n{_SECTION_34}\n")
         start_35 = text.index(f"\n{_SECTION_35}\n")
@@ -7776,6 +7776,7 @@ class TestReadmeSection35:
             _SECTION_35,
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

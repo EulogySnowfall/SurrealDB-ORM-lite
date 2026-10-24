@@ -5804,7 +5804,7 @@ _COMING_FROM_PHRASES_36 = (
     "doubled quote is a parse error",
     "no `concurrently` argument",
     "not SurrealDB's `@@`",
-    "`hybrid_search()` comes in v0.37.0",
+    "fuses `search()`'s ranking with `similar_to()`'s",
 )
 _HEADER_SENTENCE_35 = (
     "Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs."
@@ -5907,12 +5907,12 @@ _EMBEDDED_REMOVED_AGAIN_ROW = [
     "v0.36.2",
 ]
 _FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
-#: The roadmap from v0.34.0: v0.36.0 ships vector search, so the planned range starts at v0.37.0.
+#: The roadmap from v0.34.0: v0.37.0 ships hybrid search, so the planned range starts at v0.38.0.
 _ROADMAP_ROWS_36 = [
     ["v0.34.0", "Tier 3 — Model table DDL", "✅ Released"],
     ["v0.35.0", "Tier 3 — Full-text search", "✅ Released"],
     ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
-    ["v0.37.0 – v0.40.0", "Tier 3 — Advanced (hybrid search, migrations, CLI)", "📋 Planned"],
+    ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
 ]
 _COMPARISON_ROW_36 = ["Full-Text Search", "✅ v0.35.0 (`search()`)", "✅"]
 #: "Coming from the full SurrealDB-ORM", bullet 10, since v0.36.0 (whitespace normalised).
@@ -5962,8 +5962,8 @@ class TestReadmeSection36:
     "Supported Filter Lookups" sentence; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_36_follows_section_35(self) -> None:
-        """Right after section 35 (after its "Coming from" bullets), then section 37 (v0.36.0), and before the ``---``
-        of "Configuration Options"."""
+        """Right after section 35 (after its "Coming from" bullets), then section 37 (v0.36.0) and section 38
+        (v0.37.0), and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_35 = text.index(f"\n{_SECTION_35}\n")
         start_36 = text.index(f"\n{_SECTION_36}\n")
@@ -5973,6 +5973,7 @@ class TestReadmeSection36:
             _SECTION_35,
             _SECTION_36,
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -6162,6 +6163,13 @@ def _released_36() -> bool:
     return rows[1][0] == "✅ v0.36.0"
 
 
+def _released_37() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.37.0 (hybrid search) as released: its Phase G row carries the ✅ the
+    release adds."""
+    rows = [cells for _, cells in _table_rows(_subsection(_PHASE_G, _roadmap()))]
+    return rows[2][0] == "✅ v0.37.0"
+
+
 def _row(text: str, heading: str, first: str) -> list[str]:
     """The row of the first table under *heading* whose first cell is *first*."""
     rows = [cells for _, cells in _table_rows(_subsection(heading, text)) if cells[0] == first]
@@ -6200,7 +6208,10 @@ class TestRoadmap35:
     def test_phase_g(self) -> None:
         rows = [cells for _, cells in _table_rows(_subsection(_PHASE_G, _roadmap()))]
         assert rows[0] == (_PHASE_G_35 if _released_35() else _PLANNED_PHASE_G_35), rows
-        assert [cells[0] for cells in rows[1:]] == ["✅ v0.36.0" if _released_36() else "v0.36.0", "v0.37.0"], rows
+        assert [cells[0] for cells in rows[1:]] == [
+            "✅ v0.36.0" if _released_36() else "v0.36.0",
+            "✅ v0.37.0" if _released_37() else "v0.37.0",
+        ], rows
 
     def test_completed_versions(self) -> None:
         """Released: v0.35.0's block right after v0.34.0's. Planned: no such block."""
