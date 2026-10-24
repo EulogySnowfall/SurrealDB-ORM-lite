@@ -6065,15 +6065,18 @@ print(await NoteV2.objects().search(text="physics").count())
   field or an edge endpoint among the fields written, an atomic helper's field, amount or values, a subquery value in
   `bulk_update()`, a snapshot in `bulk_create()`'s list); a raw `tx.add()` is not tracked. Until
   [EulogySnowfall/SurrealDB-ORM-lite#325](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/325) is fixed,
-  some refusals made while the write is built still count, although nothing was sent or queued: `upsert()` without an
-  id, `save(tx=…)` without an id in a buffered transaction, a field name or an `extra_vars` key refused while the
-  statement of `save(server_values=…)` or `merge(server_values=…)` is compiled (an invalid name, a key that collides
-  with an internal binding), the argument checks of `relate()`, `remove_relation()` and `remove_all_relations()` (an
-  invalid edge name, or an empty list of edges, counts as a write to every table, so every later `define_indexes(tx=…)`
-  in the block is refused), a field name `bulk_update()` refuses, a filter refused while the statement of
-  `objects(tx=…).bulk_update()`, `bulk_delete()` or `patch()` is compiled, an edge id of another table in an edge's
-  `save()` or `bulk_create()`, and a payload that cannot be serialized (a `field_serializer` that raises) in `save()`,
-  `upsert()`, `bulk_create()`, or `update()` with an id.
+  some refusals made while the write is built or its values are encoded still count, although nothing was sent or
+  queued: `upsert()` without an id, `save(tx=…)` without an id in a buffered transaction, a field name or an
+  `extra_vars` key refused while the statement of `save(server_values=…)` or `merge(server_values=…)` is compiled (an
+  invalid name, a key that collides with an internal binding), the argument checks of `relate()`, `remove_relation()`
+  and `remove_all_relations()` (an invalid edge name, or an empty list of edges, counts as a write to every table, so
+  every later `define_indexes(tx=…)` in the block is refused), a field name `bulk_update()` refuses, a filter refused
+  while the statement of `objects(tx=…).bulk_update()`, `bulk_delete()` or `patch()` is compiled, an edge id of another
+  table in an edge's `save()` or `bulk_create()`, and a value the ORM cannot send, in any write (a field, a filter, a
+  patch operation, an atomic helper's value or amount, a relation's data, `extra_vars`): a `field_serializer` that
+  raises, or one of the [values refused before sending](#values-refused-before-sending), such as a negative duration,
+  an `int` outside the signed 64-bit range or a `Decimal` out of range. A write refused first for one of the arguments
+  listed above, such as an `update()` or a `merge()` without an id, does not count.
 - Prefer `define_indexes()` outside the block: on SurrealDB 2.x, a write to a table that held records, after its index
   in the same block, fails the commit with a retryable `SurrealDbConflictError` that a retry meets again; so does a
   block that removes an index of a table that held records and defines it again, where the index stands as before.
