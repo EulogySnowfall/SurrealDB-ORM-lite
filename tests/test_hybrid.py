@@ -44,6 +44,11 @@ line; an interactive transaction's own writes, and a buffered transaction's refu
 What each line answers to ``search::rrf()`` (``TestHybridLinePinsE2E``), pinned with literal statements on the same
 engines: SurrealDB 3.x has the function, 2.x and the embedded engine refuse it; its score is the sum of 1/(k + rank)
 over the lists, bit for bit, the records, scores and order the ORM's fusion gives the same lists.
+
+The documentation (``TestReadmeSection38``, ``TestRoadmap37``), with no server: README section 38 — its place, its
+examples run as written on the embedded engine, each printed line equal to its comment, its texts word for word —, the
+bullets of sections 36 and 37 that point to it, the rows v0.37.0 adds to the features, roadmap, comparison and both
+behaviour tables; ``docs/ROADMAP.md`` recording v0.37.0 as planned or, once its Phase G row carries ✅, as released.
 """
 
 import ast
@@ -84,7 +89,15 @@ from surreal_orm_lite import (
     vector,
 )
 from surreal_orm_lite.query_set import QuerySet
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import validate_field_name
+from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _md_tables
 
 #: The subject ``hybrid_search()`` gives the shared refusal texts.
 _SUBJECT = "hybrid_search()"
@@ -2931,3 +2944,543 @@ class TestHybridLinePinsE2E:
         else:
             assert refused is not None
             assert _NO_RRF in str(refused.value), f"{_ROW_FUSION}: SurrealDB 2.x has no search::rrf()"
+
+
+# === README: section 38, the behaviour tables, the features, roadmap and comparison rows; docs/ROADMAP.md ===========
+
+_SECTION_36 = "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
+_SECTION_37 = "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)"
+_SECTION_38 = "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)"
+#: Section 38's subsections, in order, after an untitled intro.
+_SUBSECTIONS_38 = [
+    "Search",
+    "With the queryset",
+    "What SurrealDB decides",
+    "Not supported",
+    "Coming from the full SurrealDB-ORM",
+]
+_INTRO_38 = (
+    "Since v0.37.0 a queryset fuses two rankings of its records with the full SurrealDB-ORM's `hybrid_search()`: the "
+    "records nearest to a query vector, as `similar_to()` finds them "
+    "([section 37](#37-vector-search-similar_to-vectorfield-indexhnswtrue)), and the best matches of a text, as "
+    "`search()` ranks them by BM25 score "
+    "([section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)), are fused into one ranking "
+    "by Reciprocal Rank Fusion. SurrealDB 3.x fuses the two lists with its `search::rrf()`; SurrealDB 2.x and the "
+    "embedded engine have no such function, so the ORM fuses them with the same formula: the same records, scores and "
+    "order on every line. Each record comes back as a dict, as in the full ORM. The examples assume a configured "
+    "connection: they run as written, in order, on the embedded engine (`mem://`)."
+)
+#: The four ``python`` blocks of section 38, in order, word for word: one opens each part but "Coming from".
+_BLOCK_SEARCH_38 = """from surreal_orm_lite import Analyzer, BaseSurrealModel, Index, SurrealConfigDict, SurrealDbError, VectorField
+
+WORDS = Analyzer("words", ["blank"], ["lowercase"])
+
+
+class Passage(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="passage",
+        indexes=[
+            Index("passage_embedding", "embedding", hnsw=True, dimension=3, dist="cosine"),
+            Index("passage_title", "title", search_analyzer=WORDS),
+        ],
+    )
+
+    id: str | None = None
+    title: str
+    topic: str = ""
+    embedding: VectorField[3]
+
+
+await Passage.define_table()
+await Passage.define_indexes()
+for key, title, topic, embedding in [
+    ("p1", "Cats and dogs", "pets", [1.0, 0.0, 0.0]),
+    ("p2", "Cats at home", "pets", [0.9, 0.1, 0.0]),
+    ("p3", "Rust programming", "tech", [0.0, 1.0, 0.0]),
+    ("p4", "Python programming", "tech", [0.1, 0.9, 0.0]),
+    ("p5", "Gardening", "home", [0.0, 0.0, 1.0]),
+    ("p6", "Cats and code", "news", [0.5, 0.5, 0.0]),
+    ("p7", "Rust and Python programming", "tech", [0.2, 0.8, 0.0]),
+    ("p8", "Cooking", "home", [0.0, 0.2, 0.8]),
+]:
+    await Passage(id=key, title=title, topic=topic, embedding=embedding).save()
+
+results = await Passage.objects().hybrid_search(
+    vector_field="embedding", vector=[1.0, 0.0, 0.0], vector_limit=3,
+    text_field="title", text_query="programming", text_limit=3,
+)
+for row in results:
+    print(row["id"], f"{row['_rrf_score']:.4f}", row["_knn_distance"] is not None, row["_search_score"] is not None)
+# passage:p1 0.0164 True False
+# passage:p3 0.0164 False True
+# passage:p2 0.0161 True False
+# passage:p4 0.0161 False True
+# passage:p6 0.0159 True False
+# passage:p7 0.0159 False True
+"""
+_BLOCK_QUERYSET_38 = """tech = await Passage.objects().filter(topic="tech").limit(2).hybrid_search(
+    vector_field="embedding", vector=[0.0, 1.0, 0.0], vector_limit=4,
+    text_field="title", text_query="programming", text_limit=4,
+)
+for row in tech:
+    print(row["id"], f"{row['_rrf_score']:.4f}")
+# passage:p3 0.0328
+# passage:p4 0.0323
+page = await Passage.objects().offset(1).limit(2).hybrid_search(
+    vector_field="embedding", vector=[1.0, 0.0, 0.0], vector_limit=3,
+    text_field="title", text_query="programming", text_limit=3,
+)
+print([str(row["id"]) for row in page])
+# ['passage:p3', 'passage:p2']
+"""
+_BLOCK_DECIDES_38 = """try:
+    await Passage.objects().hybrid_search(
+        vector_field="embedding", vector=[1.0, 0.0, 0.0], text_field="topic", text_query="tech",
+    )
+except SurrealDbError as error:
+    print(error)
+# hybrid_search(): no full-text index on field 'topic'. SurrealDB matches only a field with a FULLTEXT (3.x) or SEARCH (2.x) index: declare Index(..., search_analyzer=...) on the model and apply define_indexes().
+"""
+_BLOCK_NOT_SUPPORTED_38 = """try:
+    await Passage.objects().order_by("title").hybrid_search(
+        vector_field="embedding", vector=[1.0, 0.0, 0.0], text_field="title", text_query="cats",
+    )
+except ValueError as error:
+    print(error)
+# hybrid_search() cannot be combined with order_by(): it runs its own vector and full-text searches and orders the records by their fused score. Remove them from the queryset.
+"""
+#: Each part's block (the parts not named hold none).
+_BLOCKS_BY_PART_38 = {
+    "Search": _BLOCK_SEARCH_38,
+    "With the queryset": _BLOCK_QUERYSET_38,
+    "What SurrealDB decides": _BLOCK_DECIDES_38,
+    "Not supported": _BLOCK_NOT_SUPPORTED_38,
+}
+#: What the two dict-printing blocks print, line by line: the fused records of the corpus, the same on every line.
+_PRINTED_SEARCH_38 = [
+    "passage:p1 0.0164 True False",
+    "passage:p3 0.0164 False True",
+    "passage:p2 0.0161 True False",
+    "passage:p4 0.0161 False True",
+    "passage:p6 0.0159 True False",
+    "passage:p7 0.0159 False True",
+]
+_PRINTED_QUERYSET_38 = ["passage:p3 0.0328", "passage:p4 0.0323", "['passage:p3', 'passage:p2']"]
+#: The prose under the "Search" block.
+_S38_RANKS = (
+    "Each record gets 1 / (`rrf_k` + rank) from each list it is in, its rank counted from 1 (`rrf_k` is 60 by "
+    "default): `p1`, nearest, and `p3`, the best match, both score 1/61. Records with equal scores keep the vector "
+    "list's order first, then the full-text list's for the records it alone found, on every line — SurrealDB's "
+    "`search::rrf()` alone returns them in no fixed order. `_knn_distance` is `None` for a record only the full-text "
+    "search found, `_search_score` for one only the vector search found."
+)
+#: The prose under the "With the queryset" block.
+_S38_QUERYSET = (
+    "The queryset's conditions select the records of both lists. `select()` and `fetch()` apply to both, `id` always "
+    "read; `limit()` and `offset()` page through the fused records, of which there are at most `vector_limit + "
+    "text_limit`. `cache()`, `objects(tx=)` and named connections apply as for `exec()`, and `dist=` scans exactly, as "
+    "in section 37."
+)
+#: Each part's prose, the text of its block left out (whitespace normalised).
+_PROSE_38 = {"Search": _S38_RANKS, "With the queryset": _S38_QUERYSET}
+#: The bullets of the other parts, in order, word for word (whitespace normalised, without the leading ``- ``).
+_BULLETS_38 = {
+    "What SurrealDB decides": [
+        "Each list is SurrealDB's own: the vector list as `similar_to()` finds it — HNSW is approximate (section 37) — "
+        "and the full-text list as `search()` ranks it, with section 36's BM25 scores.",
+        "Each search needs its index. Without a full-text index on `text_field`, SurrealDB 3.3, 2.x and the embedded "
+        "engine refuse the search, and `hybrid_search()` raises `SurrealDbError` naming the field, as above; SurrealDB "
+        "3.1 and 3.2 match nothing, so the vector list alone is fused.",
+        "Without a vector index on `vector_field`, the vector search finds nothing on SurrealDB 3.3, 2.x and the "
+        "embedded engine, so the full-text ranking alone is fused, every `_knn_distance` `None`; SurrealDB 3.1 and 3.2 "
+        "list the first `vector_limit` records by id, with no distance. Pass `dist=` for an exact scan that needs no "
+        "index.",
+    ],
+    "Not supported": [
+        "`order_by()`, `annotate()`, `values()`, `search()` and `similar_to()` raise `ValueError` before any request, as "
+        "above; `as_of()` raises `SurrealDbError`: the indexes hold the records' current values.",
+        "Several full-text fields, weights and score normalisation (`search::linear()`), and the full-text side's "
+        "highlights are not available yet.",
+        "**A field stored under a name `hybrid_search()` uses for its own values** — `rrf_score`, `_rrf_score`, "
+        "`_knn_distance`, `_search_score`, `_hybrid_pos`, `_hybrid_vec_pos` or `_hybrid_text_pos` — raises `ValueError` "
+        "before any request: store it under another name (`Field(alias=...)`). On a SCHEMALESS table, a column with "
+        "one of these names that the model does not declare is not returned, on every line, even when `select()` "
+        "names it.",
+    ],
+    "Coming from the full SurrealDB-ORM": [
+        "**`hybrid_search()` keeps the full ORM's signature**: keyword-only `vector_field`, `vector`, `vector_limit=20`, "
+        "`text_field`, `text_query`, `text_limit=20`, `rrf_k=60`; `ef` is `None` for 100, so that `dist=` (an exact "
+        "scan, section 37) can be given instead.",
+        "**It returns dicts, as the full ORM does**: each holds the record's fields, keyed by their Python names as "
+        "`exec()`'s dict rows are, and `_rrf_score`, plus `_knn_distance` and `_search_score`, which the full ORM does "
+        "not return.",
+        "**It applies the queryset**: its conditions, `select()`, `fetch()`, `limit()`/`offset()`, `cache()`, "
+        "transactions and named connections; the full ORM ignores them.",
+        "**SurrealDB's `search::rrf()` fuses the lists on 3.x**, given both lists in one statement, and the ORM fuses "
+        "them on 2.x and the embedded engine; the full ORM calls `search::rrf()` with arguments SurrealDB 3.3 refuses, "
+        "and runs on 3.x only.",
+        "**Equal fused scores have a fixed order** (the vector list's first), so a page never changes between two "
+        "identical calls.",
+        "**Checked before any request**: both fields, the vector, `vector_limit` and `text_limit` (1 to 10 000), "
+        "`rrf_k` (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.",
+        "**Reciprocal Rank Fusion only**: `search::linear()` (weights and score normalisation) is not offered yet.",
+    ],
+}
+#: What v0.37.0 changes in sections 36 and 37: section 36's last "Coming from" bullet, section 37's eleventh, and the
+#: sentence that ends section 37's first "Not supported" bullet (whitespace normalised).
+_BULLET_36_HYBRID = "- **`hybrid_search()` fuses `search()`'s ranking with `similar_to()`'s** (section 38, v0.37.0)."
+_BULLET_37_ANNOTATE = (
+    "- **Vector functions in `annotate()`** (`vector::similarity::cosine()`…) are not available yet; `hybrid_search()` "
+    "(section 38) fuses this ranking with `search()`'s."
+)
+_S37_SCORES_HYBRID = (
+    " `hybrid_search()` gives each record found by both searches its BM25 score and its distance, on every line."
+)
+_HEADER_SENTENCE_37 = (
+    "Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where "
+    "they differ from 3.3.4."
+)
+#: Exactly the three rows v0.37.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
+_HYBRID_ROWS = [
+    [
+        "`hybrid_search()`: the fusion",
+        "the ORM fuses the two lists with `search::rrf()`'s formula, which SurrealDB 2.x does not have: the same records, "
+        "scores and order",
+        "SurrealDB's `search::rrf()` fuses them; the ORM orders equal scores, which SurrealDB returns in no fixed order",
+        "v0.37.0",
+    ],
+    [
+        "`hybrid_search()` with other conditions",
+        "applied to both lists; the vector list selects the records first (a `LET`), as `similar_to()` does",
+        "applied to both lists, during each search",
+        "v0.37.0",
+    ],
+    [
+        "`hybrid_search()` on a field without a vector or full-text index",
+        "no vector index: the vector list is empty, so the full-text ranking alone is fused; no full-text index: "
+        "`SurrealDbError` naming the field",
+        "the same; 3.1 and 3.2 put the first `vector_limit` records by id in the vector list, with no distance, and "
+        "match no record for the text",
+        "v0.37.0",
+    ],
+]
+#: The row v0.37.0 adds to the embedded engine's table, cell by cell.
+_EMBEDDED_HYBRID_ROW = [
+    "Hybrid search (v0.37.0)",
+    "as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, "
+    "and the vector list selects the other conditions first (a `LET`)",
+    "3.x fuses them with `search::rrf()`, each list applying the conditions: the same records, scores and order",
+    "v0.37.0",
+]
+_FEATURES_ROW_38 = ["Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)", "✅"]
+#: The roadmap from v0.36.0: v0.37.0 ships hybrid search, so the planned range starts at v0.38.0.
+_ROADMAP_ROWS_38 = [
+    ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
+    ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
+    ["v0.38.0 – v0.40.0", "Tier 3 — Advanced (migrations, CLI)", "📋 Planned"],
+    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_ROW_38 = ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"]
+#: The arguments of ``hybrid_search()`` a README example may give as numbers, with the range each accepts.
+_HYBRID_BOUNDS = {"vector_limit": (1, 10_000), "text_limit": (1, 10_000), "rrf_k": (0, 10_000), "ef": (1, 10_000)}
+
+
+def _section_38() -> str:
+    """Section 38, as written, without the ``---`` that ends it."""
+    body, separator, rest = _readme_part(_SECTION_38).rpartition("\n---\n")
+    assert separator and not rest.strip(), "section 38 ends with the --- of the next part"
+    return f"{body}\n"
+
+
+def _part_38(heading: str) -> str:
+    """One ``####`` subsection of section 38, as written (the intro, its heading included, for ``""``)."""
+    if not heading:
+        return _section_38().split("\n#### ", 1)[0]
+    return _subsection(f"#### {heading}", _section_38())
+
+
+def _readme_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _readme_printed(block: str) -> list[str]:
+    """What a README example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _readme_bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _prose(text: str) -> str:
+    """*text* without its ``python`` blocks, whitespace normalised."""
+    return _normalised(re.sub(r"^```python\n.*?^```$", "", text, flags=re.MULTILINE | re.DOTALL))
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+def _hybrid_search_numbers(block: str) -> list[tuple[str, object]]:
+    """The numbers every ``hybrid_search()`` call of a README block gives (``vector_limit``, ``text_limit``, ``rrf_k``,
+    ``ef``), as written: an ``int`` literal, or the source of any other expression."""
+    tree = compile(block, "<README section 38>", "exec", flags=ast.PyCF_ONLY_AST | ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+    found: list[tuple[str, object]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "hybrid_search":
+            assert not node.args, ast.unparse(node)
+            for keyword in node.keywords:
+                if keyword.arg in _HYBRID_BOUNDS:
+                    value = keyword.value
+                    found.append((keyword.arg, value.value if isinstance(value, ast.Constant) else ast.unparse(value)))
+    return found
+
+
+class TestReadmeSection38:
+    """README section 38 and what v0.37.0 changes elsewhere in the README: section 38's place, subsections, examples
+    (run on ``mem://`` as written, each printed line equal to its comment), its intro, prose and bullets word for word;
+    the bullets of sections 36 and 37 that point to it; the features, roadmap, comparison and both behaviour tables."""
+
+    def test_section_38_follows_section_37(self) -> None:
+        """Right after section 37 (after its "Coming from" bullets), the last section before the ``---`` of
+        "Configuration Options"."""
+        text = _readme()
+        start_37 = text.index(f"\n{_SECTION_37}\n")
+        start_38 = text.index(f"\n{_SECTION_38}\n")
+        configuration = text.index("\n## Configuration Options\n")
+        assert start_37 < start_38 < configuration
+        assert re.findall(r"^#{2,3} .*$", text[start_37 + 1 : configuration], re.MULTILINE) == [_SECTION_37, _SECTION_38]
+        assert text[:configuration].rstrip().endswith("\n---"), "section 38 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_38(), re.MULTILINE) == _SUBSECTIONS_38
+
+    def test_the_intro_word_for_word(self) -> None:
+        """The untitled intro is the heading and one paragraph, exactly."""
+        assert _normalised(_part_38("")) == f"{_SECTION_38} {_INTRO_38}"
+
+    def test_the_examples_and_where_they_stand(self) -> None:
+        """Each block exactly, opening its part; the intro and "Coming from" hold none; ``python`` fences only."""
+        assert _readme_blocks(_section_38()) == list(_BLOCKS_BY_PART_38.values())
+        for heading in ["", *_SUBSECTIONS_38]:
+            part = _part_38(heading)
+            block = _BLOCKS_BY_PART_38.get(heading)
+            assert _readme_blocks(part) == ([block] if block else []), heading
+            if block:
+                assert part.split("\n", 1)[1].lstrip().startswith(f"```python\n{block}```\n"), heading
+        fences = re.findall(r"^```(\S*)$", _section_38(), re.MULTILINE)
+        assert fences == ["python", ""] * len(_BLOCKS_BY_PART_38), fences
+
+    def test_what_the_blocks_print(self) -> None:
+        """The dict-printing blocks print the corpus's fused records; the refusals print HS1 for ``topic`` and HY1 for
+        ``order_by()``, the texts the method raises."""
+        assert _readme_printed(_BLOCK_SEARCH_38) == _PRINTED_SEARCH_38
+        assert _readme_printed(_BLOCK_QUERYSET_38) == _PRINTED_QUERYSET_38
+        assert _readme_printed(_BLOCK_DECIDES_38) == [f"hybrid_search(): no full-text index on field 'topic'. {_SI1_ADVICE}"]
+        assert _readme_printed(_BLOCK_NOT_SUPPORTED_38) == [_HY1.format("order_by()")]
+
+    @pytest.mark.parametrize("heading", list(_PROSE_38))
+    def test_the_prose_word_for_word(self, heading: str) -> None:
+        """ "Search" and "With the queryset": their block, then one paragraph, exactly."""
+        assert _prose(_part_38(heading)) == f"#### {heading} {_PROSE_38[heading]}"
+
+    @pytest.mark.parametrize("heading", list(_BULLETS_38))
+    def test_the_bullets_word_for_word(self, heading: str) -> None:
+        """ "What SurrealDB decides" (three bullets), "Not supported" (three) and "Coming from the full
+        SurrealDB-ORM" (seven): each bullet exactly, in order, and nothing else but the part's block."""
+        part = _part_38(heading)
+        bullets = _BULLETS_38[heading]
+        assert len(bullets) == {"What SurrealDB decides": 3, "Not supported": 3}.get(heading, 7)
+        assert _readme_bullets(part) == [f"- {bullet}" for bullet in bullets]
+        assert _prose(part) == _normalised(" ".join([f"#### {heading}", *(f"- {bullet}" for bullet in bullets)]))
+
+    def test_the_pins_name_section_38(self) -> None:
+        """The README row and sentence the line pins of this module name are the first row and the "Search" prose."""
+        row = _ROW_FUSION.removeprefix("README row '").removesuffix("'")
+        assert row == _HYBRID_ROWS[0][0], row
+        quoted = _S38_FORMULA.split(", '", 1)[1].removesuffix("'")
+        assert _S38_RANKS.startswith(quoted), quoted
+
+    def test_sections_36_and_37_point_to_section_38(self) -> None:
+        """Section 36's last "Coming from" bullet and section 37's eleventh name section 38; section 37's first "Not
+        supported" bullet ends saying that ``hybrid_search()`` gives both values."""
+        section_36 = _readme_part(_SECTION_36)
+        section_37 = _readme_part(_SECTION_37)
+        assert _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_36))[-1] == _BULLET_36_HYBRID
+        assert _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_37))[10] == _BULLET_37_ANNOTATE
+        first = _readme_bullets(_subsection("#### Not supported", section_37))[0]
+        assert first.startswith("- Search annotations with `similar_to()`") and first.endswith(_S37_SCORES_HYBRID), first
+        assert "comes in v0.37.0" not in section_36 + section_37
+
+    def test_numbers_within_the_ranges(self) -> None:
+        """Every ``hybrid_search()`` of the examples gives its numbers as ``int`` literals within their ranges, by
+        keyword."""
+        found = [number for block in _readme_blocks(_section_38()) for number in _hybrid_search_numbers(block)]
+        assert {name for name, _ in found} == {"vector_limit", "text_limit"}, found
+        for name, value in found:
+            low, high = _HYBRID_BOUNDS[name]
+            assert isinstance(value, int) and low <= value <= high, (name, value)
+
+    def test_no_local_reference(self) -> None:
+        """No design reference and no issue number in the section."""
+        section = _section_38()
+        for marker in ("§", r"\bspec\b", r"\.claude"):
+            assert re.search(marker, section) is None, marker
+        assert re.findall(r"(?<![(\w])#\d+", section) == []
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 38 names a heading: sections 37 and 36."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        links = re.findall(r"\]\(#([^)]+)\)", _section_38())
+        assert links == [_anchor(_SECTION_37.lstrip("# ")), _anchor(_SECTION_36.lstrip("# "))], links
+        assert [link for link in links if link not in anchors] == []
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly three rows, Since v0.37.0, together and in version order before the table's last row; the table
+        keeps its widths."""
+        assert_server_rows(_HYBRID_ROWS)
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        assert_server_header_sentence(_HEADER_SENTENCE_37)
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
+        assert_embedded_rows([_EMBEDDED_HYBRID_ROW])
+
+    def test_features_row(self) -> None:
+        """Right after vector search."""
+        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        firsts = [row[0] for row in features]
+        assert _FEATURES_ROW_38 in features, features
+        assert firsts.index(_FEATURES_ROW_38[0]) == firsts.index("Vector search (`similar_to()`, KNN, HNSW indexes)") + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        start = [row[0] for row in roadmap].index("v0.36.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_38, roadmap
+        assert "v0.37.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
+
+    def test_comparison_row(self) -> None:
+        """Released, right after vector search and before the migrations."""
+        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [row[0] for row in comparison]
+        start = firsts.index("Vector Search (KNN/HNSW)")
+        assert comparison[start + 1] == _COMPARISON_ROW_38, comparison
+        assert firsts[start + 2] == "Migrations & CLI", firsts
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.37.0 touches keeps one cell count per line and no escaped pipe; section 38 has no table."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _readme_part("### ORM behaviour: the embedded engine"),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        found = [lines for part in parts for lines in _md_tables(part)]
+        assert len(found) == len(parts)
+        for lines in found:
+            assert len({line.count("|") for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+        assert _md_tables(_section_38()) == []
+
+    async def test_section_38_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_38"}
+        try:
+            async with embedded_database():
+                for code in _readme_blocks(_section_38()):
+                    compiled = compile(code, "<README section 38>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
+        finally:
+            namespace.clear()
+
+
+# --- docs/ROADMAP.md --------------------------------------------------------------------------------------------------
+
+_ROADMAP = Path(__file__).resolve().parents[1] / "docs" / "ROADMAP.md"
+_PHASE_G = "### 🔎 Phase G — Advanced search"
+_SDK_TABLE = "## 🆕 Everything unlocked by the official SDK 2.0"
+_COMPARISON_TABLE = "## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison"
+#: The rows v0.37.0 holds while planned, by table.
+_PLANNED_OVERVIEW_37 = [["v0.37.0 – v0.40.0", "Tier 3 — Advanced (hybrid search, migrations, CLI), 4 minors", "Planned"]]
+_PLANNED_UNLOCKED_37 = ["Hybrid Search (RRF)", "vector + FTS fusion", "v0.37.0"]
+_PLANNED_COMPARISON_37 = ["Hybrid Search (RRF)", "yes", "v0.37.0"]
+_PLANNED_PHASE_G_37 = ["v0.37.0", "Hybrid Search (RRF)", "vector + FTS fusion"]
+#: The rows v0.37.0 holds once released, by table, and its "Completed versions" heading.
+_OVERVIEW_37 = [
+    ["v0.37.0", "Tier 3 — Hybrid search", "Done"],
+    ["v0.38.0 – v0.40.0", "Tier 3 — Advanced (migrations, CLI), 3 minors", "Planned"],
+]
+_UNLOCKED_37 = ["Hybrid Search (RRF)", "`search::rrf()` (3.x) or the same fusion in the ORM (2.x)", "✅ v0.37.0"]
+_COMPARISON_37 = ["Hybrid Search (RRF)", "yes", "✅ v0.37.0"]
+_PHASE_G_37 = ["✅ v0.37.0", "Hybrid Search (`hybrid_search()`, RRF)", "`search::rrf()` (3.x) + RRF in the ORM (2.x)"]
+_COMPLETED_HEADING_36 = "### Version 0.36.0 — Vector search (`similar_to()`)"
+_COMPLETED_HEADING_37 = "### Version 0.37.0 — Hybrid search (`hybrid_search()`)"
+#: What the released block names among what it defers: the other fusion.
+_DEFERRED_NEEDLES_37 = ("`search::linear()`",)
+
+
+def _roadmap() -> str:
+    return _ROADMAP.read_text(encoding="utf-8")
+
+
+def _roadmap_rows(heading: str) -> list[list[str]]:
+    """The rows of the first table under *heading*, each cell's escaped ``\\|`` read as ``|``."""
+    return [[cell.replace("\\|", "|") for cell in cells] for _, cells in _table_rows(_subsection(heading, _roadmap()))]
+
+
+def _released_37() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.37.0 (hybrid search) as released: its Phase G row carries the ✅ the
+    release adds."""
+    return _roadmap_rows(_PHASE_G)[2][0] == "✅ v0.37.0"
+
+
+class TestRoadmap37:
+    """``docs/ROADMAP.md`` records v0.37.0 as planned, or — once its Phase G row carries ✅ — as released: done in the
+    overview, ✅ in the SDK and comparison tables and in Phase G, its block in "Completed versions" right after
+    v0.36.0's. The Phase G row decides which state the whole file must be in."""
+
+    def test_overview(self) -> None:
+        overview = _roadmap_rows("## Overview")
+        start = [cells[0] for cells in overview].index("v0.36.0") + 1
+        expected = _OVERVIEW_37 if _released_37() else _PLANNED_OVERVIEW_37
+        assert overview[start : start + len(expected)] == expected, overview
+        assert overview[start + len(expected)][0] == "v0.41.0", overview
+
+    def test_sdk_table(self) -> None:
+        expected = _UNLOCKED_37 if _released_37() else _PLANNED_UNLOCKED_37
+        rows = _roadmap_rows(_SDK_TABLE)
+        assert [cells for cells in rows if cells[0].startswith("Hybrid Search")] == [expected], rows
+
+    def test_comparison_table(self) -> None:
+        expected = _COMPARISON_37 if _released_37() else _PLANNED_COMPARISON_37
+        rows = _roadmap_rows(_COMPARISON_TABLE)
+        assert [cells for cells in rows if cells[0].startswith("Hybrid Search")] == [expected], rows
+
+    def test_phase_g(self) -> None:
+        """Hybrid search is Phase G's third and last row."""
+        rows = _roadmap_rows(_PHASE_G)
+        assert rows[2:] == [_PHASE_G_37 if _released_37() else _PLANNED_PHASE_G_37], rows
+
+    def test_completed_versions(self) -> None:
+        """Released: v0.37.0's block right after v0.36.0's, naming the deferred ``search::linear()``. Planned: no such
+        block."""
+        completed = _roadmap().split("\n## Completed versions\n", 1)[1].split("\n## ", 1)[0]
+        headings = re.findall(r"^### .*$", completed, re.MULTILINE)
+        if not _released_37():
+            assert _COMPLETED_HEADING_37 not in headings, headings
+            return
+        assert headings[headings.index(_COMPLETED_HEADING_37) - 1] == _COMPLETED_HEADING_36, headings
+        block = _normalised(_subsection(_COMPLETED_HEADING_37, completed))
+        missing = [needle for needle in _DEFERRED_NEEDLES_37 if needle not in block]
+        assert not missing, missing

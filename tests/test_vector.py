@@ -5402,7 +5402,7 @@ _COMING_FROM_37 = [
     "**No `MTREE`, `MINKOWSKI`, `JACCARD` or `PEARSON`, and no `concurrently` yet**; the full ORM writes "
     "`MINKOWSKI` without its order, which SurrealDB refuses.",
     "**Vector functions in `annotate()`** (`vector::similarity::cosine()`…) are not available yet; "
-    "`hybrid_search()` comes in v0.37.0.",
+    "`hybrid_search()` (section 38) fuses this ranking with `search()`'s.",
     "**`get_vector_info()` and `is_vector_field()` are imported from `surreal_orm_lite.vector`**: the full ORM has "
     "them in `surreal_orm.fields`, a module this library does not have.",
     "**`generate_models_from_db()` does not write `VectorField` yet**, while the full ORM's generator writes it for "
@@ -5502,8 +5502,8 @@ _FEATURES_ROW_37 = ["Vector search (`similar_to()`, KNN, HNSW indexes)", "✅"]
 _ROADMAP_ROWS_37 = [
     ["v0.35.0", "Tier 3 — Full-text search", "✅ Released"],
     ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
-    ["v0.37.0 – v0.40.0", "Tier 3 — Advanced (hybrid search, migrations, CLI)", "📋 Planned"],
-    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
+    ["v0.38.0 – v0.40.0", "Tier 3 — Advanced (migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROW_37 = ["Vector Search (KNN/HNSW)", "✅ v0.36.0 (`similar_to()`)", "✅"]
 #: The rows the pins of this module name in their messages (each must be one of ``_VECTOR_ROWS``).
@@ -5563,14 +5563,19 @@ class TestReadmeSection37:
     features, roadmap, comparison and both behaviour tables."""
 
     def test_section_37_follows_section_36(self) -> None:
-        """Right after section 36 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 36 (after its "Coming from" bullets), then section 38 (v0.37.0), and before the ``---``
+        of "Configuration Options"."""
         text = _readme()
         start_36 = text.index(f"\n{_SECTION_36}\n")
         start_37 = text.index(f"\n{_SECTION_37}\n")
         configuration = text.index("\n## Configuration Options\n")
         assert start_36 < start_37 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_36 + 1 : configuration], re.MULTILINE) == [_SECTION_36, _SECTION_37]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 37 ends before the --- of the next part"
+        assert re.findall(r"^#{2,3} .*$", text[start_36 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_36,
+            _SECTION_37,
+            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         assert re.findall(r"^#### (.*)$", _section_37(), re.MULTILINE) == _SUBSECTIONS_37
@@ -5759,14 +5764,25 @@ def _released_36() -> bool:
     return _roadmap_rows(_PHASE_G)[1][0] == "✅ v0.36.0"
 
 
+def _released_37() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.37.0 (hybrid search) as released: its Phase G row carries the ✅ the
+    release adds."""
+    return _roadmap_rows(_PHASE_G)[2][0] == "✅ v0.37.0"
+
+
 class TestRoadmap36:
     """``docs/ROADMAP.md`` records v0.36.0 as planned, or — once its Phase G row carries ✅ — as released: done in the
     overview, ✅ in the SDK and comparison tables (the SDK table naming HNSW alone) and in Phase G, its block in
-    "Completed versions" right after v0.35.0's. The Phase G row decides which state the whole file must be in."""
+    "Completed versions" right after v0.35.0's. The Phase G row decides which state the whole file must be in. Once
+    v0.37.0 is released too, its rows follow v0.36.0's (``tests/test_hybrid.py::TestRoadmap37`` checks them)."""
 
     def test_overview(self) -> None:
         overview = _roadmap_rows("## Overview")
         start = [cells[0] for cells in overview].index("v0.35.0") + 1
+        if _released_37():
+            assert overview[start] == _OVERVIEW_36[0], overview
+            assert overview[start + 1][0] == "v0.37.0", overview
+            return
         expected = _OVERVIEW_36 if _released_36() else _PLANNED_OVERVIEW_36
         assert overview[start : start + len(expected)] == expected, overview
         assert overview[start + len(expected)][0] == "v0.41.0", overview
@@ -5784,7 +5800,7 @@ class TestRoadmap36:
     def test_phase_g(self) -> None:
         rows = _roadmap_rows(_PHASE_G)
         assert rows[1] == (_PHASE_G_36 if _released_36() else _PLANNED_PHASE_G_36), rows
-        assert [cells[0] for cells in rows[2:]] == ["v0.37.0"], rows
+        assert [cells[0] for cells in rows[2:]] == ["✅ v0.37.0" if _released_37() else "v0.37.0"], rows
 
     def test_completed_versions(self) -> None:
         """Released: v0.36.0's block right after v0.35.0's, naming the deferred background build. Planned: no such
