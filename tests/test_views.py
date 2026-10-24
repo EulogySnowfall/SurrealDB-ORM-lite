@@ -1325,6 +1325,82 @@ _ATOMIC_ARGUMENT_ERROR = (
     r"|values must be a list of items, got str$)"
 )
 
+#: #320: the QuerySet writes of :data:`_VIEW_WRITES`. ``bulk_create()``, ``bulk_update()``, ``bulk_delete()`` and
+#: ``patch()`` ran W1 in their body, after the wrapper had noted the table on the transaction (v0.36.2 and before);
+#: ``update_or_create()``, ``get_or_create()`` and ``delete_table()`` never noted it.
+_QUERYSET_TX_WRITES = _VIEW_WRITES[13:]
+
+_BAD_PATCH = [{"op": "nope", "path": "/total", "value": 9}]
+
+
+def _unsaved(model: type[BaseSurrealModel]) -> Any:
+    """An instance of *model* without an id, holding the ``paid`` group."""
+    return model(status="paid", total=2, revenue=15.5)
+
+
+def _held(model: type[BaseSurrealModel]) -> Any:
+    """:func:`_stats` of *model*, on its own table."""
+    return _stats(model, model.get_table_name())
+
+
+def _snapshot_of(model: type[BaseSurrealModel]) -> Any:
+    """:func:`_held` of *model*, marked as read ``as_of()`` 2021-06-01."""
+    return QuerySet._mark_snapshots(_held(model), datetime(2021, 6, 1, tzinfo=UTC))
+
+
+#: #320: a call that two refusals apply to, W1 and one of the call's own argument checks: (test id, the call as W1
+#: names it after the class name, the call made on *model* with the transaction *tx*, the argument's own error on an
+#: ordinary model, its message as a pattern).
+_VIEW_AND_ARGUMENT_REFUSALS: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]], type[Exception], str]] = [
+    ("update-no-id", "update()", lambda m, tx: _unsaved(m).update(tx=tx), SurrealDbError, r"^Can't update data, no id"),
+    ("delete-no-id", "delete()", lambda m, tx: _unsaved(m).delete(tx=tx), SurrealDbError, r"^Can't delete data, no id"),
+    ("merge-no-id", "merge()", lambda m, tx: _unsaved(m).merge(tx=tx, total=9), SurrealDbError, r"^No Id for the data"),
+    ("patch-bad-op", "patch()", lambda m, tx: _held(m).patch(_BAD_PATCH, tx=tx), ValueError, "has invalid op 'nope'"),
+    ("patch-no-id", "patch()", lambda m, tx: _unsaved(m).patch(_PATCH_TOTAL, tx=tx), SurrealDbError, r"^patch\(\) requires"),
+    (
+        "atomic-no-id",
+        "atomic_increment()",
+        lambda m, tx: _unsaved(m).atomic_increment("total", tx=tx),
+        SurrealDbError,
+        "^atomic operations require an explicit id",
+    ),
+    (
+        "save-extra_vars",
+        "save()",
+        lambda m, tx: _held(m).save(tx=tx, extra_vars={"step": 1}),
+        ValueError,
+        "^extra_vars requires server_values",
+    ),
+    (
+        "merge-server_values",
+        "merge()",
+        lambda m, tx: _held(m).merge(tx=tx, server_values={"total": "9"}),
+        TypeError,
+        r"^server_values\['total'\] must be a SurrealFunc",
+    ),
+    (
+        "bulk_create-snapshot",
+        "objects().bulk_create()",
+        lambda m, tx: m.objects(tx=tx).bulk_create([_snapshot_of(m)]),
+        SurrealDbError,
+        r"^PlainStats\.bulk_create\(\) cannot run on an instance read with as_of\(\)",
+    ),
+    (
+        "bulk_update-subquery",
+        "objects().bulk_update()",
+        lambda m, tx: m.objects(tx=tx).bulk_update(total=Subquery(PlainStats.objects().select("total"))),
+        ValueError,
+        r"^bulk_update\(\) writes its values as data; 'total' got a subquery",
+    ),
+    (
+        "queryset_patch-bad-op",
+        "objects().patch()",
+        lambda m, tx: m.objects(tx=tx).patch(_BAD_PATCH),
+        ValueError,
+        "has invalid op 'nope'",
+    ),
+]
+
 
 class _UntouchableTx:
     """A transaction a refused write must never reach: any use of it fails the test."""
@@ -1476,6 +1552,59 @@ class TestWriteGuard:
         assert client_requests == []
         if tx is not None:
             assert (tx.statements, tx._records_written(), tx._cache_written()) == ([], frozenset(), frozenset())
+
+    @pytest.mark.parametrize(("name", "call", "write"), _QUERYSET_TX_WRITES, ids=[row[0] for row in _QUERYSET_TX_WRITES])
+    async def test_a_refused_queryset_write_leaves_the_transaction_as_it_was(
+        self,
+        client_requests: list[str],
+        name: str,
+        call: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        """#320: under ``objects(tx=…)``, W1 refuses a QuerySet write in the method's ``invalidates(refuse=…)``, before
+        the wrapper notes its table on the transaction — no statement, no table written with records (which
+        ``define_indexes(tx=…)`` reads, #304), no table for the query cache at the commit (``bulk_delete()`` notes the
+        edges too) —, with the same message. ``update_or_create()``, ``get_or_create()`` and ``delete_table()`` (whose
+        resolver joins no transaction) already left it as it was."""
+        tx = BufferedTransaction(client=None)
+        with _pre_signals(OrderStats) as fired, pytest.raises(TypeError) as raised:
+            await write(_stats(), tx)
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
+        assert fired == []
+        assert client_requests == []
+        assert (tx.statements, tx.variables) == ([], {})
+        assert tx._records_written() == frozenset()
+        assert tx._cache_written() == frozenset()
+
+    @pytest.mark.parametrize(
+        ("name", "call", "write", "error", "pattern"),
+        _VIEW_AND_ARGUMENT_REFUSALS,
+        ids=[row[0] for row in _VIEW_AND_ARGUMENT_REFUSALS],
+    )
+    async def test_a_view_is_refused_before_the_arguments(
+        self,
+        client_requests: list[str],
+        name: str,
+        call: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+        error: type[Exception],
+        pattern: str,
+    ) -> None:
+        """#320: when W1 and one of the call's own argument checks both apply — a missing id, an invalid patch
+        operation, ``extra_vars`` without ``server_values``, a snapshot in ``bulk_create()``'s list, a subquery as a
+        ``bulk_update()`` value… —, W1 comes first, as before: the call raises its argument's own error on an ordinary
+        model and W1 on a view model, and neither leaves anything on the transaction."""
+        plain_tx = BufferedTransaction(client=None)
+        with pytest.raises(error, match=pattern):
+            await write(PlainStats, plain_tx)
+        tx = BufferedTransaction(client=None)
+        with _pre_signals(OrderStats) as fired, pytest.raises(TypeError) as raised:
+            await write(OrderStats, tx)
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
+        assert fired == []
+        assert client_requests == []
+        for given in (plain_tx, tx):
+            assert (given.statements, given._records_written(), given._cache_written()) == ([], frozenset(), frozenset())
 
     @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
     async def test_an_ordinary_model_is_not_refused(

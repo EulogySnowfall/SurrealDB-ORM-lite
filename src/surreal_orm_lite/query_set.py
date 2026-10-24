@@ -85,6 +85,52 @@ def _unwritable_variable(field: str, name: str) -> str:
     return f"Cannot create a record from Var('{name}') given for '{field}': {why}. {advice}"
 
 
+def _queryset_refusals(method: str) -> Callable[["QuerySet"], None]:
+    """The queryset's own refusals of the write *method* (``"bulk_update()"``), for ``invalidates(refuse=…)`` (#320).
+
+    In this order: the materialized view (W1, :meth:`BaseSurrealModel._reject_view_write`, naming
+    ``objects().<method>``), then a queryset read ``as_of()`` (T5, :meth:`QuerySet._reject_time_travel`). The wrapper
+    calls it with the queryset before the write's tables are noted on its ``objects(tx=…)`` transaction or put in
+    flight, so a refused write leaves the transaction as it was and drops no cached read. A write decorated with it
+    does not repeat these checks.
+    """
+
+    def refuse(queryset: QuerySet) -> None:
+        queryset.model._reject_view_write(f"objects().{method}")
+        queryset._reject_time_travel(method)
+
+    return refuse
+
+
+def _bulk_create_arguments(arguments: Mapping[str, Any]) -> None:
+    """:meth:`QuerySet.bulk_create`'s argument check, for ``invalidates(refuse_args=…)`` (#320): a snapshot (an
+    instance read with ``as_of()``, v0.26.0) in ``models`` is refused, naming its class, after the queryset's own
+    refusals and before anything is noted on the transaction or put in flight."""
+    for model in arguments["models"]:
+        moment = _snapshot_moment(model) if isinstance(model, BaseSurrealModel) else None
+        if moment is not None:
+            raise SurrealDbError(_time_travel.snapshot_write_refused(type(model).__name__, "bulk_create()", moment))
+
+
+def _bulk_update_arguments(arguments: Mapping[str, Any]) -> None:
+    """:meth:`QuerySet.bulk_update`'s argument checks, for ``invalidates(refuse_args=…)`` (#320), in this order: a
+    value that is a subquery (v0.27.0), then a computed field or an edge endpoint among the fields to write."""
+    values: Mapping[str, Any] = arguments["kwargs"]
+    for field, value in values.items():
+        if _subquery.subquery_of(value) is not None:
+            raise ValueError(_subquery.value_written(field))
+    arguments["self"].model._reject_computed_writes(values, "bulk_update()")
+
+
+def _patch_arguments(arguments: Mapping[str, Any]) -> None:
+    """:meth:`QuerySet.patch`'s argument checks, for ``invalidates(refuse_args=…)`` (#320): the JSON Patch document
+    (:func:`~surreal_orm_lite.utils.validate_patch_operations`), then the computed fields and edge endpoints it
+    writes."""
+    operations = arguments["operations"]
+    validate_patch_operations(operations)
+    arguments["self"].model._reject_computed_patch(operations, "patch()")
+
+
 class QuerySet:
     """
     A class used to build, execute, and manage queries on a SurrealDB table associated with a specific model.
@@ -868,8 +914,12 @@ class QuerySet:
     def _reject_time_travel(self, method: str) -> None:
         """Refuse *method* (a write or a stream, named with its ``()``) on a queryset read ``as_of()`` (v0.26.0).
 
-        A time-travel read is read-only and cannot be streamed: called at the start of each such method — right
-        after a write's materialized-view check (v0.32.0) —, so nothing is sent and no client is acquired.
+        A time-travel read is read-only and cannot be streamed, so nothing is sent and no client is acquired: each
+        such write runs it right after its materialized-view check (v0.32.0), and each stream (and ``query()``) at
+        its start. ``bulk_create()``, ``bulk_update()``, ``bulk_delete()``, ``patch()`` and ``delete_table()`` run
+        both in their ``invalidates(refuse=…)`` (:func:`_queryset_refusals`, #320), before their tables are noted on
+        the transaction or put in flight: a refused write leaves the transaction as it was and drops no cached read.
+        ``update_or_create()`` and ``get_or_create()`` run both at their start, before any lookup or write.
         """
         if self._as_of is not None:
             raise SurrealDbError(_time_travel.queryset_refused(method))
@@ -2040,7 +2090,7 @@ class QuerySet:
 
         return await self._cached_read("select", "", {"target": target}, tables, self.model._is_view(), run)
 
-    @_cache.invalidates("table", deletes=True)
+    @_cache.invalidates("table", deletes=True, refuse=_queryset_refusals("delete_table()"))
     async def delete_table(self) -> bool:
         """
         Delete the associated table from the SurrealDB database.
@@ -2051,10 +2101,10 @@ class QuerySet:
 
         It runs at once, outside the queryset's ``objects(tx=)`` transaction (a rollback does
         not bring the rows back), so the cached reads of the table — and of every edge table,
-        whose edges die with the records — are invalidated when it ends, never at a commit.
+        whose edges die with the records — are invalidated when it ends, never at a commit. A
+        materialized view (``TypeError``) and a queryset read ``as_of()`` (``SurrealDbError``) are
+        refused before any request, and drop no cached read (#320).
         """
-        self.model._reject_view_write("objects().delete_table()")
-        self._reject_time_travel("delete_table()")
         client = await self._manager().get_client()
         with contextlib.suppress(NotFoundError):
             await client.delete(self._model_table)
@@ -2377,7 +2427,7 @@ class QuerySet:
 
     # ==================== Bulk Operations ====================
 
-    @_cache.invalidates("queryset")
+    @_cache.invalidates("queryset", refuse=_queryset_refusals("bulk_create()"), refuse_args=_bulk_create_arguments)
     async def bulk_create(self, models: list[BaseSurrealModel]) -> list[BaseSurrealModel]:
         """
         Create multiple records in a single operation.
@@ -2407,10 +2457,16 @@ class QuerySet:
             edge without an explicit id keeps ``id=None``). ``[]`` for an empty list, without any
             call.
 
+        The materialized view, a queryset read ``as_of()``, then a snapshot in ``models`` are
+        refused in this order, before any call and before the table is noted on the
+        ``objects(tx=…)`` transaction or put in flight: a refused call leaves the transaction as it
+        was and drops no cached read (#320).
+
         Raises:
             SurrealDbError: an edge id that already exists, edges the ``PERMISSIONS`` refused, or
-                any other refusal of an edge batch by the server; a model read with ``as_of()``
-                (a read-only snapshot) in ``models``, before any call (v0.26.0).
+                any other refusal of an edge batch by the server; the queryset reads ``as_of()``; a
+                model read with ``as_of()`` (a read-only snapshot) in ``models``, before any call
+                (v0.26.0).
             SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation that does not exist.
             TypeError: the model is a materialized view (v0.32.0), before any call.
             ValueError: an edge id that is a ``RecordID`` of another table, or a ``bool``.
@@ -2425,12 +2481,6 @@ class QuerySet:
                 Purchased(in_=bob, out=widget, quantity=1),
             ])  # one insert_relation() round-trip
         """
-        self.model._reject_view_write("objects().bulk_create()")
-        self._reject_time_travel("bulk_create()")
-        for model in models:
-            moment = _snapshot_moment(model) if isinstance(model, BaseSurrealModel) else None
-            if moment is not None:
-                raise SurrealDbError(_time_travel.snapshot_write_refused(type(model).__name__, "bulk_create()", moment))
         if not models:
             return []
 
@@ -2480,7 +2530,7 @@ class QuerySet:
             return models  # buffered: not executed until commit; return inputs
         return cast(list[BaseSurrealModel], self.model.from_db(created))
 
-    @_cache.invalidates("queryset")
+    @_cache.invalidates("queryset", refuse=_queryset_refusals("bulk_update()"), refuse_args=_bulk_update_arguments)
     async def bulk_update(self, **kwargs: Any) -> int:
         """
         Update all records matching the current filters.
@@ -2497,24 +2547,24 @@ class QuerySet:
         Returns:
             The number of updated records (``0`` inside a buffered transaction, whose statements run at commit).
 
+        The materialized view, a queryset read ``as_of()``, then a subquery value and a computed field or an edge
+        endpoint among the fields are refused in this order, before any request and before the table is noted on the
+        ``objects(tx=…)`` transaction or put in flight: a refused call leaves the transaction as it was and drops no
+        cached read (#320).
+
         Raises:
             TypeError: the model is a materialized view (v0.32.0), before any request.
+            SurrealDbError: the queryset reads ``as_of()``, before any request.
             ValueError: a value is a ``Subquery`` or a QuerySet (v0.27.0), before any request: filter with it, and
-                pass the value to write.
+                pass the value to write; a field is a computed field or an edge endpoint.
 
         Example::
 
             count = await User.objects().filter(status="pending").bulk_update(status="active")
             count = await Post.objects().filter(author__in=Subquery(banned)).bulk_update(hidden=True)
         """
-        self.model._reject_view_write("objects().bulk_update()")
-        self._reject_time_travel("bulk_update()")
         if not kwargs:
             return 0
-        for field, value in kwargs.items():
-            if _subquery.subquery_of(value) is not None:
-                raise ValueError(_subquery.value_written(field))
-        self.model._reject_computed_writes(kwargs, "bulk_update()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
             where_clause, where_vars = self._write_where(compiler)
@@ -2531,7 +2581,7 @@ class QuerySet:
         results = await self._run_compiled(compile_statement, write=True)
         return len(results) if isinstance(results, list) else 0
 
-    @_cache.invalidates("queryset", deletes=True)
+    @_cache.invalidates("queryset", deletes=True, refuse=_queryset_refusals("bulk_delete()"))
     async def bulk_delete(self) -> int:
         """
         Delete all records matching the current filters.
@@ -2543,13 +2593,15 @@ class QuerySet:
         Returns:
             The number of deleted records (``0`` inside a buffered transaction, whose statements run at commit).
 
+        The materialized view (``TypeError``), then a queryset read ``as_of()`` (``SurrealDbError``), are refused
+        before any request and before the table and the edges are noted on the ``objects(tx=…)`` transaction or put in
+        flight: a refused call leaves the transaction as it was and drops no cached read (#320).
+
         Example::
 
             count = await User.objects().filter(status="inactive").bulk_delete()
             count = await Post.objects().filter(author__in=Subquery(banned)).bulk_delete()
         """
-        self.model._reject_view_write("objects().bulk_delete()")
-        self._reject_time_travel("bulk_delete()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
             where_clause, where_vars = self._write_where(compiler)
@@ -2559,7 +2611,7 @@ class QuerySet:
         results = await self._run_compiled(compile_statement, write=True)
         return len(results) if isinstance(results, list) else 0
 
-    @_cache.invalidates("queryset")
+    @_cache.invalidates("queryset", refuse=_queryset_refusals("patch()"), refuse_args=_patch_arguments)
     async def patch(self, operations: list[dict[str, Any]]) -> int:
         """
         Apply a JSON Patch (RFC 6902) to every row matching the current filters.
@@ -2571,16 +2623,17 @@ class QuerySet:
         (v0.36.0) it patches the ``limit`` nearest records among those the filters select, by their ids
         (:meth:`_write_where`).
 
+        The materialized view (``TypeError``), a queryset read ``as_of()`` (``SurrealDbError``), invalid operations,
+        then a computed field or an edge endpoint they write (``ValueError``) are refused in this order, before any
+        request and before the table is noted on the ``objects(tx=…)`` transaction or put in flight: a refused call
+        leaves the transaction as it was and drops no cached read (#320).
+
         Example::
 
             n = await User.objects().filter(status="trial").patch(
                 [{"op": "replace", "path": "/plan", "value": "free"}]
             )
         """
-        self.model._reject_view_write("objects().patch()")
-        self._reject_time_travel("patch()")
-        validate_patch_operations(operations)
-        self.model._reject_computed_patch(operations, "patch()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
             where_clause, where_vars = self._write_where(compiler)

@@ -63,6 +63,17 @@ _GUARDED_INSERT = (
 )
 
 
+def _save_arguments(arguments: Mapping[str, Any]) -> None:
+    """An edge's ``save()`` argument check, for ``invalidates(refuse_args=…)`` (#320): ``server_values`` and
+    ``extra_vars`` are refused, after the snapshot refusal and before the edge table is noted on the transaction or
+    put in flight — ``INSERT RELATION`` cannot evaluate ``SET`` expressions."""
+    if arguments["server_values"] or arguments["extra_vars"]:
+        raise SurrealDbError(
+            "save(server_values=) is not available on an edge: INSERT RELATION cannot evaluate SET "
+            "expressions. Use DEFINE FIELD … DEFAULT/VALUE on the edge table."
+        )
+
+
 def _check_edge_id(model: BaseSurrealModel) -> None:
     """Refuse, before any call, an edge id the server would misread.
 
@@ -454,7 +465,7 @@ class BaseSurrealEdge(BaseSurrealModel):
         """``in_``/``out``: SurrealDB ignores a change to an existing edge's endpoints."""
         return _ENDPOINT_FIELDS
 
-    @_cache.invalidates("self", refuse=_write_refusals("save()"))
+    @_cache.invalidates("self", refuse=_write_refusals("save()"), refuse_args=_save_arguments)
     async def save(
         self,
         tx: Transaction | None = None,
@@ -490,16 +501,12 @@ class BaseSurrealEdge(BaseSurrealModel):
 
         Raises:
             SurrealDbError: the edge was read with ``as_of()`` (a snapshot) — before its table is noted
-                on the transaction (#315); ``server_values``/``extra_vars`` given (before any call); a
+                on the transaction (#315); ``server_values``/``extra_vars`` given — after the snapshot
+                check, before any call and before its table is noted on the transaction (#320); a
                 duplicate id, a refused or rejected write.
             SurrealDbNotFoundError: an ``ENFORCED`` endpoint that does not exist.
             ValueError: an id that is a ``RecordID`` of another table, or a ``bool``.
         """
-        if server_values or extra_vars:
-            raise SurrealDbError(
-                "save(server_values=) is not available on an edge: INSERT RELATION cannot evaluate SET "
-                "expressions. Use DEFINE FIELD … DEFAULT/VALUE on the edge table."
-            )
         return await super().save(tx=tx)
 
     async def upsert(self, tx: Transaction | None = None) -> Self:
