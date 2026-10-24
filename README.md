@@ -6058,10 +6058,22 @@ print(await NoteV2.objects().search(text="physics").count())
   has already written records to the model's table with the ORM (`save()`, `objects(tx=…).bulk_create()`, …). The
   refusal covers every kind of index, not only full-text ones: a search would miss those records, and a `UNIQUE` index
   missing them would not enforce uniqueness for them. The refusal does not fail the block. `define_table(tx=…)`,
-  `define_relation(tx=…)` and a write to another table do not count, nor does a write the ORM refused for a
-  materialized view or a snapshot read with `as_of()` (a snapshot in `bulk_create()`'s list included), an `update()`,
-  `merge()`, `patch()`, `delete()` or `atomic_*()` call refused for a missing id, or a `patch()` refused for its
-  operations; a raw `tx.add()` is not tracked.
+  `define_relation(tx=…)` and a write to another table do not count, nor does a write the ORM refused before sending or
+  queuing it: one refused for a materialized view, a snapshot read with `as_of()`, an auth model with a
+  `Field(exclude=True)` field SIGNUP writes, a `tx=` of another connection, or one of its arguments (a missing id,
+  invalid patch operations, an invalid `server_values`/`extra_vars` pair or either one on an edge's `save()`, a computed
+  field or an edge endpoint among the fields written, an atomic helper's field, amount or values, a subquery value in
+  `bulk_update()`, a snapshot in `bulk_create()`'s list); a raw `tx.add()` is not tracked. Until
+  [EulogySnowfall/SurrealDB-ORM-lite#325](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/325) is fixed,
+  some refusals made while the write is built still count, although nothing was sent or queued: `upsert()` without an
+  id, `save(tx=…)` without an id in a buffered transaction, a field name or an `extra_vars` key refused while the
+  statement of `save(server_values=…)` or `merge(server_values=…)` is compiled (an invalid name, a key that collides
+  with an internal binding), the argument checks of `relate()`, `remove_relation()` and `remove_all_relations()` (an
+  invalid edge name, or an empty list of edges, counts as a write to every table, so every later `define_indexes(tx=…)`
+  in the block is refused), a field name `bulk_update()` refuses, a filter refused while the statement of
+  `objects(tx=…).bulk_update()`, `bulk_delete()` or `patch()` is compiled, an edge id of another table in an edge's
+  `save()` or `bulk_create()`, and a payload that cannot be serialized (a `field_serializer` that raises) in `save()`,
+  `upsert()`, `bulk_create()`, or `update()` with an id.
 - Prefer `define_indexes()` outside the block: on SurrealDB 2.x, a write to a table that held records, after its index
   in the same block, fails the commit with a retryable `SurrealDbConflictError` that a retry meets again; so does a
   block that removes an index of a table that held records and defines it again, where the index stands as before.
