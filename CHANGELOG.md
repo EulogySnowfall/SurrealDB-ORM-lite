@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.3] - 2026-10-24
+
+Follow-up to the review of v0.36.0 (#316): a vector field declared with `| None` keeps its
+`Vector` marker, so the checks v0.36.0 added for vector fields apply to it too. No new public API.
+
+### Fixed
+
+- **A vector field written `VectorField[d] | None`, `Optional[VectorField[d]]` or
+  `Annotated[list[float], Vector(d)] | None` is read as a vector field** (#318). In these
+  spellings the marker sits inside a union member, not in the field's metadata, so since v0.36.0
+  `get_vector_info()` returned `None` and `is_vector_field()` `False` for them. The `class`
+  statement then skipped the vector-index check: an `Index(..., hnsw=True)` of another dimension
+  or storage type than the field was accepted, while `define_table()` still wrote
+  `option<array<float, d>>`, so the column and the index disagreed without an error; and
+  `similar_to()` took the expected length of the query vector from the index, not the field.
+  `get_vector_info()` and `is_vector_field()` now read the field's annotation when its metadata
+  holds no marker, as `define_table()` does: these spellings give the same column, the same
+  index checks at the `class` statement, the same dimension check in `similar_to()` and the same
+  `(dimension, storage type)` as `VectorField[d]`. Vectors held in a container
+  (`list[VectorField[d]]`) are still not a vector field.
+
+### Changed
+
+- **A field with no single vector dimension is refused at the `class` statement** (#318): a
+  `Vector` marker next to a type other than `None` in a union (`VectorField[3] | str`), or two
+  different `Vector` markers on one field (`Annotated[VectorField[3], Vector(4)]`). The
+  `ValueError` names the model and the field and says to write `VectorField[d]` alone (it is
+  already optional) or `Annotated[list[float] | None, Vector(d)]`; the check runs on every model,
+  whether or not it declares indexes. Until v0.36.2 such a model was accepted (the first of two
+  markers decided the checks, a union with another type was not a vector field).
+  `get_vector_info()` and `is_vector_field()` raise the same `ValueError` for such a field or
+  annotation. Every spelling that v0.36.2 read as a vector field gives the same result.
+
+### Notes
+
+- **Docs**: README section 37 (Vector search) says `VectorField[d]` is already optional and
+  needs no `| None`: written with it, the field needs `= None`, since Pydantic ignores a default
+  inside a union member (with an `UnsupportedFieldAttributeWarning`) and the field is otherwise
+  required. It also says how the union spellings are read.
+- The fix is in the ORM's model checks: the behaviour is the same on SurrealDB 2.x and 3.x and on
+  the embedded engine. Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0, plus
+  3.1.5 for backward compatibility.
+
 ## [0.36.2] - 2026-10-23
 
 Follow-ups to the review of v0.35.3 (#312): an index that `remove_index(tx=…)` removed earlier in
