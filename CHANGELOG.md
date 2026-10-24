@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-10-24
+
+Hybrid search: a queryset fuses the records nearest to a query vector, as `similar_to()` finds
+them, and the best matches of a text, as `search()` ranks them, into one ranking by Reciprocal
+Rank Fusion, with the full SurrealDB-ORM's `hybrid_search()`. SurrealDB 3.x fuses the two lists
+with `search::rrf()`; SurrealDB 2.x and the embedded engine have no such function, so the ORM
+fuses them with the same formula: the same two lists give the same records, scores and order on
+every line. The third and last minor of Tier 3's search phase.
+
+### Added
+
+- **`QuerySet.hybrid_search(*, vector_field, vector, vector_limit=20, text_field, text_query, text_limit=20, rrf_k=60, ef=None, dist=None)`**,
+  the full SurrealDB-ORM's method: each record gets 1 / (`rrf_k` + rank) from each list it is in,
+  its rank counted from 1, and the records come best fused score first. It returns a list of
+  dicts, as the full ORM does, each holding the record's fields keyed by their Python names (as
+  `exec()`'s dict rows are), `_rrf_score`, and `_knn_distance` and `_search_score` (`None` for a
+  record that only the other search found). The query vector and the text are bound as query
+  variables, never written into the statement. **`dist=`** is an addition: an exact scan that
+  needs no vector index, as in `similar_to()`. The queryset applies: its conditions select the
+  records of both lists, `select()` and `fetch()` apply to both (`id` always read),
+  `limit()`/`offset()` page through the fused records (at most `vector_limit + text_limit`), and
+  `cache()`, `objects(tx=)` and named connections apply as for `exec()`; the full ORM ignores them.
+- README section 38, "Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)" (search, with the
+  queryset, what SurrealDB decides, what is not supported, a note for users of the full
+  SurrealDB-ORM), four rows of the "ORM behaviour: SurrealDB 2.x vs 3.x" table and one of the
+  embedded engine's, and the example notebook `examples/v0.37.0_hybrid_search.ipynb`.
+
+  ```python
+  results = await Passage.objects().filter(topic="tech").hybrid_search(
+      vector_field="embedding", vector=[0.0, 1.0, 0.0], vector_limit=4,
+      text_field="title", text_query="programming", text_limit=4,
+  )
+  for row in results:  # best fused score first
+      print(row["id"], row["_rrf_score"], row["_knn_distance"], row["_search_score"])
+  ```
+
+### Notes
+
+- **SurrealDB 3.x fuses with `search::rrf()`**, given both lists in one statement; **SurrealDB
+  2.x and the embedded engine get the same fusion from the ORM**: the same records, scores and
+  order for the same two lists. The line is read from `client.version()`, as for `search()`'s
+  index keyword. Other conditions apply to both lists; on SurrealDB 2.x and the embedded engine
+  the vector list selects the records matching them first, as `similar_to()` does.
+- **Equal fused scores come in a fixed order**: the vector list's first, then the full-text list's
+  for the records it alone found, on every line (SurrealDB's `search::rrf()` alone returns them in
+  no fixed order), so the same two lists always give the same page. Each list is SurrealDB's own:
+  BM25 scores depend on the line (a term found in more than half the documents scores `0.0` on 3.x
+  and below zero on 2.x and the embedded engine), and on SurrealDB 2.x and the embedded engine an
+  exact scan (`dist=`) picks among records at an equal distance at the `vector_limit`-th place in
+  no fixed order, as `similar_to()`'s does since v0.36.0: the vector list, and a page of the fused
+  records, can then change between two identical calls. The HNSW index, and SurrealDB 3.x's exact
+  scan, return the same list on every call.
+- **Checked before any request**: both fields, the vector, `vector_limit` and `text_limit` (1 to
+  10 000), `rrf_k` (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.
+- **Refused before any request**: `order_by()`, `annotate()`, `values()`, `search()` and
+  `similar_to()` on the queryset (`ValueError`), and `as_of()` (`SurrealDbError`: the indexes hold
+  the records' current values). A model field stored under one of the seven names the method uses
+  for its own values (`rrf_score`, `_rrf_score`, `_knn_distance`, `_search_score`, `_hybrid_pos`,
+  `_hybrid_vec_pos`, `_hybrid_text_pos`) raises `ValueError`: store it under another name with
+  `Field(alias=...)`. On a SCHEMALESS table, a column with one of these names that the model does
+  not declare is not returned, even when `select()` names it.
+- **Each search needs its index.** Without a full-text index on `text_field`, SurrealDB 3.3, 2.x
+  and the embedded engine refuse the search and `hybrid_search()` raises `SurrealDbError` naming
+  the field; SurrealDB 3.1 and 3.2 match nothing, so the vector list alone is fused. Without a
+  vector index on `vector_field`, the vector list is empty on SurrealDB 3.3, 2.x and the embedded
+  engine, so the full-text ranking alone is fused; SurrealDB 3.1 and 3.2 list the first
+  `vector_limit` records by id, with no distance. `dist=` needs no index.
+- **Not yet**: `search::linear()` (weights and score normalisation), several full-text fields,
+  the full-text side's highlights, and search annotations next to `similar_to()` on SurrealDB 2.x
+  and the embedded engine, which the ORM still refuses there; `hybrid_search()` gives each record
+  found by both searches its BM25 score and its distance, on every line.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility; the new behaviour rows were also measured on 3.2.6.
+
 ## [0.36.5] - 2026-10-24
 
 Follow-up to v0.36.1 (#315): a queryset write that the ORM refuses, and an instance write

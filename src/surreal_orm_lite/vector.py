@@ -440,8 +440,9 @@ def checked_count(value: object, *, subject: str, arg: str, low: int, high: int)
     return value
 
 
-def checked_query_vector(value: object) -> list[float]:
-    """The query vector of ``similar_to()`` as a ``list[float]``, the value the ORM binds.
+def checked_query_vector(value: object, *, subject: str = "similar_to()") -> list[float]:
+    """The query vector of ``similar_to()`` (or of *subject*, which starts each refusal) as a ``list[float]``, the
+    value the ORM binds.
 
     A ``list`` or ``tuple`` of real numbers — ``int``, ``float``, any ``numbers.Real``, a ``Decimal``; not a ``bool``
     nor a ``str`` —, not empty, each finite. Another container (a NumPy array: ``.tolist()``) or an item that is not a
@@ -449,18 +450,18 @@ def checked_query_vector(value: object) -> list[float]:
     """
     if not isinstance(value, list | tuple):
         raise TypeError(
-            f"similar_to() takes the vector as a list or tuple of numbers, got {type(value).__name__}; convert an "
+            f"{subject} takes the vector as a list or tuple of numbers, got {type(value).__name__}; convert an "
             "array with .tolist()."
         )
     if not value:
-        raise ValueError("similar_to(): the vector is empty.")
+        raise ValueError(f"{subject}: the vector is empty.")
     floats: list[float] = []
     for position, item in enumerate(value):
         number = _as_float(item)
         if number is None:
-            raise TypeError(f"similar_to(): vector item {position} is {type(item).__name__}, not a number.")
+            raise TypeError(f"{subject}: vector item {position} is {type(item).__name__}, not a number.")
         if not math.isfinite(number):
-            raise ValueError(f"similar_to(): vector item {position} is not finite ({item!r}).")
+            raise ValueError(f"{subject}: vector item {position} is not finite ({item!r}).")
         floats.append(number)
     return floats
 
@@ -482,25 +483,27 @@ def checked_knn_field(value: object) -> str:
     return value
 
 
-def checked_limit(value: object) -> int:
+def checked_limit(value: object, *, subject: str = "similar_to()", arg: str = "limit") -> int:
     """The ``limit`` of ``similar_to()`` — ``K``, the number of neighbours —, an ``int`` (not a ``bool``) from 1 to
-    ``MAX_K``. Another type raises ``TypeError``, a value out of range ``ValueError``."""
+    ``MAX_K``. Another type raises ``TypeError``, a value out of range ``ValueError``; each refusal reads
+    ``{subject} {arg} must be …`` (``hybrid_search() vector_limit``, ``hybrid_search() text_limit``)."""
     if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"similar_to() limit must be an int, got {type(value).__name__}.")
+        raise TypeError(f"{subject} {arg} must be an int, got {type(value).__name__}.")
     if not 1 <= value <= MAX_K:
-        raise ValueError(f"similar_to() limit must be between 1 and {MAX_K}, got {value!r}.")
+        raise ValueError(f"{subject} {arg} must be between 1 and {MAX_K}, got {value!r}.")
     return value
 
 
-def checked_ef(value: object) -> int | None:
+def checked_ef(value: object, *, subject: str = "similar_to()") -> int | None:
     """The ``ef`` of ``similar_to()`` — the HNSW search's candidate list —, ``None`` (``DEFAULT_EF``) or an ``int``
-    (not a ``bool``) from 1 to ``MAX_EF``. Another type raises ``TypeError``, a value out of range ``ValueError``."""
+    (not a ``bool``) from 1 to ``MAX_EF``. Another type raises ``TypeError``, a value out of range ``ValueError``;
+    *subject* starts each refusal."""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"similar_to() ef must be an int or None, got {type(value).__name__}.")
+        raise TypeError(f"{subject} ef must be an int or None, got {type(value).__name__}.")
     if not 1 <= value <= MAX_EF:
-        raise ValueError(f"similar_to() ef must be between 1 and {MAX_EF}, got {value!r}.")
+        raise ValueError(f"{subject} ef must be between 1 and {MAX_EF}, got {value!r}.")
     return value
 
 
@@ -581,10 +584,11 @@ class KnnSearch:
         return knn_condition(self.column, self.k, self.ef, self.dist, variable)
 
 
-def field_refused(field: str, *, endpoint: bool) -> str:
-    """The refusal of ``similar_to()`` on *field*, the record id — or an edge endpoint when *endpoint*."""
+def field_refused(field: str, *, endpoint: bool, subject: str = "similar_to()") -> str:
+    """The refusal of ``similar_to()`` (or *subject*) on *field*, the record id — or an edge endpoint when
+    *endpoint*."""
     what = "an edge endpoint" if endpoint else "the record id"
-    return f"similar_to() compares vectors: {field!r} is {what}, not a vector field."
+    return f"{subject} compares vectors: {field!r} is {what}, not a vector field."
 
 
 def distance_attribute_refused(model: str) -> str:
@@ -593,15 +597,16 @@ def distance_attribute_refused(model: str) -> str:
     return f"similar_to() sets each record's distance as {DISTANCE_ALIAS}, which {model} defines; rename that attribute."
 
 
-def ef_and_dist_refused() -> str:
-    """The refusal of ``similar_to()`` given both ``ef`` and ``dist``: an HNSW search or an exact scan, not both."""
-    return "similar_to() takes ef= (the HNSW index's search) or dist= (an exact scan without an index), not both."
+def ef_and_dist_refused(*, subject: str = "similar_to()") -> str:
+    """The refusal of ``similar_to()`` (or *subject*) given both ``ef`` and ``dist``: an HNSW search or an exact scan,
+    not both."""
+    return f"{subject} takes ef= (the HNSW index's search) or dist= (an exact scan without an index), not both."
 
 
-def dimension_refused(field: str, n: int, d: int, source: str) -> str:
+def dimension_refused(field: str, n: int, d: int, source: str, *, subject: str = "similar_to()") -> str:
     """The refusal of a query vector of *n* numbers for *field*, which holds vectors of *d* as *source* declares
-    (``VectorField[d]``, or ``index 'name'``)."""
-    return f"similar_to(): the vector has {n} dimensions; field {field!r} holds vectors of {d} ({source})."
+    (``VectorField[d]``, or ``index 'name'``); *subject* starts it."""
+    return f"{subject}: the vector has {n} dimensions; field {field!r} holds vectors of {d} ({source})."
 
 
 def is_dimension_error(error: BaseException) -> bool:
@@ -610,15 +615,17 @@ def is_dimension_error(error: BaseException) -> bool:
     return isinstance(error, ServerError) and _DIMENSION_MARKER in str(error)
 
 
-def dimension_error_refused(fields: Sequence[str], n: int, d: int) -> str:
+def dimension_error_refused(fields: Sequence[str], n: int, d: int, *, subject: str = "similar_to()") -> str:
     """The ORM's error for a query vector of *n* numbers that a vector index of dimension *d* refused. *fields*: the
-    vector fields of the statement; one is named alone, several as "one of the fields"."""
+    vector fields of the statement; one is named alone, several as "one of the fields". *subject* starts it."""
     named = ", ".join(repr(field) for field in fields)
     where = f"field {named}" if len(fields) == 1 else f"one of the fields {named}"
-    return f"similar_to(): the vector has {n} dimensions; the vector index on {where} expects {d}."
+    return f"{subject}: the vector has {n} dimensions; the vector index on {where} expects {d}."
 
 
-def dimension_refusal(error: BaseException, fields: Mapping[str, str]) -> SurrealDbError | None:
+def dimension_refusal(
+    error: BaseException, fields: Mapping[str, str], *, subject: str = "similar_to()"
+) -> SurrealDbError | None:
     """The ORM's error for SurrealDB's refusal *error* of a query vector whose length is not its vector index's
     dimension, not raised; ``None`` for any other error.
 
@@ -626,6 +633,7 @@ def dimension_refusal(error: BaseException, fields: Mapping[str, str]) -> Surrea
     subqueries'). The server names neither, so the error names that field, or each of them when there are several. The
     two lengths are read from the server's text, which holds nothing else: the caller raises the error ``from`` it.
     ``None`` too — the server's error relayed — when that text cannot be read or the statement searches no vector.
+    *subject* starts the error (``dimension_error_refused()``).
     """
     if not is_dimension_error(error):
         return None
@@ -633,12 +641,13 @@ def dimension_refusal(error: BaseException, fields: Mapping[str, str]) -> Surrea
     names = list(dict.fromkeys(fields.values()))
     if lengths is None or not names:
         return None
-    return SurrealDbError(dimension_error_refused(names, int(lengths.group(1)), int(lengths.group(2))))
+    return SurrealDbError(dimension_error_refused(names, int(lengths.group(1)), int(lengths.group(2)), subject=subject))
 
 
-def zero_vector_refused() -> str:
-    """The refusal of a zero query vector for a ``COSINE`` search, which has no distance to rank by."""
-    return "similar_to(): a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance."
+def zero_vector_refused(*, subject: str = "similar_to()") -> str:
+    """The refusal of a zero query vector for a ``COSINE`` search, which has no distance to rank by; *subject* starts
+    it."""
+    return f"{subject}: a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance."
 
 
 def search_annotation_refused(annotation: str) -> str:

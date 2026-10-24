@@ -3679,8 +3679,8 @@ class TestReadmeSection32:
 
     def test_section_32_follows_section_31(self) -> None:
         """Right after section 31 (after its "Coming from" bullets), then section 33 (v0.32.0), section 34 (v0.33.0),
-        section 35 (v0.34.0), section 36 (v0.35.0) and section 37 (v0.36.0), and before the ``---`` of
-        "Configuration Options"."""
+        section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0) and section 38 (v0.37.0), and before the
+        ``---`` of "Configuration Options"."""
         readme = _readme()
         start_31 = readme.index(f"\n{_SECTION_31}\n")
         start_32 = readme.index(f"\n{_SECTION_32}\n")
@@ -3694,6 +3694,7 @@ class TestReadmeSection32:
             "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
