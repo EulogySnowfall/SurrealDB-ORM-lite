@@ -5567,10 +5567,11 @@ _S37_UNION = (
     "`VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or "
     "`Optional[VectorField[d]]`, its `None` default sits inside a union member, where Pydantic ignores it with an "
     "`UnsupportedFieldAttributeWarning`: write `= None`, or the field is required. The ORM reads these spellings, and "
-    "`Annotated[list[float], Vector(d)] | None`, like the plain ones: the same column, the same checks of the vector "
-    "index when the class is defined, the same dimension for `similar_to()`, the same answer from `get_vector_info()`. "
-    "A union that holds a vector next to a type other than `None`, or two different `Vector` markers, has no single "
-    "dimension: the class statement refuses it, naming the field."
+    "`Annotated[list[float], Vector(d)] | None`, like the plain ones (a `Literal[None]` member counts as `None`): the "
+    "same column, the same checks of the vector index when the class is defined, the same dimension for "
+    "`similar_to()`, the same answer from `get_vector_info()`. A union that holds a vector next to a type other than "
+    "`None`, or two different `Vector` markers, has no single dimension: the class statement refuses it, naming the "
+    "field, and `get_vector_info()` and `is_vector_field()` raise `ValueError` for such a field or annotation."
 )
 #: The nine sentences section 37 says word for word (whitespace normalised), with their subsection.
 _SENTENCES_37 = [
