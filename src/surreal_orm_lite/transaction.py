@@ -32,10 +32,18 @@ records a transaction wrote before the index was defined. A raw ``tx.add()`` is 
 
 Indexes removed (issue #312): ``remove_index(tx=…)`` notes the index it removes, by table (``_note_index_removal``).
 ``define_indexes(tx=…)`` reads committed state, where that index still stands: it counts the indexes noted for its table
-(``_indexes_removed``) as missing, plans them again, and forgets those it defines (``_forget_index_removals``).
-``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` read committed state too, and leave the noted indexes out of
-those that use the analyzer (issue #323). The commit and the cancel keep the note, like the tables written. A raw
-``tx.add("REMOVE INDEX …")`` is not noted.
+(``_indexes_removed``) as missing, plans them again, and forgets those it defines (``_forget_index_removals``, through
+``_note_index_definition``). ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` read committed state too, and
+leave the noted indexes out of those that use the analyzer (issue #323). The commit and the cancel keep the note, like
+the tables written. A raw ``tx.add("REMOVE INDEX …")`` is not noted.
+
+Indexes defined (issue #329): ``define_indexes(tx=…)`` notes each index it defines or redefines, by table, with its
+analyzer (``_note_index_definition``, ``""`` for none), once the statements are applied or queued — a refusal notes
+nothing. ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` count them among the indexes that use their analyzer
+(``_indexes_defined``), although committed state does not hold them yet, or holds them with another analyzer. The last
+change of an index name wins: a definition forgets the removal noted for that name and replaces an earlier definition;
+a removal drops the definition. The commit and the cancel keep the note; a statement a buffered commit refuses leaves
+it as noted, like the other notes. A raw ``tx.add("DEFINE INDEX …")`` is not noted.
 
 Analyzers changed (issue #323): ``remove_analyzer(tx=…)`` notes the analyzer it removes (``_note_analyzer_removal``),
 ``define_analyzer(tx=…)`` the one it defines or redefines (``_note_analyzer_definition``); the last change of a name
@@ -248,6 +256,9 @@ class Transaction(ABC):
         # Issue #312: the indexes remove_index(tx=…) removed in this transaction, by table, until define_indexes(tx=…)
         # defines them again; kept until the transaction ends.
         self._removed_indexes: dict[str, set[str]] = {}
+        # Issue #329: the indexes define_indexes(tx=…) defined in this transaction, by table, each with its analyzer
+        # ("" for none) — the last change of an index name wins; kept until the transaction ends.
+        self._defined_indexes: dict[str, dict[str, str]] = {}
         # Issue #323: the analyzers remove_analyzer(tx=…) removed and those define_analyzer(tx=…) defined or redefined
         # in this transaction — the last change of a name wins; kept until the transaction ends.
         self._removed_analyzers: set[str] = set()
@@ -319,9 +330,12 @@ class Transaction(ABC):
         ``remove_index(tx=…)`` calls it once its ``REMOVE INDEX`` was applied (interactive) or queued (buffered).
         ``define_indexes(tx=…)``, which reads committed state where the index still stands, counts it as missing;
         ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` no longer count it among the indexes that use an
-        analyzer (issue #323). Like the tables written, the commit and the cancel keep it. A raw ``tx.add()`` is not
-        noted.
+        analyzer (issue #323). A definition noted before for the same name on *table* is forgotten (issue #329). Like
+        the tables written, the commit and the cancel keep it. A raw ``tx.add()`` is not noted.
         """
+        defined = self._defined_indexes.get(table)
+        if defined is not None:
+            defined.pop(name, None)
         self._removed_indexes.setdefault(table, set()).add(name)
 
     def _indexes_removed(self, table: str) -> frozenset[str]:
@@ -335,6 +349,25 @@ class Transaction(ABC):
         removed = self._removed_indexes.get(table)
         if removed is not None:
             removed.difference_update(names)
+
+    def _note_index_definition(self, table: str, name: str, analyzer: str) -> None:
+        """Note that the index *name* of *table* was defined or redefined in this transaction with the analyzer
+        *analyzer* (``""`` for none) — issue #329.
+
+        ``define_indexes(tx=…)`` calls it for each index it defines, once their ``DEFINE INDEX`` statements were applied
+        (interactive) or queued (buffered): a refusal notes nothing. ``remove_analyzer(tx=…)`` and
+        ``define_analyzer(tx=…)``, which read committed state where the index is missing or holds another analyzer,
+        count it among the indexes that use *analyzer*. A removal noted before for the same name on *table* is forgotten
+        (:meth:`_forget_index_removals`), and a definition noted before replaced: the last change of a name wins. The
+        commit and the cancel keep it. A raw ``tx.add("DEFINE INDEX …")`` is not noted.
+        """
+        self._forget_index_removals(table, (name,))
+        self._defined_indexes.setdefault(table, {})[name] = analyzer
+
+    def _indexes_defined(self) -> dict[str, dict[str, str]]:
+        """The indexes defined in this transaction and not removed since, by table, each with its analyzer (``""`` for
+        none) — a copy, without the tables left with none (issue #329)."""
+        return {table: dict(indexes) for table, indexes in self._defined_indexes.items() if indexes}
 
     def _note_analyzer_removal(self, name: str) -> None:
         """Note that the analyzer *name* was removed in this transaction — issue #323.

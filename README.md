@@ -6080,13 +6080,21 @@ print(await NoteV2.objects().search(text="physics").count())
 - Prefer `define_indexes()` outside the block: on SurrealDB 2.x, a write to a table that held records, after its index
   in the same block, fails the commit with a retryable `SurrealDbConflictError` that a retry meets again; so does a
   block that removes an index of a table that held records and defines it again, where the index stands as before.
-  Nothing of such a block is committed. On an empty table both commit, as on 3.x.
+  Nothing of such a block is committed. On an empty table both commit, as on 3.x. On SurrealDB 3.x, a block that
+  defines an index and then removes it fails the commit the same way, whatever the table holds; 2.x and the embedded
+  engine commit it.
 - `remove_analyzer(tx=…)` (on SurrealDB 2.x and the embedded engine; 3.x checks in the transaction itself) and
   `define_analyzer(tx=…)` read committed state to find the indexes that use the analyzer. An index `remove_index(tx=…)`
   removed earlier in the block no longer counts, although committed state still holds it: once the block has removed the
   last index that uses an analyzer, it can remove the analyzer, or redefine it without `REBUILD INDEX`, on every engine.
   An index removed then defined again in the block, or removed with a raw `tx.add("REMOVE INDEX …")`, still counts
-  there, and an index queued earlier in a buffered block is not seen.
+  there.
+- An index `define_indexes(tx=…)` defined earlier in the block counts too, with the analyzer the block gave it, although
+  committed state does not hold it yet, or holds it with another analyzer: `remove_analyzer(tx=…)` and
+  `define_analyzer(tx=…)` of that analyzer raise `SurrealDbError` before any DDL, naming the index, on every engine —
+  SurrealDB 3.x included, whose own refusal of the removal used to fail the block. The refusal does not fail the block.
+  An index defined then removed in the block no longer counts, and one the block defined again with another analyzer
+  counts for that analyzer only. A raw `tx.add("DEFINE INDEX …")` is not tracked.
 - Once the block has removed or redefined an analyzer, an index that uses it can no longer be defined in the block,
   whether the model declares the analyzer as an `Analyzer` or names it by `str`: `define_indexes(tx=…)` raises
   `SurrealDbError` before any DDL. A removed analyzer counts as missing, although committed state still holds it — the
