@@ -17,9 +17,10 @@ upper case, equal and hashed by both, with the ``repr`` ``Vector(3, 'F32')``, re
 equal marker; its arguments are checked with exact texts. ``get_vector_info()`` reads ``(dimension, type)`` from a
 model field of either spelling or from an ``Annotated`` annotation, ``None`` from anything else;
 ``is_vector_field()`` tells which. Both read a union of either spelling with ``None`` (``VectorField[3] | None``,
-``Optional[VectorField[3]]``, ``Annotated[list[float], Vector(3)] | None``: issue #318) as the plain spelling, never
-the vectors a container holds (``list[VectorField[3]]``), and refuse with an exact text a field or an annotation holding
-two different markers, or a marker next to a type other than ``None``. ``VectorField[3] | None`` needs its ``= None``
+``Optional[VectorField[3]]``, ``Annotated[list[float], Vector(3)] | None``: issue #318; ``VectorField[3] |
+Literal[None]``, a ``Literal`` of ``None`` only counting as ``None``: issue #327) as the plain spelling, never the vectors
+a container holds (``list[VectorField[3]]``), and refuse with an exact text a field or an annotation holding two
+different markers, or a marker next to a type other than ``None`` (a ``Literal`` holding another value included). ``VectorField[3] | None`` needs its ``= None``
 (Pydantic ignores the default of a union member, with a warning), and checks its values as ``VectorField[3]`` does.
 
 The checks of the vector search's arguments (``TestCheckers``): the distances (``EUCLIDEAN``, ``COSINE``,
@@ -254,8 +255,8 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", UnsupportedFieldAttributeWarning)
 
     class VecUnion(BaseSurrealModel):
-        """The union spellings of a vector field (issue #318), one aliased, none indexed; and vectors held in
-        containers, which are not vector fields."""
+        """The union spellings of a vector field (issue #318), one aliased, one with a ``Literal[None]`` member (issue
+        #327), none indexed; and vectors held in containers, which are not vector fields."""
 
         model_config = SurrealConfigDict(table_name="vec_union")
 
@@ -266,6 +267,7 @@ with warnings.catch_warnings():
         wide: Annotated[list[float], Vector(3, "F64")] | None = None
         aliased: Annotated[list[float], Vector(3)] | None = Field(default=None, alias="aliased_vec")
         noted: Annotated[VectorField[3] | None, "a note"] = None
+        literal: VectorField[3] | Literal[None] = None
         listed: list[VectorField[3]] = Field(default_factory=list)
         keyed: dict[str, VectorField[3]] = Field(default_factory=dict)
         maybe_listed: list[VectorField[3]] | None = None
@@ -279,6 +281,7 @@ _UNION_FIELDS = [
     ("wide", (3, "F64")),
     ("aliased", (3, "F32")),
     ("noted", (3, "F32")),
+    ("literal", (3, "F32")),
 ]
 
 #: The refusal of a field or an annotation whose ``Vector`` markers are ambiguous: its subject, then what it holds.
@@ -299,6 +302,8 @@ _AMBIGUOUS_ANNOTATIONS = [
     (VectorField[2] | VectorField[3] | VectorField[4], "Vector(2, 'F32'), Vector(3, 'F32') and Vector(4, 'F32')"),
     (VectorField[2] | VectorField[3] | list[float], f"Vector(2, 'F32') and Vector(3, 'F32') {_NEXT_TO}"),
     (Annotated[list[float] | None, Vector(3), Vector(4)], "Vector(3, 'F32') and Vector(4, 'F32')"),
+    (VectorField[3] | Literal[None, "x"], f"Vector(3, 'F32') {_NEXT_TO}"),
+    (VectorField[3] | Literal["x"] | None, f"Vector(3, 'F32') {_NEXT_TO}"),
 ]
 _AMBIGUOUS_IDS = [
     "str",
@@ -310,6 +315,8 @@ _AMBIGUOUS_IDS = [
     "three-markers",
     "two-and-a-type",
     "two-in-one-annotated",
+    "literal-none-and-a-value",
+    "literal-value",
 ]
 
 #: An ambiguous union as a name (a string in an annotation reads as a forward reference).
@@ -682,6 +689,11 @@ class TestVectorMarker:
             (Annotated[VectorField[3] | None, "a note"], (3, "F32")),
             (Annotated[list[float], Vector(2)] | Annotated[list[float] | None, Vector(2)], (2, "F32")),
             (Annotated[VectorField[4] | None, Vector(3)], (3, "F32")),
+            (VectorField[3] | Literal[None], (3, "F32")),
+            (Literal[None] | VectorField[3, "F64"], (3, "F64")),
+            (Annotated[list[float], Vector(3)] | Literal[None], (3, "F32")),
+            (VectorField[3] | Literal[None] | None, (3, "F32")),
+            (Annotated[Literal[None], "a note"] | VectorField[3], (3, "F32")),
         ],
         ids=[
             "or-none",
@@ -694,6 +706,11 @@ class TestVectorMarker:
             "noted",
             "one-marker-twice",
             "outer-marker",
+            "literal-none",
+            "literal-none-first",
+            "typed-literal-none",
+            "literal-none-and-none",
+            "noted-literal-none",
         ],
     )
     def test_the_union_spellings_of_an_annotation(self, annotation: Any, info: tuple[int, str]) -> None:
@@ -1404,6 +1421,7 @@ def _vec_union_bad(indexes: object) -> type[BaseSurrealModel]:
             typed: Annotated[list[float], Vector(3)] | None = None
             wide: Annotated[list[float], Vector(3, "F64")] | None = None
             aliased: Annotated[list[float], Vector(3)] | None = Field(default=None, alias="aliased_vec")
+            literal: VectorField[3] | Literal[None] = None
 
     return VecUnionBad
 
@@ -1574,6 +1592,11 @@ class TestClassChecks:
                 _hnsw("vec_a", "aliased", vector_type="i32"),
                 _IC8.format("VecUnionBad", "vec_a", 3, "I32", "aliased", 3, "F32"),
             ),
+            (_hnsw("vec_a", "literal", dimension=4), _IC8.format("VecUnionBad", "vec_a", 4, "F32", "literal", 3, "F32")),
+            (
+                _hnsw("vec_a", "literal", vector_type="f64"),
+                _IC8.format("VecUnionBad", "vec_a", 3, "F64", "literal", 3, "F32"),
+            ),
         ],
         ids=[
             "or-none-dimension",
@@ -1586,6 +1609,8 @@ class TestClassChecks:
             "typed-f64-dimension",
             "alias-column",
             "alias-name",
+            "literal-none-dimension",
+            "literal-none-type",
         ],
     )
     def test_ic8_on_each_union_spelling(self, index: Index, text: str) -> None:
@@ -1599,6 +1624,7 @@ class TestClassChecks:
             _hnsw("vec_c", "typed", vector_type="f32"),
             _hnsw("vec_d", "wide", vector_type="F64", efc=100, m=8),
             _hnsw("vec_e", "aliased_vec"),
+            _hnsw("vec_f", "literal", dist="cosine"),
         ]
         assert _vec_union_bad(indexes).get_indexes() == tuple(indexes)
 
@@ -1672,8 +1698,20 @@ class TestFieldKind:
             (Annotated[list[float], Vector(2)], "option<array<float, 2>>"),
             (list[VectorField[3]], "array<option<array<float, 3>>>"),
             (list[float] | None, "option<array<float>>"),
+            (VectorField[3] | Literal[None], "option<array<float, 3>>"),
+            (Annotated[list[float], Vector(2, "F64")] | Literal[None], "option<array<float, 2>>"),
         ],
-        ids=["vector-field", "vector-field-i16", "typed", "typed-f64", "typed-not-optional", "list-of-vectors", "plain"],
+        ids=[
+            "vector-field",
+            "vector-field-i16",
+            "typed",
+            "typed-f64",
+            "typed-not-optional",
+            "list-of-vectors",
+            "plain",
+            "literal-none",
+            "typed-literal-none",
+        ],
     )
     def test_the_kind_of_an_annotation(self, annotation: Any, text: str) -> None:
         assert render_kind(model_ddl.field_kind(annotation)) == text
@@ -1695,7 +1733,7 @@ class TestFieldKind:
         assert VecUnion.table_ddl()[1:] == [
             *(
                 f"DEFINE FIELD OVERWRITE `{column}` ON `vec_union` TYPE option<array<float, 3>>;"
-                for column in ("optional", "legacy", "typed", "wide", "aliased_vec", "noted")
+                for column in ("optional", "legacy", "typed", "wide", "aliased_vec", "noted", "literal")
             ),
             "DEFINE FIELD OVERWRITE `listed` ON `vec_union` TYPE array<option<array<float, 3>>>;",
             "DEFINE FIELD OVERWRITE `keyed` ON `vec_union` TYPE object;",
