@@ -6585,6 +6585,19 @@ _EMBEDDED_REMOVED_AGAIN_ROW = [
     "the same on 3.x; on 2.x, on a table holding records, the commit fails with a retryable conflict",
     "v0.36.2",
 ]
+#: Issue #329: the sentence v0.36.6 adds to the 2.x/3.x table's intro and its row there, cell by cell — what
+#: ``test_an_index_defined_then_removed_in_the_block`` pins. The embedded engine's table has no row for it: the prose
+#: of section 36 describes that engine.
+_HEADER_SENTENCE_366 = (
+    "The row added in v0.36.6 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
+    "identical on 3.1.5."
+)
+_DEFINED_THEN_REMOVED_ROW = [
+    "`define_indexes(tx=)` then `remove_index(tx=)` in one block, the index not stored before the block",
+    "committed: the index absent after the commit, whatever the table holds",
+    "the commit fails with a retryable `SurrealDbConflictError`, whatever the table holds: nothing committed",
+    "v0.36.6",
+]
 _FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
 #: The roadmap from v0.34.0: v0.36.0 ships vector search, so the planned range starts at v0.37.0.
 _ROADMAP_ROWS_36 = [
@@ -6739,6 +6752,12 @@ class TestReadmeSection36:
         assert_server_rows([_REMOVED_AGAIN_ROW])
         assert_server_header_sentence(_HEADER_SENTENCE_362)
         assert_embedded_rows([_EMBEDDED_REMOVED_AGAIN_ROW])
+
+    def test_index_defined_then_removed_in_a_transaction_row(self) -> None:
+        """Issue #329: v0.36.6's one row in the 2.x/3.x table, cell by cell and in version order, and its sentence in
+        the table's intro; widths kept."""
+        assert_server_rows([_DEFINED_THEN_REMOVED_ROW])
+        assert_server_header_sentence(_HEADER_SENTENCE_366)
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]
