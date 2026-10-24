@@ -1439,7 +1439,9 @@ class BaseSurrealModel(BaseModel):
         refuses or a statement is refused at once. ``remove_analyzer()`` and ``define_analyzer()`` with the same *tx*
         count those indexes, although committed state does not hold them yet (or holds them with another analyzer):
         removing or redefining their analyzer later in the block is refused before any DDL, on every engine. An index
-        :meth:`remove_index` then removes with the same *tx* no longer counts.
+        :meth:`remove_index` then removes with the same *tx* no longer counts. Without *overwrite*, an index defined
+        with ``IF NOT EXISTS`` keeps the block's earlier definition — another model's on the same table, with another
+        analyzer — and so does the note: that index counts with the analyzer the block gave it first.
 
         Names are written in backticks, filters re-rendered from a closed grammar, numbers from Python numbers,
         comments as string literals. A refusal names the analyzer or the index and its table, never the statement:
@@ -1556,8 +1558,9 @@ class BaseSurrealModel(BaseModel):
             # Noted once applied or queued: every refusal above notes nothing. Issue #312: an index defined again is no
             # longer missing (its removal is forgotten). Issue #329: remove_analyzer(tx=…) and define_analyzer(tx=…)
             # read committed state, which does not hold these definitions yet, or holds them with another analyzer.
+            # Without overwrite, each is a DEFINE INDEX IF NOT EXISTS: one this block defined earlier stays as it was.
             for name, _ in definitions:
-                tx._note_index_definition(table, name, analyzer_of[name])
+                tx._note_index_definition(table, name, analyzer_of[name], if_not_exists=not overwrite)
         applied += await apply_rebuilds(client, tx, own_rebuilds)
         warn_redefined(redefine, [*other_rebuilds, *redefined_indexes, *own_rebuilds])
         return applied

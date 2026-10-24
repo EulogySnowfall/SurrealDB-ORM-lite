@@ -42,8 +42,10 @@ analyzer (``_note_index_definition``, ``""`` for none), once the statements are 
 nothing. ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` count them among the indexes that use their analyzer
 (``_indexes_defined``), although committed state does not hold them yet, or holds them with another analyzer. The last
 change of an index name wins: a definition forgets the removal noted for that name and replaces an earlier definition;
-a removal drops the definition. The commit and the cancel keep the note; a statement a buffered commit refuses leaves
-it as noted, like the other notes. A raw ``tx.add("DEFINE INDEX …")`` is not noted.
+a removal drops the definition. A ``DEFINE INDEX IF NOT EXISTS`` (``define_indexes(overwrite=False, tx=…)``) is the
+exception: it leaves an index the block defined earlier as it is, and the note keeps that definition. The commit and
+the cancel keep the note; a statement a buffered commit refuses leaves it as noted, like the other notes. A raw
+``tx.add("DEFINE INDEX …")`` is not noted.
 
 Analyzers changed (issue #323): ``remove_analyzer(tx=…)`` notes the analyzer it removes (``_note_analyzer_removal``),
 ``define_analyzer(tx=…)`` the one it defines or redefines (``_note_analyzer_definition``); the last change of a name
@@ -350,7 +352,7 @@ class Transaction(ABC):
         if removed is not None:
             removed.difference_update(names)
 
-    def _note_index_definition(self, table: str, name: str, analyzer: str) -> None:
+    def _note_index_definition(self, table: str, name: str, analyzer: str, *, if_not_exists: bool = False) -> None:
         """Note that the index *name* of *table* was defined or redefined in this transaction with the analyzer
         *analyzer* (``""`` for none) — issue #329.
 
@@ -358,11 +360,16 @@ class Transaction(ABC):
         (interactive) or queued (buffered): a refusal notes nothing. ``remove_analyzer(tx=…)`` and
         ``define_analyzer(tx=…)``, which read committed state where the index is missing or holds another analyzer,
         count it among the indexes that use *analyzer*. A removal noted before for the same name on *table* is forgotten
-        (:meth:`_forget_index_removals`), and a definition noted before replaced: the last change of a name wins. The
-        commit and the cancel keep it. A raw ``tx.add("DEFINE INDEX …")`` is not noted.
+        (:meth:`_forget_index_removals`), and a definition noted before replaced: the last change of a name wins. With
+        *if_not_exists* (a ``DEFINE INDEX IF NOT EXISTS``, ``define_indexes(overwrite=False, tx=…)``), a definition
+        noted before for the name is kept instead: the statement leaves the index the block defined earlier as it is.
+        The commit and the cancel keep it. A raw ``tx.add("DEFINE INDEX …")`` is not noted.
         """
+        defined = self._defined_indexes.setdefault(table, {})
+        if if_not_exists and name in defined:
+            return
         self._forget_index_removals(table, (name,))
-        self._defined_indexes.setdefault(table, {})[name] = analyzer
+        defined[name] = analyzer
 
     def _indexes_defined(self) -> dict[str, dict[str, str]]:
         """The indexes defined in this transaction and not removed since, by table, each with its analyzer (``""`` for

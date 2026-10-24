@@ -1696,6 +1696,26 @@ class TestIndexDefinitionNote:
             copy["v"] = {"a": "fts_plain"}
             assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}}
 
+    def test_an_index_defined_if_not_exists_keeps_the_earlier_definition(self) -> None:
+        """``define_indexes(overwrite=False, tx=…)`` defines with ``IF NOT EXISTS``, which leaves an index the block
+        defined earlier as it is: the definition noted for that name is kept. With no definition noted for the name on
+        its table — none yet, another table's, or one a removal dropped — the index is defined, and noted."""
+        for tx in TestIndexRemovalNote._transactions():
+            tx._note_index_definition("t", "a", "fts_plain")
+            tx._note_index_definition("t", "a", "fts_p", if_not_exists=True)
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain"}}
+            tx._note_index_definition("t", "b", "", if_not_exists=True)
+            tx._note_index_definition("u", "a", "fts_p", if_not_exists=True)
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}, "u": {"a": "fts_p"}}
+            # After a removal the index is missing: defined again, the removal forgotten.
+            tx._note_index_removal("t", "a")
+            tx._note_index_definition("t", "a", "fts_p", if_not_exists=True)
+            assert tx._indexes_defined() == {"t": {"a": "fts_p", "b": ""}, "u": {"a": "fts_p"}}
+            assert tx._indexes_removed("t") == frozenset()
+            # OVERWRITE replaces it, as before.
+            tx._note_index_definition("t", "a", "fts_plain")
+            assert tx._indexes_defined() == {"t": {"a": "fts_plain", "b": ""}, "u": {"a": "fts_p"}}
+
     async def test_kept_by_the_commit_and_the_cancel(self) -> None:
         for tx in TestIndexRemovalNote._transactions():
             tx._note_index_definition("t", "a", "fts_plain")
@@ -3437,9 +3457,9 @@ _REMOVED_AGAIN_PIN_2X = (
 
 #: The assertion message of the pin of an index defined then removed in one transaction, on SurrealDB 3.x.
 _DEFINED_REMOVED_PIN_3X = (
-    "README section 36, Transactions (issue #329): SurrealDB 3.x fails the commit of a block that defines an index and "
-    "then removes it with a retryable conflict, whatever the table holds. If this fails, 3.x commits it now: the README "
-    "sentence can be reconsidered."
+    "README section 36, Transactions, and the v0.36.6 row of the 2.x/3.x table (issue #329): SurrealDB 3.x fails the "
+    "commit of a block that defines an index and then removes it with a retryable conflict, whatever the table holds. "
+    "If this fails, 3.x commits it now: the README sentence and the row can be reconsidered."
 )
 
 #: The assertion message of the materialized-view pin on SurrealDB 3.x.
@@ -5146,6 +5166,42 @@ class TestIndexesDefinedInTheBlockE2E:
         assert indexes == {}
         assert created == []
 
+    @pytest.mark.parametrize("table", ["no-table", "empty-table", "table-holding-a-record"])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_defined_then_removed_in_the_block(self, kind: str, table: str) -> None:
+        """The v0.36.6 row of the 2.x/3.x table: ``define_indexes(tx=…)``, then ``remove_index(tx=…)`` of that index,
+        not stored before the block. SurrealDB 2.x and the embedded engine commit the block: the index is absent
+        after the commit. SurrealDB 3.x fails the commit with a retryable conflict, whatever the table holds: nothing
+        committed. Either way no index is left, and the table takes writes."""
+        async with _fts_models(kind) as client:
+            server = None if kind == "mem" else await _major(client)
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            if table == "empty-table":
+                await _apply_ddl(client, "DEFINE TABLE `fts_post` SCHEMALESS;")
+            elif table == "table-holding-a-record":
+                await FtsPost(id="p1", title="Physics Rocks").save()
+            failed: SurrealDbError | None = None
+            try:
+                async with SurrealDBConnectionManager.transaction("fts") as tx:
+                    defined = await FtsPost.define_indexes(tx=tx)
+                    removed = await FtsPost.remove_index("fts_post_title", tx=tx)
+            except SurrealDbError as error:
+                failed = error
+            indexes = await _indexes(client, "fts_post")
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+            kept = await FtsPost.objects().count()
+        assert defined == FtsPost.index_ddl(line=2 if server != 3 else 3)[1:]
+        assert removed == "REMOVE INDEX IF EXISTS `fts_post_title` ON `fts_post`;"
+        if server == 3:
+            assert type(failed) is SurrealDbConflictError, _DEFINED_REMOVED_PIN_3X
+        else:
+            assert failed is None, (
+                "README row 'define_indexes(tx=) then remove_index(tx=)': 2.x and the embedded engine commit it"
+            )
+        assert indexes == {}
+        assert created == []
+        assert kept == (2 if table == "table-holding-a-record" else 1)
+
     @_ANALYZER_DDL
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_index_the_block_defined_again_with_another_analyzer(self, kind: str, ddl: str) -> None:
@@ -5178,6 +5234,58 @@ class TestIndexesDefinedInTheBlockE2E:
         state = indexes["fts_post_title"]
         assert state is not None and state.search_analyzer == "fts_p"
         assert created == []
+
+    @_ANALYZER_DDL
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_defined_if_not_exists_keeps_the_blocks_earlier_definition(
+        self, kind: str, ddl: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``FTS_PLAIN`` and ``FTS_P`` committed, a record of ``fts_post`` committed, ``fts_post_title`` not yet defined:
+        ``FtsPost.define_indexes(tx=…)``, then ``FtsPostP.define_indexes(overwrite=False, tx=…)``, whose ``DEFINE
+        INDEX IF NOT EXISTS`` leaves the block's earlier definition in place. The note keeps ``fts_plain``, so the
+        removal or redefinition of ``fts_plain`` is refused before any DDL, on every engine, and the block commits the
+        index with ``fts_plain``: a search finds the record. The second call used to note ``fts_p``, and the analyzer DDL
+        to join the transaction — leaving the index without its analyzer, or with the tokens of the old definition."""
+        async with _fts_models(kind) as client:
+            major = await _major(client)
+            line = await _keyword_line(client)
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            await SurrealDBConnectionManager.define_analyzer(FTS_P)
+            await FtsPost(id="p1", title="Physics Rocks").save()
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                await FtsPost.define_indexes(tx=tx)
+                again = await FtsPostP.define_indexes(overwrite=False, tx=tx)
+                noted = tx._indexes_defined()
+                queued = list(getattr(tx, "statements", []))
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as refused:
+                    await _analyzer_ddl(ddl, tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                still = list(getattr(tx, "statements", []))
+                changed = (tx._analyzers_removed(), tx._analyzers_defined())
+            analyzers = await _stored_analyzers(client)
+            indexes = await _indexes(client, "fts_post")
+            created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
+            found = await FtsPost.objects().search(title="Physics").count()
+        assert again == FtsPostP.index_ddl(overwrite=False, line=line)[1:]
+        assert noted == {"fts_post": {"fts_post_title": "fts_plain"}}
+        assert type(refused.value) is SurrealDbError
+        if ddl == "removal":
+            assert str(refused.value) == search.analyzer_in_use_refused("fts_plain", "fts_post_title", "fts_post")
+            reads = [("version", None)] if major >= 3 else [("version", None), *_query(_INFO_DB), *_query(_INFO_POST)]
+        else:
+            assert str(refused.value) == _DA2
+            reads = [*_query(_INFO_DB), *_query(_INFO_POST)]
+        assert sent == reads
+        assert still == queued
+        assert changed == (frozenset(), frozenset())
+        assert sorted(analyzers) == ["fts_p", "fts_plain"]
+        assert search.analyzer_matches(FTS_PLAIN, analyzers["fts_plain"])
+        state = indexes["fts_post_title"]
+        assert state is not None and state.search_analyzer == "fts_plain"
+        assert created == []
+        assert found == 2
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_define_indexes_notes_the_indexes_it_defines(self, kind: str) -> None:
