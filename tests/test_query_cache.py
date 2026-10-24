@@ -23,7 +23,7 @@ import math
 import random
 import re
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -67,12 +67,16 @@ from tests.conftest import _ws_url, default_connection_class
 from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
 from tests.test_time_travel import (
     _SERVER_BEHAVIOUR,
+    M2021,
+    Snap,
     _forbidden_client,
     _http_url,
     _line,
     _record_queries,
     connected,
 )
+from tests.test_transactions import _ARGUMENT_REFUSALS
+from tests.test_views import _QUERYSET_TX_WRITES, _stats
 
 # --- models (spec §9) ---------------------------------------------------------------------------------
 
@@ -1565,6 +1569,53 @@ class _Guarded(_Writer):
         return _in_flight()
 
 
+def _check_arguments(arguments: Mapping[str, Any]) -> None:
+    """A ``refuse_args`` hook (#320): records what it got on the writer, without the writer; refuses ``"bad"``."""
+    writer = arguments["self"]
+    writer.calls.append(("refuse_args", {name: value for name, value in arguments.items() if name != "self"}))
+    if "bad" in (arguments.get("value"), *arguments.get("kwargs", {}).values()):
+        raise ValueError("bad argument")
+
+
+class _ArgGuarded(_Writer):
+    """A model whose writes check their arguments through ``invalidates(refuse_args=)`` (#320), after their own
+    refusals (``save()``): *refusal* is the ``TypeError`` those raise (``None``: none); *calls* records the hooks run,
+    with the arguments ``refuse_args`` got, and the bodies entered."""
+
+    def __init__(self, calls: list[Any] | None = None, refusal: str | None = None) -> None:
+        self.calls = calls if calls is not None else []
+        self.refusal = refusal
+
+    def _refuse(self) -> None:
+        self.calls.append("refuse")
+        if self.refusal is not None:
+            raise TypeError(self.refusal)
+
+    @cache.invalidates("self", refuse=lambda writer: writer._refuse(), refuse_args=_check_arguments)
+    async def save(self, value: str = "", tx: Any = None, **extra: Any) -> Any:
+        self.calls.append("body")
+        return _in_flight()
+
+    @cache.invalidates("self", deletes=True, refuse_args=_check_arguments)
+    async def delete(self, value: str = "", tx: Any = None) -> Any:
+        self.calls.append("body")
+        return _in_flight()
+
+
+class _GuardedQs(_Qs):
+    """A queryset whose writes run the queryset's refusals and their argument checks through ``invalidates()``
+    (#320); *calls* is ``_ArgGuarded``'s."""
+
+    def __init__(self, table: str, tx: Any = None) -> None:
+        super().__init__(table, tx)
+        self.calls: list[Any] = []
+
+    @cache.invalidates("queryset", refuse=lambda qs: qs.calls.append("refuse"), refuse_args=_check_arguments)
+    async def bulk_update(self, **kwargs: Any) -> Any:
+        self.calls.append("body")
+        return _in_flight()
+
+
 class _Manager:
     @classmethod
     @cache.invalidates("all")
@@ -1744,6 +1795,92 @@ class TestInvalidatesDecorator:
             await guarded.save(1, 2, 3)
         assert str(raised.value) != "refused"
         assert guarded.calls == []
+        checked = _ArgGuarded()
+        with pytest.raises(TypeError):
+            await checked.save("a", None, "extra positional")  # type: ignore[call-arg]
+        assert checked.calls == []
+
+    async def test_refuse_args_gets_the_bound_arguments_with_their_defaults(self) -> None:
+        """#320: ``refuse_args`` gets every argument by name, as bound, defaults applied (``**extra`` as a dict), after
+        ``refuse`` and before the body."""
+        guarded = _ArgGuarded()
+        assert await guarded.save("a") == ({"w": 1}, 0)
+        await guarded.save(value="b", tx=None, note=1)
+        assert guarded.calls == [
+            "refuse",
+            ("refuse_args", {"value": "a", "tx": None, "extra": {}}),
+            "body",
+            "refuse",
+            ("refuse_args", {"value": "b", "tx": None, "extra": {"note": 1}}),
+            "body",
+        ]
+
+    async def test_a_refused_argument_comes_before_any_note_or_flight(self) -> None:
+        """#320: a call ``refuse_args`` refuses leaves the transaction and the cache as they were — no table noted,
+        written with records or for the query cache, none put in flight — with a transaction or without, ``EDGES``
+        included, and enters no body; on a queryset too, whose transaction is its ``objects(tx=)``'s."""
+        QueryCache.set("k", 1, "w")
+        QueryCache.set("e", 2, EDGES)
+        QueryCache.set("q", 3, "q")
+        tx = _RecordTx()
+        guarded = _ArgGuarded()
+        queryset = _GuardedQs("q", tx)
+        for write in (
+            lambda: guarded.save("bad", tx=tx),
+            lambda: guarded.save("bad"),
+            lambda: guarded.delete("bad", tx),
+            lambda: guarded.delete("bad"),
+            lambda: queryset.bulk_update(value="bad"),
+            lambda: _GuardedQs("q").bulk_update(value="bad"),
+        ):
+            with pytest.raises(ValueError, match="^bad argument$"):
+                await write()
+        assert (tx.noted, tx.records) == ([], [])
+        assert (QueryCache.get("k"), QueryCache.get("e"), QueryCache.get("q")) == (1, 2, 3)
+        assert _in_flight() == ({}, 0)
+        assert "body" not in guarded.calls
+        assert queryset.calls == ["refuse", ("refuse_args", {"kwargs": {"value": "bad"}})]
+
+    async def test_arguments_the_hook_lets_through(self) -> None:
+        tx = _RecordTx()
+        queryset = _GuardedQs("q", tx)
+        assert await queryset.bulk_update(value="ok") == ({}, 0)
+        assert await _ArgGuarded().delete("ok", tx) == ({}, 0)
+        assert queryset.calls == ["refuse", ("refuse_args", {"kwargs": {"value": "ok"}}), "body"]
+        assert tx.noted == [frozenset({"q"}), frozenset({"w", EDGES})]
+        assert tx.records == [frozenset({"q"}), frozenset({"w", EDGES})]
+
+    async def test_the_arguments_come_after_the_connection_check_and_the_refusals(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#320: the refusal order — ``routing.check_transaction()``, the method's own refusals (``refuse``), then its
+        arguments (``refuse_args``) — holds when each of them would refuse the call."""
+        calls: list[Any] = []
+
+        def check_transaction(model: type, tx: object, operation: str) -> None:
+            calls.append(f"check {operation}")
+            raise SurrealDbError("another connection")
+
+        guarded = _ArgGuarded(calls=calls, refusal="refused")
+        monkeypatch.setattr(cache._routing, "check_transaction", check_transaction)
+        with pytest.raises(SurrealDbError, match="another connection"):
+            await guarded.save("bad", tx=_Tx())
+        assert calls == ["check _ArgGuarded.save()"]
+        monkeypatch.undo()
+        with pytest.raises(TypeError, match="^refused$"):
+            await guarded.save("bad", tx=_Tx())
+        assert calls == ["check _ArgGuarded.save()", "refuse"]
+        guarded.refusal = None
+        tx = _Tx()
+        with pytest.raises(ValueError, match="^bad argument$"):
+            await guarded.save("bad", tx=tx)
+        assert calls == [
+            "check _ArgGuarded.save()",
+            "refuse",
+            "refuse",
+            ("refuse_args", {"value": "bad", "tx": tx, "extra": {}}),
+        ]
+        assert tx.noted == []
 
     def test_an_unknown_resolver_is_refused(self) -> None:
         with pytest.raises(ValueError, match="invalidates"):
@@ -1771,6 +1908,67 @@ class TestInvalidatesDecorator:
         release.set()
         await write
         assert QueryCache.stats()["entries"] == 0
+
+
+#: #320: ORM writes refused before any request, outside a transaction: (test id, the call, the error, its message as a
+#: pattern). The QuerySet writes on a materialized view (W1) and on a queryset read ``as_of()`` (T5), ``bulk_create()``
+#: with a snapshot in its list, and every argument refusal of ``tests/test_transactions.py``.
+_REFUSED_OUTSIDE_A_TRANSACTION: list[tuple[str, Callable[[], Awaitable[Any]], type[Exception], str]] = [
+    *(
+        (f"view-{name}", functools.partial(write, _stats(), None), TypeError, "^Cannot modify materialized view")
+        for name, _call, write in _QUERYSET_TX_WRITES
+    ),
+    *(
+        (f"as_of-{method}", functools.partial(write, M2021), SurrealDbError, rf"^{method}\(\) is not available on a queryset")
+        for method, write in [
+            ("bulk_create", lambda moment: Snap.objects().as_of(moment).bulk_create([Snap(id="x")])),
+            ("bulk_update", lambda moment: Snap.objects().as_of(moment).bulk_update(n=1)),
+            ("bulk_delete", lambda moment: Snap.objects().as_of(moment).bulk_delete()),
+            ("patch", lambda moment: Snap.objects().as_of(moment).patch([{"op": "replace", "path": "/n", "value": 1}])),
+            ("delete_table", lambda moment: Snap.objects().as_of(moment).delete_table()),
+        ]
+    ),
+    (
+        "bulk_create-snapshot",
+        lambda: Snap.objects().bulk_create([QuerySet._mark_snapshots(Snap(id="a"), M2021)]),
+        SurrealDbError,
+        r"^Snap\.bulk_create\(\) cannot run on an instance read with as_of\(\)",
+    ),
+    *(
+        (f"argument-{name}", functools.partial(write, None), error, pattern)
+        for name, _tables, write, error, pattern in _ARGUMENT_REFUSALS
+    ),
+]
+
+#: The tables the writes of :data:`_REFUSED_OUTSIDE_A_TRANSACTION` would put in flight, ``EDGES`` included.
+_REFUSED_TABLES = ("order_stats", "Snap", "tx_args", "tx_args_edge", EDGES)
+
+
+class TestRefusedWritesKeepTheCache:
+    """#320: outside a transaction, an ORM write refused before any request — by the model's or the queryset's own
+    refusals, or for one of its arguments — puts no table in flight and drops no cached read, as a write the model
+    refuses since v0.36.1: the refusal runs in the method's ``invalidates()`` hooks, before ``cache.writing()``."""
+
+    @pytest.mark.parametrize(
+        ("name", "write", "error", "pattern"),
+        _REFUSED_OUTSIDE_A_TRANSACTION,
+        ids=[row[0] for row in _REFUSED_OUTSIDE_A_TRANSACTION],
+    )
+    async def test_a_refused_write_drops_no_cached_read(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        write: Callable[[], Awaitable[Any]],
+        error: type[Exception],
+        pattern: str,
+    ) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+        for table in _REFUSED_TABLES:
+            QueryCache.set(table, [table], table)
+        with pytest.raises(error, match=pattern):
+            await write()
+        assert {table: QueryCache.get(table) for table in _REFUSED_TABLES} == {table: [table] for table in _REFUSED_TABLES}
+        assert _in_flight() == ({}, 0)
 
 
 # --- spec §6.5: transactions note the tables written and invalidate them at commit ----------------------

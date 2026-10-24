@@ -755,10 +755,10 @@ _MODEL_RESOLVERS: Final = frozenset({"self", "cls", "edge"})
 def _resolve(
     of: _Of, first: str, bound: inspect.BoundArguments, has_tx: bool, deletes: bool
 ) -> tuple[frozenset[str] | None, Any]:
-    """The tables a call writes and the transaction it joins; every table when resolving raises."""
+    """The tables a call writes and the transaction it joins; every table when resolving raises. *bound* has its
+    defaults applied."""
     tx: Any = None
     try:
-        bound.apply_defaults()
         if has_tx:
             tx = bound.arguments.get("tx")
         if of == "all":
@@ -791,7 +791,12 @@ def _note_records(tables: frozenset[str] | None, tx: Any) -> None:
 
 
 def invalidates(
-    of: _Of, *, deletes: bool = False, records: bool = True, refuse: Callable[[Any], None] | None = None
+    of: _Of,
+    *,
+    deletes: bool = False,
+    records: bool = True,
+    refuse: Callable[[Any], None] | None = None,
+    refuse_args: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> Callable[[F], F]:
     """Decorate an ORM write method so that it invalidates the cached reads it can change.
 
@@ -813,11 +818,16 @@ def invalidates(
     on the transaction, so a refused write invalidates nothing. The transaction is read statically, never asked. A
     queryset's transaction is checked by ``objects(tx=)``.
 
-    ``refuse`` (issue #315) runs the method's own refusals — the model's materialized-view, snapshot and excluded
-    signup field checks — with the call's first argument, right after that connection check and before the tables
-    are noted on the transaction or put in flight, with a transaction or without. Whatever it raises propagates: a
-    write it refuses leaves the transaction as it was (no statement, no table noted) and invalidates nothing. It is
-    not called when the arguments do not bind (Python raises the function's own error).
+    ``refuse`` (issue #315) runs the method's own refusals with the call's first argument: the model's
+    materialized-view, snapshot and excluded signup field checks, or a queryset's materialized-view and ``as_of()``
+    checks (issue #320). Then ``refuse_args`` (issue #320) runs the checks of the call's other arguments that need no
+    request — a missing id, invalid patch operations, ``extra_vars`` without ``server_values``, a snapshot in
+    ``bulk_create()``'s list… — with the bound arguments by name, defaults applied. Both run right after that
+    connection check and before the tables are noted on the transaction or put in flight, with a transaction or
+    without, so the refusal order is the connection, the method's own refusals, then the arguments. They send nothing
+    and never ask the transaction. Whatever they raise propagates: a write they refuse leaves the transaction as it was
+    (no statement, no table noted) and invalidates nothing — no table in flight, no cached read dropped. Neither is
+    called when the arguments do not bind (Python raises the function's own error).
     """
     if of not in _RESOLVERS:
         raise ValueError(f"invalidates() takes one of {sorted(_RESOLVERS)}, not {of!r}")
@@ -833,6 +843,7 @@ def invalidates(
                 bound = signature.bind(*args, **kwargs)
             except TypeError:
                 return await func(*args, **kwargs)  # Python raises the function's own error
+            bound.apply_defaults()
             tables, tx = _resolve(of, first, bound, has_tx, deletes)
             if tx is not None and of in _MODEL_RESOLVERS and first in bound.arguments:
                 arg0 = bound.arguments[first]
@@ -840,6 +851,8 @@ def invalidates(
                 _routing.check_transaction(model, tx, f"{model.__name__}.{func.__name__}()")
             if refuse is not None and first in bound.arguments:
                 refuse(bound.arguments[first])
+            if refuse_args is not None:
+                refuse_args(bound.arguments)
             if records and tx is not None:
                 _note_records(tables, tx)
             async with writing(tables, tx):

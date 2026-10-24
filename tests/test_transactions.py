@@ -2,15 +2,24 @@ import asyncio
 import contextlib
 import os
 import traceback
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from typing import Any
 
 import pytest
+from pydantic import field_serializer
+from pydantic_core import PydanticSerializationError
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
+    BaseSurrealEdge,
     BaseSurrealModel,
+    Computed,
+    Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    SurrealFunc,
+    computed,
 )
 from surreal_orm_lite.concurrency import is_conflict_error
 from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
@@ -1905,3 +1914,348 @@ class TestEmbeddedCommitErrorE2E:
             with pytest.raises(SurrealDbConflictError, match="can be retried"):
                 async with SurrealDBConnectionManager.transaction() as tx:
                     await TxFailRow(id="ok", age=1).save(tx=tx)
+
+
+# --- #320: a write refused for its arguments leaves the transaction as it was --------------------------------------
+
+
+class TxArgs(BaseSurrealModel):
+    """A model whose writes the ORM refuses for their arguments (#320); ``double`` is a computed field."""
+
+    model_config = SurrealConfigDict(table_name="tx_args")
+
+    id: str | None = None
+    n: int = 0
+    tags: list[str] = []
+    double: Computed[int] = computed("n * 2")
+
+
+class TxArgsEdge(BaseSurrealEdge):
+    """An edge, whose ``save()`` refuses ``server_values``/``extra_vars`` (#320)."""
+
+    model_config = SurrealConfigDict(table_name="tx_args_edge")
+
+    quantity: int = 1
+
+
+def _tx_args_edge() -> TxArgsEdge:
+    return TxArgsEdge(in_=RecordID("tx_args", "a"), out=RecordID("tx_args", "b"))
+
+
+_NO_ID = (SurrealDbError, "^atomic operations require an explicit id")
+_ONE = SurrealFunc("1")
+
+#: #320: each write the ORM refuses for one of its arguments, without a request: (test id, the tables the write
+#: would note, the call made with the transaction *tx*, the error, its message as a pattern). v0.36.4 and before
+#: checked them in the method's body, after the wrapper had noted the tables on the transaction (outside one: put
+#: them in flight, dropping their cached reads at the end).
+_ARGUMENT_REFUSALS: list[tuple[str, frozenset[str], Callable[[Any], Awaitable[Any]], type[Exception], str]] = [
+    # update(), delete(), patch() (issue #320, "Path 2").
+    (
+        "update-no-id",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(n=1).update(tx=tx),
+        SurrealDbError,
+        r"^Can't update data, no id found\.$",
+    ),
+    (
+        "delete-no-id",
+        frozenset({"tx_args", "<edges>"}),
+        lambda tx: TxArgs(n=1).delete(tx=tx),
+        SurrealDbError,
+        r"^Can't delete data, no id found\.$",
+    ),
+    (
+        "patch-bad-op",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").patch([{"op": "nope", "path": "/n"}], tx=tx),
+        ValueError,
+        r"^patch operation #0 has invalid op 'nope'",
+    ),
+    (
+        "patch-not-a-list",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").patch([], tx=tx),
+        ValueError,
+        "^patch operations must be a non-empty list",
+    ),
+    (
+        "patch-computed",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").patch([{"op": "replace", "path": "/double", "value": 4}], tx=tx),
+        ValueError,
+        r"^patch\(\): double is a computed field",
+    ),
+    (
+        "patch-no-id",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(n=1).patch([{"op": "replace", "path": "/n", "value": 4}], tx=tx),
+        SurrealDbError,
+        r"^patch\(\) requires an explicit id \(there is nothing to patch without one\)\.$",
+    ),
+    # An edge's save() (issue #320, "Path 2").
+    (
+        "edge-save-server_values",
+        frozenset({"tx_args_edge"}),
+        lambda tx: _tx_args_edge().save(tx=tx, server_values={"quantity": _ONE}),
+        SurrealDbError,
+        r"^save\(server_values=\) is not available on an edge",
+    ),
+    (
+        "edge-save-extra_vars",
+        frozenset({"tx_args_edge"}),
+        lambda tx: _tx_args_edge().save(tx=tx, extra_vars={"step": 1}),
+        SurrealDbError,
+        r"^save\(server_values=\) is not available on an edge",
+    ),
+    # save() and merge() with server_values/extra_vars, merge() without an id.
+    (
+        "save-extra_vars-alone",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").save(tx=tx, extra_vars={"step": 1}),
+        ValueError,
+        "^extra_vars requires server_values",
+    ),
+    (
+        "save-server_values-not-a-function",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").save(tx=tx, server_values={"n": "1"}),
+        TypeError,
+        r"^server_values\['n'\] must be a SurrealFunc",
+    ),
+    (
+        "save-server_values-computed",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").save(tx=tx, server_values={"double": _ONE}),
+        ValueError,
+        r"^save\(server_values=\): double is a computed field",
+    ),
+    (
+        "merge-computed",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").merge(tx=tx, double=4),
+        ValueError,
+        r"^merge\(\): double is a computed field",
+    ),
+    (
+        "merge-extra_vars-alone",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").merge(tx=tx, extra_vars={"step": 1}, n=2),
+        ValueError,
+        "^extra_vars requires server_values",
+    ),
+    (
+        "merge-server_values-not-a-function",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").merge(tx=tx, server_values={"n": "1"}),
+        TypeError,
+        r"^server_values\['n'\] must be a SurrealFunc",
+    ),
+    (
+        "merge-server_values-computed",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").merge(tx=tx, server_values={"double": _ONE}),
+        ValueError,
+        r"^merge\(server_values=\): double is a computed field",
+    ),
+    (
+        "merge-no-id",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(n=1).merge(tx=tx, n=2),
+        SurrealDbError,
+        r"^No Id for the data to merge: \{'n': 2\}$",
+    ),
+    (
+        "merge-server_values-no-id",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(n=1).merge(tx=tx, server_values={"n": _ONE}, n=2),
+        SurrealDbError,
+        r"^No Id for the data to merge: \{'n': 2\}$",
+    ),
+    # The atomic helpers: their field, their amount or values, then the id.
+    (
+        "atomic_append-field",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").atomic_append("bad field!", "x", tx=tx),
+        ValueError,
+        "^Invalid atomic field name 'bad field!'",
+    ),
+    (
+        "atomic_increment-computed",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").atomic_increment("double", tx=tx),
+        ValueError,
+        "^atomic operation: double is a computed field",
+    ),
+    (
+        "atomic_increment-duration",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").atomic_increment("n", timedelta(seconds=1), tx=tx),
+        TypeError,
+        r"^atomic_increment\(\) adds a number, not a duration",
+    ),
+    (
+        "atomic_append_many-values",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs(id="a").atomic_append_many("tags", "x", tx=tx),
+        ValueError,
+        "^values must be a list of items, got str$",
+    ),
+    ("atomic_append-no-id", frozenset({"tx_args"}), lambda tx: TxArgs().atomic_append("tags", "x", tx=tx), *_NO_ID),
+    ("atomic_remove-no-id", frozenset({"tx_args"}), lambda tx: TxArgs().atomic_remove("tags", "x", tx=tx), *_NO_ID),
+    ("atomic_set_add-no-id", frozenset({"tx_args"}), lambda tx: TxArgs().atomic_set_add("tags", "x", tx=tx), *_NO_ID),
+    ("atomic_increment-no-id", frozenset({"tx_args"}), lambda tx: TxArgs().atomic_increment("n", tx=tx), *_NO_ID),
+    (
+        "atomic_append_many-no-id",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs().atomic_append_many("tags", ["x"], tx=tx),
+        *_NO_ID,
+    ),
+    (
+        "atomic_set_add_many-no-id",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs().atomic_set_add_many("tags", ["x"], tx=tx),
+        *_NO_ID,
+    ),
+    (
+        "atomic_remove_many-no-id",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs().atomic_remove_many("tags", ["x"], tx=tx),
+        *_NO_ID,
+    ),
+    # The QuerySet writes' own argument checks, under objects(tx=).
+    (
+        "bulk_update-subquery",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs.objects(tx=tx).bulk_update(n=Subquery(TxArgs.objects().select("n"))),
+        ValueError,
+        r"^bulk_update\(\) writes its values as data; 'n' got a subquery",
+    ),
+    (
+        "bulk_update-computed",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs.objects(tx=tx).bulk_update(double=4),
+        ValueError,
+        r"^bulk_update\(\): double is a computed field",
+    ),
+    (
+        "queryset-patch-bad-op",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs.objects(tx=tx).patch([{"op": "nope", "path": "/n"}]),
+        ValueError,
+        r"^patch operation #0 has invalid op 'nope'",
+    ),
+    (
+        "queryset-patch-computed",
+        frozenset({"tx_args"}),
+        lambda tx: TxArgs.objects(tx=tx).patch([{"op": "replace", "path": "/double", "value": 4}]),
+        ValueError,
+        r"^patch\(\): double is a computed field",
+    ),
+]
+
+_ARGUMENT_REFUSAL_IDS = [row[0] for row in _ARGUMENT_REFUSALS]
+
+
+@pytest.fixture
+def no_client(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every ``get_client()`` call from now on, each one failing the call: a refused write asks for no client."""
+    requests: list[str] = []
+
+    async def get_client(*args: Any, **kwargs: Any) -> Any:
+        requests.append("get_client")
+        raise AssertionError("get_client() was called")
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+    return requests
+
+
+class TestArgumentRefusalLeavesTheTransaction:
+    """#320: a write the ORM refuses for one of its arguments — before any request — raises the same error as before
+    and leaves its transaction as it was: no statement, no table written with records (``define_indexes(tx=…)``'s
+    #304 check reads them), no table for the query cache to drop at the commit. The same on both transaction
+    strategies and server lines: this bookkeeping is the client's."""
+
+    @pytest.mark.parametrize(("name", "tables", "write", "error", "pattern"), _ARGUMENT_REFUSALS, ids=_ARGUMENT_REFUSAL_IDS)
+    async def test_the_transaction_is_left_as_it_was(
+        self,
+        no_client: list[str],
+        name: str,
+        tables: frozenset[str],
+        write: Callable[[Any], Awaitable[Any]],
+        error: type[Exception],
+        pattern: str,
+    ) -> None:
+        tx = BufferedTransaction(client=None)
+        with pytest.raises(error, match=pattern) as raised:
+            await write(tx)
+        assert type(raised.value) is error
+        assert no_client == []
+        assert (tx.statements, tx.variables) == ([], {})
+        assert tx._records_written() == frozenset()
+        assert tx._cache_written() == frozenset()
+
+    async def test_the_transaction_still_takes_a_write(self, no_client: list[str]) -> None:
+        """The refusal does not spoil the transaction: the next write joins it and notes its table."""
+        tx = BufferedTransaction(client=None)
+        with pytest.raises(SurrealDbError):
+            await TxArgs(n=1).update(tx=tx)
+        await TxArgs(id="a", n=1).update(tx=tx)
+        assert len(tx.statements) == 1
+        assert tx._records_written() == frozenset({"tx_args"})
+        assert tx._cache_written() == frozenset({"tx_args"})
+
+    async def test_update_builds_its_payload_before_reading_the_id(self, no_client: list[str]) -> None:
+        """``update()`` builds what it writes before it reads the id: a payload that cannot be built raises its own
+        error first, as before, also without an id."""
+
+        class Unwritable(TxArgs):
+            model_config = SurrealConfigDict(table_name="tx_args")
+
+            @field_serializer("n")
+            def _refuse(self, value: int) -> int:
+                raise ValueError("n cannot be written")
+
+        with pytest.raises(PydanticSerializationError, match="n cannot be written"):
+            await Unwritable(id="a", n=1).update()
+        tx = BufferedTransaction(client=None)
+        with pytest.raises(PydanticSerializationError, match="n cannot be written"):
+            await Unwritable(n=1).update(tx=tx)
+        with pytest.raises(SurrealDbError, match="no id found"):
+            await TxArgs(n=1).update(tx=tx)
+        assert (tx.statements, tx._records_written(), tx._cache_written()) == ([], frozenset(), frozenset())
+
+    async def test_the_merge_checks_keep_their_order(self, no_client: list[str]) -> None:
+        """``merge()`` checks its fields, then ``server_values``/``extra_vars``, then the computed server values, then
+        the id: each call below has the next refusal too, and raises the earlier one."""
+        unsaved = TxArgs(n=1)
+        with pytest.raises(ValueError, match=r"^merge\(\): double is a computed field"):
+            await unsaved.merge(extra_vars={"step": 1}, double=4)
+        with pytest.raises(ValueError, match="^extra_vars requires server_values"):
+            await unsaved.merge(extra_vars={"step": 1}, n=2)
+        with pytest.raises(ValueError, match=r"^merge\(server_values=\): double is a computed field"):
+            await unsaved.merge(server_values={"double": _ONE})
+        with pytest.raises(SurrealDbError, match="^No Id for the data to merge"):
+            await unsaved.merge(server_values={"n": _ONE})
+
+    async def test_the_atomic_checks_keep_their_order(self, no_client: list[str]) -> None:
+        """An atomic helper checks its amount (``atomic_increment()``), then its field, then its values, then the id."""
+        unsaved = TxArgs()
+        with pytest.raises(TypeError, match="not a duration"):
+            await unsaved.atomic_increment("bad field!", timedelta(seconds=1))
+        with pytest.raises(ValueError, match="^Invalid atomic field name"):
+            await unsaved.atomic_append_many("bad field!", "x")
+        with pytest.raises(ValueError, match="^values must be a list"):
+            await unsaved.atomic_append_many("tags", "x")
+        with pytest.raises(SurrealDbError, match="^atomic operations require"):
+            await unsaved.atomic_append_many("tags", ["x"])
+
+    async def test_the_patch_checks_keep_their_order(self, no_client: list[str]) -> None:
+        """``patch()`` checks its operations, then the computed fields they write, then the id."""
+        unsaved = TxArgs()
+        with pytest.raises(ValueError, match="invalid op 'nope'"):
+            await unsaved.patch([{"op": "replace", "path": "/double", "value": 1}, {"op": "nope", "path": "/n"}])
+        with pytest.raises(ValueError, match="double is a computed field"):
+            await unsaved.patch([{"op": "replace", "path": "/double", "value": 1}])
+        with pytest.raises(SurrealDbError, match=r"^patch\(\) requires an explicit id"):
+            await unsaved.patch([{"op": "replace", "path": "/n", "value": 1}])

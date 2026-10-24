@@ -41,8 +41,10 @@ from surreal_orm_lite import (
     Duration,
     GeoDistance,
     GeometryPoint,
+    Index,
     PointField,
     Q,
+    Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealDbError,
@@ -1712,6 +1714,53 @@ def _assert_untouched(tx: BufferedTransaction) -> None:
     assert tx._cache_written() == frozenset()
 
 
+def _snap(snapshot: bool, **fields: Any) -> Snap:
+    """A ``Snap`` holding *fields*; marked as read ``as_of()`` at ``M2021`` when *snapshot*."""
+    instance = Snap(**fields)
+    return QuerySet._mark_snapshots(instance, M2021) if snapshot else instance
+
+
+_BAD_PATCH = [{"op": "nope", "path": "/n", "value": 1}]
+
+#: #320: a call that two refusals apply to, T9 and one of the call's own argument checks: (test id, the method as T9
+#: names it, the call made on a ``Snap`` — a snapshot when the first argument is ``True`` — with the transaction *tx*,
+#: the argument's own error on a current record, its message as a pattern).
+_SNAPSHOT_AND_ARGUMENT_REFUSALS: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]], type[Exception], str]] = [
+    ("update-no-id", "update()", lambda s, tx: _snap(s, n=1).update(tx=tx), SurrealDbError, r"^Can't update data, no id"),
+    ("delete-no-id", "delete()", lambda s, tx: _snap(s, n=1).delete(tx=tx), SurrealDbError, r"^Can't delete data, no id"),
+    ("merge-no-id", "merge()", lambda s, tx: _snap(s, n=1).merge(tx=tx, n=2), SurrealDbError, r"^No Id for the data"),
+    ("patch-bad-op", "patch()", lambda s, tx: _snap(s, id="a").patch(_BAD_PATCH, tx=tx), ValueError, "invalid op 'nope'"),
+    (
+        "patch-no-id",
+        "patch()",
+        lambda s, tx: _snap(s, n=1).patch([{"op": "replace", "path": "/n", "value": 1}], tx=tx),
+        SurrealDbError,
+        r"^patch\(\) requires an explicit id",
+    ),
+    (
+        "atomic-no-id",
+        "atomic_append()",
+        lambda s, tx: _snap(s, n=1).atomic_append("tags", "x", tx=tx),
+        SurrealDbError,
+        "^atomic operations require an explicit id",
+    ),
+    (
+        "save-extra_vars",
+        "save()",
+        lambda s, tx: _snap(s, id="a").save(tx=tx, extra_vars={"step": 1}),
+        ValueError,
+        "^extra_vars requires server_values",
+    ),
+    (
+        "merge-server_values",
+        "merge()",
+        lambda s, tx: _snap(s, id="a").merge(tx=tx, server_values={"n": "1"}),
+        TypeError,
+        r"^server_values\['n'\] must be a SurrealFunc",
+    ),
+]
+
+
 class TestSnapshotWriteLeavesTheTransaction:
     """#315: with a real transaction object, a snapshot's write is refused (T9) before the write's tables are noted on
     the transaction, which is left as it was — for every instance write, an edge's own writes and ``_save_naming()``
@@ -1818,6 +1867,120 @@ class TestSnapshotWriteLeavesTheTransaction:
         assert len(tx.statements) == 1
         assert tx._records_written() == frozenset({"Snap"})
         assert tx._cache_written() == frozenset({"Snap"})
+
+    async def test_bulk_create_with_a_snapshot_in_its_list(self, no_client: list[str]) -> None:
+        """#320: ``objects(tx=…).bulk_create()`` refuses a snapshot in its list in its ``invalidates(refuse_args=…)``,
+        before the wrapper notes the table on the transaction, which it leaves as it was; the message names the
+        snapshot's class. A current record before it in the list changes nothing."""
+        snapshot = QuerySet._mark_snapshots(Snap(id="a", n=10), M2021)
+        tx = BufferedTransaction(client=None)
+        with pytest.raises(SurrealDbError) as info:
+            await Snap.objects(tx=tx).bulk_create([Snap(id="b", n=1), snapshot])
+        assert str(info.value) == time_travel.snapshot_write_refused("Snap", "bulk_create()", M2021)
+        assert no_client == []
+        _assert_untouched(tx)
+
+    @pytest.mark.parametrize(
+        ("name", "method", "write", "error", "pattern"),
+        _SNAPSHOT_AND_ARGUMENT_REFUSALS,
+        ids=[row[0] for row in _SNAPSHOT_AND_ARGUMENT_REFUSALS],
+    )
+    async def test_a_snapshot_is_refused_before_the_arguments(
+        self,
+        no_client: list[str],
+        name: str,
+        method: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+        error: type[Exception],
+        pattern: str,
+    ) -> None:
+        """#320: when the snapshot refusal (T9) and one of the call's own argument checks both apply — a missing id, an
+        invalid patch operation, ``extra_vars`` without ``server_values``… —, T9 comes first, as before: the call
+        raises its argument's own error on a current record and T9 on a snapshot, and neither leaves anything on the
+        transaction."""
+        current_tx = BufferedTransaction(client=None)
+        with pytest.raises(error, match=pattern):
+            await write(False, current_tx)
+        tx = BufferedTransaction(client=None)
+        with _pre_signals(Snap) as fired, pytest.raises(SurrealDbError) as info:
+            await write(True, tx)
+        assert str(info.value) == time_travel.snapshot_write_refused("Snap", method, M2021)
+        assert fired == []
+        assert no_client == []
+        _assert_untouched(current_tx)
+        _assert_untouched(tx)
+
+
+#: #320: a QuerySet write on a queryset read ``as_of()`` with an argument it refuses too, and that argument's own
+#: error on a queryset without ``as_of()``.
+_AS_OF_AND_ARGUMENT_REFUSALS: list[tuple[str, Callable[[Any], Awaitable[Any]], type[Exception], str]] = [
+    (
+        "bulk_create()",
+        lambda qs: qs.bulk_create([QuerySet._mark_snapshots(Snap(id="a"), M2021)]),
+        SurrealDbError,
+        r"^Snap\.bulk_create\(\) cannot run on an instance read with as_of\(\)",
+    ),
+    (
+        "bulk_update()",
+        lambda qs: qs.bulk_update(n=Subquery(Snap.objects().select("n"))),
+        ValueError,
+        r"^bulk_update\(\) writes its values as data",
+    ),
+    ("patch()", lambda qs: qs.patch(_BAD_PATCH), ValueError, "invalid op 'nope'"),
+]
+
+
+@pytest.mark.usefixtures("_no_request")
+class TestAsOfBeforeTheArguments:
+    """#320: on a queryset read ``as_of()``, the time-travel refusal (T5) comes before the write's own argument checks,
+    as before; without ``as_of()``, the argument's own error."""
+
+    @pytest.mark.parametrize(
+        ("method", "write", "error", "pattern"),
+        _AS_OF_AND_ARGUMENT_REFUSALS,
+        ids=[row[0] for row in _AS_OF_AND_ARGUMENT_REFUSALS],
+    )
+    async def test_t5_first(
+        self, method: str, write: Callable[[Any], Awaitable[Any]], error: type[Exception], pattern: str
+    ) -> None:
+        with pytest.raises(error, match=pattern):
+            await write(Snap.objects())
+        with pytest.raises(SurrealDbError) as info:
+            await write(Snap.objects().as_of(M2021))
+        assert str(info.value) == time_travel.queryset_refused(method)
+
+
+class SnapIndexed(BaseSurrealModel):
+    """A model with an index for ``define_indexes(tx=…)`` to define after a refused write (#320)."""
+
+    model_config = SurrealConfigDict(table_name="snap_indexed", indexes=[Index("snap_indexed_name", "name")])
+
+    id: str | None = None
+    name: str = ""
+
+
+class TestRefusedBulkCreateInTransactionE2E:
+    """#320 on both server lines: ``objects(tx=…).bulk_create()`` refused for a snapshot in its list leaves the
+    transaction as it was. ``define_indexes(tx=…)`` on the same table then defines the index instead of refusing it as
+    if a record had been written there (#304), and the commit applies it (at once on SurrealDB 3.x over WebSocket,
+    interactive; at the commit on 2.x, buffered)."""
+
+    async def test_define_indexes_follows_a_refused_bulk_create(self) -> None:
+        snapshot = QuerySet._mark_snapshots(SnapIndexed(id="a", name="Ada"), M2021)
+        async with orm_client("snap_indexed") as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                with pytest.raises(SurrealDbError) as raised:
+                    await SnapIndexed.objects(tx=tx).bulk_create([SnapIndexed(id="b", name="Bob"), snapshot])
+                written = (tx._records_written(), tx._cache_written())
+                applied = await SnapIndexed.define_indexes(tx=tx)
+            info = await client.query("INFO FOR TABLE snap_indexed;", {})
+            rows = await client.query("SELECT * FROM snap_indexed;", {})
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == time_travel.snapshot_write_refused("SnapIndexed", "bulk_create()", M2021)
+        assert written == (frozenset(), frozenset())
+        assert applied == SnapIndexed.index_ddl()
+        assert list(info["indexes"]) == ["snap_indexed_name"]
+        assert rows == []
 
 
 # --- fetch() under as_of(), dispatched by line (AC-10, D6) ---------------------------------------------

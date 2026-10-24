@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.5] - 2026-10-24
+
+Follow-up to v0.36.1 (#315): a queryset write that the ORM refuses, and an instance write
+refused for one of its arguments, now leave the transaction and the query cache as they were.
+No new public API.
+
+### Fixed
+
+- **A refused queryset write no longer marks its table as written** (#320).
+  `objects(tx=tx).bulk_create()`, `bulk_update()`, `bulk_delete()` and `patch()` ran their
+  materialized-view and `as_of()` refusals, `bulk_create()`'s check of a snapshot in its list,
+  `bulk_update()`'s check of a subquery value or a computed field and `patch()`'s check of its
+  operations after the ORM had noted the table on the transaction. The refused call queued no
+  statement but left the table noted: a caller that caught the error and kept the transaction had
+  a later `define_indexes(tx=tx)` on that table refused by the v0.35.3 check (#304), and the
+  commit dropped the table's cached reads although nothing was written. Outside a transaction,
+  the refused call (a queryset read `as_of()` included, and `delete_table()` on a view or under
+  `as_of()`) put the table in flight and dropped its cached reads. These refusals now run before
+  anything is noted: the transaction keeps no statement and no table, `define_indexes(tx=tx)` is
+  accepted, and no cached read is dropped, with a transaction or without.
+- **An instance write refused for one of its arguments no longer marks its table as written**
+  (#320). `update()` and `delete()` without an id, `patch()` refused for its operations, a
+  computed field or a missing id, `merge()` refused for its fields, `server_values`/`extra_vars`
+  or a missing id, `save()` refused for `server_values`/`extra_vars`, the `atomic_*()` helpers
+  refused for their amount, field, values or a missing id, and an edge's `save(server_values=…)`
+  or `save(extra_vars=…)` had the same effect as above, with `tx=` or without. These checks now
+  run right after the model's own refusals (materialized view, snapshot, excluded signup field)
+  and before anything is noted. Error types, messages and the refusal order are unchanged: the
+  connection, the model's refusals, then the arguments (`update()` and `patch()` still build their
+  payload before reading the id). The bookkeeping is client-side: the behaviour is the same on
+  SurrealDB 2.x and 3.x and on both transaction strategies.
+
+### Notes
+
+- A few refusals still run after the table is noted (`upsert()` without an id, a buffered
+  `save(tx=…)` without an id, the argument checks of `relate()`, `remove_relation()` and
+  `remove_all_relations()`, among others); they are tracked in #325.
+- **Docs**: the README sections "Snapshots" and "What a time-travel queryset refuses" (27),
+  "Writes are refused" (33) and the `define_indexes(tx=…)` note of "Transactions" (36), and the
+  docstrings of the affected writes, say that a refused write leaves the transaction and the query
+  cache as they were. No behaviour-table row: the change is client-side and identical on both
+  lines.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0, plus 3.1.5 for backward
+  compatibility.
+
 ## [0.36.4] - 2026-10-24
 
 Follow-ups to the review of v0.36.2 (#322): an index that `remove_index(tx=…)` removed earlier

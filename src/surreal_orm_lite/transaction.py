@@ -297,10 +297,11 @@ class Transaction(ABC):
         """Note the tables an ORM write of records in this transaction changes (``None``: every table) — issue #304.
 
         ``cache.invalidates()`` calls it for each write method of records that joins the transaction, before the write
-        is sent or queued and after the method's own refusals (``invalidates(refuse=…)``: an instance write the model
-        refuses as a materialized view, a snapshot or SG1 notes nothing, #315) — never for a definition
-        (``define_table()``, ``remove_index()``…), whose table is noted for the query cache only. Unlike the query
-        cache's tables, the commit and the cancel keep them.
+        is sent or queued and after the method's own refusals and argument checks (``invalidates(refuse=…,
+        refuse_args=…)``: a write refused for a materialized view, a snapshot or SG1, #315, or for a snapshot in
+        ``bulk_create()``'s list, a missing id or another argument it checks, #320, notes nothing) — never for a
+        definition (``define_table()``, ``remove_index()``…), whose table is noted for the query cache only. Unlike
+        the query cache's tables, the commit and the cancel keep them.
         """
         if tables is None:
             self._record_all = True

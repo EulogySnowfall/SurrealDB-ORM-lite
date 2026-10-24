@@ -595,7 +595,9 @@ def _write_refusals(call: str, *, view: bool = True, signup: bool = False) -> Ca
     :meth:`~BaseSurrealModel.upsert`), SG1 (:meth:`BaseSurrealModel._reject_signup_excluded`). The wrapper calls it
     with the instance after ``routing.check_transaction()`` and before the write's tables are noted on the transaction
     or put in flight, so a refused write leaves the transaction as it was: no statement, no table noted for
-    ``define_indexes(tx=…)`` (#304) or the query cache. A write decorated with it does not repeat these checks.
+    ``define_indexes(tx=…)`` (#304) or the query cache. A write decorated with it does not repeat these checks. The
+    call's argument checks (a missing id, invalid patch operations…) run right after it, in the write's
+    ``invalidates(refuse_args=…)`` (#320), so these refusals come first when both apply.
     """
 
     def refuse(instance: Any) -> None:
@@ -606,6 +608,95 @@ def _write_refusals(call: str, *, view: bool = True, signup: bool = False) -> Ca
             instance._reject_signup_excluded()
 
     return refuse
+
+
+# The argument checks of the instance writes, for ``invalidates(refuse_args=…)`` (issue #320). The wrapper calls each
+# with the call's bound arguments, after the model's own refusals (``_write_refusals()``) and before the write's tables
+# are noted on the transaction or put in flight: a call they refuse leaves the transaction as it was — no statement,
+# no table noted for ``define_indexes(tx=…)`` (#304) or the query cache — and drops no cached read. Each keeps the
+# order and the messages the method's body had; none sends anything or asks the transaction.
+
+_UPDATE_WITHOUT_ID = "Can't update data, no id found."
+_DELETE_WITHOUT_ID = "Can't delete data, no id found."
+_PATCH_WITHOUT_ID = "patch() requires an explicit id (there is nothing to patch without one)."
+_ATOMIC_WITHOUT_ID = "atomic operations require an explicit id."
+
+
+def _save_arguments(arguments: Mapping[str, Any]) -> None:
+    """``save()``: the ``server_values``/``extra_vars`` pair (:meth:`BaseSurrealModel._validate_server_values`), then a
+    computed field or an edge endpoint among the server values."""
+    instance, server_values = arguments["self"], arguments["server_values"]
+    instance._validate_server_values(server_values, arguments["extra_vars"])
+    if server_values:
+        instance._reject_computed_writes(server_values, "save(server_values=)")
+
+
+def _update_arguments(arguments: Mapping[str, Any]) -> None:
+    """``update()``: an instance without an id. ``update()`` builds what it writes before it reads the id, so without
+    an id the payload is built here first: one that cannot be built raises its own error, as before."""
+    instance = arguments["self"]
+    if instance.get_id() is None:
+        instance._write_payload(replace=True)
+        raise SurrealDbError(_UPDATE_WITHOUT_ID)
+
+
+def _merge_arguments(arguments: Mapping[str, Any]) -> None:
+    """``merge()``: a computed field or an edge endpoint among the fields, the ``server_values``/``extra_vars`` pair,
+    a computed field or an endpoint among the server values, then an instance without an id."""
+    instance, data, server_values = arguments["self"], arguments["data"], arguments["server_values"]
+    instance._reject_computed_writes(data, "merge()")
+    instance._validate_server_values(server_values, arguments["extra_vars"])
+    if server_values:
+        instance._reject_computed_writes(server_values, "merge(server_values=)")
+    if instance.get_id() is None:
+        raise SurrealDbError(f"No Id for the data to merge: {data}")
+
+
+def _patch_arguments(arguments: Mapping[str, Any]) -> None:
+    """``patch()``: the JSON Patch document (:func:`~surreal_orm_lite.utils.validate_patch_operations`), the computed
+    fields and edge endpoints it writes, then an instance without an id. ``patch()`` rewrites the pointers to columns
+    before it reads the id, so without an id they are rewritten here first, as before."""
+    instance, operations = arguments["self"], arguments["operations"]
+    validate_patch_operations(operations)
+    instance._reject_computed_patch(operations, "patch()")
+    if instance.get_id() is None:
+        instance._columns_for_patch(operations)
+        raise SurrealDbError(_PATCH_WITHOUT_ID)
+
+
+def _reject_duration_amount(field: str, amount: object) -> None:
+    """Refuse a duration as ``atomic_increment()``'s amount (v0.23.0): SurrealDB 2.x ignores ``+=`` with a duration."""
+    if isinstance(amount, (timedelta, SdkDuration, Duration)):
+        raise TypeError(
+            f"atomic_increment() adds a number, not a duration ({amount!r}): SurrealDB 2.x ignores += with a "
+            "duration, so the result would differ between server lines. "
+            f"Set the new value with merge({field}=…) instead."
+        )
+
+
+def _atomic_arguments(*, amount: bool = False, values: bool = False) -> Callable[[Mapping[str, Any]], None]:
+    """An atomic helper's checks, in this order: a duration ``amount`` (``amount=True``: ``atomic_increment()``), the
+    field (:meth:`BaseSurrealModel._validate_atomic_field`), a ``values`` that is not a list (``values=True``: the
+    ``atomic_*_many()`` helpers), then an instance without an id. The helper's body reads the field's column and the
+    list of values again for what it writes."""
+
+    def refuse(arguments: Mapping[str, Any]) -> None:
+        instance = arguments["self"]
+        if amount:
+            _reject_duration_amount(arguments["field"], arguments["amount"])
+        instance._validate_atomic_field(arguments["field"])
+        if values:
+            instance._as_value_list(arguments["values"])
+        if instance.get_id() is None:
+            raise SurrealDbError(_ATOMIC_WITHOUT_ID)
+
+    return refuse
+
+
+def _delete_arguments(arguments: Mapping[str, Any]) -> None:
+    """``delete()``: an instance without an id."""
+    if arguments["self"].get_id() is None:
+        raise SurrealDbError(_DELETE_WITHOUT_ID)
 
 
 class SurrealConfigDict(ConfigDict, total=False):
@@ -822,7 +913,8 @@ class BaseSurrealModel(BaseModel):
         Called at the start of every instance write — right after the materialized-view check of the writes that
         have one (:meth:`_reject_view_write`, v0.32.0) —, so no signal, transaction or request runs before it: by the
         write's ``invalidates(refuse=…)`` (:func:`_write_refusals`), before its tables are noted on the transaction, so
-        a refused write leaves the transaction as it was (#315). The marker is read through :func:`_snapshot_moment`,
+        a refused write leaves the transaction as it was (#315), and before the call's argument checks (a missing id,
+        invalid patch operations…, #320). The marker is read through :func:`_snapshot_moment`,
         the only reader (an instance pickled by v0.25.x may have no private state).
 
         Raises:
@@ -1550,10 +1642,13 @@ class BaseSurrealModel(BaseModel):
 
         SurrealDB computes a view's records from its ``view_query``, so the ORM never writes them: the first statement
         of every ORM write of the model — the instance writes and the queryset's — before the snapshot check, any
-        signal, transaction use or request. An instance write runs it through its ``invalidates(refuse=…)``
-        (:func:`_write_refusals`), before its table is noted on the transaction, which a refused write leaves as it
-        was (#315). The relation helpers write the edge table, not the view, and stay allowed; raw SurrealQL is never
-        guarded.
+        signal, transaction use or request. Every one runs it through its ``invalidates(refuse=…)`` — an instance write
+        through :func:`_write_refusals` (#315), ``bulk_create()``, ``bulk_update()``, ``bulk_delete()``, ``patch()``
+        and ``delete_table()`` through ``query_set._queryset_refusals()`` (#320) —, before its table is noted on the
+        transaction or put in flight: a refused write leaves the transaction as it was and drops no cached read.
+        ``update_or_create()`` and ``get_or_create()`` run it at their start, before any lookup. It comes before the
+        call's argument checks too. The relation helpers write the edge table, not the view, and stay allowed; raw
+        SurrealQL is never guarded.
 
         Raises:
             TypeError: the model is a materialized view (W1, naming the class and *call*).
@@ -3172,7 +3267,7 @@ class BaseSurrealModel(BaseModel):
             return await self.save(tx=tx)
         return await self._save_with_signals(functools.partial(self._do_save, keep=keep), tx)
 
-    @_cache.invalidates("self", refuse=_write_refusals("save()"))
+    @_cache.invalidates("self", refuse=_write_refusals("save()"), refuse_args=_save_arguments)
     async def save(
         self,
         tx: Transaction | None = None,
@@ -3219,10 +3314,12 @@ class BaseSurrealModel(BaseModel):
             In a **buffered** transaction (HTTP or SurrealDB 2.6.x) the server-computed
             values are unknown until commit, so the instance keeps its pre-save values for
             those fields — ``refresh()`` after commit if you need them.
+
+        An invalid ``server_values``/``extra_vars`` pair, or a computed field or an edge endpoint in
+        ``server_values``, is refused before any signal or request and before the model's table is
+        noted on ``tx``, which a refused call leaves as it was (#320).
         """
-        self._validate_server_values(server_values, extra_vars)
         if server_values:
-            self._reject_computed_writes(server_values, "save(server_values=)")
             do_op = functools.partial(self._do_save_server, server_values=server_values, extra_vars=extra_vars)
             return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
@@ -3512,7 +3609,7 @@ class BaseSurrealModel(BaseModel):
         """
         return await self._save_with_signals(self._do_upsert, tx)
 
-    @_cache.invalidates("self", refuse=_write_refusals("update()", signup=True))
+    @_cache.invalidates("self", refuse=_write_refusals("update()", signup=True), refuse_args=_update_arguments)
     async def update(self, tx: Transaction | None = None) -> Any:
         """
         Update the model instance to the database.
@@ -3557,10 +3654,11 @@ class BaseSurrealModel(BaseModel):
             The updated row as the SDK reads it (``[]`` for a record that does not exist), or
             ``None`` in a transaction.
 
-        The view, snapshot and SG1 refusals below come before the model's table is noted on
-        ``tx``: a call they refuse leaves nothing on the transaction — no statement, and no table
-        noted as written, so a later ``define_indexes(tx=…)`` of the model is not refused for it
-        and the commit drops no cached read for it (#315).
+        The view, snapshot and SG1 refusals below, then the missing id, come before the model's
+        table is noted on ``tx``: a call they refuse leaves nothing on the transaction — no
+        statement, and no table noted as written, so a later ``define_indexes(tx=…)`` of the model
+        is not refused for it and the commit drops no cached read for it (#315, #320). Outside a
+        transaction, it drops no cached read either.
 
         Raises:
             TypeError: the model is a materialized view (W1); or an auth model
@@ -3573,8 +3671,7 @@ class BaseSurrealModel(BaseModel):
         sender = self.__class__
         data = self._write_payload(replace=True)
         record_id = self._record_id()
-        if record_id is None:
-            raise SurrealDbError("Can't update data, no id found.")
+        assert record_id is not None  # refused by _update_arguments() (#320)
         content, bound = replace_content(data)
 
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
@@ -3644,8 +3741,7 @@ class BaseSurrealModel(BaseModel):
         """
         sender = self.__class__
         record_id = self._record_id()
-        if record_id is None:
-            raise SurrealDbError(f"No Id for the data to merge: {data}")
+        assert record_id is not None  # refused by merge()'s _merge_arguments() (#320)
 
         # Columns on the wire, Python names in the signal payload and the local apply below.
         merged: dict[str, Any] = {**self._columns_for(data), **self._columns_for(server_values)}
@@ -3678,7 +3774,7 @@ class BaseSurrealModel(BaseModel):
         await post_update.send(sender, instance=self, update_fields=update_fields)
         return None
 
-    @_cache.invalidates("self", refuse=_write_refusals("merge()"))
+    @_cache.invalidates("self", refuse=_write_refusals("merge()"), refuse_args=_merge_arguments)
     async def merge(
         self,
         tx: Transaction | None = None,
@@ -3731,11 +3827,14 @@ class BaseSurrealModel(BaseModel):
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
             >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
+
+        A computed field or an edge endpoint in ``data`` (``ValueError``), an invalid
+        ``server_values``/``extra_vars`` pair (``ValueError``/``TypeError``), a computed field or an
+        endpoint in ``server_values`` (``ValueError``) and a missing id (``SurrealDbError``) are
+        refused in this order, before any signal or request and before the model's table is noted
+        on ``tx``, which a refused call leaves as it was (#320).
         """
-        self._reject_computed_writes(data, "merge()")
-        self._validate_server_values(server_values, extra_vars)
         if server_values:
-            self._reject_computed_writes(server_values, "merge(server_values=)")
             return await self._merge_server(tx, server_values, extra_vars, data, refresh)
 
         sender = self.__class__
@@ -3744,9 +3843,7 @@ class BaseSurrealModel(BaseModel):
         # that stays on this side of the wire — signals, the local apply — keeps `data_set`.
         wire_data = self._columns_for(data_set)
         record_id = self._record_id()
-
-        if record_id is None:
-            raise SurrealDbError(f"No Id for the data to merge: {data}")
+        assert record_id is not None  # refused by _merge_arguments() (#320)
 
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 
@@ -3775,7 +3872,7 @@ class BaseSurrealModel(BaseModel):
 
     # ==================== Patch & atomic operations ====================
 
-    @_cache.invalidates("self", refuse=_write_refusals("patch()"))
+    @_cache.invalidates("self", refuse=_write_refusals("patch()"), refuse_args=_patch_arguments)
     async def patch(self, operations: list[dict[str, Any]], tx: Transaction | None = None) -> Self:
         """Apply a JSON Patch (RFC 6902) to this record.
 
@@ -3791,14 +3888,14 @@ class BaseSurrealModel(BaseModel):
         Unlike ``merge``/``save`` this emits NO signals: it is a low-level atomic primitive.
         ``operations`` is validated then bound as data, never string-interpolated. Pointers may
         name a field either way — ``/password`` or its column ``/password_hash`` — and are
-        rewritten to the column before they are sent.
+        rewritten to the column before they are sent. Invalid operations (``ValueError``), a
+        computed field or an edge endpoint they write (``ValueError``) and a missing id
+        (``SurrealDbError``) are refused in this order, before any request and before the model's
+        table is noted on ``tx``, which a refused call leaves as it was (#320).
         """
-        validate_patch_operations(operations)
-        self._reject_computed_patch(operations, "patch()")
         operations = self._columns_for_patch(operations)
         record_id = self._record_id()
-        if record_id is None:
-            raise SurrealDbError("patch() requires an explicit id (there is nothing to patch without one).")
+        assert record_id is not None  # refused by _patch_arguments() (#320)
         if tx is not None:
             rows = await tx.add("UPDATE $rid PATCH $data;", {"rid": record_id, "data": operations})
             self._apply_record(rows)  # interactive: applies; buffered: add() returns None → no-op (stale)
@@ -3816,11 +3913,13 @@ class BaseSurrealModel(BaseModel):
         Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
         ``self`` stale (the new value is computed server-side, unknown until commit).
         Each helper refuses a materialized view (v0.32.0) and a snapshot (v0.26.0) under its own
-        name through its ``invalidates(refuse=…)`` (#315), before its field is checked.
+        name through its ``invalidates(refuse=…)`` (#315), then its arguments — the amount, the
+        field, the values — and a missing id through its ``invalidates(refuse_args=…)``
+        (:func:`_atomic_arguments`, #320), all before its table is noted on the transaction or put
+        in flight.
         """
         record_id = self._record_id()
-        if record_id is None:
-            raise SurrealDbError("atomic operations require an explicit id.")
+        assert record_id is not None  # refused by the helper's _atomic_arguments() (#320)
         vars_: dict[str, Any] = {"rid": record_id, **variables}
         statement = f"UPDATE $rid SET {set_expr};"
         if tx is not None:
@@ -3832,7 +3931,7 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(rows)
         return self
 
-    @_cache.invalidates("self", refuse=_write_refusals("atomic_append()"))
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_append()"), refuse_args=_atomic_arguments())
     async def atomic_append(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically append ``value`` to an array ``field`` (duplicates allowed).
 
@@ -3842,7 +3941,7 @@ class BaseSurrealModel(BaseModel):
         column = self._validate_atomic_field(field)
         return await self._atomic_update(f"{column} = array::append({column}, $value)", {"value": value}, tx)
 
-    @_cache.invalidates("self", refuse=_write_refusals("atomic_remove()"))
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_remove()"), refuse_args=_atomic_arguments())
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of ``value`` from an array ``field``.
 
@@ -3853,7 +3952,7 @@ class BaseSurrealModel(BaseModel):
         column = self._validate_atomic_field(field)
         return await self._atomic_update(f"{column} = array::complement({column}, [$value])", {"value": value}, tx)
 
-    @_cache.invalidates("self", refuse=_write_refusals("atomic_set_add()"))
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_set_add()"), refuse_args=_atomic_arguments())
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically add ``value`` to an array ``field`` only if not already present.
 
@@ -3863,7 +3962,7 @@ class BaseSurrealModel(BaseModel):
         column = self._validate_atomic_field(field)
         return await self._atomic_update(f"{column} = array::add({column}, $value)", {"value": value}, tx)
 
-    @_cache.invalidates("self", refuse=_write_refusals("atomic_increment()"))
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_increment()"), refuse_args=_atomic_arguments(amount=True))
     async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
         """Atomically add ``amount`` (default 1) to a numeric ``field``.
 
@@ -3877,12 +3976,6 @@ class BaseSurrealModel(BaseModel):
         A duration amount raises ``TypeError`` (v0.23.0): SurrealDB 2.x ignores ``+=`` with a
         duration.
         """
-        if isinstance(amount, (timedelta, SdkDuration, Duration)):
-            raise TypeError(
-                f"atomic_increment() adds a number, not a duration ({amount!r}): SurrealDB 2.x ignores += with a "
-                "duration, so the result would differ between server lines. "
-                f"Set the new value with merge({field}=…) instead."
-            )
         column = self._validate_atomic_field(field)
         return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx)
 
@@ -3895,7 +3988,7 @@ class BaseSurrealModel(BaseModel):
             return list(values)
         raise ValueError(f"values must be a list of items, got {type(values).__name__}")
 
-    @_cache.invalidates("self", refuse=_write_refusals("atomic_append_many()"))
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_append_many()"), refuse_args=_atomic_arguments(values=True))
     async def atomic_append_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically append every element of ``values`` to an array ``field`` (duplicates allowed).
 
@@ -3911,7 +4004,7 @@ class BaseSurrealModel(BaseModel):
             tx,
         )
 
-    @_cache.invalidates("self", refuse=_write_refusals("atomic_set_add_many()"))
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_set_add_many()"), refuse_args=_atomic_arguments(values=True))
     async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically add every element of ``values`` to an array ``field``, skipping any already present.
 
@@ -3926,7 +4019,7 @@ class BaseSurrealModel(BaseModel):
             tx,
         )
 
-    @_cache.invalidates("self", refuse=_write_refusals("atomic_remove_many()"))
+    @_cache.invalidates("self", refuse=_write_refusals("atomic_remove_many()"), refuse_args=_atomic_arguments(values=True))
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of every element of ``values`` from an array ``field``.
 
@@ -3940,7 +4033,7 @@ class BaseSurrealModel(BaseModel):
             tx,
         )
 
-    @_cache.invalidates("self", deletes=True, refuse=_write_refusals("delete()"))
+    @_cache.invalidates("self", deletes=True, refuse=_write_refusals("delete()"), refuse_args=_delete_arguments)
     async def delete(self, tx: Transaction | None = None) -> None:
         """
         Delete the model instance from the database.
@@ -3953,11 +4046,13 @@ class BaseSurrealModel(BaseModel):
         Emits pre_delete, post_delete, and around_delete signals. In tx mode,
         ``around_delete`` is skipped (the write is deferred to commit) and
         ``post_delete`` only fires after a successful commit.
+
+        An instance without an id raises ``SurrealDbError`` before any signal or request, and
+        before the model's table is noted on ``tx``, which it leaves as it was (#320).
         """
         sender = self.__class__
         record_id = self._record_id()
-        if record_id is None:
-            raise SurrealDbError("Can't delete data, no id found.")
+        assert record_id is not None  # refused by _delete_arguments() (#320)
 
         has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
 

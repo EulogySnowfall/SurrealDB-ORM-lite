@@ -3344,8 +3344,9 @@ check. The moment is always a bound parameter.
 The instances a time-travel read returns are **snapshots**, read-only: `save()`, `update()`,
 `merge()`, `patch()`, `upsert()`, `delete()`, the `atomic_*()` methods, `relate()`,
 `remove_relation()` and `remove_all_relations()` raise `SurrealDbError` before any signal or
-request, and `bulk_create()` refuses a snapshot in its list. To restore a past state, build a new
-instance from the snapshot:
+request, and `bulk_create()` refuses a snapshot in its list. A refused write leaves a transaction
+as it was (no statement, its table not counted as written) and drops no cached read. To restore a
+past state, build a new instance from the snapshot:
 
 ```python
 from surreal_orm_lite import SurrealDbError
@@ -3399,9 +3400,9 @@ assert old_desk != current_desk and old_desk.model_dump() == current_desk.model_
 A time-travel read is read-only and cannot be streamed: `bulk_create()`, `bulk_update()`,
 `bulk_delete()`, `patch()`, `update_or_create()`, `get_or_create()`, `delete_table()`, `query()`,
 `live()`, `watch()` and `changes()` raise `SurrealDbError` on a queryset with `as_of()`, before
-any request. History cannot join a transaction: `Model.objects(tx=...).as_of(...)` raises at the
-call. On the embedded engine, a URL that keeps no history raises before any request, naming
-`surrealkv+versioned://`.
+any request and without dropping any cached read. History cannot join a transaction:
+`Model.objects(tx=...).as_of(...)` raises at the call. On the embedded engine, a URL that keeps
+no history raises before any request, naming `surrealkv+versioned://`.
 
 #### SurrealDB 2.x without versioned storage
 
@@ -4904,6 +4905,10 @@ print([(str(order.id), order.amount) for order in await PaidOrder.objects().orde
   `bulk_delete()`, `patch()`, `update_or_create()`, `get_or_create()` (even when the record exists) and
   `delete_table()`. The message starts with the full ORM's `Cannot modify materialized view '<table>'` and names the
   call: write to the tables the view selects from instead.
+- The refusal comes before the call's own argument checks (a missing id, an invalid patch operation, a snapshot in
+  `bulk_create()`'s list…). A refused call, under `tx=` or `objects(tx=…)`, leaves the transaction as it was: no
+  statement, and its table is not counted as written, so a later `define_indexes(tx=…)` of the model in the block is
+  not refused for it and the commit drops no cached read. Outside a transaction it drops no cached read either.
 - `refresh()`, `relate()`, `remove_relation()`, `remove_all_relations()`, `define_events()` and `remove_event()` stay
   allowed: they do not write the view's table.
 - Raw SurrealQL (`raw_query()`, `QuerySet.query()`, the client's `query()`) is not checked: SurrealDB 3.2 and later
@@ -6053,7 +6058,10 @@ print(await NoteV2.objects().search(text="physics").count())
   has already written records to the model's table with the ORM (`save()`, `objects(tx=…).bulk_create()`, …). The
   refusal covers every kind of index, not only full-text ones: a search would miss those records, and a `UNIQUE` index
   missing them would not enforce uniqueness for them. The refusal does not fail the block. `define_table(tx=…)`,
-  `define_relation(tx=…)` and a write to another table do not count; a raw `tx.add()` is not tracked.
+  `define_relation(tx=…)` and a write to another table do not count, nor does a write the ORM refused for a
+  materialized view or a snapshot read with `as_of()` (a snapshot in `bulk_create()`'s list included), an `update()`,
+  `merge()`, `patch()`, `delete()` or `atomic_*()` call refused for a missing id, or a `patch()` refused for its
+  operations; a raw `tx.add()` is not tracked.
 - Prefer `define_indexes()` outside the block: on SurrealDB 2.x, a write to a table that held records, after its index
   in the same block, fails the commit with a retryable `SurrealDbConflictError` that a retry meets again; so does a
   block that removes an index of a table that held records and defines it again, where the index stands as before.
