@@ -95,9 +95,10 @@ def user_namespace() -> dict[str, Any]:
     """The local names of the first frame outside the ORM (its subpackages included); ``{}`` when there is none.
 
     Pydantic completes a model that a forward reference left incomplete at its ``class`` statement, on its first
-    instantiation, with the names of the module the model is defined in and the local names of the caller's frame.
-    ``BaseSurrealModel._complete_pending_checks()`` completes such a model the same way before the ORM reads its fields
-    or its indexes (issue #327): the caller is the first frame outside the ORM, whatever the depth of the call.
+    instantiation, with the local names of the caller's frame, then the names of the module the model is defined in (a
+    caller's local name wins). ``BaseSurrealModel._complete_pending_checks()`` completes such a model the same way
+    before the ORM reads its fields or its indexes (issue #327): the caller is the first frame outside the ORM, whatever
+    the depth of the call.
     """
     frame = inspect.currentframe()
     try:

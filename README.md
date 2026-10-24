@@ -5457,6 +5457,12 @@ Each column's `TYPE` comes from its annotation (`Annotated` unwrapped):
 
 Anything else is `any`.
 
+A field annotated with a name defined after the class (a forward reference: `score: "Score" = 0`, then `Score = int`)
+gets the kind of the type its name resolves to. Since v0.37.1, `table_ddl()` and `define_table()` complete such a model
+first, as its first instantiation does, so they write the same statements before and after an instance (`score` is
+`TYPE int DEFAULT 0`, which earlier versions wrote `TYPE any DEFAULT 0` until the model was instantiated or rebuilt). A
+name still undefined gives `any`.
+
 - **Columns**: every field but `id` (and an edge's `in_` and `out`), under its column — its alias, if any
   ([section 20](#20-field-aliases-server_fields-and-mergerefreshfalse)) —, then the Pydantic `@computed_field`s; a
   `Field(exclude=True)` field is left out. A sub-model's fields follow its column (`address.city`, `subs.*.city`), its

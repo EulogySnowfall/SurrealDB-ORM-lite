@@ -1114,10 +1114,16 @@ class BaseSurrealModel(BaseModel):
         ``model_rebuild()`` or at its first instantiation, validation or JSON schema, never when the ORM writes its DDL
         or builds a query: ``define_table()`` would write the field's column ``any`` and ``define_indexes()`` a vector
         index its field contradicts, unchecked. So the model is rebuilt here as Pydantic's first instantiation rebuilds
-        it — the names of the model's module and the local names of the first caller outside the ORM
-        (``utils.user_namespace()``) — and ``__pydantic_on_complete__()`` runs the checks: a refusal raises from here,
-        at every call, the model staying incomplete. A name still undefined leaves the model incomplete, read as
-        before, without an error; the next call tries again. A complete model costs one attribute read.
+        it — with the local names of the first caller outside the ORM (``utils.user_namespace()``), then the names of
+        the model's module: a caller's local name wins, and the field keeps what it resolved to — and
+        ``__pydantic_on_complete__()`` runs the checks: a refusal raises from here, at every call, the model staying
+        incomplete. A name still undefined leaves the model incomplete, read as before, without an error; the next call
+        tries again. A complete model costs one attribute read.
+
+        Every model a forward reference left incomplete is completed, with or without a vector field: its columns get
+        the resolved kinds (``define_table()`` writes ``int`` for ``score: "Score" = 0`` once ``Score = int`` is
+        defined, not ``any``), and its links are resolved for the cross-connection check (``routing.linked_models()``),
+        whether or not the model was instantiated first.
         """
         if cls.__pydantic_complete__ or not cls.__dict__.get("__surreal_checks_pending__", False):
             return

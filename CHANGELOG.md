@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Follow-ups to the review of v0.36.3 (#327): a `Literal[None]` member of a vector field's union
 reads as `None`, and a vector field declared through a forward reference gets the vector checks
-of the `class` statement once its name resolves. No new public API.
+of the `class` statement once its name resolves. Any model a forward reference left incomplete is
+completed before the ORM writes its DDL or builds a queryset. No new public API.
 
 ### Fixed
 
@@ -33,13 +34,29 @@ of the `class` statement once its name resolves. No new public API.
   the model (at `model_rebuild()`, or at its first instantiation, validation or JSON schema), and
   the ORM completes such a model before `table_ddl()`, `define_table()`, `index_ddl()`,
   `define_indexes()`, `get_indexes()` or a queryset (`similar_to()` included) reads it, resolving
-  the name as Pydantic's first instantiation does (the model's module, then the caller's local
-  names). The refusals are those of the field written directly, naming the model, the index and
+  the name as Pydantic's first instantiation does: with the local names of the caller, then the
+  names of the model's module (a caller's local name wins, and the field keeps what it resolved
+  to). The refusals are those of the field written directly, naming the model, the index and
   the field, raised before anything is sent; a refused model stays incomplete, so each of these
   calls raises the same error again. A matching index is accepted, and `similar_to()` checks the
   query vector against the field's dimension. A name still undefined leaves the model incomplete
   and read as before. A model complete at its `class` statement is checked there only, in the same
   order and with the same messages.
+- **Every model a forward reference left incomplete is completed before the ORM reads it**
+  (#327). The completion of the previous bullet applies to any model Pydantic could not complete
+  at its `class` statement, with or without a vector field: `table_ddl()`, `define_table()`,
+  `index_ddl()`, `define_indexes()`, `get_indexes()` and every queryset complete it first. Until
+  now such a model was read with its unresolved fields as `any` until `model_rebuild()` or its
+  first instance: in `Author` with `best: "Book | None" = None` and `score: "Score" = 0`, `Book`
+  and `Score = int` defined after it, `table_ddl()` and `define_table()` wrote `best TYPE any`
+  and `score TYPE any DEFAULT 0`, and the cross-connection check of a queryset that follows a
+  link (`fetch()`) saw no linked model in such a field. Its columns now get the resolved kinds,
+  whether or not the model was instantiated first — what these calls already wrote after an
+  instance: `best TYPE option<object> FLEXIBLE` and `score TYPE int DEFAULT 0` on a `SCHEMAFULL`
+  table —, and its links are resolved for the cross-connection check, without `model_rebuild()`.
+  **Upgrading**: `define_table()` on such a model now redefines a column it wrote `any` with its
+  kind, and SurrealDB checks the values written to that column against it from then on. A name
+  still undefined leaves the model read as before.
 
 ### Notes
 
@@ -52,7 +69,9 @@ of the `class` statement once its name resolves. No new public API.
   `is_vector_field()` raise `ValueError` for a field or annotation with no single dimension (code
   that scans the fields of a plain Pydantic model has no `class`-statement check, so it gets the
   exception where v0.36.2 returned `False`), that a `Literal[None]` member counts as `None`, and
-  which calls check a field declared through a forward reference.
+  which calls check a field declared through a forward reference. Section 35 (Model table DDL)
+  says that such a field gets the kind of the type its name resolves to, before or after an
+  instance.
 - The fixes are in the ORM's model checks, built on Pydantic's `__pydantic_on_complete__` hook
   (available in the supported `pydantic>=2.13.4`): the behaviour is the same on SurrealDB 2.x and
   3.x and on the embedded engine. Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0,
