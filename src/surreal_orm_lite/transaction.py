@@ -32,8 +32,10 @@ records a transaction wrote before the index was defined. A raw ``tx.add()`` is 
 
 Indexes removed (issue #312): ``remove_index(tx=…)`` notes the index it removes, by table (``_note_index_removal``).
 ``define_indexes(tx=…)`` reads committed state, where that index still stands: it counts the indexes noted for its table
-(``_indexes_removed``) as missing, plans them again, and forgets those it defines (``_forget_index_removals``). The
-commit and the cancel keep the note, like the tables written. A raw ``tx.add("REMOVE INDEX …")`` is not noted.
+(``_indexes_removed``) as missing, plans them again, and forgets those it defines (``_forget_index_removals``).
+``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` read committed state too, and leave the noted indexes out of
+those that use the analyzer (issue #323). The commit and the cancel keep the note, like the tables written. A raw
+``tx.add("REMOVE INDEX …")`` is not noted.
 
 Errors (issue #278): the errors a failed transaction raises give the server's reason and the failed statement's
 position, without the server's excerpt of the statement; the server's own text stays reachable as their suppressed
@@ -304,8 +306,10 @@ class Transaction(ABC):
         """Note that the index *name* of *table* was removed in this transaction — issue #312.
 
         ``remove_index(tx=…)`` calls it once its ``REMOVE INDEX`` was applied (interactive) or queued (buffered).
-        ``define_indexes(tx=…)``, which reads committed state where the index still stands, counts it as missing. Like
-        the tables written, the commit and the cancel keep it. A raw ``tx.add()`` is not noted.
+        ``define_indexes(tx=…)``, which reads committed state where the index still stands, counts it as missing;
+        ``remove_analyzer(tx=…)`` and ``define_analyzer(tx=…)`` no longer count it among the indexes that use an
+        analyzer (issue #323). Like the tables written, the commit and the cancel keep it. A raw ``tx.add()`` is not
+        noted.
         """
         self._removed_indexes.setdefault(table, set()).add(name)
 

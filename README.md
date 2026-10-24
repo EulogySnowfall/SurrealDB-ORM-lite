@@ -6058,8 +6058,12 @@ print(await NoteV2.objects().search(text="physics").count())
   in the same block, fails the commit with a retryable `SurrealDbConflictError` that a retry meets again; so does a
   block that removes an index of a table that held records and defines it again, where the index stands as before.
   Nothing of such a block is committed. On an empty table both commit, as on 3.x.
-- `remove_analyzer(tx=…)` reads committed state to find the indexes that use the analyzer: an index queued earlier in
-  a buffered block is not seen.
+- `remove_analyzer(tx=…)` (on SurrealDB 2.x and the embedded engine; 3.x checks in the transaction itself) and
+  `define_analyzer(tx=…)` read committed state to find the indexes that use the analyzer. An index `remove_index(tx=…)`
+  removed earlier in the block no longer counts, although committed state still holds it: once the block has removed the
+  last index that uses an analyzer, it can remove the analyzer, or redefine it without `REBUILD INDEX`, on every engine.
+  An index removed then defined again in the block, or removed with a raw `tx.add("REMOVE INDEX …")`, still counts
+  there, and an index queued earlier in a buffered block is not seen.
 - A search in an interactive transaction sees the transaction's writes; in a buffered one, a read raises, as every
   read does there.
 - In a transaction, a search on a field without a full-text index raises the same `SurrealDbError`, which the

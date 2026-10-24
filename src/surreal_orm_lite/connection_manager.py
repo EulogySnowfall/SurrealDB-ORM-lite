@@ -2746,7 +2746,11 @@ class SurrealDBConnectionManager:
 
         With *tx*, a new analyzer — or a redefinition no index uses — joins the transaction. A redefinition with indexes
         to rebuild is refused before any DDL: the servers rebuild an index with the analyzers committed before the
-        transaction began, so the rebuild must follow the committed definition.
+        transaction began, so the rebuild must follow the committed definition. An index ``Model.remove_index()``
+        removed earlier with the same *tx* is not to rebuild, although committed state still holds it: once the block
+        has removed every index that uses the analyzer, the redefinition joins the transaction, without
+        ``REBUILD INDEX``. An index removed then defined again in the block (``define_indexes(tx=…)``), or removed with
+        a raw ``tx.add("REMOVE INDEX …")``, which the transaction does not track, still counts.
 
         :param analyzer: the ``Analyzer`` to define.
         :param overwrite: ``True`` (default) redefines a changed analyzer (``OVERWRITE``) and rebuilds its indexes;
@@ -2790,8 +2794,12 @@ class SurrealDBConnectionManager:
         removed``. SurrealDB 3.x refuses it itself; on SurrealDB 2.x and the embedded engine, which would remove it and
         then refuse every write to that table, the ORM reads the line (``client.version()``), then ``INFO FOR DB`` and
         ``INFO FOR TABLE`` of every table, and refuses it before any DDL. Remove its indexes first
-        (``Model.remove_index()``). In a buffered transaction those reads see the committed state: an index queued
-        earlier in the block is not seen. No cached read is dropped: a removal succeeds only when no index uses the
+        (``Model.remove_index()``). With *tx*, those reads see the committed state: an index ``Model.remove_index()``
+        removed earlier with the same *tx* is left out, although committed state still holds it, so a block that
+        removes the last index using the analyzer and then the analyzer commits, as on SurrealDB 3.x, which checks in
+        the transaction; an index removed then defined again in the block, or removed with a raw
+        ``tx.add("REMOVE INDEX …")``, which the transaction does not track, still counts, and an index queued earlier in
+        a buffered block is not seen. No cached read is dropped: a removal succeeds only when no index uses the
         analyzer.
 
         :param analyzer: the analyzer's name (letters, digits, underscores; not starting with a digit).

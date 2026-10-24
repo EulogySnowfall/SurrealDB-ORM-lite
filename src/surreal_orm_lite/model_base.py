@@ -1455,14 +1455,16 @@ class BaseSurrealModel(BaseModel):
         index as missing, although committed state still holds it, and defines it again after the removal when its
         model declares it — so removing an index and defining it again in one block keeps it. On SurrealDB 2.x, on a
         table that held records, such a block fails the commit with a retryable ``SurrealDbConflictError`` that a retry
-        meets again, and nothing of it is committed. A raw ``tx.add("REMOVE INDEX …")`` is not noted.
+        meets again, and nothing of it is committed. ``SurrealDBConnectionManager.remove_analyzer(tx=…)`` and
+        ``define_analyzer(tx=…)`` read the note too: the removed index no longer counts as one using the analyzer (issue
+        #323). A raw ``tx.add("REMOVE INDEX …")`` is not noted.
 
         Args:
             name: the index's name.
             missing_ok: ``True`` (default) emits ``REMOVE INDEX IF EXISTS …``, so a missing index is not an error;
                 ``False`` raises ``SurrealDbNotFoundError`` for it.
             tx: optional transaction the statement is applied with; it notes the removal for
-                :meth:`define_indexes`.
+                :meth:`define_indexes`, ``remove_analyzer()`` and ``define_analyzer()``.
 
         Raises:
             TypeError, ValueError: *name* is not an identifier, or *missing_ok* not a ``bool`` — before any request.
