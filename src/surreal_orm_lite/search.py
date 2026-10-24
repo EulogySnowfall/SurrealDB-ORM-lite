@@ -833,11 +833,11 @@ def check_indexes_config(
     by *column* — the model's ``to_db_field`` — so an aliased field counts under its column (SurrealDB would use either
     for ``search()``, with different scores); two different ``Analyzer`` objects share a name (an analyzer belongs to
     the database: one definition per name); two vector indexes cover one column, counted the same way (SurrealDB would
-    use either for ``similar_to()``); a vector index on a vector field — *vectors* maps the column of each, either
-    spelling, to its ``(dimension, storage type)`` — whose dimension or storage type differs from the field's, the
-    index's effective type compared (``F32`` when it declares none, ``Index._hnsw_options()``). A vector index on a
-    column that is not a vector field is not checked against it. Each ``Index`` was checked when it was built. The
-    messages name *model*.
+    use either for ``similar_to()``); a vector index on a vector field — *vectors* maps the column of each, any
+    spelling (a union with ``None`` included), to its ``(dimension, storage type)`` — whose dimension or storage type
+    differs from the field's, the index's effective type compared (``F32`` when it declares none,
+    ``Index._hnsw_options()``). A vector index on a column that is not a vector field is not checked against it. Each
+    ``Index`` was checked when it was built. The messages name *model*.
 
     :raises TypeError: *value* is not a ``list`` or a ``tuple``, or holds something other than an ``Index``.
     :raises ValueError: two indexes share a name; a view declares an index; two full-text indexes cover one column;

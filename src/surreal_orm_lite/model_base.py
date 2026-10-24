@@ -114,7 +114,7 @@ from .utils import (
     validate_thing,
     warn_on_multiple_statements,
 )
-from .vector import get_vector_info
+from .vector import declared_vectors
 
 if TYPE_CHECKING:
     from .edge import BaseSurrealEdge
@@ -877,12 +877,16 @@ class BaseSurrealModel(BaseModel):
         names — an inherited value is checked again, the messages naming the subclass. So is the
         ``view_query`` key (v0.32.0): ``None``, or one ``SELECT`` (``schema.check_view_query()``)
         on a model that is not an edge, does not mix in ``AuthenticatedUserMixin`` and declares no
-        computed field (``schema.check_view_config()``) — inherited values included. So is, right
-        after it, the ``indexes`` key (v0.35.0, ``search.check_indexes_config()``): ``None``, or a
+        computed field (``schema.check_view_config()``) — inherited values included. So are, right
+        after it and on every model, the ``Vector`` markers of the fields (``vector.declared_vectors()``):
+        a field holding two different markers, or a marker next to a type other than ``None`` in a
+        union, is refused, naming it — inherited fields included, the message naming the subclass. So
+        is then the ``indexes`` key (v0.35.0, ``search.check_indexes_config()``): ``None``, or a
         ``list`` or ``tuple`` of ``Index`` with distinct names, none on a view, one full-text index
         per column and one ``Analyzer`` definition per analyzer name, one vector index per column
-        and, on a vector field, of its dimension and storage type (v0.36.0) — inherited values
-        included, the messages naming the subclass. So are the ``table_type``, ``relation_in``,
+        and, on a vector field of any spelling — a union with ``None`` included —, of its dimension
+        and storage type (v0.36.0) — inherited values included, the messages naming the subclass.
+        So are the ``table_type``, ``relation_in``,
         ``relation_out`` and ``enforced`` keys (v0.33.0), when any of them is not ``None``: a
         ``TableType`` (``RELATION`` on an edge only), and the relation keys on an edge model only
         (``schema.check_relation_config()``). So are, on every model and after the relation keys,
@@ -915,13 +919,11 @@ class BaseSurrealModel(BaseModel):
                 user=issubclass(cls, AuthenticatedUserMixin),
                 computed=tuple(cls.__surreal_computed__),
             )
+        # Every model, with or without indexes: a field whose Vector markers are ambiguous is refused here.
+        declared = declared_vectors(cls.__name__, cls.model_fields)
         indexes = cls.model_config.get("indexes")
         if indexes is not None:
-            vectors = {
-                cls.to_db_field(name): info
-                for name, field in cls.model_fields.items()
-                if (info := get_vector_info(field)) is not None
-            }
+            vectors = {cls.to_db_field(name): info for name, info in declared.items()}
             check_indexes_config(cls, indexes, view=cls._is_view(), column=cls.to_db_field, vectors=vectors)
         relation = {key: cls.model_config.get(key) for key in ("table_type", "relation_in", "relation_out", "enforced")}
         if any(value is not None for value in relation.values()):
