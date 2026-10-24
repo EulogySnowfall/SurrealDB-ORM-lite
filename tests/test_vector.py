@@ -2107,6 +2107,29 @@ class TestForwardReferenceOrm:
         assert _raised(ValueError, model.table_ddl) == text
         assert _raised(ValueError, model.get_indexes) == text
 
+    def test_a_callers_local_name_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """As at Pydantic's first instantiation, the caller's local names come before the model's module: the field
+        keeps what the first completing call resolved it to."""
+        module = types.ModuleType("vec_fwd_module_local")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, VectorField\n"
+            "class VecFwdModuleLocal(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_module_local')\n"
+            "    id: str | None = None\n"
+            "    e: 'Later' = None\n"
+            "Later = VectorField[3]\n",
+            module.__dict__,
+        )
+        model = module.VecFwdModuleLocal
+        Later = VectorField[5]  # noqa: F841 - read by the completion, from this frame's local names
+        column = ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_module_local` TYPE option<array<float, 5>>;"]
+        assert model.table_ddl()[1:] == column
+        assert model.__pydantic_complete__ is True
+        assert get_vector_info(model.model_fields["e"]) == (5, "F32")
+        del Later
+        assert model.table_ddl()[1:] == column
+
     def test_the_callers_namespace(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``utils.user_namespace()``: a copy of the local names of the first frame outside the ORM; ``{}`` without
         frames (an interpreter without ``sys._getframe``)."""

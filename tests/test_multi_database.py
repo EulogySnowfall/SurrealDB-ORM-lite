@@ -3564,6 +3564,31 @@ class TestLinkGuard:
             await MdLate.objects().fetch("later").exec()
         assert str(info.value) == _x4("MdLate", "later", "MdLater", "md_a", "default")
 
+    async def test_a_queryset_completes_a_forward_referenced_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #327: the first queryset completes a model a forward reference left incomplete, so its links resolve
+        and X4 applies without ``model_rebuild()`` or a first instance."""
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+
+        class MdLateAuto(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="md_late_auto")
+
+            id: str | None = None
+            later: "MdLaterAuto | RecordID | None" = None
+
+        class MdLaterAuto(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="md_later_auto", connection="md_a")
+
+            id: str | None = None
+
+        assert MdLateAuto.__pydantic_complete__ is False
+        assert routing.linked_models(MdLateAuto, "later") == ()
+        query = MdLateAuto.objects()
+        assert MdLateAuto.__pydantic_complete__ is True
+        assert routing.linked_models(MdLateAuto, "later") == (MdLaterAuto,)
+        with pytest.raises(SurrealDbError) as info:
+            await query.fetch("later").exec()
+        assert str(info.value) == _x4("MdLateAuto", "later", "MdLaterAuto", "md_a", "default")
+
     async def test_the_linked_models_connection_is_read_at_each_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cached: the linked classes; never their connection (a ``using()`` block, or a model routed elsewhere)."""
         monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
