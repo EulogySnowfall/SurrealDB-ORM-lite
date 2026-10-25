@@ -148,6 +148,9 @@ class QuerySet:
     """
 
     def __init__(self, model: type[BaseSurrealModel]) -> None:
+        # Issue #327: a model a forward reference left incomplete at its class statement is completed, and its vector
+        # checks run, before a query reads its fields — their refusal raises here.
+        model._complete_pending_checks()
         self.model = model
         self._filters: list[tuple[str, str, Any]] = []
         self._q_filters: list[Q] = []

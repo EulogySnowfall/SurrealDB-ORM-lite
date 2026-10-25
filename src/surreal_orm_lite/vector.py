@@ -9,10 +9,12 @@ Pydantic reads the ``Vector`` marker exactly as ``VectorField[1536]``'s. Both sp
 validation, the same column type (``option<array<float, 1536>>``), the same schema. ``get_vector_info()`` and
 ``is_vector_field()`` — the full ORM's helpers, under their names — read the marker of either spelling from a model
 field or an annotation, and of their unions with ``None`` (``VectorField[1536] | None``,
-``Annotated[list[float], Vector(1536)] | None``), as ``define_table()`` reads them; never from inside a container
-(``list[VectorField[3]]``). A field or an annotation holding two different markers, or a marker next to a type other
-than ``None``, has no single dimension: the helpers refuse it, and a model's ``class`` statement refuses such a field
-(``declared_vectors()``).
+``Annotated[list[float], Vector(1536)] | None``, ``VectorField[1536] | Literal[None]``), as ``define_table()`` reads
+them; never from inside a container (``list[VectorField[3]]``). A field or an annotation holding two different markers,
+or a marker next to a type other than ``None``, has no single dimension: the helpers refuse it, and a model's ``class``
+statement refuses such a field (``declared_vectors()``) — or, for a field declared through a forward reference, the
+completion of the model once the name resolves: ``model_rebuild()``, its first instantiation, validation or JSON schema,
+or the ORM's first DDL or queryset of the model (``BaseSurrealModel._complete_pending_checks()``).
 
 A value is ``None`` or a ``list``/``tuple`` of exactly ``d`` real numbers — ``int``, ``float``, any ``numbers.Real``,
 a ``decimal.Decimal`` (SurrealDB's decimals read back as ``Decimal``) —, never a ``bool`` nor a ``str``, each finite
@@ -55,7 +57,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from numbers import Real
 from types import NoneType, UnionType
-from typing import Annotated, Any, NoReturn, Self, TypedDict, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, NoReturn, Self, TypedDict, Union, get_args, get_origin
 
 from pydantic import Field, GetCoreSchemaHandler, GetJsonSchemaHandler
 from pydantic.fields import FieldInfo
@@ -303,9 +305,11 @@ def _held(annotation: Any, metadata: Sequence[Any] = ()) -> tuple[tuple[Vector, 
 
     The ``Annotated`` layers are unwrapped and their metadata added to *metadata*: when it holds a ``Vector``, those
     markers decide, whatever the type under them (a ``Vector`` validates the value itself). Otherwise ``None`` gives
-    neither; a union gives the markers and other types of its members, each read the same way; any other type is
-    another type — a container holding vectors (``list[VectorField[3]]``) included, whose arguments are never read.
-    This is the reading ``model_ddl`` gives the column its kind by, so the column and the checks agree.
+    neither, and so does a ``Literal`` whose values are all ``None`` (``Literal[None]`` admits ``None`` only, issue
+    #327); a union gives the markers and other types of its members, each read the same way; any other type is
+    another type — a ``Literal`` holding another value (``Literal[None, "x"]``) and a container holding vectors
+    (``list[VectorField[3]]``) included, whose arguments are never read. This is the reading ``model_ddl`` gives the
+    column its kind by, so the column and the checks agree.
     """
     while get_origin(annotation) is Annotated:
         metadata = (*metadata, *annotation.__metadata__)
@@ -313,9 +317,9 @@ def _held(annotation: Any, metadata: Sequence[Any] = ()) -> tuple[tuple[Vector, 
     markers = tuple(dict.fromkeys(item for item in metadata if isinstance(item, Vector)))
     if markers:
         return markers, False
-    if annotation is None or annotation is NoneType:
-        return (), False
     origin = get_origin(annotation)
+    if annotation is None or annotation is NoneType or (origin is Literal and all(arg is None for arg in get_args(annotation))):
+        return (), False
     if origin is not Union and origin is not UnionType:
         return (), True
     members = [_held(member) for member in get_args(annotation)]
@@ -360,30 +364,35 @@ def get_vector_info(annotation_or_field: Any) -> tuple[int, str] | None:
     Takes a model field (``Model.model_fields["embedding"]``, a Pydantic ``FieldInfo``) or an annotation
     (``VectorField[3]``, ``Annotated[list[float] | None, Vector(3)]``): both spellings give ``(3, "F32")``, and so do
     their unions with ``None`` (``VectorField[3] | None``, ``Optional[VectorField[3]]``,
-    ``Annotated[list[float], Vector(3)] | None``), read as ``define_table()`` reads them. Anything without a ``Vector``
-    marker — ``list[float]``, another field, vectors held in a container such as ``list[VectorField[3]]`` — gives
-    ``None``.
+    ``Annotated[list[float], Vector(3)] | None``, ``VectorField[3] | Literal[None]``), read as ``define_table()`` reads
+    them. Anything without a ``Vector`` marker — ``list[float]``, another field, vectors held in a container such as
+    ``list[VectorField[3]]`` — gives ``None``.
 
     :raises ValueError: the field or annotation holds two different ``Vector`` markers, or a marker next to a type
-        other than ``None`` in a union (``VectorField[3] | str``): its dimension and storage type are not one. A
-        model's ``class`` statement refuses such a field already, naming it.
+        other than ``None`` in a union (``VectorField[3] | str``, ``VectorField[3] | Literal[None, "x"]``): its
+        dimension and storage type are not one. A model's ``class`` statement refuses such a field already, naming it
+        (for a field declared through a forward reference, once Pydantic completes the model).
     """
     marker = _marker(annotation_or_field)
     return None if marker is None else (marker.dimension, marker.vector_type)
 
 
 def is_vector_field(annotation_or_field: Any) -> bool:
-    """Whether a model field or an annotation is a vector field, any spelling — a union with ``None`` included — (the
-    full ORM's helper). Refuses what ``get_vector_info()`` refuses, with its ``ValueError``."""
+    """Whether a model field or an annotation is a vector field, any spelling — a union with ``None`` or
+    ``Literal[None]`` included — (the full ORM's helper). Refuses what ``get_vector_info()`` refuses, with its
+    ``ValueError``: a field or an annotation holding two different ``Vector`` markers, or a marker next to a type other
+    than ``None``."""
     return _marker(annotation_or_field) is not None
 
 
 def declared_vectors(owner: str, fields: Mapping[str, FieldInfo]) -> dict[str, tuple[int, str]]:
     """The ``(dimension, storage type)`` of each vector field among a model's *fields*, by field name, as
-    ``get_vector_info()`` reads them: what the model's ``class`` statement checks (issue #318).
+    ``get_vector_info()`` reads them: what the model's ``class`` statement checks (issue #318), and checks again once
+    Pydantic completes a model a forward reference left incomplete there (issue #327).
 
     A field whose ``Vector`` markers are ambiguous raises ``ValueError`` naming the model *owner* and the field, so the
-    ``class`` statement refuses it whether or not the model declares indexes.
+    ``class`` statement refuses it whether or not the model declares indexes. A field still a forward reference has no
+    marker yet: it is not a vector field here.
     """
     declared: dict[str, tuple[int, str]] = {}
     for name, field in fields.items():

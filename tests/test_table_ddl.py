@@ -2276,6 +2276,37 @@ class TestTableDdl:
     def test_the_kitchen_statements(self) -> None:
         assert TdlKitchenBase.table_ddl() == _KITCHEN_BASE
 
+    def test_a_forward_reference_resolved_before_any_instance(self) -> None:
+        """Issue #327: a model a forward reference left incomplete at its ``class`` statement, with no vector field, is
+        completed before ``table_ddl()`` reads it — its columns get the resolved kinds, as after a first instance, never
+        ``any``."""
+
+        class TdlFwdAuthor(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_fwd_author", schema_mode=SchemaMode.SCHEMAFULL)
+
+            id: str | None = None
+            best: "TdlFwdBook | None" = None
+            score: "Score" = 0
+            later: "TdlFwdBook | RecordID | None" = None
+
+        class TdlFwdBook(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_fwd_book")
+
+            id: str | None = None
+
+        Score = int
+        assert TdlFwdAuthor.__pydantic_complete__ is False
+        statements = [
+            "DEFINE TABLE OVERWRITE `tdl_fwd_author` TYPE NORMAL SCHEMAFULL;",
+            "DEFINE FIELD OVERWRITE `best` ON `tdl_fwd_author` TYPE option<object> FLEXIBLE;",
+            "DEFINE FIELD OVERWRITE `score` ON `tdl_fwd_author` TYPE int DEFAULT 0;",
+            "DEFINE FIELD OVERWRITE `later` ON `tdl_fwd_author` TYPE option<object | record> FLEXIBLE;",
+        ]
+        assert TdlFwdAuthor.table_ddl() == statements
+        assert TdlFwdAuthor.__pydantic_complete__ is True
+        TdlFwdAuthor()
+        assert TdlFwdAuthor.table_ddl() == statements
+
     def test_declared_clauses_order(self) -> None:
         clauses = schema.TableClauses(
             schema_mode="SCHEMAFULL",
@@ -7362,6 +7393,11 @@ _USER_MODELS_SG1 = (
 _SENTENCES_35 = {
     "Field types": (
         "Anything else is `any`.",
+        'A field annotated with a name defined after the class (a forward reference: `score: "Score" = 0`, then '
+        "`Score = int`) gets the kind of the type its name resolves to. Since v0.37.1, `table_ddl()` and "
+        "`define_table()` complete such a model first, as its first instantiation does, so they write the same "
+        "statements before and after an instance (`score` is `TYPE int DEFAULT 0`, which earlier versions wrote `TYPE "
+        "any DEFAULT 0` until the model was instantiated or rebuilt). A name still undefined gives `any`.",
         "A computed field is written `VALUE`; over a field the database defines `COMPUTED` (SurrealDB 3.x), "
         "`define_table()` writes `COMPUTED`: replacing it by `VALUE` would leave the stored records without the field "
         "until their next write.",
