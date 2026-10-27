@@ -308,7 +308,8 @@ def diff(current: SchemaState, target: SchemaState) -> "list[Operation]":
 
     1. ``DefineAnalyzer`` for each analyzer of *target* missing from *current*, then each one that differs (with
        ``previous=``), by name;
-    2. the tables of *target* missing from *current*, by name, views last: ``CreateTable``, ``AddField`` for each
+    2. the tables of *target* missing from *current*, by name, views last: ``CreateTable`` (the schema mode and the
+       table type *target*'s marks leave to the database not written: SurrealDB's defaults), ``AddField`` for each
        field (by name: a parent before its children), ``CreateIndex`` for each index, ``DefineEvent`` for each event;
     3. the tables both hold, by name, compared with their effective target (:func:`effective`): ``AlterTable`` when a
        table clause differs; per field ``AddField``/``AlterField``, then ``DropField`` for the extra ones (children
@@ -341,7 +342,7 @@ def diff(current: SchemaState, target: SchemaState) -> "list[Operation]":
     new = sorted((name for name in tables if name not in stored), key=lambda name: (tables[name].view_query is not None, name))
     for name in new:
         table = tables[name]
-        result.append(ops.CreateTable.from_table_state(table))
+        result.append(_table_creation(ops, table))
         result.extend(ops.AddField.from_field_state(name, field) for field in _compared_fields(table).values())
         result.extend(_index_creation(ops, name, index) for index in table.indexes.values())
         result.extend(_event_definition(ops, name, event) for event in table.events.values())
@@ -401,6 +402,20 @@ def _access_changes(ops: Any, current: SchemaState, target: SchemaState) -> "lis
         if name not in target.accesses:
             result.append(ops.RemoveAccess(name, previous=ops.DefineAccess.from_access_state(access)))
     return result
+
+
+#: The table keys a new table takes SurrealDB's default for when its model leaves them to the database.
+_CREATION_DEFAULTS = ("schema_mode", "table_type")
+
+
+def _table_creation(ops: Any, table: TableState) -> "Operation":
+    """The ``CreateTable`` of a *target* table: every clause it holds, but the schema mode and the table type its marks
+    leave to the database, written as nothing — the statement its model's applier writes on a new table, which
+    SurrealDB defines ``SCHEMALESS`` and ``TYPE ANY`` (spec §5.4's golden equality)."""
+    operation = ops.CreateTable.from_table_state(table)
+    unwritten = {key: None for key in _CREATION_DEFAULTS if key in table.undeclared}
+    created: Operation = replace(operation, **unwritten) if unwritten else operation
+    return created
 
 
 def _index_creation(ops: Any, table: str, index: IndexState) -> "Operation":

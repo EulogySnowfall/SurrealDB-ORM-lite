@@ -1448,12 +1448,14 @@ class DefineEvent(Operation):
     @classmethod
     def from_event_state(cls, state: EventState) -> "DefineEvent | None":
         """The operation that defines *state*, or ``None`` when ``schema.Event`` refuses it. ``then`` loses the one
-        ``{ … }`` block around it (the servers render the block ``Event.ddl()`` writes), so it is not wrapped twice."""
+        ``{ … }`` block around it (the servers render the block ``Event.ddl()`` writes), so it is not wrapped twice;
+        ``WHEN true`` — what the servers render for an event without ``WHEN`` — is ``when=None``, so the operation
+        writes the statement ``Event.ddl()`` writes for that event."""
         try:
             return cls(
                 state.name,
                 state.table,
-                state.when,
+                None if state.when.strip().lower() == "true" else state.when,
                 _block_content(state.then),
                 state.comment,
                 async_mode=state.async_mode,

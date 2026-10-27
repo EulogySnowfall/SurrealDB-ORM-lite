@@ -71,7 +71,7 @@ from .introspection import (
 )
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
-from .model_base import BaseSurrealModel, SurrealConfigDict
+from .model_base import BaseSurrealModel, SurrealConfigDict, get_registered_models
 from .q import Q
 from .query_set import QuerySet
 from .schema import Event, function_ddl
@@ -109,6 +109,7 @@ __all__ = [
     "SurrealConfigDict",
     "TableType",
     "SchemaMode",
+    "get_registered_models",
     # QuerySet
     "QuerySet",
     "Q",

@@ -2731,6 +2731,16 @@ class TestFromState:
         assert rebuilt.then == "CREATE a;\n\tCREATE b;"
         assert DefineEvent.from_event_state(EventState("e", "t", "a; b", "CREATE a")) is None
 
+    @pytest.mark.parametrize("when", ["true", " TRUE "])
+    def test_an_event_when_true_is_written_without_when(self, when: str) -> None:
+        # The servers render an event defined without WHEN as WHEN true: the operation writes Event.ddl()'s statement.
+        rebuilt = DefineEvent.from_event_state(EventState("e", "t", when, "{ CREATE a }"))
+        assert rebuilt is not None
+        assert rebuilt.when is None
+        assert rebuilt.forwards() == Event("e", then="CREATE a").ddl("t").replace(" OVERWRITE", "", 1)
+        kept = DefineEvent.from_event_state(EventState("e", "t", "true = $x", "{ CREATE a }"))
+        assert kept is not None and kept.when == "true = $x"
+
     def test_an_access(self) -> None:
         assert DefineAccess.from_access_state(AccessState("api", access_type="JWT")) is None
         server = (

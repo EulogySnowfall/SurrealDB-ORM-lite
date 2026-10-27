@@ -4933,3 +4933,42 @@ class BaseSurrealModel(BaseModel):
         """
         check_transaction(cls, tx, f"{cls.__name__}.call_function()")
         return await cls._connection_manager().call_function(function, args, params=params, return_type=return_type, tx=tx)
+
+
+def _library_class(cls: type) -> bool:
+    """Whether *cls* is defined by ``surreal_orm_lite`` itself (``BaseSurrealEdge``), not by an application."""
+    module = cls.__module__
+    return module == "surreal_orm_lite" or module.startswith("surreal_orm_lite.")
+
+
+def get_registered_models() -> list[type[BaseSurrealModel]]:
+    """The model classes of the application (v0.38.0; the full SurrealDB-ORM's function) — a new list on each call.
+
+    Built by a walk of ``BaseSurrealModel.__subclasses__()``, without a registry: depth first, each class's subclasses
+    in the order ``__subclasses__()`` lists them (their definition order), a class reached twice (multiple inheritance)
+    listed once. The walk descends into every subclass; a class is listed when it is not one of the library's own
+    (``BaseSurrealEdge``) and its name does not start with ``_`` (an intermediate base such as ``_Timestamped``). An
+    excluded class only leaves itself out: ``class Person(_Timestamped)`` and ``class Likes(BaseSurrealEdge)`` are
+    listed. The order is the walk's — a class's subclasses right after it —, not the order in which the application
+    defined its models. A class no longer referenced anywhere drops out once collected, so there is no registry to
+    clear.
+
+    ``migrations.introspect_models()`` and ``migrations.ModelIntrospector`` read it when no models are given; to keep
+    some models out, pass them explicitly.
+
+    Example:
+        >>> [model.__name__ for model in get_registered_models()]
+        ['Person', 'Employee', 'Likes']
+    """
+    result: list[type[BaseSurrealModel]] = []
+    seen: set[type] = set()
+    stack = list(reversed(BaseSurrealModel.__subclasses__()))
+    while stack:
+        cls = stack.pop()
+        if cls in seen:
+            continue
+        seen.add(cls)
+        if not _library_class(cls) and not cls.__name__.startswith("_"):
+            result.append(cls)
+        stack.extend(reversed(cls.__subclasses__()))
+    return result

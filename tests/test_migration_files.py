@@ -272,7 +272,7 @@ class TestMigrationStatementError:
 
 
 def test_the_package_exports() -> None:
-    # The names that exist after Task 3 of v0.38.0's plan; the later tasks add the rest of spec §5.1.
+    # The names that exist after Task 5 of v0.38.0's plan; the later tasks add the rest of spec §5.1.
     assert set(migrations.__all__) == {
         "MIGRATIONS_TABLE",
         "Migration",
@@ -299,6 +299,8 @@ def test_the_package_exports() -> None:
         "RawSQL",
         "DefaultExpression",
         "split_destructive",
+        "ModelIntrospector",
+        "introspect_models",
     }
     for name in migrations.__all__:
         assert getattr(migrations, name) is not None

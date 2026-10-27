@@ -18,14 +18,40 @@ The diff (``TestDiffRules``, ``TestDiffOrder``: spec §5.7, AC-6), the effective
 (``TestUnmarkedDiff``: C2, AC-12), what it ignores (``TestIgnored``) and the definitions an operation cannot write
 (``TestUnrepresentable``). The marks and ``applied_migrations`` (``TestStateAttributes``: §5.9, §5.10, C4, AC-31,
 AC-33). The strict and file replays and the rewind (``TestReplay``, ``TestRewind``: §6.3, C9, E-R1, D36, D37), and
-Task 3's round trip in its ``diff()`` form (``TestRoundTripDiff``, AC-4). Unit tests only (no server).
+Task 3's round trip in its ``diff()`` form (``TestRoundTripDiff``, AC-4).
+
+The models' state (spec §5.9, ``migrations/introspector.py``): ``introspect_models()`` reads back what each model's
+appliers write (``TestModelState``), with the marks — ``TableState.undeclared`` (``TestUndeclared``),
+``FieldState.undeclared`` and ``FieldState.server`` (``TestFieldMarks``, AC-33) —; the operations its diff from an empty
+state gives replay to a state that diffs ``[]`` against it in both directions, marks removed (``TestRoundTrip``, AC-4);
+``get_registered_models()`` walks the model classes depth first (``TestRegistryWalk``, AC-32). Unit tests only (no
+server).
 """
 
 import dataclasses
-from typing import Any
+import itertools
+import re
+import sys
+import textwrap
+import types
+from datetime import datetime
+from typing import Any, Literal
 
 import pytest
+from pydantic import Field
 
+import surreal_orm_lite
+from surreal_orm_lite import (
+    Analyzer,
+    AuthenticatedUserMixin,
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    Index,
+    SchemaMode,
+    SurrealConfigDict,
+    TableType,
+    get_registered_models,
+)
 from surreal_orm_lite.define_parser import parse_define_access, parse_define_event, parse_define_field, parse_define_table
 from surreal_orm_lite.migrations import (
     AddField,
@@ -41,6 +67,7 @@ from surreal_orm_lite.migrations import (
     DropIndex,
     DropTable,
     Migration,
+    ModelIntrospector,
     Operation,
     RawSQL,
     RebuildIndex,
@@ -49,11 +76,13 @@ from surreal_orm_lite.migrations import (
     RemoveEvent,
     RemoveFunction,
     compare,
+    introspect_models,
+    introspector,
     render,
     state,
 )
 from surreal_orm_lite.migrations.constants import MIGRATIONS_TABLE
-from surreal_orm_lite.schema import Event
+from surreal_orm_lite.schema import Event, access_statement
 from surreal_orm_lite.schema_state import (
     AccessState,
     AnalyzerState,
@@ -66,7 +95,16 @@ from surreal_orm_lite.schema_state import (
     SchemaState,
     TableState,
 )
-from tests.test_migration_operations import _round_trips
+from tests.test_migration_operations import (
+    AdPlain,
+    AdRefresh,
+    AdUserTable,
+    MigLikes,
+    MigPerson,
+    MigStats,
+    MigUser,
+    _round_trips,
+)
 
 
 class TestLiteralEqual:
@@ -603,8 +641,8 @@ class TestDiffRules:
         previous = DefineEvent("audit", "person", "$event = 'CREATE'", "CREATE log SET who = $after.id")
         assert current.diff(target) == [
             DefineEvent("audit", "person", "$event = 'UPDATE'", "CREATE log SET who = $after.id", previous=previous),
-            DefineEvent("hello", "person", "true", "CREATE hi"),
-            RemoveEvent("gone", "person", previous=DefineEvent("gone", "person", "true", "CREATE log")),
+            DefineEvent("hello", "person", None, "CREATE hi"),
+            RemoveEvent("gone", "person", previous=DefineEvent("gone", "person", None, "CREATE log")),
         ]
 
     def test_a_view_query_changed(self) -> None:
@@ -664,8 +702,8 @@ class TestDiffRules:
             AddField("post", "body", "string"),
             AddField("post", "title", "string"),
             CreateIndex("post", "post_title", ["title"], unique=True),
-            DefineEvent("a", "post", "true", "CREATE a"),
-            DefineEvent("b", "post", "true", "CREATE b"),
+            DefineEvent("a", "post", None, "CREATE a"),
+            DefineEvent("b", "post", None, "CREATE b"),
         ]
 
     def test_a_table_removed(self) -> None:
@@ -722,7 +760,7 @@ class TestDiffOrder:
             accesses=(_access(duration_token="1h"), _access(name="new_acc")),
         )
         previous_english = DefineAnalyzer("english", ["blank"], ["lowercase"])
-        previous_audit = DefineEvent("audit", "person", "true", "CREATE log SET who = $after.id")
+        previous_audit = DefineEvent("audit", "person", None, "CREATE log SET who = $after.id")
         assert current.diff(target) == [
             DefineAnalyzer("fresh", ["blank"]),
             DefineAnalyzer("english", ["blank"], ["lowercase", "ascii"], previous=previous_english),
@@ -730,7 +768,7 @@ class TestDiffOrder:
             CreateTable("zeta", "SCHEMAFULL", "normal"),
             AddField("zeta", "a", "int"),
             CreateIndex("zeta", "za", ["a"]),
-            DefineEvent("ze", "zeta", "true", "CREATE z"),
+            DefineEvent("ze", "zeta", None, "CREATE z"),
             CreateTable("aview", "SCHEMALESS", view_query="SELECT * FROM person"),
             AlterTable(
                 "person",
@@ -744,7 +782,7 @@ class TestDiffOrder:
             AddField("person", "email", "string"),
             DropField("person", "nick"),
             CreateIndex("person", "by_age", ["age", "email"], previous=CreateIndex("person", "by_age", ["age"])),
-            DefineEvent("greet", "person", "true", "CREATE hi"),
+            DefineEvent("greet", "person", None, "CREATE hi"),
             RemoveEvent("audit", "person", previous=previous_audit),
             RebuildIndex("post", "post_body"),
             DefineAccess("account", "users", _SIGNUP_FIELDS, _SIGNIN, "1h", previous=_access_op()),
@@ -1178,7 +1216,7 @@ class TestUnrepresentable:
         odd = _e("odd", "{ CREATE a }", async_mode=True, retry=70000)
         assert _s(_person(events=(odd,))).diff(_s(_person())) == [RemoveEvent("odd", "person")]
         operations = _s(_person(events=(odd,))).diff(_s(_person(events=(_e("odd", "{ CREATE b }"),))))
-        assert operations == [DefineEvent("odd", "person", "true", "CREATE b", overwrite=True)]
+        assert operations == [DefineEvent("odd", "person", None, "CREATE b", overwrite=True)]
 
     def test_an_unwritable_definition_both_states_hold_alike_gives_nothing(self) -> None:
         holding = _s(
@@ -1529,3 +1567,593 @@ class TestRoundTripDiff:
     @pytest.mark.parametrize(("operation", "start"), _round_trips(), ids=lambda value: type(value).__name__)
     def test_the_round_trip(self, operation: Operation, start: SchemaState) -> None:
         assert start.diff(operation.state_backwards(operation.state_forwards(start))) == []
+
+
+# --- the models' state: introspect_models(), ModelIntrospector, get_registered_models() -------------------------------
+
+
+class MiBare(BaseSurrealModel):
+    """A node model declaring no table clause."""
+
+    model_config = SurrealConfigDict(table_name="mi_bare")
+
+    id: str | None = None
+    label: str = ""
+
+
+class MiCommented(BaseSurrealModel):
+    """A node model declaring its comment only, on a ``TYPE ANY`` table."""
+
+    model_config = SurrealConfigDict(table_name="mi_commented", table_type=TableType.ANY, comment="Commented")
+
+    id: str | None = None
+    data: dict[str, Any] = {}
+
+
+class MiServer(BaseSurrealModel):
+    """``server_fields``: one column with a constant default (written), one without."""
+
+    model_config = SurrealConfigDict(
+        table_name="mi_server", schema_mode=SchemaMode.SCHEMAFULL, server_fields=["created", "rank"]
+    )
+
+    id: str | None = None
+    created: datetime | None = None
+    rank: int = 0
+    note: str = ""
+
+
+class MiSchemaless(AuthenticatedUserMixin, BaseSurrealModel):
+    """A user model declaring its schema mode (``SCHEMALESS``) and its table type."""
+
+    model_config = SurrealConfigDict(
+        table_name="mi_schemaless", schema_mode=SchemaMode.SCHEMALESS, table_type=TableType.NORMAL, comment="Members"
+    )
+
+    email: str
+    password: str
+
+
+class MiOther(BaseSurrealModel):
+    """A model of another connection."""
+
+    model_config = SurrealConfigDict(table_name="mi_other", connection="other")
+
+    id: str | None = None
+    label: str = ""
+
+
+#: Every kind of model v0.34.0 writes: a SCHEMAFULL node with every declarable clause, an index trio with an analyzer
+#: and two events (``MigPerson``), a node declaring nothing, a ``TYPE ANY`` node, ``server_fields``, a view, an edge, a
+#: SCHEMAFULL user model with a ``primary_key``, a SCHEMALESS user model with and without its ``table_type``, a
+#: ``TableType.USER`` model and a user model with refresh tokens.
+_MODEL_SET: tuple[type[BaseSurrealModel], ...] = (
+    MigPerson,
+    MiBare,
+    MiCommented,
+    MiServer,
+    MigStats,
+    MigLikes,
+    MigUser,
+    AdPlain,
+    MiSchemaless,
+    AdUserTable,
+    AdRefresh,
+)
+#: The keys of ``TableState.undeclared`` for a model declaring none of the table clauses.
+_NOTHING_DECLARED = frozenset({"schema_mode", "comment", "changefeed", "permissions", "drop"})
+
+
+def _model_id(model: type[BaseSurrealModel]) -> str:
+    return model.__name__
+
+
+def _appliers_state(model: type[BaseSurrealModel]) -> SchemaState:
+    """The state ``render.read_own()`` gives for the statements a model's appliers write (spec §5.9), without marks:
+    the table statement of ``table_ddl()`` (an auth model: of ``access_ddl()``) with ``table_ddl()``'s fields, the
+    analyzers and indexes of ``index_ddl(line=3)``, ``event_ddl()``, and an auth model's access statement."""
+    ddl = model.table_ddl()
+    auth = issubclass(model, AuthenticatedUserMixin)
+    table = render.read_own(model.access_ddl()[0] if auth else ddl[0])
+    assert isinstance(table, TableState)
+    fields = [render.read_own(statement) for statement in ddl[1:]]
+    defined = [render.read_own(statement) for statement in model.index_ddl(line=3)]
+    events = [render.read_own(statement) for statement in model.event_ddl()]
+    accesses = []
+    if auth:
+        accesses.append(render.read_own(access_statement(model._access_parts(), clause="")))  # type: ignore[attr-defined]
+    table = dataclasses.replace(
+        table,
+        fields={field.name: field for field in fields},
+        indexes={index.name: index for index in defined if isinstance(index, IndexState)},
+        events={event.name: event for event in events},
+    )
+    return SchemaState(
+        {table.name: table},
+        analyzers={analyzer.name: analyzer for analyzer in defined if isinstance(analyzer, AnalyzerState)},
+        accesses={access.name: access for access in accesses},
+    )
+
+
+class TestModelState:
+    """Spec §5.9: a model's state is what its appliers write on a new table, read back by the parser (M17)."""
+
+    @pytest.mark.parametrize("model", _MODEL_SET, ids=_model_id)
+    def test_each_model_is_its_appliers_statements_read_back(self, model: type[BaseSurrealModel]) -> None:
+        assert _unmarked(introspect_models([model])) == _appliers_state(model)
+
+    def test_the_node_model(self) -> None:
+        table = introspect_models([MigPerson]).tables["mig_person"]
+        assert (table.schema_mode, table.table_type, table.comment) == ("SCHEMAFULL", "normal", "People")
+        assert (table.changefeed, table.changefeed_include_original) == ("7d", True)
+        assert list(table.fields) == sorted(render.read_own(statement).name for statement in MigPerson.table_ddl()[1:])
+        assert table.fields["age"].default == "18"
+        assert table.fields["full"].value == "string::concat(name, ' ', email)"
+        assert set(table.indexes) == {"mig_person_email", "mig_person_bio", "mig_person_emb"}
+        assert table.indexes["mig_person_bio"].search_analyzer == "mig_english"
+        assert set(table.events) == {"mig_audit", "mig_every"}
+
+    def test_the_analyzer(self) -> None:
+        result = introspect_models([MigPerson])
+        assert list(result.analyzers) == ["mig_english"]
+        assert result.analyzers["mig_english"].filters == ("lowercase", "snowball(english)")
+        assert result.accesses == {}
+
+    def test_the_view_and_the_edge(self) -> None:
+        result = introspect_models([MigStats, MigLikes])
+        view, edge = result.tables["mig_stats"], result.tables["mig_likes"]
+        assert view.view_query == "SELECT count() AS n FROM mig_person GROUP ALL"
+        assert view.fields == {}
+        assert (edge.table_type, edge.relation_in, edge.relation_out, edge.enforced) == (
+            "relation",
+            ("mig_person",),
+            ("mig_person", "mig_page"),
+            True,
+        )
+        assert list(edge.fields) == ["weight"]
+
+    def test_a_primary_key_user_model(self) -> None:
+        result = introspect_models([MigUser])
+        table, access = result.tables["mig_user"], result.accesses["mig_account"]
+        assert table.schema_mode == "SCHEMAFULL"
+        assert dict(table.permissions) == {
+            "select": "WHERE id = $auth.id",
+            "update": "WHERE id = $auth.id",
+            "create": "NONE",
+            "delete": "NONE",
+        }
+        assert set(table.fields) == {"email", "password", "name"}
+        assert access.table == "mig_user"
+        assert list(access.signup_fields.items())[0] == ("email", "$email")
+        assert access.signup_fields["id"] == "$email"
+
+    def test_a_schemaless_user_model(self) -> None:
+        table = introspect_models([AdPlain]).tables["AdPlain"]
+        assert (table.schema_mode, table.table_type) == ("SCHEMALESS", "any")
+        assert dict(table.permissions)["select"] == "WHERE id = $auth.id"
+        assert set(table.fields) == {"email", "password"}
+
+    def test_several_models(self) -> None:
+        result = introspect_models(_MODEL_SET)
+        assert set(result.tables) == {model.get_table_name() for model in _MODEL_SET}
+        assert set(result.accesses) == {"mig_account", "AdPlain_access", "mi_schemaless_access", "ad_user", "ad_refresh"}
+        assert list(result.analyzers) == ["mig_english"]
+        assert (result.applied_migrations, result.issues, result.connection) == ((), (), "default")
+
+    def test_the_models_attribute(self) -> None:
+        assert ModelIntrospector([MiBare, MiServer]).models == [MiBare, MiServer]
+        assert ModelIntrospector(model for model in (MiServer,)).models == [MiServer]
+        assert ModelIntrospector([]).introspect() == SchemaState()
+
+    def test_two_models_on_one_table_with_the_same_definition(self) -> None:
+        class MiBareAgain(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="mi_bare")
+
+            id: str | None = None
+            label: str = ""
+
+        assert introspect_models([MiBare, MiBareAgain]) == introspect_models([MiBare])
+
+    def test_two_models_on_one_table_with_different_definitions(self) -> None:
+        class MiBareInt(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="mi_bare")
+
+            id: str | None = None
+            label: int = 0
+
+        message = (
+            "Models MiBare and MiBareInt both declare table 'mi_bare' with different definitions; pass one of them in models=."
+        )
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            introspect_models([MiBare, MiBareInt])
+
+    def test_one_analyzer_object_shared_by_two_models(self) -> None:
+        class MiPosts(BaseSurrealModel):
+            model_config = SurrealConfigDict(
+                table_name="mi_posts",
+                indexes=[Index("mi_posts_body", "body", search_analyzer=MigPerson.get_indexes()[1].search_analyzer)],
+            )
+
+            id: str | None = None
+            body: str = ""
+
+        result = introspect_models([MigPerson, MiPosts])
+        assert list(result.analyzers) == ["mig_english"]
+
+    def test_one_analyzer_name_with_two_definitions(self) -> None:
+        other = Analyzer("mig_english", ["blank"], ["lowercase"])
+
+        class MiNotes(BaseSurrealModel):
+            model_config = SurrealConfigDict(
+                table_name="mi_notes", indexes=[Index("mi_notes_body", "body", search_analyzer=other)]
+            )
+
+            id: str | None = None
+            body: str = ""
+
+        message = (
+            "Analyzer 'mig_english' is declared twice with different definitions (models MigPerson and MiNotes); "
+            "declare it once and reference that object."
+        )
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            introspect_models([MigPerson, MiNotes])
+
+    def test_one_access_name_with_two_definitions(self) -> None:
+        class MiMembers(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="mi_members", access_name="ad_user")
+
+            email: str
+            password: str
+
+        message = (
+            "Models AdUserTable and MiMembers both declare access 'ad_user' with different definitions; pass one of "
+            "them in models=."
+        )
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            introspect_models([AdUserTable, MiMembers])
+
+    def test_a_model_refusal_propagates(self) -> None:
+        class MiExcluded(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="mi_excluded")
+
+            email: str
+            password: str = Field(exclude=True)
+
+        with pytest.raises(TypeError, match="MiExcluded"):
+            introspect_models([MiExcluded])
+
+    def test_a_statement_read_to_another_kind_is_a_bug(self) -> None:
+        class MiBroken(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="mi_broken")
+
+            id: str | None = None
+
+            @classmethod
+            def table_ddl(cls, *, overwrite: bool = True) -> list[str]:
+                return ["DEFINE FIELD OVERWRITE `a` ON `mi_broken` TYPE int;"]
+
+        message = (
+            "ModelIntrospector: a statement MiBroken writes for its TableState defines something else; this is a bug "
+            "of surreal_orm_lite."
+        )
+        with pytest.raises(RuntimeError, match=f"^{re.escape(message)}$"):
+            introspect_models([MiBroken])
+
+    def test_an_index_statement_read_to_another_kind_is_a_bug(self) -> None:
+        class MiBrokenIndex(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="mi_broken_index")
+
+            id: str | None = None
+
+            @classmethod
+            def index_ddl(cls, *, overwrite: bool = True, line: Literal[2, 3] = 3) -> list[str]:
+                return ["DEFINE EVENT OVERWRITE `e` ON `mi_broken_index` THEN { CREATE a };"]
+
+        with pytest.raises(RuntimeError, match=r"^ModelIntrospector: .*MiBrokenIndex writes for its IndexState "):
+            introspect_models([MiBrokenIndex])
+
+    @pytest.mark.parametrize("item", [object(), "MiBare", MiBare(), dict])
+    def test_an_item_that_is_not_a_model_is_refused(self, item: Any) -> None:
+        with pytest.raises(TypeError, match=r"^ModelIntrospector: models= holds .*, not a BaseSurrealModel subclass\.$"):
+            ModelIntrospector([MiBare, item])
+
+    def test_a_bare_str_is_refused(self) -> None:
+        with pytest.raises(TypeError, match=r"^ModelIntrospector: models= takes an iterable of model classes"):
+            introspect_models("MiBare")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("connection", [3, b"other", ["other"]])
+    def test_a_connection_that_is_not_a_str_is_refused(self, connection: Any) -> None:
+        with pytest.raises(TypeError, match=r"^ModelIntrospector: connection= takes a connection name \(str\) or None"):
+            ModelIntrospector([MiBare], connection=connection)
+
+    def test_the_connection_filter(self) -> None:
+        assert ModelIntrospector([MiBare, MiOther], connection="other").models == [MiOther]
+        assert ModelIntrospector([MiBare, MiOther], connection="default").models == [MiBare]
+        assert ModelIntrospector([MiBare, MiOther]).models == [MiBare, MiOther]
+        result = introspect_models([MiBare, MiOther], connection="other")
+        assert (set(result.tables), result.connection) == ({"mi_other"}, "other")
+        assert introspect_models([MiBare, MiOther], connection="nowhere") == SchemaState(connection="nowhere")
+
+
+class TestUndeclared:
+    """Spec §5.9, D28: ``TableState.undeclared`` — ``drop`` always, each table clause the model leaves to the
+    database, and ``table_type`` for a user model whose ``access_ddl()`` table statement writes no ``TYPE``."""
+
+    @staticmethod
+    def _undeclared(model: type[BaseSurrealModel]) -> frozenset[str]:
+        return introspect_models([model]).tables[model.get_table_name()].undeclared
+
+    def test_a_node_model_declaring_nothing(self) -> None:
+        assert self._undeclared(MiBare) == _NOTHING_DECLARED
+
+    def test_a_declared_comment(self) -> None:
+        assert self._undeclared(MiCommented) == _NOTHING_DECLARED - {"comment"}
+
+    def test_every_clause_declared(self) -> None:
+        assert self._undeclared(MigPerson) == {"drop"}
+
+    def test_the_view_and_the_edge(self) -> None:
+        assert self._undeclared(MigStats) == _NOTHING_DECLARED - {"comment"}
+        assert self._undeclared(MigLikes) == _NOTHING_DECLARED
+
+    def test_a_schemafull_user_model_writes_its_permissions(self) -> None:
+        assert self._undeclared(MigUser) == {"comment", "changefeed", "drop"}
+        assert self._undeclared(AdUserTable) == {"changefeed", "drop"}
+
+    def test_a_schemaless_user_model_without_its_table_type(self) -> None:
+        assert self._undeclared(AdPlain) == _NOTHING_DECLARED | {"table_type"}
+
+    def test_a_schemaless_user_model_declaring_its_table_type(self) -> None:
+        assert self._undeclared(MiSchemaless) == {"changefeed", "permissions", "drop"}
+
+    def test_drop_on_every_table(self) -> None:
+        assert all("drop" in table.undeclared for table in introspect_models(_MODEL_SET).tables.values())
+
+
+class TestFieldMarks:
+    """Spec §5.9, AC-33: ``FieldState.undeclared`` — the clauses a model cannot declare (F8) on every field,
+    ``default`` without a ``DEFAULT``, ``value`` without a ``VALUE`` — and ``FieldState.server`` on the
+    ``server_fields`` columns; states not built from models carry none."""
+
+    @staticmethod
+    def _fields(model: type[BaseSurrealModel]) -> dict[str, FieldState]:
+        return dict(introspect_models([model]).tables[model.get_table_name()].fields)
+
+    def test_every_field_holds_what_models_cannot_declare(self) -> None:
+        fields = [field for table in introspect_models(_MODEL_SET).tables.values() for field in table.fields.values()]
+        assert len(fields) > 30
+        assert all(field.undeclared >= _FIELD_MARKS for field in fields)
+        assert all(field.undeclared - _FIELD_MARKS <= {"default", "value"} for field in fields)
+
+    def test_default(self) -> None:
+        fields = self._fields(MigPerson)
+        assert "default" not in fields["age"].undeclared
+        assert "default" in fields["name"].undeclared
+        assert all(("default" in field.undeclared) is (field.default is None) for field in fields.values())
+
+    def test_value(self) -> None:
+        fields = self._fields(MigPerson)
+        assert fields["full"].undeclared == _FIELD_MARKS | {"default"}
+        assert fields["age"].undeclared == _FIELD_MARKS | {"value"}
+        assert all(("value" in field.undeclared) is (field.value is None) for field in fields.values())
+
+    def test_server_exactly_on_server_fields(self) -> None:
+        fields = self._fields(MiServer)
+        assert {name for name, field in fields.items() if field.server} == {"created", "rank"}
+        assert fields["rank"].default == "0"
+        assert "default" not in fields["rank"].undeclared
+
+    def test_a_computed_field_is_not_a_server_field(self) -> None:
+        assert MigPerson.get_server_fields() == {"full"}
+        assert not any(field.server for field in self._fields(MigPerson).values())
+
+    def test_states_not_built_from_models_carry_none(self) -> None:
+        read = [
+            render.read_own("DEFINE FIELD OVERWRITE `age` ON `t` TYPE int DEFAULT 18;"),
+            parse_define_field("DEFINE FIELD age ON t TYPE int DEFAULT 18 PERMISSIONS FULL").state,
+            FieldState("age", "int"),
+        ]
+        assert all(isinstance(field, FieldState) for field in read)
+        assert all((field.undeclared, field.server) == (frozenset(), False) for field in read)
+        tables = [render.read_own(MiBare.table_ddl()[0]), parse_define_table("DEFINE TABLE t TYPE NORMAL SCHEMAFULL")]
+        assert all(table.undeclared == frozenset() for table in tables)
+
+    def test_the_marks_are_ignored_by_the_comparator(self) -> None:
+        marked = introspect_models([MigPerson]).tables["mig_person"]
+        unmarked = _unmarked(introspect_models([MigPerson])).tables["mig_person"]
+        assert compare.table_key(marked) == compare.table_key(unmarked)
+        assert all(
+            compare.field_key(field) == compare.field_key(unmarked.fields[name]) for name, field in marked.fields.items()
+        )
+
+
+class TestRoundTrip:
+    """AC-4: the operations the diff from an empty state gives for the models — what ``makemigrations()`` writes for a
+    new database —, replayed, give a state that diffs ``[]`` against the models' state in both directions, marks
+    removed; their statements are the appliers' (spec §5.4's golden equality, as sets per kind)."""
+
+    def test_the_replay_diffs_empty(self) -> None:
+        target = introspect_models(_MODEL_SET)
+        replayed = _replay(*SchemaState().diff(target))
+        assert replayed.diff(target) == []
+        unmarked = _unmarked(target)
+        assert replayed.diff(unmarked) == []
+        assert unmarked.diff(replayed) == []
+
+    def test_a_new_table_leaves_its_undeclared_mode_and_type_to_surrealdb(self) -> None:
+        bare = _t("bare", mode="SCHEMALESS", table_type="any", undeclared={"schema_mode", "table_type", "drop"})
+        assert _s().diff(_s(bare)) == [CreateTable("bare", schema_mode=None, table_type=None)]
+        assert CreateTable("bare", schema_mode=None, table_type=None).forwards() == "DEFINE TABLE `bare`;"
+        declared = dataclasses.replace(bare, undeclared={"drop"})
+        assert _s().diff(_s(declared)) == [CreateTable("bare", schema_mode="SCHEMALESS", table_type="any")]
+        # The replay reads SurrealDB's defaults back: nothing left to do.
+        assert _replay(*_s().diff(_s(bare))).diff(_s(bare)) == []
+
+    def test_every_model_kind_is_written(self) -> None:
+        operations = SchemaState().diff(introspect_models(_MODEL_SET))
+        kinds = {type(operation).__name__ for operation in operations}
+        assert kinds == {"DefineAnalyzer", "CreateTable", "AddField", "CreateIndex", "DefineEvent", "DefineAccess"}
+        assert sum(isinstance(operation, DefineAccess) for operation in operations) == 5
+
+    @pytest.mark.parametrize("model", [MigPerson, MiBare, MiCommented, MiServer, MigStats, MigLikes], ids=_model_id)
+    def test_the_statements_are_the_appliers(self, model: type[BaseSurrealModel]) -> None:
+        statements = [operation.forwards() for operation in SchemaState().diff(introspect_models([model]))]
+        ddl = model.table_ddl()
+        appliers = [*ddl, *model.index_ddl(), *model.event_ddl()]
+        kept = [statement for statement in appliers if statement.startswith("DEFINE ANALYZER")]
+        plain = [render.plain(statement) for statement in appliers if not statement.startswith("DEFINE ANALYZER")]
+        assert statements[len(kept)] == render.plain(ddl[0])
+        for kind in ("ANALYZER", "TABLE", "FIELD", "INDEX", "EVENT"):
+            expected = [statement for statement in (*kept, *plain) if statement.startswith(f"DEFINE {kind} ")]
+            assert sorted(statement for statement in statements if statement.startswith(f"DEFINE {kind} ")) == sorted(
+                expected
+            ), kind
+
+    def test_an_access_is_the_model_access(self) -> None:
+        operations = SchemaState().diff(introspect_models([MigUser]))
+        access = [operation for operation in operations if isinstance(operation, DefineAccess)]
+        assert len(access) == 1
+        # The SET items in the state's order (the id item first, then by name): the same access for the comparator (M19).
+        model_access = render.read_own(access_statement(MigUser._access_parts(), clause=""))
+        assert compare.access_key(_own(access[0].forwards())) == compare.access_key(model_access)
+        assert operations[0].forwards() == render.plain(MigUser.access_ddl()[0])
+
+
+_MODULES = itertools.count()
+
+
+@pytest.fixture
+def model_module(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Defines models in a module created for the test (``types.ModuleType``), registered in ``sys.modules`` while
+    the test runs: ``model_module(source)`` runs *source* in it and returns it."""
+
+    def define(source: str) -> types.ModuleType:
+        module = types.ModuleType(f"mig_registry_{next(_MODULES)}")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(textwrap.dedent(source), module.__dict__)
+        return module
+
+    return define
+
+
+def _of(module: types.ModuleType, models: list[type[BaseSurrealModel]]) -> list[type[BaseSurrealModel]]:
+    """The classes of *models* defined in *module*, in their order."""
+    return [model for model in models if model.__module__ == module.__name__]
+
+
+_ORDER = """
+    from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict
+
+    class A(BaseSurrealModel):
+        model_config = SurrealConfigDict(table_name="mi_walk_a")
+        id: str | None = None
+
+    class _Base(BaseSurrealModel):
+        model_config = SurrealConfigDict(table_name="mi_walk_base")
+        id: str | None = None
+
+    class B(BaseSurrealModel):
+        model_config = SurrealConfigDict(table_name="mi_walk_b")
+        id: str | None = None
+
+    class C(_Base):
+        model_config = SurrealConfigDict(table_name="mi_walk_c")
+"""
+
+
+class TestRegistryWalk:
+    """D18, D33, C11, AC-32: ``get_registered_models()`` walks the model classes depth first, without a registry."""
+
+    def test_a_new_list_on_each_call(self) -> None:
+        first = get_registered_models()
+        assert first
+        assert get_registered_models() is not first
+        first.clear()
+        assert get_registered_models()
+
+    def test_the_library_classes_are_not_models(self) -> None:
+        models = get_registered_models()
+        assert BaseSurrealModel not in models
+        assert BaseSurrealEdge not in models
+        assert not any(model.__module__.split(".")[0] == "surreal_orm_lite" for model in models)
+        assert MigPerson in models and MigLikes in models and MigUser in models
+
+    def test_the_top_level_export(self) -> None:
+        import surreal_orm_lite.migrations as migrations
+        import surreal_orm_lite.model_base as model_base
+
+        assert surreal_orm_lite.get_registered_models is model_base.get_registered_models
+        assert "get_registered_models" in surreal_orm_lite.__all__
+        assert "get_registered_models" not in migrations.__all__
+        assert not hasattr(migrations, "get_registered_models")
+
+    def test_a_module_created_for_the_test(self, model_module: Any) -> None:
+        module = model_module(_ORDER)
+        assert _of(module, get_registered_models()) == [module.A, module.C, module.B]
+
+    def test_an_edge_subclassing_the_library_edge(self, model_module: Any) -> None:
+        module = model_module(
+            """
+            from surreal_orm_lite import BaseSurrealEdge, SurrealConfigDict
+
+            class Follows(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="mi_walk_follows")
+
+            class _Weighted(BaseSurrealEdge):
+                weight: int = 1
+
+            class Rates(_Weighted):
+                model_config = SurrealConfigDict(table_name="mi_walk_rates")
+            """
+        )
+        assert _of(module, get_registered_models()) == [module.Follows, module.Rates]
+
+    def test_a_class_with_two_model_bases_is_listed_once(self, model_module: Any) -> None:
+        module = model_module(
+            """
+            from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+
+            class A(BaseSurrealModel):
+                id: str | None = None
+                a: int = 0
+
+            class B(BaseSurrealModel):
+                id: str | None = None
+                b: int = 0
+
+            class D(A, B):
+                model_config = SurrealConfigDict(table_name="mi_walk_d")
+            """
+        )
+        assert _of(module, get_registered_models()) == [module.A, module.D, module.B]
+
+    def test_models_none_reads_the_registry(self, model_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        module = model_module(_ORDER)
+        assert _of(module, ModelIntrospector().models) == [module.A, module.C, module.B]
+        assert _of(module, ModelIntrospector(models=None).models) == [module.A, module.C, module.B]
+        # The whole suite's models would be read: keep this module's, through the function the introspector calls.
+        walk = introspector.get_registered_models
+        monkeypatch.setattr(introspector, "get_registered_models", lambda: _of(module, walk()))
+        expected = {"mi_walk_a", "mi_walk_c", "mi_walk_b"}
+        assert set(introspect_models().tables) == expected
+        assert set(introspect_models(None).tables) == expected
+        assert set(ModelIntrospector(models=None).introspect().tables) == expected
+
+    def test_models_none_with_a_connection(self, model_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        module = model_module(
+            """
+            from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+
+            class Here(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="mi_walk_here")
+                id: str | None = None
+
+            class There(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="mi_walk_there", connection="other")
+                id: str | None = None
+            """
+        )
+        walk = introspector.get_registered_models
+        monkeypatch.setattr(introspector, "get_registered_models", lambda: _of(module, walk()))
+        assert ModelIntrospector(connection="other").models == [module.There]
+        assert set(introspect_models(connection="other").tables) == {"mi_walk_there"}
