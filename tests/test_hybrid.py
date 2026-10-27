@@ -32,7 +32,8 @@ On a server (``TestHybridSearchE2E``, ``TestHybridDispatchE2E``), over WebSocket
 the embedded engine: the cases of an eight-record corpus fuse to the same records, order and scores on every line —
 equal scores in the vector list's order, then the full-text list's, every time —, each distance and score the one
 ``similar_to()`` and ``search()`` give the same record; SurrealDB 3.x fuses with ``search::rrf()``, the ORM below 3,
-the line read once per client.
+the line read once per client. Every seed of a vector index waits for the index's background compaction before the
+test reads or writes (``tests/_compaction.py``, issue #344).
 
 With the rest of the queryset and what the server decides (``TestHybridCompositionE2E``,
 ``TestHybridReservedColumnsE2E``, ``TestHybridErrorsE2E``, ``TestHybridTransactionsE2E``), on the same engines:
@@ -95,6 +96,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import validate_field_name
+from tests import _compaction
 from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
 from tests._readme_tables import normalised as _normalised
 from tests._readme_tables import readme as _readme
@@ -2139,15 +2141,16 @@ def _corpus_statements(table: str, extra: Callable[[int], str] | None = None) ->
 
 async def _setup(client: Any, model: type[BaseSurrealModel] = HyDoc) -> None:
     """*model*'s table and fields (``define_table()``), its indexes — the analyzer first — (``define_indexes()``), then
-    the eight records."""
+    the eight records, and the wait for its vector index's compaction (issue #344)."""
     await model.define_table()
     await model.define_indexes()
     await _apply_ddl(client, _corpus_statements(model.get_table_name()))
+    await _compaction.wait_for_model_indexes(client, model)
 
 
 async def _setup_linked(client: Any) -> None:
     """``HyLinked`` set up as ``HyDoc``, each record linked to an author: ``Ann`` for the odd numbers, ``Bob`` for the
-    even ones."""
+    even ones; then the wait for its vector index's compaction (issue #344)."""
     await HyAuthor.define_table()
     await HyLinked.define_table()
     await HyLinked.define_indexes()
@@ -2155,6 +2158,7 @@ async def _setup_linked(client: Any) -> None:
     await _apply_ddl(
         client, _corpus_statements("hy_linked", lambda number: f", author = hy_author:{'ann' if number % 2 else 'bob'}")
     )
+    await _compaction.wait_for_model_indexes(client, HyLinked)
 
 
 #: The query vectors of the cases.
@@ -2554,7 +2558,9 @@ def _bare_ddl(major: int) -> str:
 
 
 async def _setup_sl(client: Any) -> None:
-    """``HySl`` set up as ``HyDoc``, then every record given the stored columns of ``_SL_UPDATE``, checked."""
+    """``HySl`` set up as ``HyDoc`` — :func:`_setup` waits for its vector index's compaction (issue #344) —, then every
+    record given the stored columns of ``_SL_UPDATE``, checked: an ``UPDATE`` that leaves the vectors alone starts no
+    compaction (measured on 3.3.4)."""
     await _setup(client, HySl)
     await _apply_ddl(client, _SL_UPDATE)
     stored = await client.query("SELECT * FROM hy_sl;", {})
@@ -2616,6 +2622,7 @@ class TestHybridCompositionE2E:
             await HyAliased.define_table()
             await HyAliased.define_indexes()
             await _apply_ddl(client, _corpus_statements("hy_aliased", lambda number: f", label_text = 'Label {number}'"))
+            await _compaction.wait_for_model_indexes(client, HyAliased)
             rows = await HyAliased.objects().hybrid_search(**_ARGS)
             selected = await HyAliased.objects().select("title", "label").hybrid_search(**_ARGS)
         assert _ranking(rows) == _expected("C1")
@@ -2661,6 +2668,7 @@ class TestHybridCompositionE2E:
             await HyRouted.define_table()
             await HyRouted.define_indexes()
             await _apply_ddl(client, _corpus_statements("hy_routed"))
+            await _compaction.wait_for_model_indexes(client, HyRouted)
             routed = await HyRouted.objects().hybrid_search(**_ARGS)
             async with SurrealDBConnectionManager.using("hy_two"):
                 await _setup(other)
@@ -2766,8 +2774,10 @@ class TestHybridErrorsE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_vector_of_another_length_than_its_index(self, kind: str) -> None:
         async with _hy_models(kind) as client:
-            await _apply_ddl(client, _bare_ddl(await _major(client)))
+            bare = _bare_ddl(await _major(client))
+            await _apply_ddl(client, bare)
             await _apply_ddl(client, _corpus_statements("hy_bare"))
+            await _compaction.wait_for_defined_indexes(client, bare)
             with pytest.raises(SurrealDbError) as raised:
                 await HyBare.objects().hybrid_search(**{**_ARGS, "vector": [0.0, 1.0]})
         assert type(raised.value) is SurrealDbError
@@ -3014,6 +3024,7 @@ class TestExactScanTiesE2E:
             await HyDoc.define_table()
             await HyDoc.define_indexes()
             await _apply_ddl(client, _TIE_CORPUS)
+            await _compaction.wait_for_model_indexes(client, HyDoc)
             exact_fused, exact_nearest = await _tie_answers("cosine")
             index_fused, index_nearest = await _tie_answers(None)
         for answer in exact_fused + index_fused:

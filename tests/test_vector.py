@@ -161,6 +161,13 @@ whose ``WHERE`` holds the KNN (2.x's exact scan writes every record; next to a r
 written, on any engine); a search score in the ``LET`` form (``None`` below 3, an error on 3.x); a live query whose
 condition holds the KNN, which never notifies.
 
+The seeds' wait (``TestCompactionWait``, ``TestCompactionWaitE2E``, issue #344): from SurrealDB 3.3 a write to an HNSW
+index's table while the index's background compaction runs can fail with a write conflict, so every seed of a vector
+index waits — before any spy records — until ``INFO FOR INDEX`` no longer reports ``building.compacting = true``
+(``tests/_compaction.py``). The wait returns after one read per index where the key is missing (SurrealDB 2.x, 3.1, the
+embedded engine), and fails with a clear message when the compaction outlasts its timeout or the answer holds no
+``building`` state.
+
 The documentation (``TestReadmeSection37``): README section 37 — its place after section 36, its seven subsections,
 its examples (run on ``mem://`` as written, each printed line equal to its comment; the search annotations' block
 printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences, the paragraph on the union spellings and thirteen "Coming from"
@@ -230,6 +237,7 @@ from surreal_orm_lite.subquery import TABLE_PROBE, SubqueryCompiler, _MissingSub
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import user_namespace, validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
+from tests import _compaction
 from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
 from tests._readme_tables import normalised as _normalised
 from tests._readme_tables import readme as _readme
@@ -2764,6 +2772,7 @@ class TestDefineVectorIndexesE2E:
             await VecOnly.define_indexes()
             if held:
                 await VecOnly(id="o1", embedding=[1.0, 0.0, 0.0]).save()
+                await _compaction.wait_for_model_indexes(client, VecOnly)
             seen: dict[str, Any] = {}
 
             async def block() -> SurrealDbError | None:
@@ -3540,9 +3549,11 @@ def _seed_statements(
 
 
 async def _seed(client: Any) -> None:
-    """``VecDoc``'s indexes applied (``define_indexes()``), then its six records."""
+    """``VecDoc``'s indexes applied (``define_indexes()``), then its six records, and the wait for its vector indexes'
+    compaction (issue #344)."""
     await VecDoc.define_indexes()
     await _apply_ddl(client, _seed_statements("vec_doc", doc=True))
+    await _compaction.wait_for_model_indexes(client, VecDoc)
 
 
 class VecExtra(BaseSurrealModel):
@@ -3649,6 +3660,7 @@ class TestSimilarToE2E:
         async with _vec_models(kind) as client:
             await VecExtra.define_indexes()
             await _apply_ddl(client, _seed_statements("vec_extra"))
+            await _compaction.wait_for_model_indexes(client, VecExtra)
             docs = await VecExtra.objects().values("category").similar_to("embedding", _Q, 2).exec()
             assert [type(doc) for doc in docs] == [VecExtra, VecExtra]
             assert _ids(docs) == ["d1", "d2"]
@@ -3719,6 +3731,7 @@ class TestSimilarToE2E:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _NESTED_INDEX)
             await _apply_ddl(client, _seed_statements("vec_nested", nested=True))
+            await _compaction.wait_for_defined_indexes(client, _NESTED_INDEX)
             nearest = await VecNested.objects().similar_to("meta.vec", _Q, 3).exec()
         assert _ids(nearest) == ["d1", "d2", "d6"]
         assert _distances(nearest) == pytest.approx([_euclidean(i) for i in ("d1", "d2", "d6")], rel=1e-5)
@@ -3841,11 +3854,13 @@ class TestCombinationsE2E:
         async with _vec(kind) as client, _vec(kind, "vec_two", "vec_db_two") as other:
             applied = await VecRouted.define_indexes()
             await _apply_ddl(client, _seed_statements("vec_routed"))
+            await _compaction.wait_for_model_indexes(client, VecRouted)
             routed = await VecRouted.objects().similar_to("embedding", _Q, 2).exec()
             calls = _spy(monkeypatch, client)
             async with SurrealDBConnectionManager.using("vec_two"):
                 defined = await VecDoc.define_indexes()
                 await _apply_ddl(other, _seed_statements("vec_doc", doc=True, only=("d3", "d4", "d6")))
+                await _compaction.wait_for_model_indexes(other, VecDoc)
                 nearest = await VecDoc.objects().similar_to("embedding", _Q, 2).exec()
                 count = await VecDoc.objects().similar_to("embedding", _Q, 10).count()
             sent = _calls(calls)
@@ -4011,16 +4026,20 @@ _OWNERS = {"d1": "a", "d2": "a", "d3": "a", "d4": "b", "d5": "a", "d6": "b"}
 
 
 async def _seed_ranked(client: Any) -> None:
-    """``VecRanked``'s indexes applied (``define_indexes()``), then its six records (``n`` 1 to 6)."""
+    """``VecRanked``'s indexes applied (``define_indexes()``), then its six records (``n`` 1 to 6), and the wait for its
+    vector index's compaction (issue #344)."""
     await VecRanked.define_indexes()
     await _apply_ddl(client, _seed_statements("vec_ranked", numbered=True))
+    await _compaction.wait_for_model_indexes(client, VecRanked)
 
 
 async def _seed_owned(client: Any) -> None:
-    """``VecOwned``'s index applied, then the owners ``a`` (team ``x``) and ``b`` (``y``) and the six records."""
+    """``VecOwned``'s index applied, then the owners ``a`` (team ``x``) and ``b`` (``y``) and the six records, and the
+    wait for the index's compaction (issue #344)."""
     await VecOwned.define_indexes()
     owned = [f"CREATE vec_owned:{i} SET embedding = {_EMBEDDINGS[i]}, owner = vec_owner:{o};" for i, o in _OWNERS.items()]
     await _apply_ddl(client, " ".join(["CREATE vec_owner:a SET team = 'x';", "CREATE vec_owner:b SET team = 'y';", *owned]))
+    await _compaction.wait_for_model_indexes(client, VecOwned)
 
 
 def _compiled(queryset: Any, *, knn_prefilter: bool = False, **kwargs: Any) -> tuple[tuple[str, dict[str, Any]], Any]:
@@ -5087,8 +5106,9 @@ _LOOSE_INDEX = "DEFINE INDEX vec_loose_embedding ON vec_loose FIELDS embedding H
 
 
 async def _seed_loose(client: Any) -> None:
-    """``VecLoose``'s index, then the six records."""
+    """``VecLoose``'s index, then the six records, and the wait for the index's compaction (issue #344)."""
     await _apply_ddl(client, f"{_LOOSE_INDEX} {_seed_statements('vec_loose')}")
+    await _compaction.wait_for_defined_indexes(client, _LOOSE_INDEX)
 
 
 class _DimensionClient:
@@ -5359,6 +5379,150 @@ class TestTransactionsE2E:
         assert stored == ["d1", "d2", "d3", "d4", "d5", "d6"]
 
 
+# === The seeds' wait for the vector indexes' background compaction (issue #344) =====================================
+
+
+class _InfoClient:
+    """A client whose ``query()`` answers each ``INFO FOR INDEX`` with the next of *answers* (the last one again once
+    they run out): records what it was sent."""
+
+    def __init__(self, *answers: Any) -> None:
+        self.answers = answers
+        self.sent: list[str] = []
+
+    async def query(self, statement: str, variables: dict[str, Any]) -> Any:
+        assert variables == {}
+        self.sent.append(statement)
+        return self.answers[min(len(self.sent), len(self.answers)) - 1]
+
+
+#: ``INFO FOR INDEX``'s answer for an HNSW index of six records, measured on each engine: SurrealDB 3.3.4 while its
+#: background compaction runs and once it is over, 2.7.0 and 3.1.5, the embedded engine.
+_COMPACTING = {"building": {"compacting": True, "initial": 0, "pending": 0, "status": "ready", "updated": 0}}
+_COMPACTED = {"building": {"compacting": False, "initial": 0, "pending": 0, "status": "ready", "updated": 0}}
+_NO_COMPACTION = {"building": {"initial": 0, "pending": 0, "status": "ready", "updated": 0}}
+_EMBEDDED_READY = {"building": {"status": "ready"}}
+
+
+@pytest.fixture
+def recorded_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Every pause the wait takes, recorded instead of slept."""
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(_compaction.asyncio, "sleep", sleep)
+    return sleeps
+
+
+class TestCompactionWait:
+    """``tests/_compaction.py``, the wait every seed of a vector index makes before the test writes to its table (issue
+    #344): it reads ``INFO FOR INDEX`` until ``building.compacting`` is no longer true, returns after one read when
+    the engine reports no such key (SurrealDB 2.x, 3.1, the embedded engine), and fails with a clear message — never
+    passes silently — when the compaction outlasts its timeout or the answer holds no ``building`` state. A model's
+    wait reads its vector indexes from ``get_indexes()``; hand-written statements give theirs."""
+
+    @pytest.mark.parametrize("answer", [_NO_COMPACTION, _EMBEDDED_READY, _COMPACTED], ids=["2x-31", "embedded", "33-idle"])
+    async def test_no_compaction_running_returns_after_one_read(self, answer: Any, recorded_sleeps: list[float]) -> None:
+        client = _InfoClient(answer)
+        await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc")
+        assert client.sent == ["INFO FOR INDEX vec_doc_embedding ON vec_doc;"]
+        assert recorded_sleeps == []
+
+    async def test_reads_until_the_compaction_is_over(self, recorded_sleeps: list[float]) -> None:
+        client = _InfoClient(_COMPACTING, _COMPACTING, _COMPACTING, _COMPACTED)
+        await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc")
+        assert client.sent == ["INFO FOR INDEX vec_doc_embedding ON vec_doc;"] * 4
+        assert recorded_sleeps == [0.02] * 3
+
+    async def test_a_compaction_that_outlasts_the_timeout_fails_the_test(self) -> None:
+        client = _InfoClient(_COMPACTING)
+        with pytest.raises(AssertionError) as raised:
+            await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc", timeout=0.05)
+        assert str(raised.value) == (
+            "INFO FOR INDEX vec_doc_embedding ON vec_doc; still reports building.compacting = true after 0.05 s: the "
+            "background compaction of the vector index did not finish"
+        )
+        assert len(client.sent) >= 2
+        assert _compaction.COMPACTION_TIMEOUT == 10.0
+
+    @pytest.mark.parametrize("answer", [{}, None, [], {"building": "ready"}])
+    async def test_an_answer_without_a_building_state_fails_the_test(self, answer: Any, recorded_sleeps: list[float]) -> None:
+        client = _InfoClient(answer)
+        with pytest.raises(AssertionError) as raised:
+            await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc")
+        assert str(raised.value) == f"INFO FOR INDEX vec_doc_embedding ON vec_doc; answered no building state: {answer!r}"
+        assert recorded_sleeps == []
+
+    async def test_a_model_waits_on_each_of_its_vector_indexes(self, recorded_sleeps: list[float]) -> None:
+        documents = _InfoClient(_COMPACTING, _COMPACTED, _NO_COMPACTION)
+        await _compaction.wait_for_model_indexes(documents, VecDoc)
+        ranked = _InfoClient(_NO_COMPACTION)
+        await _compaction.wait_for_model_indexes(ranked, VecRanked)
+        plain = _InfoClient(_NO_COMPACTION)
+        await _compaction.wait_for_model_indexes(plain, VecLoose)
+        assert documents.sent == [
+            "INFO FOR INDEX vec_doc_embedding ON vec_doc;",
+            "INFO FOR INDEX vec_doc_embedding ON vec_doc;",
+            "INFO FOR INDEX vec_doc_summary ON vec_doc;",
+        ], "the two vector indexes, not the full-text one"
+        assert ranked.sent == ["INFO FOR INDEX vec_ranked_embedding ON vec_ranked;"], "not the two plain indexes"
+        assert plain.sent == [], "a model that declares no vector index"
+        assert recorded_sleeps == [0.02]
+
+    async def test_hand_written_statements_give_their_vector_indexes(self, recorded_sleeps: list[float]) -> None:
+        sent = {}
+        for name, ddl in {
+            "pins": _PIN_WRITE_DDL,
+            "loose": _LOOSE_INDEX,
+            "orm": " ".join(VecDoc.index_ddl(line=3)),
+            "if-not-exists": Index("i", "e", hnsw=True, dimension=3).ddl("t", overwrite=False),
+        }.items():
+            client = _InfoClient(_NO_COMPACTION)
+            await _compaction.wait_for_defined_indexes(client, ddl)
+            sent[name] = client.sent
+        assert sent == {
+            "pins": ["INFO FOR INDEX vec_pin_w_e ON vec_pin_w;", "INFO FOR INDEX vec_pin_r_e ON vec_pin_r;"],
+            "loose": ["INFO FOR INDEX vec_loose_embedding ON vec_loose;"],
+            "orm": ["INFO FOR INDEX vec_doc_embedding ON vec_doc;", "INFO FOR INDEX vec_doc_summary ON vec_doc;"],
+            "if-not-exists": ["INFO FOR INDEX i ON t;"],
+        }
+        plain = _InfoClient(_NO_COMPACTION)
+        with pytest.raises(AssertionError) as raised:
+            await _compaction.wait_for_defined_indexes(plain, "DEFINE INDEX vec_pin_r_n ON vec_pin_r FIELDS n;")
+        assert str(raised.value) == "no vector index is defined in 'DEFINE INDEX vec_pin_r_n ON vec_pin_r FIELDS n;'"
+        assert plain.sent == []
+        assert recorded_sleeps == []
+
+
+class TestCompactionWaitE2E:
+    """The wait after a seed on every engine (the line under test over WebSocket and HTTP, and the embedded engine):
+    SurrealDB 3.3 reports ``building.compacting`` and the wait returns once it is false; SurrealDB 2.x, 3.1 and the
+    embedded engine report no such key and the wait sends one ``INFO FOR INDEX`` per vector index, no other query, and
+    fails none."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_wait_returns_once_the_compaction_is_over(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        reads = [f"INFO FOR INDEX {name} ON vec_doc;" for name in ("vec_doc_embedding", "vec_doc_summary")]
+        async with _vec_models(kind) as client:
+            await VecDoc.define_indexes()
+            await _apply_ddl(client, _seed_statements("vec_doc", doc=True))
+            line = await _line(client)
+            calls = _spy(monkeypatch, client)
+            await _compaction.wait_for_model_indexes(client, VecDoc)
+            sent = _calls(calls)
+            monkeypatch.undo()
+            states = [(await client.query(read, {}))["building"] for read in reads]
+        if line >= (3, 3):
+            assert [state["compacting"] for state in states] == [False, False]
+            assert sent[:2] == _query(reads[0]) and sent[-2:] == _query(reads[1])
+            assert set(sent) == {*_query(reads[0]), *_query(reads[1])}, "INFO FOR INDEX only"
+        else:
+            assert ["compacting" in state for state in states] == [False, False]
+            assert sent == _sent(reads), "one read per vector index"
+
+
 # === Pinned line facts ==============================================================================================
 
 #: The README rows the line pins back (with ``_VECTOR_INDEX_ROW`` above).
@@ -5618,6 +5782,7 @@ class TestLinePinsE2E:
             await _apply_ddl(client, _PIN_WRITE_DDL)
             await _apply_ddl(client, _seed_statements("vec_pin_w", numbered=True))
             await _apply_ddl(client, _seed_statements("vec_pin_r", numbered=True))
+            await _compaction.wait_for_defined_indexes(client, _PIN_WRITE_DDL)
             major = await _major(client)
             returned = await client.query(_PIN_W_UPDATE, {"q": _Q})
             written = await _keys(client, _PIN_W_HITS)
