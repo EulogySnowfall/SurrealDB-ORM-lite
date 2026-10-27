@@ -2491,8 +2491,10 @@ def parse_define_access(text: str) -> AccessState:
     ``BEARER``) is read positionally, then the clauses ``SIGNUP``, ``SIGNIN``, ``WITH REFRESH``, ``WITH JWT``,
     ``ALGORITHM``, ``URL``, ``WITH ISSUER``, ``AUTHENTICATE``, ``DURATION`` and ``COMMENT``. ``signup`` and ``signin``
     keep their groups, parentheses included. ``table`` and ``signup_fields`` come from a SIGNUP ``CREATE <target> SET
-    <field> = <expr>, …`` whose target is a table name or a guarded ``type::thing('<table>', …)`` /
-    ``type::record('<table>', …)`` call; ``signin_where`` from a SIGNIN ``SELECT … FROM <table> WHERE <expr>``; any
+    <field> = <expr>, …`` whose target is a table name — ``define_access()``'s form, whose ``id = $<key>`` item for a
+    ``primary_key`` is one of the ``signup_fields`` — or a guarded ``type::thing('<table>', …)`` /
+    ``type::record('<table>', …)`` call (the ORM's ``primary_key`` form before #338, or one written by hand), every
+    ``SET`` item read; ``signin_where`` from a SIGNIN ``SELECT … FROM <table> WHERE <expr>``; any
     other shape gives ``""`` and ``{}``, with no error (the full ORM's attributes, made exact). Durations are kept as
     rendered (``"4w2d"``, ``"NONE"``), ``None`` for one the ``DURATION`` clause does not name. The servers render the
     keys ``[REDACTED]``. Raises ``DefineParseError``.

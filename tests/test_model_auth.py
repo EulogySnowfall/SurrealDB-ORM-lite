@@ -41,7 +41,7 @@ from surreal_orm_lite._sdk import RecordID, SurrealError
 from surreal_orm_lite.define_parser import parse_define_access
 from surreal_orm_lite.schema import signup_excluded_refused
 from surreal_orm_lite.signals import around_save, around_update, post_save, post_update, pre_save, pre_update
-from surreal_orm_lite.time_travel import line_major, snapshot_write_refused
+from surreal_orm_lite.time_travel import snapshot_write_refused
 from surreal_orm_lite.transaction import BufferedTransaction
 from tests.conftest import orm_client
 
@@ -210,29 +210,25 @@ class TestAccessDDL:
         assert "name = $name" in access
 
     def test_primary_key_targets_the_record_id(self) -> None:
-        """A configured primary key must drive the record id, not a random one: ``type::record`` for SurrealDB 3.x
-        (the default), ``type::thing`` for 2.x — each line refuses the other's (#338)."""
+        """A configured primary key must drive the record id, not a random one: SIGNUP assigns it from the bound key,
+        first item of the ``SET`` — no ``type::thing`` (refused by SurrealDB 3.x at ``DEFINE``) nor ``type::record``
+        (a type check on 2.x, failing every signup), so one statement serves both lines (#338)."""
 
         class Keyed(AuthenticatedUserMixin, BaseSurrealModel):
             model_config = SurrealConfigDict(primary_key="email")
             email: str
             password: str
 
-        assert "CREATE type::record('Keyed', $email) SET" in Keyed.access_ddl(with_table=False)[0]
-        assert Keyed.access_ddl(line=3) == Keyed.access_ddl()
-        line_2 = Keyed.access_ddl(line=2)
-        assert "CREATE type::thing('Keyed', $email) SET" in line_2[-1]
-        assert [statement.replace("type::thing(", "type::record(") for statement in line_2] == Keyed.access_ddl()
+        access = Keyed.access_ddl(with_table=False)[0]
+        assert (
+            "SIGNUP ( CREATE Keyed SET id = $email, email = $email, password = crypto::argon2::generate($password) )" in access
+        )
+        assert "type::" not in access
 
-    def test_line_changes_nothing_without_a_primary_key(self) -> None:
-        """#338: only the record id of a primary key depends on the line."""
-        for model in (DefaultUser, ConfiguredUser):
-            assert model.access_ddl(line=2) == model.access_ddl(line=3) == model.access_ddl()
-
-    @pytest.mark.parametrize(("line", "error"), [(True, TypeError), ("3", TypeError), (3.0, TypeError), (4, ValueError)])
-    def test_line_is_checked(self, line: Any, error: type[Exception]) -> None:
-        with pytest.raises(error, match=r"line= must be 2 or 3"):
-            DefaultUser.access_ddl(line=line)
+    def test_without_a_primary_key_signup_sets_no_id(self) -> None:
+        """#338 changes nothing for a model whose record id the server mints."""
+        access = DefaultUser.access_ddl(with_table=False)[0]
+        assert "SIGNUP ( CREATE DefaultUser SET email = $email, password = crypto::argon2::generate($password) )" in access
 
     def test_id_field_is_never_written_in_signup(self) -> None:
         class WithId(AuthenticatedUserMixin, BaseSurrealModel):
@@ -347,7 +343,7 @@ class TestDefineAccessE2E:
 
 
 class KeyedUser(AuthenticatedUserMixin, BaseSurrealModel):
-    """#338: an auth model whose record id is its e-mail address — SIGNUP targets the record id from ``primary_key``."""
+    """#338: an auth model whose record id is its e-mail address — SIGNUP sets the record id from ``primary_key``."""
 
     model_config = SurrealConfigDict(access_name="e2e_keyed_acct", primary_key="email")
 
@@ -376,16 +372,20 @@ class KeyedRulesUser(AuthenticatedUserMixin, BaseSurrealModel):
     password: str
 
 
-async def _server_line() -> Literal[2, 3]:
-    """The SurrealDB major line the shared connection talks to, as ``define_access()`` reads it."""
-    client = await SurrealDBConnectionManager.get_client()
-    return 3 if line_major(await client.version()) >= 3 else 2
+class KeyedSlugUser(AuthenticatedUserMixin, BaseSurrealModel):
+    """#338: a primary key other than the identifier, which a signup may leave ``None``."""
+
+    model_config = SurrealConfigDict(access_name="e2e_keyed_slug", primary_key="slug")
+
+    slug: str | None = None
+    email: str
+    password: str
 
 
 class TestPrimaryKeyAccessE2E:
-    """#338 on both server lines: a model with a ``primary_key`` gets an access method the connected line accepts —
-    ``type::record`` on SurrealDB 3.x, which refuses ``type::thing`` at ``DEFINE``; ``type::thing`` on 2.x, where
-    ``type::record(table, key)`` checks a type and the signup fails — and the record id is the key."""
+    """#338 on both server lines: a model with a ``primary_key`` gets an access method both lines accept — SIGNUP runs
+    ``CREATE <table> SET id = $<key>, …``, where ``type::thing`` was refused by SurrealDB 3.x at ``DEFINE`` and
+    ``type::record(table, key)`` fails every signup on 2.x — and the record id is the key."""
 
     @pytest.mark.asyncio
     async def test_define_access_succeeds(self) -> None:
@@ -395,18 +395,16 @@ class TestPrimaryKeyAccessE2E:
             assert model.get_access_name() in info["accesses"]
 
     @pytest.mark.asyncio
-    async def test_applies_the_function_of_the_connected_line(self) -> None:
+    async def test_applies_the_same_statements_on_both_lines(self) -> None:
         async with auth_model(KeyedUser) as model:
-            line = await _server_line()
             applied = await model.define_access()
-            assert applied == model.access_ddl(line=line)
-            function = "type::record" if line == 3 else "type::thing"
-            assert f"CREATE {function}('KeyedUser', $email) SET" in applied[-1]
+            assert applied == model.access_ddl()
+            assert "SIGNUP ( CREATE KeyedUser SET id = $email, email = $email, password = " in applied[-1]
 
     @pytest.mark.asyncio
     async def test_signup_and_signin_address_the_record_by_its_key(self) -> None:
         async with auth_model(KeyedUser) as model:
-            email = _unique_email()
+            email = f"ada:{_unique_email()}"  # a key the record id quotes: `KeyedUser:⟨ada:…⟩`
             created = await model.signup(email=email, password=AUTH_PASSWORD, name="Ada")
             signed_in = await model.signin(email=email, password=AUTH_PASSWORD)
             me = await model.authenticate(signed_in.tokens.access)
@@ -421,33 +419,36 @@ class TestPrimaryKeyAccessE2E:
 
     @pytest.mark.asyncio
     async def test_the_stored_definition_reads_back(self) -> None:
-        """``define_parser`` reads the SIGNUP target as the table, whichever function the line stored."""
+        """``define_parser`` reads the SIGNUP target as the table, and every ``SET`` item — ``id`` included."""
         async with auth_model(KeyedUser) as model:
             client = await SurrealDBConnectionManager.get_client()
             info = await client.query("INFO FOR DB;", {})
             state = parse_define_access(info["accesses"][model.get_access_name()])
             assert state.table == "KeyedUser"
-            assert sorted(state.signup_fields) == ["email", "name", "password"]
-            assert state.signup_fields["email"] == "$email"
+            assert dict(state.signup_fields) == {
+                "id": "$email",
+                "email": "$email",
+                "password": "crypto::argon2::generate($password)",
+                "name": "$name",
+            }
 
     @pytest.mark.asyncio
     async def test_a_schemafull_model(self) -> None:
         async with auth_model(KeyedFullUser) as model:
-            line = await _server_line()
             applied = await model.define_access()
-            assert applied[-1] == model.access_ddl(with_table=False, line=line)[0]
+            assert applied == model.access_ddl()
             email = _unique_email()
             created = await model.signup(email=email, password=AUTH_PASSWORD)
-            assert created.user.email == email
+            signed_in = await model.signin(email=email, password=AUTH_PASSWORD)
+            assert (created.user.email, signed_in.user.email) == (email, email)
             client = await SurrealDBConnectionManager.get_client()
             assert await client.query("SELECT VALUE id FROM KeyedFullUser;", {}) == [RecordID("KeyedFullUser", email)]
 
     @pytest.mark.asyncio
     async def test_declared_permissions(self) -> None:
         async with auth_model(KeyedRulesUser) as model:
-            line = await _server_line()
             applied = await model.define_access()
-            assert applied == model.access_ddl(line=line)
+            assert applied == model.access_ddl()
             email = _unique_email()
             await model.signup(email=email, password=AUTH_PASSWORD)
             signed_in = await model.signin(email=email, password=AUTH_PASSWORD)
@@ -455,10 +456,8 @@ class TestPrimaryKeyAccessE2E:
 
     @pytest.mark.asyncio
     async def test_over_http(self) -> None:
-        """The line is read through the HTTP client too."""
         async with auth_model(KeyedUser, scheme="http") as model:
-            line = await _server_line()
-            assert await model.define_access() == model.access_ddl(line=line)
+            assert await model.define_access() == model.access_ddl()
             email = _unique_email()
             created = await model.signup(email=email, password=AUTH_PASSWORD)
             signed_in = await model.signin(email=email, password=AUTH_PASSWORD)
@@ -468,10 +467,9 @@ class TestPrimaryKeyAccessE2E:
     async def test_in_a_transaction(self) -> None:
         _connect()
         try:
-            line = await _server_line()
             async with SurrealDBConnectionManager.transaction() as tx:
                 applied = await KeyedUser.define_access(tx=tx)
-            assert applied == KeyedUser.access_ddl(line=line)
+            assert applied == KeyedUser.access_ddl()
             email = _unique_email()
             created = await KeyedUser.signup(email=email, password=AUTH_PASSWORD)
             assert created.user.email == email
@@ -483,16 +481,21 @@ class TestPrimaryKeyAccessE2E:
             await SurrealDBConnectionManager.unset_connection()
 
     @pytest.mark.asyncio
-    async def test_no_version_request_without_a_primary_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A model without a primary key renders the same text on both lines, so its access costs no request more."""
-        async with auth_model() as model:
+    async def test_a_primary_key_left_none_never_reaches_the_server(self) -> None:
+        """``SET id = NONE`` would have the server mint a random id, one ``objects().get(<key>)`` never finds: the
+        signup is refused before the exchange, and no record is created."""
+        async with auth_model(KeyedSlugUser) as model:
+            with pytest.raises(ValueError, match=r"requires slug=: it is the primary key"):
+                await model.signup(email=_unique_email(), password=AUTH_PASSWORD)
+            with pytest.raises(ValueError, match=r"requires slug="):
+                await model.signup(slug=None, email=_unique_email(), password=AUTH_PASSWORD)
             client = await SurrealDBConnectionManager.get_client()
+            assert await client.query("SELECT VALUE id FROM KeyedSlugUser;", {}) == []
 
-            async def refused() -> str:
-                raise AssertionError("define_access() read the server version for a model without a primary key")
-
-            monkeypatch.setattr(client, "version", refused)
-            assert await model.define_access() == model.access_ddl()
+            email = _unique_email()
+            created = await model.signup(slug="ada", email=email, password=AUTH_PASSWORD)
+            assert (created.user.slug, created.user.email) == ("ada", email)
+            assert await client.query("SELECT VALUE id FROM KeyedSlugUser;", {}) == [RecordID("KeyedSlugUser", "ada")]
 
 
 class TestSignupE2E:
@@ -1454,7 +1457,7 @@ class TestReviewRegressions:
     """One test per correctness issue raised in the v0.17.0 PR review."""
 
     def test_primary_key_id_is_refused_at_render_time(self) -> None:
-        """SIGNUP never binds $id, so type::thing(table, NONE) would fail server-side."""
+        """SIGNUP never binds $id, so `SET id = $id` would have the server mint a random id."""
 
         class PkId(AuthenticatedUserMixin, BaseSurrealModel):
             model_config = SurrealConfigDict(primary_key="id")
@@ -1474,7 +1477,7 @@ class TestReviewRegressions:
             password: str
 
         # `slug` IS a signup field, so this one renders.
-        assert "type::record('PkGhost', $slug)" in PkGhost.access_ddl(with_table=False)[0]
+        assert "CREATE PkGhost SET id = $slug, slug = $slug," in PkGhost.access_ddl(with_table=False)[0]
 
     def test_falsy_credentials_are_not_treated_as_missing(self) -> None:
         """0, '' and False are values, not omissions."""

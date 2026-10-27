@@ -28,7 +28,7 @@ import logging
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pydantic import AliasChoices, AliasPath, ValidationError
 
@@ -39,8 +39,6 @@ from .connection_manager import SurrealDBConnectionManager
 from .embedded import model_auth_unsupported
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError
 from .schema import TableClauses, declared_clauses, signup_excluded_refused
-from .search import checked_line
-from .time_travel import line_major
 from .transaction import Transaction
 from .types import SchemaMode
 from .utils import apply_ddl_statements, validate_alias_name, validate_field_name
@@ -73,14 +71,6 @@ _ACCESS_RULES = "FOR select, update WHERE id = $auth.id"
 _ACCESS_PERMISSIONS = MappingProxyType(
     {"select": "WHERE id = $auth.id", "create": "NONE", "update": "WHERE id = $auth.id", "delete": "NONE"}
 )
-
-
-def _record_function(line: Literal[2, 3]) -> str:
-    """The SurrealQL function a SIGNUP builds a record id from a table and a key with, on the SurrealDB major *line*
-    (#338): ``type::record`` from 3 on, ``type::thing`` before (2.x, the embedded engine). Each line refuses the other's
-    — SurrealDB 3.x refuses ``type::thing`` at ``DEFINE``, and 2.x reads ``type::record(table, key)`` as a check of
-    the key's type, so the definition is stored and every signup fails."""
-    return "type::record" if line == 3 else "type::thing"
 
 
 def _alias_keys(alias: str | AliasPath | AliasChoices | None) -> set[str]:
@@ -180,8 +170,8 @@ class AuthenticatedUserMixin:
     a ``primary_key`` — otherwise the instance these methods return cannot be constructed at
     all. Prefer the ``id`` field here: SIGNUP lets the server mint the record id, and this is
     what receives it. Configure ``primary_key`` instead when the identity *is* a column (say
-    the e-mail address), and the SIGNUP clause will target the record id built from it —
-    ``type::record(…)`` on SurrealDB 3.x, ``type::thing(…)`` on 2.x (see :meth:`access_ddl`).
+    the e-mail address), and the SIGNUP clause will set the record id from it (``id = $email``)
+    accordingly — the same statement on SurrealDB 3.x, 2.x and the embedded engine.
     """
 
     # ------------------------------------------------------------------
@@ -314,10 +304,10 @@ class AuthenticatedUserMixin:
     def _signup_primary_key(cls) -> str | None:
         """The primary key SIGNUP builds the record id from, or ``None`` for a server id.
 
-        The key has to be *bindable*: SIGNUP renders ``type::record(table, $pk)``
-        (``type::thing`` on SurrealDB 2.x), so a key that is not among the fields signup sends
-        would evaluate to ``type::record(table, NONE)`` and fail server-side with an opaque
-        error. ``primary_key="id"`` is the trap — ``id`` is deliberately excluded from the signup
+        The key has to be *bindable*: SIGNUP renders ``CREATE <table> SET id = $pk, …``, so a key
+        that is not among the fields signup sends would evaluate to ``id = NONE`` and have the
+        server mint a random record id — one no ``objects().get(<key>)`` addresses.
+        ``primary_key="id"`` is the trap — ``id`` is deliberately excluded from the signup
         payload (the server mints it), so it can never be bound. Caught here, at render time,
         rather than on every signup.
         """
@@ -371,7 +361,7 @@ class AuthenticatedUserMixin:
         return f"DEFINE TABLE {clause} {table} {' '.join(parts)};"
 
     @classmethod
-    def access_ddl(cls, *, overwrite: bool = True, with_table: bool = True, line: Literal[2, 3] = 3) -> list[str]:
+    def access_ddl(cls, *, overwrite: bool = True, with_table: bool = True) -> list[str]:
         """Render this model's authentication DDL. Pure — it touches no database.
 
         Returns the table's statements followed by the ``DEFINE ACCESS`` one, so the result can
@@ -397,11 +387,11 @@ class AuthenticatedUserMixin:
         ``define_table()`` writes ``TYPE NORMAL``, so calling both changes the type each time.
         Declaring ``table_type`` gives both the same type.
 
-        A model with a ``primary_key`` has SIGNUP create the record whose id is the key (#338):
-        ``CREATE type::record('<table>', $<key>)`` for SurrealDB 3.x, ``type::thing`` for 2.x and
-        the embedded engine — *line* picks one, since each line refuses the other's (3.x at
-        ``DEFINE``, 2.x at every signup). :meth:`define_access` reads the connected line itself.
-        Without a primary key the statements are the same for both lines.
+        A model with a ``primary_key`` has SIGNUP create the record whose id is the key:
+        ``CREATE <table> SET id = $<key>, …``, the assignment first (#338). The statements are
+        the same for SurrealDB 3.x, 2.x and the embedded engine — a function building the id
+        would not be: 3.x refuses ``type::thing`` at ``DEFINE``, and 2.x reads
+        ``type::record(table, key)`` as a type check that fails every signup.
 
         Args:
             overwrite: ``True`` (default) emits ``OVERWRITE`` — the model is the source of
@@ -411,9 +401,6 @@ class AuthenticatedUserMixin:
                 yourself (wider permissions, say) — then make sure the record can still select
                 itself; a model whose schema mode is ``SCHEMAFULL`` gets its fields from
                 ``define_access()``.
-            line: the SurrealDB major line the statements are for: ``3`` (default) or ``2`` —
-                SurrealDB 2.x and the embedded engine. Only the record id of a ``primary_key``
-                depends on it (``type::record`` for ``3``, ``type::thing`` for ``2``).
 
         Returns:
             The table's statements — the table statement, then, for a model whose schema mode
@@ -421,8 +408,7 @@ class AuthenticatedUserMixin:
             the access statement alone with ``with_table=False``.
 
         Raises:
-            TypeError: *line* is not an ``int`` (a ``bool`` included) — checked first; with
-                ``with_table=True``, a ``TableType.USER`` model with
+            TypeError: with ``with_table=True``, a ``TableType.USER`` model with
                 ``extra="allow"`` (its ``SCHEMAFULL`` table refuses or drops the fields the
                 model does not declare), or, for a model whose schema mode is ``SCHEMAFULL``,
                 an *overwrite* that is not a ``bool``; then, whatever the schema mode and
@@ -439,8 +425,7 @@ class AuthenticatedUserMixin:
                 with or without ``tx`` — leaving nothing on the transaction (#315). Remove
                 ``exclude=True`` and pass ``exclude=`` to ``model_dump()`` where you serialise
                 the model.
-            ValueError: *line* is an ``int`` other than 2 or 3 — checked first; an auth key naming
-                no field of the model, an unknown hashing family or
+            ValueError: an auth key naming no field of the model, an unknown hashing family or
                 duration, a primary key SIGNUP cannot bind; with ``with_table=True`` and a
                 ``SCHEMAFULL`` schema mode, a ``FLEXIBLE`` request on a kind without an object
                 or a computed field's expression that is not SurrealQL the ORM can embed.
@@ -454,7 +439,6 @@ class AuthenticatedUserMixin:
             >>> User.access_ddl(with_table=False)
             ["DEFINE ACCESS OVERWRITE account ON DATABASE TYPE RECORD SIGNUP ( ... );"]
         """
-        line = checked_line(line)
         table = cls.get_table_name()  # type: ignore[attr-defined]
         validate_alias_name(table)
         identifier = cls.get_identifier_field()
@@ -475,9 +459,13 @@ class AuthenticatedUserMixin:
 
         # The record id follows the model's primary key, because the rest of the ORM does: a
         # random id here would leave User.objects().get(email=…) addressing a record the
-        # signup never wrote. Its function depends on the line (#338).
+        # signup never wrote. It is assigned from the bound key (`id = $<key>`, first item of
+        # the SET), not built with a function: SurrealDB 3.x refuses `type::thing` at DEFINE,
+        # and 2.x reads `type::record(table, key)` as a type check that fails every signup
+        # (#338), while the assignment gives the record id `<table>:<key>` on both lines and on
+        # the embedded engine.
         primary_key = cls._signup_primary_key()
-        target = f"{_record_function(line)}('{table}', ${primary_key})" if primary_key is not None else table
+        items = [] if primary_key is None else [f"id = ${primary_key}"]
 
         # Column on the left of each assignment, bound variable on the right: the variable
         # keeps the Python name the caller passes as a keyword argument, while the column is
@@ -486,16 +474,16 @@ class AuthenticatedUserMixin:
         # `password_hash` — signin would then keep validating against a hash no ORM write ever
         # updates.
         to_column = cls.to_db_field  # type: ignore[attr-defined]
-        assignments = ", ".join(
+        items += [
             f"{to_column(name)} = crypto::{algorithm}::generate(${name})"
             if name == password
             else f"{to_column(name)} = ${name}"
             for name in cls._signup_fields()
-        )
+        ]
 
         parts = [
             f"DEFINE ACCESS {clause} {access} ON DATABASE TYPE RECORD",
-            f"SIGNUP ( CREATE {target} SET {assignments} )",
+            f"SIGNUP ( CREATE {table} SET {', '.join(items)} )",
             f"SIGNIN ( SELECT * FROM {table} WHERE {to_column(identifier)} = ${identifier} "
             f"AND crypto::{algorithm}::compare({to_column(password)}, ${password}) )",
         ]
@@ -514,17 +502,6 @@ class AuthenticatedUserMixin:
 
         statements.append(" ".join(parts))
         return statements
-
-    @classmethod
-    async def _access_statement_for_line(cls, client: Any, statement: str, overwrite: bool) -> str:
-        """*statement* — the access statement :meth:`access_ddl` renders by default, for SurrealDB 3.x — for the line
-        *client* talks to (#338). Only a model with a ``primary_key`` depends on the line: for it, the line is read from
-        ``client.version()`` with the lite's rule (``time_travel.line_major()``: a version that cannot be read counts as
-        3.x), and below 3 — SurrealDB 2.x, the embedded engine — the statement is rendered for 2.x
-        (``access_ddl(line=2)``). Any other model gets *statement* back without a request."""
-        if cls._signup_primary_key() is None or line_major(await client.version()) >= 3:
-            return statement
-        return cls.access_ddl(overwrite=overwrite, with_table=False, line=2)[0]
 
     @classmethod
     @_cache.invalidates("cls", records=False)
@@ -563,14 +540,6 @@ class AuthenticatedUserMixin:
         ``TYPE ANY``) and ``TYPE NORMAL`` from ``define_table()``, so calling both changes the
         table's type each time; declaring ``table_type`` keeps one type.
 
-        A model with a ``primary_key`` gets the access statement of the connected line (#338):
-        ``CREATE type::record(…)`` on SurrealDB 3.x, ``type::thing(…)`` on 2.x and the embedded
-        engine — ``access_ddl(line=…)``'s. The line is read from ``client.version()`` once, with
-        the rule of the other line-dependent DDL (a version that cannot be read counts as 3.x),
-        before any DDL — for a model whose schema mode is ``SCHEMAFULL``, after its table's reads
-        and statements. Any other model renders the same statement for both lines, and costs no
-        request more.
-
         Args:
             overwrite: see :meth:`access_ddl`.
             with_table: see :meth:`access_ddl`.
@@ -582,7 +551,7 @@ class AuthenticatedUserMixin:
         Returns:
             The statements applied (or queued): the table's — for a model whose schema mode is
             ``SCHEMAFULL``, the table and its fields as written over what exists — then the
-            access statement, rendered for the connected line.
+            access statement.
 
         Raises:
             TypeError: see :meth:`access_ddl` — before any request, a field SIGNUP writes that
@@ -614,12 +583,10 @@ class AuthenticatedUserMixin:
                 overwrite=overwrite, tx=tx, method="define_access", clauses=cls._access_table_clauses()
             )
             client = await cls._connection_manager().get_client()  # type: ignore[attr-defined]
-            statement = await cls._access_statement_for_line(client, statements[-1], overwrite)
-            access = await apply_ddl_statements([statement], client=client, tx=tx, what="access", hint=hint)
+            access = await apply_ddl_statements(statements[-1:], client=client, tx=tx, what="access", hint=hint)
             return [*applied, *access]
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await cls._connection_manager().get_client()  # type: ignore[attr-defined]
-        statements[-1] = await cls._access_statement_for_line(client, statements[-1], overwrite)
         if with_table and cls._auth_setting("permissions", None) is not None:
             # Declared rules are never quoted in a refusal: the table statement on its own, named by its table.
             table = statements[0]
@@ -698,6 +665,14 @@ class AuthenticatedUserMixin:
                 f"{'s' if len(missing) > 1 else ''}: {', '.join(missing)}. "
                 f"They have no default, so the instance could not be built from the record "
                 f"the server would create."
+            )
+        # The record id SIGNUP creates is the primary key's value (`SET id = $<key>`, #338): a
+        # `None` there has the server mint a random id, one no objects().get(<key>) addresses —
+        # refused before the exchange as well.
+        primary_key = cls.get_index_primary_key()  # type: ignore[attr-defined]
+        if primary_key in payload and payload[primary_key] is None:
+            raise ValueError(
+                f"{cls.__name__}.{action}() requires {primary_key}=: it is the primary key, which SIGNUP makes the record id."
             )
         return payload
 
@@ -1009,7 +984,8 @@ class AuthenticatedUserMixin:
                 would strip of its password hash. :meth:`signin`, :meth:`authenticate`,
                 :meth:`refresh`, ``update()`` and ``upsert()`` refuse such a model the same way
                 (#310), whoever wrote the record.
-            ValueError: for an unknown field or a missing required one — before any request.
+            ValueError: for an unknown field, a missing required one, or a ``primary_key`` left
+                ``None`` (it is the record id SIGNUP creates) — before any request.
             SurrealDbAuthenticationError: if the server refuses the signup, or returns no
                 record for the new session (the message says how to grant the permission).
             SurrealDbError: on the embedded engine without ``bind=True``.

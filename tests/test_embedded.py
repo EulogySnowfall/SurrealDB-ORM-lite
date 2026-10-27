@@ -2102,15 +2102,17 @@ class TestModelAuthEmbeddedE2E:
             assert await SurrealDBConnectionManager.get_client() is client
 
     async def test_a_primary_key_signs_up_on_its_key(self) -> None:
-        """#338: the engine reports SurrealDB 2 (``surrealdb-2.0.0``), so ``define_access()`` targets the record id with
-        ``type::thing``, and the record id is the key."""
+        """#338: the servers' statement — ``CREATE emb_keyed SET id = $email, …`` — on the engine too (SurrealDB 2.x
+        SurrealQL), and the record id is the key."""
         async with embedded() as client:
             applied = await EmbKeyed.define_access()
-            assert applied == EmbKeyed.access_ddl(line=2)
-            assert "CREATE type::thing('emb_keyed', $email) SET" in applied[-1]
-            result = await EmbKeyed.signup(email="k@x", password="p", bind=True)
-            assert result.user.email == "k@x"
-            assert await client.query("SELECT VALUE id FROM emb_keyed;") == [RecordID("emb_keyed", "k@x")]
+            assert applied == EmbKeyed.access_ddl()
+            assert "SIGNUP ( CREATE emb_keyed SET id = $email, email = $email, " in applied[-1]
+            result = await EmbKeyed.signup(email="k:x", password="p", bind=True)
+            assert result.user.email == "k:x"
+            assert await client.query("SELECT VALUE id FROM emb_keyed;") == [RecordID("emb_keyed", "k:x")]
+            signed_in = await EmbKeyed.signin(email="k:x", password="p", bind=True)
+            assert signed_in.user.email == "k:x"
 
     async def test_signin_with_bind_after_invalidate(self) -> None:
         async with _embedded_auth():

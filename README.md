@@ -1246,9 +1246,7 @@ a concurrent server).
 
 The model must declare either an `id` field or a `primary_key`, as every ORM model must. Prefer
 `id` here so the server mints the record id during SIGNUP; configure `primary_key` when identity
-_is_ a column, and the SIGNUP clause targets the record id built from it: `type::record(…)` on SurrealDB 3.x,
-`type::thing(…)` on 2.x and the embedded engine, each line refusing the other's. `define_access()` reads the connected
-line and applies the right one; the record id is the key on both.
+_is_ a column, and the SIGNUP clause targets `type::thing(…)` to match.
 
 #### Configuration
 
@@ -1274,10 +1272,6 @@ for statement in User.access_ddl():
 # DEFINE TABLE OVERWRITE User SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;
 # DEFINE ACCESS OVERWRITE account ON DATABASE TYPE RECORD SIGNUP ( ... ) SIGNIN ( ... ) ...;
 ```
-
-Being pure, `access_ddl()` cannot see the server line. Only a model with a `primary_key` depends on it: its SIGNUP
-target is rendered for SurrealDB 3.x by default (`CREATE type::record('User', $email)`), and `line=2` renders it for
-2.x (`type::thing`), as `index_ddl(line=…)` does for full-text indexes.
 
 The `DEFINE TABLE` ships **by default**, and deliberately: without `FOR select WHERE id = $auth.id`
 a signin succeeds and `$auth` is set, yet the server returns no record — so no instance can be
@@ -6821,7 +6815,6 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Signing in as a system user while a record session is open                                                                             | permissions change, `$auth` still points at the record — only `invalidate()` clears it                                                                                        | 3.2.x: same as 2.x. **3.3.0**: the identity is cleared and `info()` returns `None`; `invalidate()` stays the portable log-out                                                       | v0.16.0                              |
 | Duplicate signin identifier in the record table                                                                                        | signin fails (`No record was returned`)                                                                                                                                       | signin succeeds, picking one record                                                                                                                                                 | v0.16.0                              |
 | Model auth (`signup`/`signin`/`authenticate`, `access_ddl`/`define_access`)                                                            | same on both lines (verified on 2.6.5)                                                                                                                                        | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.17.0                              |
-| Model auth with a `primary_key`: the record id SIGNUP creates (`access_ddl()`, `define_access()`)                                      | `CREATE type::thing('<table>', $<key>)` (`access_ddl(line=2)`); `type::record(table, key)` would be stored but checks a type, so every signup fails                           | `CREATE type::record('<table>', $<key>)` (`access_ddl()`'s default); `type::thing` is refused at `DEFINE`. `define_access()` reads the line; the id is the key on both              | v0.17.0                              |
 | Model auth session isolation (each call on its own ephemeral connection)                                                               | same on both lines (an SDK/connection property, not a server one)                                                                                                             | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.17.0                              |
 | Hydrated instance's password field after `signup`/`signin`                                                                             | holds the stored **hash**, never the plaintext                                                                                                                                | same on both lines                                                                                                                                                                  | v0.17.0                              |
 | Model config `with_refresh=True` → `define_access()`                                                                                   | raises `SurrealDbError` (clause does not parse; message names the 3.x requirement)                                                                                            | applies, and `AuthResult.tokens.refresh` is populated                                                                                                                               | v0.17.0                              |
