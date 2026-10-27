@@ -1916,6 +1916,15 @@ class EmbMisfit(AuthenticatedUserMixin, BaseSurrealModel):
     nickname: str
 
 
+class EmbKeyed(AuthenticatedUserMixin, BaseSurrealModel):
+    """#338: a user whose record id is its e-mail address (``primary_key``), on the engine — whose SurrealQL is 2.x's."""
+
+    model_config = SurrealConfigDict(table_name="emb_keyed", access_name="emb_keyed_access", primary_key="email")
+
+    email: str
+    password: str
+
+
 @contextlib.asynccontextmanager
 async def _embedded_auth() -> AsyncIterator[Any]:
     """:func:`embedded` with ``EmbUser``'s access method and table defined by the in-process owner."""
@@ -2091,6 +2100,19 @@ class TestModelAuthEmbeddedE2E:
             assert me["email"] == "b@x"
             assert urls == []
             assert await SurrealDBConnectionManager.get_client() is client
+
+    async def test_a_primary_key_signs_up_on_its_key(self) -> None:
+        """#338: the servers' statement — ``CREATE emb_keyed SET id = $email, …`` — on the engine too (SurrealDB 2.x
+        SurrealQL), and the record id is the key."""
+        async with embedded() as client:
+            applied = await EmbKeyed.define_access()
+            assert applied == EmbKeyed.access_ddl()
+            assert "SIGNUP ( CREATE emb_keyed SET id = $email, email = $email, " in applied[-1]
+            result = await EmbKeyed.signup(email="k:x", password="p", bind=True)
+            assert result.user.email == "k:x"
+            assert await client.query("SELECT VALUE id FROM emb_keyed;") == [RecordID("emb_keyed", "k:x")]
+            signed_in = await EmbKeyed.signin(email="k:x", password="p", bind=True)
+            assert signed_in.user.email == "k:x"
 
     async def test_signin_with_bind_after_invalidate(self) -> None:
         async with _embedded_auth():

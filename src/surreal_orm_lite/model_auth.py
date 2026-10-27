@@ -170,7 +170,8 @@ class AuthenticatedUserMixin:
     a ``primary_key`` — otherwise the instance these methods return cannot be constructed at
     all. Prefer the ``id`` field here: SIGNUP lets the server mint the record id, and this is
     what receives it. Configure ``primary_key`` instead when the identity *is* a column (say
-    the e-mail address), and the SIGNUP clause will target ``type::thing(…)`` accordingly.
+    the e-mail address), and the SIGNUP clause will set the record id from it (``id = $email``)
+    accordingly — the same statement on SurrealDB 3.x, 2.x and the embedded engine.
     """
 
     # ------------------------------------------------------------------
@@ -303,11 +304,12 @@ class AuthenticatedUserMixin:
     def _signup_primary_key(cls) -> str | None:
         """The primary key SIGNUP builds the record id from, or ``None`` for a server id.
 
-        The key has to be *bindable*: SIGNUP renders ``type::thing(table, $pk)``, so a key that
-        is not among the fields signup sends would evaluate to ``type::thing(table, NONE)`` and
-        fail server-side with an opaque error. ``primary_key="id"`` is the trap — ``id`` is
-        deliberately excluded from the signup payload (the server mints it), so it can never be
-        bound. Caught here, at render time, rather than on every signup.
+        The key has to be *bindable*: SIGNUP renders ``CREATE <table> SET id = $pk, …``, so a key
+        that is not among the fields signup sends would evaluate to ``id = NONE`` and have the
+        server mint a random record id — one no ``objects().get(<key>)`` addresses.
+        ``primary_key="id"`` is the trap — ``id`` is deliberately excluded from the signup
+        payload (the server mints it), so it can never be bound. Caught here, at render time,
+        rather than on every signup.
         """
         primary_key = cls.get_index_primary_key()  # type: ignore[attr-defined]
         if primary_key is None:
@@ -385,6 +387,12 @@ class AuthenticatedUserMixin:
         ``define_table()`` writes ``TYPE NORMAL``, so calling both changes the type each time.
         Declaring ``table_type`` gives both the same type.
 
+        A model with a ``primary_key`` has SIGNUP create the record whose id is the key:
+        ``CREATE <table> SET id = $<key>, …``, the assignment first (#338). The statements are
+        the same for SurrealDB 3.x, 2.x and the embedded engine — a function building the id
+        would not be: 3.x refuses ``type::thing`` at ``DEFINE``, and 2.x reads
+        ``type::record(table, key)`` as a type check that fails every signup.
+
         Args:
             overwrite: ``True`` (default) emits ``OVERWRITE`` — the model is the source of
                 truth, so re-running converges the database onto the code. ``False`` emits
@@ -451,9 +459,13 @@ class AuthenticatedUserMixin:
 
         # The record id follows the model's primary key, because the rest of the ORM does: a
         # random id here would leave User.objects().get(email=…) addressing a record the
-        # signup never wrote.
+        # signup never wrote. It is assigned from the bound key (`id = $<key>`, first item of
+        # the SET), not built with a function: SurrealDB 3.x refuses `type::thing` at DEFINE,
+        # and 2.x reads `type::record(table, key)` as a type check that fails every signup
+        # (#338), while the assignment gives the record id `<table>:<key>` on both lines and on
+        # the embedded engine.
         primary_key = cls._signup_primary_key()
-        target = f"type::thing('{table}', ${primary_key})" if primary_key is not None else table
+        items = [] if primary_key is None else [f"id = ${primary_key}"]
 
         # Column on the left of each assignment, bound variable on the right: the variable
         # keeps the Python name the caller passes as a keyword argument, while the column is
@@ -462,16 +474,16 @@ class AuthenticatedUserMixin:
         # `password_hash` — signin would then keep validating against a hash no ORM write ever
         # updates.
         to_column = cls.to_db_field  # type: ignore[attr-defined]
-        assignments = ", ".join(
+        items += [
             f"{to_column(name)} = crypto::{algorithm}::generate(${name})"
             if name == password
             else f"{to_column(name)} = ${name}"
             for name in cls._signup_fields()
-        )
+        ]
 
         parts = [
             f"DEFINE ACCESS {clause} {access} ON DATABASE TYPE RECORD",
-            f"SIGNUP ( CREATE {target} SET {assignments} )",
+            f"SIGNUP ( CREATE {table} SET {', '.join(items)} )",
             f"SIGNIN ( SELECT * FROM {table} WHERE {to_column(identifier)} = ${identifier} "
             f"AND crypto::{algorithm}::compare({to_column(password)}, ${password}) )",
         ]
@@ -653,6 +665,14 @@ class AuthenticatedUserMixin:
                 f"{'s' if len(missing) > 1 else ''}: {', '.join(missing)}. "
                 f"They have no default, so the instance could not be built from the record "
                 f"the server would create."
+            )
+        # The record id SIGNUP creates is the primary key's value (`SET id = $<key>`, #338): a
+        # `None` there has the server mint a random id, one no objects().get(<key>) addresses —
+        # refused before the exchange as well.
+        primary_key = cls.get_index_primary_key()  # type: ignore[attr-defined]
+        if primary_key in payload and payload[primary_key] is None:
+            raise ValueError(
+                f"{cls.__name__}.{action}() requires {primary_key}=: it is the primary key, which SIGNUP makes the record id."
             )
         return payload
 
@@ -964,7 +984,8 @@ class AuthenticatedUserMixin:
                 would strip of its password hash. :meth:`signin`, :meth:`authenticate`,
                 :meth:`refresh`, ``update()`` and ``upsert()`` refuse such a model the same way
                 (#310), whoever wrote the record.
-            ValueError: for an unknown field or a missing required one — before any request.
+            ValueError: for an unknown field, a missing required one, or a ``primary_key`` left
+                ``None`` (it is the record id SIGNUP creates) — before any request.
             SurrealDbAuthenticationError: if the server refuses the signup, or returns no
                 record for the new session (the message says how to grant the permission).
             SurrealDbError: on the embedded engine without ``bind=True``.

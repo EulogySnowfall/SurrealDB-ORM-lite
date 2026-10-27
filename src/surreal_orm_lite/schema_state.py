@@ -279,8 +279,9 @@ class AccessState:
     ``signup_fields``, ``signin_where``, ``duration_token``, ``duration_session``, ``access_type``,
     ``duration_grant``. Lite additions, keyword-only: ``signup``, ``signin``, ``with_refresh``, ``comment``, ``raw``.
 
-    ``table`` and ``signup_fields`` come from a ``SIGNUP (CREATE <table> SET <field> = <expr>, …)``, ``signin_where``
-    from a ``SIGNIN (SELECT … FROM <table> WHERE <expr>)`` (``""``/empty otherwise). Durations are kept as rendered
+    ``table`` and ``signup_fields`` come from a ``SIGNUP (CREATE <table> SET <field> = <expr>, …)`` — every item,
+    the ``id = $<key>`` of a model with a ``primary_key`` included —, ``signin_where`` from a ``SIGNIN (SELECT … FROM
+    <table> WHERE <expr>)`` (``""``/empty otherwise). Durations are kept as rendered
     (``"15m"``, ``"NONE"``). The keys of a ``raw`` statement are already ``[REDACTED]`` by the server; ``raw``,
     ``signup``, ``signin`` and ``signin_where`` are kept out of ``repr`` all the same, and ``signup_fields`` shows its
     keys only.

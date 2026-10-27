@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.2] - 2026-10-27
+
+A model with a `primary_key` can have its access defined on SurrealDB 3.x. No new public API.
+
+### Fixed
+
+- **`access_ddl()` and `define_access()` work for a model with a `primary_key` on SurrealDB 3.x** (#338).
+  The SIGNUP clause built the record id with `type::thing('<table>', $<key>)`, which 3.x refuses at
+  `DEFINE`, so `define_access()` failed there; `type::record(table, key)` is no replacement, since 2.x
+  reads it as a type check that fails every signup. SIGNUP now sets the id from the bound key,
+  `CREATE <table> SET id = $<key>, ...`, a statement accepted by 3.x, 2.x and the embedded engine
+  that gives the record id `<table>:<key>` on all of them. `access_ddl()` stays pure, with no
+  version parameter, and a model without a `primary_key` is unchanged.
+- **A signup leaving the `primary_key` as `None` is refused before the exchange.** `SET id = NONE`
+  would have the server mint a random record id, one no `objects().get(<key>)` addresses; the
+  `ValueError` names the key.
+- **`parse_define_access()` reads the new form**: the `id = $<key>` item is one of `signup_fields`.
+  The older `type::thing(...)` and `type::record(...)` targets are still read.
+
+### Notes
+
+- **Upgrading**: re-run `define_access()` for such a model to replace the old SIGNUP clause. Accesses
+  already defined on 2.x keep working; on 2.x the old clause and the new one create the same records.
+
 ## [0.37.1] - 2026-10-24
 
 Follow-ups to the review of v0.36.3 (#327): a `Literal[None]` member of a vector field's union

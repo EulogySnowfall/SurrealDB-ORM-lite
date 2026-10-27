@@ -2290,10 +2290,11 @@ _COMING_FROM_31 = [
     "for a field without `TYPE`, as in the full ORM.",
     "- **Accesses are database-level**: they are in `schema.accesses`, and `TableState` has no `access` attribute; "
     'find a table\'s with `[a for a in schema.accesses.values() if a.table == "user"]`. `table`, `signup_fields` and '
-    "`signin_where` are read from `SIGNUP (CREATE <table> SET …)` (also `CREATE type::thing('<table>', …) SET …` and "
-    "`CREATE type::record('<table>', …) SET …`, the forms `define_access()` uses for a `primary_key`) and `SIGNIN "
-    "(SELECT … FROM <table> WHERE …)`. The full ORM reads the first form only, and another shape leaves them empty, "
-    "with field names unescaped; durations are kept as rendered, `'NONE'` included.",
+    "`signin_where` are read from `SIGNUP (CREATE <table> SET …)` (the form `define_access()` uses, whose "
+    "`id = $<key>` for a `primary_key` is one of the `signup_fields`; also `CREATE type::thing('<table>', …) SET …` and "
+    "`CREATE type::record('<table>', …) SET …`) and `SIGNIN (SELECT … FROM <table> WHERE …)`. The full ORM reads the "
+    "first form only, and another shape leaves them empty, with field names unescaped; durations are kept as rendered, "
+    "`'NONE'` included.",
     "- **`encrypted` is not provided**: the lite has no `Encrypted` type, so a hashing `VALUE` "
     "(`crypto::argon2::generate($value)`) stays in `FieldState.value` and the field is generated as a writable field.",
     '- **APIs and the GraphQL config are not typed**: their definitions are in `SchemaState.other["apis"]` and '
