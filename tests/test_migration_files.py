@@ -15,7 +15,17 @@ import pytest
 
 import surreal_orm_lite.migrations as migrations
 from surreal_orm_lite.exceptions import SurrealDbError
-from surreal_orm_lite.migrations import MIGRATIONS_TABLE, Migration, MigrationStatementError, Operation
+from surreal_orm_lite.migrations import (
+    MIGRATIONS_TABLE,
+    AddField,
+    CreateTable,
+    DataMigration,
+    DropTable,
+    Migration,
+    MigrationStatementError,
+    Operation,
+    RawSQL,
+)
 from surreal_orm_lite.migrations.constants import MIGRATIONS_TABLE as CONSTANTS_TABLE
 from surreal_orm_lite.migrations.executor import MigrationStatementError as ExecutorError
 from surreal_orm_lite.migrations.migration import generate_migration_name, parse_migration_name
@@ -121,6 +131,31 @@ class TestMigrationClass:
     def test_operation_is_abstract(self) -> None:
         with pytest.raises(TypeError):
             Operation()  # type: ignore[abstract]
+
+    def test_schema_and_data_operations(self) -> None:
+        table = CreateTable(name="t")
+        data = DataMigration(forwards_sql="UPDATE t SET a = 1;")
+        field = AddField("t", "a", "int")
+        raw = RawSQL("UPDATE t SET b = 2;")
+        migration = Migration(name="0001_a", operations=[table, data, field, raw])
+        assert migration.has_data_migrations is True
+        assert migration.schema_operations == [table, field, raw]
+        assert migration.data_operations == [data]
+        assert isinstance(migration.schema_operations, list)
+        schema_only = Migration(name="0001_a", operations=[table])
+        assert (schema_only.has_data_migrations, schema_only.data_operations) == (False, [])
+        assert Migration(name="0001_a").schema_operations == []
+
+    def test_is_reversible_with_operations(self) -> None:
+        assert Migration(name="0001_a", operations=[CreateTable(name="t"), AddField("t", "a", "int")]).is_reversible
+        assert not Migration(name="0001_a", operations=[CreateTable(name="t"), DropTable("old")]).is_reversible
+
+    def test_describe_with_operations(self) -> None:
+        migration = Migration(name="0001_a", operations=[CreateTable(name="t"), DropTable("user-events")])
+        assert migration.describe() == (
+            "Migration: 0001_a\nOperations (2):\n  1. Create table t\n  2. Drop table 'user-events'"
+        )
+        assert repr(migration) == "Migration(name='0001_a', operations=2)"
 
 
 class TestMigrationNames:
@@ -237,6 +272,33 @@ class TestMigrationStatementError:
 
 
 def test_the_package_exports() -> None:
-    assert set(migrations.__all__) == {"MIGRATIONS_TABLE", "Migration", "MigrationStatementError", "Operation"}
+    # The names that exist after Task 3 of v0.38.0's plan; the later tasks add the rest of spec §5.1.
+    assert set(migrations.__all__) == {
+        "MIGRATIONS_TABLE",
+        "Migration",
+        "MigrationStatementError",
+        "Operation",
+        "CreateTable",
+        "AlterTable",
+        "DropTable",
+        "AddField",
+        "AlterField",
+        "DropField",
+        "CreateIndex",
+        "DropIndex",
+        "RebuildIndex",
+        "DefineAnalyzer",
+        "RemoveAnalyzer",
+        "DefineEvent",
+        "RemoveEvent",
+        "DefineAccess",
+        "RemoveAccess",
+        "DefineFunction",
+        "RemoveFunction",
+        "DataMigration",
+        "RawSQL",
+        "DefaultExpression",
+        "split_destructive",
+    }
     for name in migrations.__all__:
         assert getattr(migrations, name) is not None

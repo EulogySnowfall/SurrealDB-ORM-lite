@@ -14,13 +14,14 @@ in its own file of the migrations directory, ``<NNNN>_<name>.py``, which defines
 """
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any, Literal
 
-if TYPE_CHECKING:
-    from .operations import Operation
+from ..schema_state import SchemaState
+from ..search import checked_line
+from .operations import AddField, AlterField, AlterTable, DataMigration, Operation, RawSQL
 
 #: A migration's name: a number, an underscore, then ASCII letters, digits or underscores (``0001_initial``).
 _NAME = re.compile(r"[0-9]+_[A-Za-z0-9_]+")
@@ -51,12 +52,10 @@ class Migration:
 
     name: str
     dependencies: Sequence[str] = ()
-    operations: Sequence["Operation"] = ()
+    operations: Sequence[Operation] = ()
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
-        from .operations import Operation
-
         name = self.name
         if not isinstance(name, str):
             raise TypeError(f"Migration name must be a str, not {type(name).__name__}.")
@@ -85,10 +84,47 @@ class Migration:
         object.__setattr__(self, "dependencies", dependencies)
         object.__setattr__(self, "operations", operations)
 
+    def forwards_sql(self, *, line: Literal[2, 3] = 3, state: SchemaState | None = None) -> list[str]:
+        """Each operation's ``forwards()`` that is not empty, in order — the statements that apply the migration on the
+        SurrealDB major *line* (3 by default; 2 for SurrealDB 2.x and the embedded engine). Pure: no database is read.
+
+        The operations render from the state after the migration: the **file replay** of its operations over *state*
+        (``SchemaState()`` when ``None``) — so on line 2 the ``FLEXIBLE`` choices are those of the files' state, where
+        ``migrate()`` writes those of the database's. An ``AlterTable`` leaves out of its ``FLEXIBLE`` redefinitions
+        the fields the migration defines itself (``skip_fields``).
+        """
+        checked = checked_line(line)
+        after = SchemaState() if state is None else state
+        for operation in self.operations:
+            after = operation.state_forwards(after)
+        return [text for _, text in _statements(self, line=checked, state=after)]
+
+    def backwards_sql(self, *, line: Literal[2, 3] = 3, state: SchemaState | None = None) -> list[str]:
+        """The reversible operations' ``backwards()`` that is not empty, in reverse order — the statements that undo
+        the migration on the SurrealDB major *line*. *state* is the state **before** the migration (the one the
+        backwards restore, read by the ``FLEXIBLE`` rule on line 2). Pure.
+        """
+        return [text for _, text in _statements(self, line=checked_line(line), state=state, backwards=True)]
+
     @property
     def is_reversible(self) -> bool:
         """Whether every operation is reversible, so that the whole migration can be rolled back."""
         return all(operation.reversible for operation in self.operations)
+
+    @property
+    def has_data_migrations(self) -> bool:
+        """Whether the migration holds a ``DataMigration`` (records transformed, not schema)."""
+        return any(isinstance(operation, DataMigration) for operation in self.operations)
+
+    @property
+    def schema_operations(self) -> list[Operation]:
+        """Every operation but the ``DataMigration`` ones, in order."""
+        return [operation for operation in self.operations if not isinstance(operation, DataMigration)]
+
+    @property
+    def data_operations(self) -> list[Operation]:
+        """The ``DataMigration`` operations, in order."""
+        return [operation for operation in self.operations if isinstance(operation, DataMigration)]
 
     def describe(self) -> str:
         """A multi-line description: the name, the dependencies and each operation's ``describe()``."""
@@ -102,6 +138,47 @@ class Migration:
 
     def __repr__(self) -> str:
         return f"Migration(name={self.name!r}, operations={len(self.operations)})"
+
+
+def _own_fields(operations: Iterable[Operation], table: str) -> set[str]:
+    """The fields of *table* that *operations* define or redefine — their ``AddField`` and ``AlterField`` operations,
+    those in a ``RawSQL``'s ``state_operations`` included (D29)."""
+    names: set[str] = set()
+    for operation in operations:
+        if isinstance(operation, AddField | AlterField) and operation.table == table:
+            names.add(operation.name)
+        elif isinstance(operation, RawSQL):
+            names |= _own_fields(operation.state_operations, table)
+    return names
+
+
+def _statements(
+    migration: Migration, *, line: Literal[2, 3], state: SchemaState | None, backwards: bool = False
+) -> list[tuple[int, str]]:
+    """Each operation's index in ``migration.operations`` (0-based) and its non-empty text — ``forwards(line=…,
+    state=…)`` in order, or ``backwards(…)`` in reverse order — for ``forwards_sql()``, ``backwards_sql()``,
+    ``show_sql()`` and the executor's batches (spec §6.3). *state* is passed as it is: the state after the migration
+    for the forwards, before it for the backwards. An ``AlterTable`` is given ``skip_fields``: the fields of its table
+    the migration defines or redefines itself, which its line-2 ``FLEXIBLE`` redefinitions leave out (D29). Pure.
+    """
+    indexed = list(enumerate(migration.operations))
+    if backwards:
+        indexed.reverse()
+    statements: list[tuple[int, str]] = []
+    for index, operation in indexed:
+        if isinstance(operation, AlterTable):
+            skip = _own_fields(migration.operations, operation.name)
+            if backwards:
+                text = operation.backwards(line=line, state=state, skip_fields=skip)
+            else:
+                text = operation.forwards(line=line, state=state, skip_fields=skip)
+        elif backwards:
+            text = operation.backwards(line=line, state=state)
+        else:
+            text = operation.forwards(line=line, state=state)
+        if text:
+            statements.append((index, text))
+    return statements
 
 
 def parse_migration_name(filename: str) -> tuple[int, str]:

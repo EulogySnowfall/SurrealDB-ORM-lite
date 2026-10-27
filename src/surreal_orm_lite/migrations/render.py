@@ -5,10 +5,13 @@ An operation's statement is built by the renderers the appliers already use (``t
 they do not write:
 
 - :func:`plain` — the creation form of an ``OVERWRITE`` statement (``DEFINE <KIND>`` with no clause);
+- :func:`table_statement` and :func:`index_statement` — an operation's table and index statements in the three modes,
+  over ``schema``'s and ``search``'s renderers;
 - :func:`field_statement` — the one writer of a field statement from a ``FieldState``: every clause it holds, in the
   order the servers render them (``TYPE``, ``FLEXIBLE``, ``REFERENCE[ ON DELETE …]``, ``DEFAULT[ ALWAYS]``,
   ``READONLY``, ``VALUE``, ``ASSERT``, ``COMMENT``, ``PERMISSIONS``; with ``COMPUTED``: ``TYPE``, ``FLEXIBLE``,
-  ``COMPUTED``, ``COMMENT``, ``PERMISSIONS``), so :func:`read_own` reads the ``FieldState`` back;
+  ``COMPUTED``, ``COMMENT``, ``PERMISSIONS``), so :func:`read_own` reads the ``FieldState`` back; :func:`field_state`
+  turns a field operation's attributes into that ``FieldState`` (:func:`default_text` writes its default);
 - the line-dependent ``FLEXIBLE`` rule (v0.34.0): before SurrealDB 3.x — a 2.x server or the embedded engine —, a
   ``SCHEMAFULL`` table empties an object held by an ``any`` column, and drops a ``FLEXIBLE`` or ``any`` column's value
   from every item of a list of sub-models unless the list is ``FLEXIBLE`` too. :func:`flexible_before_3` reads that
@@ -27,9 +30,10 @@ Imports ``schema_state``, ``define_parser``, ``model_ddl``, ``search``, ``surql_
 ``model_base``, ``model_auth`` or ``connection_manager`` — and, of the ``migrations`` package, ``compare`` only.
 """
 
+import dataclasses
 import re
-from collections.abc import Callable, Collection, Sequence
-from typing import Literal
+from collections.abc import Callable, Collection, Mapping, Sequence
+from typing import Any, Literal
 
 from ..define_parser import (
     DefineParseError,
@@ -38,6 +42,7 @@ from ..define_parser import (
     KName,
     KUnion,
     blank_literals,
+    normalise_kind,
     parse_define_access,
     parse_define_analyzer,
     parse_define_event,
@@ -50,8 +55,9 @@ from ..define_parser import (
     scan_fragment,
     top_level_keywords,
 )
-from ..functions import normalize_function_name
+from ..functions import SurrealFunc, normalize_function_name
 from ..model_ddl import _children, field_path, field_permissions_text, holds_any, holds_object
+from ..schema import TableClauses, _view_statement, declared_clauses, relation_statement, relation_type_clause
 from ..schema_state import (
     AccessState,
     AnalyzerState,
@@ -62,20 +68,25 @@ from ..schema_state import (
     SchemaState,
     TableState,
 )
-from ..search import checked_line
+from ..search import Index, checked_line
 from ..surql_literal import _identifier, _quoted, to_surql_literal
 from . import compare
 
 __all__ = [
+    "Expression",
     "check_statements",
+    "default_text",
+    "field_state",
     "field_statement",
     "flexible_before_3",
     "flexible_candidate",
     "flexible_redefinitions",
+    "index_statement",
     "literal_value",
     "plain",
     "read_own",
     "removal",
+    "table_statement",
 ]
 
 #: How a statement defines: ``plain`` creates (``DEFINE <KIND>``), ``overwrite`` defines or replaces (``OVERWRITE``),
@@ -123,6 +134,70 @@ def plain(statement: str) -> str:
     if head is None:
         raise ValueError("plain(): the statement does not start with DEFINE <KIND> OVERWRITE.")
     return f"DEFINE {head.group(1)} {statement[head.end() :]}"
+
+
+def _in_mode(statement: str, mode: Mode) -> str:
+    """*statement*, written with ``OVERWRITE`` or ``IF NOT EXISTS`` by its renderer, in *mode*: :func:`plain` of it
+    for ``"plain"``, as it is otherwise."""
+    return plain(statement) if mode == "plain" else statement
+
+
+# --- tables and indexes ----------------------------------------------------------------------------------------------
+
+
+def table_statement(
+    name: str,
+    *,
+    schema_mode: str | None,
+    table_type: str | None,
+    changefeed: str | None,
+    permissions: Mapping[str, str] | None,
+    comment: str | None,
+    view_query: str | None,
+    relation_in: Sequence[str],
+    relation_out: Sequence[str],
+    enforced: bool,
+    drop: bool,
+    mode: Mode,
+) -> str:
+    """The ``DEFINE TABLE`` statement of a ``CreateTable`` or an ``AlterTable`` — every clause it is given and nothing
+    else (an ``OVERWRITE`` resets the others, M13). Pure.
+
+    A view (*view_query*): ``schema._view_statement()`` — ``DROP`` and the schema mode before ``AS (<query>)``, the
+    other clauses after it. Any other table: the type clause (none for *table_type* ``None``: SurrealDB's ``TYPE
+    ANY``; ``TYPE NORMAL``, ``TYPE ANY``, or ``schema.relation_type_clause()`` for ``"relation"``), ``DROP``, then
+    ``schema.declared_clauses()`` — schema mode, ``COMMENT``, ``CHANGEFEED``, ``PERMISSIONS`` — through
+    ``schema.relation_statement()``, the statement ``define_table()`` sends. *mode*: ``"plain"``, ``"overwrite"`` or
+    ``"if_not_exists"``. The values come from an operation, which checked them.
+
+    :raises ValueError: an unknown *mode*; *name* is not an identifier.
+    """
+    clause = _mode_clause(mode)
+    clauses = TableClauses(schema_mode=schema_mode, comment=comment, changefeed=changefeed, permissions=permissions)
+    overwrite = mode != "if_not_exists"
+    if view_query is not None:
+        return _in_mode(_view_statement(name, view_query, overwrite, clauses, drop=drop), mode)
+    head: list[str] = []
+    if table_type == "relation":
+        head.append(relation_type_clause(relation_in, relation_out, enforced))
+    elif table_type is not None:
+        head.append(f"TYPE {table_type.upper()}")
+    if drop:
+        head.append("DROP")
+    body = " ".join([*head, *declared_clauses(clauses)])
+    if not body:
+        return f"DEFINE TABLE{clause} {_identifier(name)};"
+    return _in_mode(relation_statement(name, body, overwrite), mode)
+
+
+def index_statement(index: Index, table: str, *, mode: Mode, line: Literal[2, 3]) -> str:
+    """The ``DEFINE INDEX`` statement of *index* on *table* for the SurrealDB major *line* — ``Index.ddl()``'s text
+    (``FULLTEXT`` on 3, ``SEARCH`` on 2), in *mode*. Pure.
+
+    :raises ValueError: an unknown *mode*, a *line* other than 2 or 3, *table* not an identifier.
+    """
+    _mode_clause(mode)
+    return _in_mode(index.ddl(table, overwrite=mode != "if_not_exists", line=line), mode)
 
 
 # --- kinds and the FLEXIBLE rule -------------------------------------------------------------------------------------
@@ -227,7 +302,15 @@ def _flexible(table: str, field: FieldState, kind: Kind, *, line: int, state: Sc
     return field.flexible or _selects(state, table, field.path, kind)
 
 
-def field_statement(table: str, field: FieldState, *, mode: Mode, line: Literal[2, 3], state: SchemaState | None) -> str:
+def field_statement(
+    table: str,
+    field: FieldState,
+    *,
+    mode: Mode,
+    line: Literal[2, 3],
+    state: SchemaState | None,
+    typed: bool = True,
+) -> str:
     """``DEFINE FIELD[ OVERWRITE | IF NOT EXISTS] <path> ON `<table>` TYPE <kind>…;`` — every clause *field* holds, the
     one field-statement writer of the migration system. Pure.
 
@@ -247,6 +330,8 @@ def field_statement(table: str, field: FieldState, *, mode: Mode, line: Literal[
     The expressions are written as *field* holds them: the state was read from SurrealQL, or its operation checked
     them. :func:`read_own` of the result gives *field* back (``raw`` aside; a nullable ``any`` reads back not nullable,
     default ``FULL`` permissions back empty). *mode*: ``"plain"``, ``"overwrite"`` or ``"if_not_exists"``.
+    ``typed=False`` writes no ``TYPE`` clause (an ``AlterField`` without ``field_type``: SurrealDB's ``any``, which
+    ``field.field_type`` then is); the ``FLEXIBLE`` rule is the same (2.x accepts ``FLEXIBLE`` alone, measured).
 
     :raises ValueError: an unknown *mode*, a *line* other than 2 or 3 (``TypeError`` for a non-``int``), a
         ``field_type`` the parser cannot read, a comment holding a NUL character.
@@ -254,7 +339,9 @@ def field_statement(table: str, field: FieldState, *, mode: Mode, line: Literal[
     clause = _mode_clause(mode)
     checked = checked_line(line)
     kind = _field_kind(field)
-    parts = [f"DEFINE FIELD{clause} {field_path(field.path)} ON {_identifier(table)} TYPE {render_kind(kind)}"]
+    parts = [f"DEFINE FIELD{clause} {field_path(field.path)} ON {_identifier(table)}"]
+    if typed:
+        parts.append(f"TYPE {render_kind(kind)}")
     if _flexible(table, field, kind, line=checked, state=state):
         parts.append("FLEXIBLE")
     if field.computed is not None:
@@ -280,6 +367,65 @@ def field_statement(table: str, field: FieldState, *, mode: Mode, line: Literal[
     if permissions is not None:
         parts.append(f"PERMISSIONS {permissions}")
     return " ".join(parts) + ";"
+
+
+@dataclasses.dataclass(frozen=True)
+class Expression:
+    """A SurrealQL expression a statement writes as it is — the base of ``operations.DefaultExpression``, which this
+    module cannot import (it imports this one). ``text`` is kept out of ``repr``."""
+
+    text: str = dataclasses.field(repr=False)
+
+
+def default_text(value: object) -> str | None:
+    """The SurrealQL text a field statement writes after ``DEFAULT`` for an operation's *value*: ``None`` for none, a
+    ``SurrealFunc``'s expression or an :class:`Expression`'s text as it is, and any other value through
+    ``to_surql_literal()`` (a ``str`` is always a string literal). Pure.
+
+    :raises TypeError: a value with no SurrealQL literal form (``to_surql_literal()``'s refusal).
+    """
+    if value is None:
+        return None
+    if isinstance(value, SurrealFunc):
+        return value.expression
+    if isinstance(value, Expression):
+        return value.text
+    return to_surql_literal(value)
+
+
+def field_state(op: Any, *, previous: bool = False) -> FieldState:
+    """The ``FieldState`` an ``AddField`` or an ``AlterField`` *op* writes — its target attributes, or with *previous*
+    its ``previous_*`` ones — the state :func:`field_statement` renders. Pure.
+
+    ``field_type`` (``previous_type``) goes through ``define_parser.normalise_kind()``: ``option<X>`` gives ``X``,
+    nullable, as ``read_own()`` reads it back; ``None`` (an ``AlterField`` without a type) gives ``any``. The default
+    becomes SurrealQL text through :func:`default_text`; ``None`` permissions become empty (every rule ``FULL``).
+    The attributes are read by name: this module cannot import ``operations``, and the operation checked them.
+    """
+
+    def read(name: str) -> Any:
+        return getattr(op, f"previous_{name}" if previous else name)
+
+    kind: str | None = read("type") if previous else op.field_type
+    field_type, wrapped = ("any", False) if kind is None else normalise_kind(kind)
+    return FieldState(
+        name=op.name,
+        field_type=field_type,
+        nullable=wrapped or bool(read("nullable")),
+        default=default_text(read("default")),
+        assertion=read("assertion"),
+        flexible=read("flexible"),
+        readonly=read("readonly"),
+        value=read("value"),
+        reference=read("reference"),
+        on_delete=read("on_delete"),
+        comment=read("comment"),
+        path=op.path,
+        table=op.table,
+        default_always=read("default_always"),
+        computed=read("computed"),
+        permissions=read("permissions") or {},
+    )
 
 
 def flexible_redefinitions(table: str, state: SchemaState, *, skip: Collection[str]) -> list[str]:
