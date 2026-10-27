@@ -47,8 +47,9 @@ engines: SurrealDB 3.x has the function, 2.x and the embedded engine refuse it; 
 over the lists, bit for bit, the records, scores and order the ORM's fusion gives the same lists.
 
 Records at an equal distance at the ``vector_limit``-th place (``TestExactScanTiesE2E``), on the same engines: the
-HNSW index, and SurrealDB 3.x's exact scan, give identical calls one answer; SurrealDB 2.x's and the embedded engine's
-exact scan (``dist=``, in ``hybrid_search()`` as in ``similar_to()``) picks among the tied records in no fixed order.
+HNSW index and the exact scan (``dist=``, in ``hybrid_search()`` as in ``similar_to()``) give identical calls one answer
+on every engine; below SurrealDB 3, whose own exact scan picks among the tied records in no fixed order, the ORM ranks
+the scan by distance then id, so the tied records kept are the first by id, in that order.
 
 The documentation (``TestReadmeSection38``, ``TestRoadmap37``), with no server: README section 38 — its place, its
 examples run as written on the embedded engine, each printed line equal to its comment, its texts word for word —, the
@@ -943,6 +944,27 @@ _G4 = (
     "@0@ $_f1 ORDER BY _search_score DESC, id LIMIT 4); ([$_sq0, $_sq1]) };"
 )
 
+#: ``_G4`` with ``dist="cosine"`` once the line is read below SurrealDB 3: the four nearest ranked by distance then id in
+#: a ``LET``, the vector list searching their ids.
+_G4_EXACT = (
+    "{ LET $_sq0 = (SELECT id, 1 - vector::similarity::cosine(embedding, $_f0) AS _knn_distance FROM hy_doc WHERE "
+    "type::is::array(embedding) AND array::len(embedding) = 3 AND type::is::number(array::min(embedding)) AND "
+    "type::is::number(array::max(embedding)) ORDER BY _knn_distance, id LIMIT 4).id; LET $_sq1 = (SELECT *, "
+    "vector::distance::knn() AS _knn_distance FROM hy_doc WHERE id IN $_sq0 AND embedding <|4,COSINE|> $_f0 ORDER BY "
+    "_knn_distance, id LIMIT 4); LET $_sq2 = (SELECT *, search::score(0) AS _search_score FROM hy_doc WHERE title @0@ "
+    "$_f1 ORDER BY _search_score DESC, id LIMIT 4); ([$_sq1, $_sq2]) };"
+)
+#: ``_G4_EXACT`` with ``filter(category="tech")``: the condition ranked with the nearest, and in the full-text list.
+_G4_EXACT_TECH = (
+    "{ LET $_sq0 = (SELECT id, 1 - vector::similarity::cosine(embedding, $_f1) AS _knn_distance FROM hy_doc WHERE "
+    "category = $_f0 AND type::is::array(embedding) AND array::len(embedding) = 3 AND "
+    "type::is::number(array::min(embedding)) AND type::is::number(array::max(embedding)) ORDER BY _knn_distance, id "
+    "LIMIT 4).id; LET $_sq1 = (SELECT *, vector::distance::knn() AS _knn_distance FROM hy_doc WHERE id IN $_sq0 AND "
+    "embedding <|4,COSINE|> $_f1 ORDER BY _knn_distance, id LIMIT 4); LET $_sq2 = (SELECT *, search::score(0) AS "
+    "_search_score FROM hy_doc WHERE category = $_f2 AND title @0@ $_f3 ORDER BY _search_score DESC, id LIMIT 4); "
+    "([$_sq1, $_sq2]) };"
+)
+
 #: ``HyLinked.objects().fetch("author")`` on SurrealDB 3.x: each list fetches the link, before its ``.map()``.
 _G6 = (
     "SELECT *, IF _hybrid_vec_pos != NONE THEN _hybrid_vec_pos ELSE 4 + _hybrid_text_pos END AS _hybrid_pos FROM "
@@ -1042,16 +1064,18 @@ class TestCompileHybrid:
         assert _compiled(HyDoc.objects(), below_3=True, knn_prefilter=True) == expected
 
     def test_a_knn_next_to_a_condition_asks_for_the_line(self) -> None:
-        # The flag _run_uncached() and _run_cached() read the line by (the pre-filter below 3), as for similar_to().
-        for queryset, expected in [
-            (HyDoc.objects(), False),
-            (HyDoc.objects().filter(category="tech"), True),
-            (HyDoc.objects().filter(id__in=Subquery(HyDoc.objects().filter(n__gt=2))), False),
+        # The flag _run_uncached() and _run_cached() read the line by (the pre-filter below 3, the exact scan's ranking),
+        # as for similar_to().
+        for queryset, dist, expected in [
+            (HyDoc.objects(), None, False),
+            (HyDoc.objects().filter(category="tech"), None, True),
+            (HyDoc.objects().filter(id__in=Subquery(HyDoc.objects().filter(n__gt=2))), None, False),
+            (HyDoc.objects(), "COSINE", True),
         ]:
-            runner = _runner(queryset)
+            runner = _runner(queryset, dist=dist)
             compiler = runner._subquery_compiler()
             runner._compile_hybrid(compiler, below_3=False, text_limit=4, rrf_k=60)
-            assert compiler.knn_conditions is expected, queryset._filters
+            assert compiler.knn_conditions is expected, (queryset._filters, dist)
 
     def test_a_fresh_compiler_compiles_the_same_statement_again(self) -> None:
         runner = _runner(HyDoc.objects().filter(category="tech"))
@@ -1086,6 +1110,11 @@ class TestCompileHybrid:
         cosine = vector.checked_distance("cosine", subject=_SUBJECT)
         assert _compiled(HyDoc.objects(), below_3=False, dist=cosine)[0] == _G1.replace("<|4,100|>", "<|4,COSINE|>")
         assert _compiled(HyDoc.objects(), below_3=True, dist=cosine)[0] == _G4.replace("<|4,100|>", "<|4,COSINE|>")
+        # Below 3 (the line read: knn_prefilter) the vector list searches the four nearest ranked by distance then id.
+        ranked = _compiled(HyDoc.objects(), below_3=True, knn_prefilter=True, dist=cosine)
+        assert ranked == (_G4_EXACT, {"_f0": _VECTOR, "_f1": "programming"})
+        tech = _compiled(HyDoc.objects().filter(category="tech"), below_3=True, knn_prefilter=True, dist=cosine)[0]
+        assert tech == _G4_EXACT_TECH
 
     def test_g5_ef_raised_to_the_vector_limit(self) -> None:
         query = _compiled(HyDoc.objects(), below_3=False, ef=40, vector_limit=50)[0]
@@ -2980,18 +3009,19 @@ _TIE_CORPUS = "CREATE hy_doc:d1 SET title = 'news one', category = 'tie', n = 1,
 
 _TIE_VECTOR = [1.0, 0.0, 0.0]
 
-#: Identical calls of each search. SurrealDB 2.x's and the embedded engine's exact scan picks two of the seven tied
+#: Identical calls of each search. SurrealDB 2.x's and the embedded engine's own exact scan picks two of the seven tied
 #: records in no fixed order — measured on 60 calls: 20 of the 21 pairs, none above one call in eight —, so twelve
-#: calls giving a single answer would happen far less than once in 10^9 runs.
+#: calls giving a single answer without the ORM's ranking would happen far less than once in 10^9 runs.
 _TIE_CALLS = 12
 
 
-async def _tie_answers(dist: str | None) -> tuple[list[tuple[str, ...]], list[frozenset[str]]]:
+async def _tie_answers(dist: str | None) -> tuple[list[tuple[str, ...]], list[tuple[str, ...]]]:
     """``_TIE_CALLS`` identical calls of ``hybrid_search()`` (three nearest, the one match of "news") and of
     ``similar_to()`` (three nearest), with *dist* (an exact scan) or the HNSW index: each fused answer's ids in order,
-    after checking that the two tied records it holds come at one distance; each ``similar_to()`` answer's ids."""
+    after checking that the two tied records it holds come at one distance; each ``similar_to()`` answer's ids, in
+    order."""
     fused: list[tuple[str, ...]] = []
-    nearest: list[frozenset[str]] = []
+    nearest: list[tuple[str, ...]] = []
     for _ in range(_TIE_CALLS):
         rows = await HyDoc.objects().hybrid_search(
             vector_field="embedding",
@@ -3005,7 +3035,7 @@ async def _tie_answers(dist: str | None) -> tuple[list[tuple[str, ...]], list[fr
         assert len(rows) == 3 and rows[1]["_knn_distance"] == rows[2]["_knn_distance"], rows
         fused.append(tuple(row["id"].id for row in rows))
         records = await HyDoc.objects().similar_to("embedding", _TIE_VECTOR, 3, dist=dist).exec()
-        nearest.append(frozenset(str(record.id) for record in records))
+        nearest.append(tuple(str(record.id) for record in records))
     return fused, nearest
 
 
@@ -3013,12 +3043,13 @@ class TestExactScanTiesE2E:
     """Records at an equal distance at the ``vector_limit``-th place, pinned on every engine (the line under test over
     WebSocket and HTTP, and the embedded engine), the test naming the README row it backs: every answer holds the
     nearest record and two of the tied ones, the fused records in the ORM's order (distance, then id); the HNSW index
-    gives one answer to identical calls on every line, and so does SurrealDB 3.x's exact scan, while SurrealDB 2.x's
-    and the embedded engine's pick among the tied records in no fixed order. The keys of ``similar_to()``'s answers
-    are compared as sets: it orders by distance only."""
+    and the exact scan give one answer to identical calls on every engine. Below SurrealDB 3, whose own exact scan picks
+    among the tied records in no fixed order, the ORM ranks the scan by distance then id: the tied records kept are the
+    first two by id, and ``similar_to()`` returns them in that order. On SurrealDB 3.x ``similar_to()`` orders by
+    distance only, so its answers are compared as sets there."""
 
     @pytest.mark.parametrize("kind", _KINDS)
-    async def test_an_exact_scan_picks_among_ties_in_no_fixed_order_below_3(self, kind: str) -> None:
+    async def test_an_exact_scan_gives_one_answer_on_every_engine(self, kind: str) -> None:
         async with _hy_models(kind) as client:
             major = await _major(client)
             await HyDoc.define_table()
@@ -3032,17 +3063,16 @@ class TestExactScanTiesE2E:
                 f"{_ROW_TIES}: the nearest record, then two tied ones by id: {answer}"
             )
         for keys in exact_nearest + index_nearest:
-            assert len(keys) == 3 and "d1" in keys and keys - {"d1"} <= set(_TIED), f"{_ROW_TIES}: {sorted(keys)}"
-        assert len(set(index_fused)) == 1 and len(set(index_nearest)) == 1, (
+            assert len(keys) == 3 and "d1" in keys and set(keys) - {"d1"} <= set(_TIED), f"{_ROW_TIES}: {sorted(keys)}"
+        assert len(set(index_fused)) == 1 and len({frozenset(keys) for keys in index_nearest}) == 1, (
             f"{_ROW_TIES}: the HNSW index returns the same records on every call"
         )
-        if major >= 3:
-            assert len(set(exact_fused)) == 1 and len(set(exact_nearest)) == 1, (
-                f"{_ROW_TIES}: SurrealDB 3.x's exact scan returns the same records on every call"
-            )
-        else:
-            assert len(set(exact_fused)) > 1 and len(set(exact_nearest)) > 1, (
-                f"{_ROW_TIES}: below 3 the exact scan picks among the tied records in no fixed order"
+        assert len(set(exact_fused)) == 1 and len({frozenset(keys) for keys in exact_nearest}) == 1, (
+            f"{_ROW_TIES}: the exact scan returns the same records on every call"
+        )
+        if major < 3:
+            assert set(exact_fused) == {("d1", "d2", "d3")} and set(exact_nearest) == {("d1", "d2", "d3")}, (
+                f"{_ROW_TIES}: below 3 the ORM keeps the tied records by id, in that order"
             )
 
 

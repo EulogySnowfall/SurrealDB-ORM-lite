@@ -227,9 +227,10 @@ class SubqueryCompiler:
         knn_fields: (table, column) → the field as given, for each ``similar_to()`` of the statement's subqueries:
             the dimension error names the field (v0.36.0).
         knn_prefilter: the statement is for a line below SurrealDB 3 (2.x, the embedded engine): every condition of a
-            KNN's ``WHERE`` but an id subquery goes into a ``LET`` id subquery (v0.36.0).
-        knn_conditions: a KNN of the statement shares its ``WHERE`` with a condition that is not an id subquery: the
-            caller reads the line (v0.36.0).
+            KNN's ``WHERE`` but an id subquery goes into a ``LET`` id subquery (v0.36.0), and an exact scan's ``LET``
+            holds its nearest ranked by distance then id, every condition applied first.
+        knn_conditions: a KNN of the statement shares its ``WHERE`` with a condition that is not an id subquery
+            (v0.36.0), or is an exact scan (``dist=``): the caller reads the line.
         warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
             ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
             re-send for a missing subquery table), so each read warns once (v0.28.1).

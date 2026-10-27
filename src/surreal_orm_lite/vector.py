@@ -42,6 +42,13 @@ column, a function call, a negation, a group, a dotted path, a full-text match â
 records matching them first, in a ``LET`` of the statement, and the KNN searches those ids. ``id_subquery_part()``
 tells the only parts that stay next to the KNN on every line: the ORM's own id subqueries.
 
+**The exact scan below SurrealDB 3.** SurrealDB 2.x's and the embedded engine's exact scan (``<|K,DIST|>``) picks among
+records at an equal distance at the ``K``-th place in no fixed order, so the same read can return other records, and a
+page skip or repeat one. Below 3 the queryset selects the ``K`` nearest first, in a ``LET`` ranked by distance then id
+(``exact_scan_select()``): the distance is the function SurrealDB's scan computes (``exact_distance()``), bit for bit,
+on the records its scan scores (``scored_vector()``). The KNN then searches exactly those ids, so each record's
+``vector::distance::knn()`` stays SurrealDB's own; SurrealDB 3.x's exact scan, which gives one answer, is unchanged.
+
 **The server's dimension error.** When the model does not declare a field's dimension, SurrealDB checks the query
 vector against the vector index and refuses one of another length; ``dimension_refusal()`` reads that refusal into the
 ORM's error, naming the field and both lengths (``is_dimension_error()`` tells it).
@@ -88,6 +95,17 @@ DEFAULT_EF = 100
 
 #: The distances the ORM writes, in SurrealDB's spelling.
 DISTANCES = ("EUCLIDEAN", "COSINE", "MANHATTAN", "CHEBYSHEV", "HAMMING")
+
+#: The function call that computes each distance as SurrealDB's exact scan does, on a vector ``{column}`` and the query
+#: vector ``${variable}``: the same value and type as ``vector::distance::knn()`` on SurrealDB 2.x and the embedded engine.
+#: SurrealDB has no ``vector::distance::cosine()``: its scan's ``COSINE`` distance is 1 minus the cosine similarity.
+_DISTANCE_CALLS = {
+    "EUCLIDEAN": "vector::distance::euclidean({column}, ${variable})",
+    "COSINE": "1 - vector::similarity::cosine({column}, ${variable})",
+    "MANHATTAN": "vector::distance::manhattan({column}, ${variable})",
+    "CHEBYSHEV": "vector::distance::chebyshev({column}, ${variable})",
+    "HAMMING": "vector::distance::hamming({column}, ${variable})",
+}
 
 #: The storage types of a vector field and of an HNSW index, in SurrealDB's spelling.
 VECTOR_TYPES = ("F64", "F32", "I64", "I32", "I16")
@@ -552,6 +570,64 @@ def knn_condition(column: str, k: int, ef: int | None, dist: str | None, variabl
     if candidates is not None:
         raise ValueError("knn_condition() takes ef or dist, not both.")
     return f"{column} <|{limit},{checked_distance(dist, subject='similar_to()')}|> ${variable}"
+
+
+def exact_distance(column: str, dist: str, variable: str) -> str:
+    """The distance *dist* of *column* from the query vector ``$<variable>``, written as the function SurrealDB's exact
+    scan computes it: ``vector::distance::<dist>(<column>, $<variable>)``, ``1 - vector::similarity::cosine(<column>,
+    $<variable>)`` for ``COSINE``. Pure.
+
+    On SurrealDB 2.x and the embedded engine the value is ``vector::distance::knn()``'s for the same record: bit for bit
+    and of the same type (an ``int`` with ``HAMMING``) on a vector of floats or integers, the same number on one of
+    decimals (which may come as a decimal). The call raises on a record whose column is not a vector of the query's
+    length: :func:`scored_vector` keeps such records out. ``dist`` is written as the ORM's own constant, ``column`` must
+    be a field path and ``variable`` the name the ORM bound the query vector under (``_f<N>``).
+    """
+    validate_field_name(column, "similar_to field")
+    if not variable.startswith("_f") or not variable[2:].isdigit():
+        raise ValueError(f"exact_distance() binds the query vector as $_f<N>, not ${variable}.")
+    return _DISTANCE_CALLS[checked_distance(dist, subject="similar_to()")].format(column=column, variable=variable)
+
+
+def scored_vector(column: str, dimension: int) -> str:
+    """The condition that *column* is a vector SurrealDB's exact scan scores against a query vector of *dimension*
+    numbers: ``type::is::array(<column>) AND array::len(<column>) = <dimension> AND type::is::number(array::min(<column>))
+    AND type::is::number(array::max(<column>))``. Pure; for SurrealDB 2.x and the embedded engine only (3.x renamed
+    ``type::is::array()``).
+
+    The scan skips, silently, a record whose column is missing, ``NULL``, not an array, an array of another length or
+    one holding an item that is not a number; :func:`exact_distance` would raise on it. SurrealDB orders values by their
+    type first, numbers between booleans and strings, so an array whose least and greatest items are numbers holds
+    numbers only: two passes over the array, where a closure on each item costs several times the scan.
+    """
+    validate_field_name(column, "similar_to field")
+    length = checked_count(dimension, subject="scored_vector()", arg="dimension", low=1, high=MAX_DIMENSION)
+    return (
+        f"type::is::array({column}) AND array::len({column}) = {length} AND type::is::number(array::min({column})) AND "
+        f"type::is::number(array::max({column}))"
+    )
+
+
+def exact_scan_select(table: str, search: "KnnSearch", variable: str, conditions: Sequence[str]) -> str:
+    """The ids of the ``K`` nearest records of an exact scan, ranked by distance then id, for SurrealDB 2.x and the
+    embedded engine: ``(SELECT id, <distance> AS _knn_distance FROM <table> WHERE <conditions AND> <scored vector> ORDER
+    BY _knn_distance, id LIMIT <K>).id``. Pure.
+
+    *search* is the queryset's ``similar_to()`` with ``dist``, its query vector bound as ``$<variable>``; *conditions*
+    the other parts of the statement's ``WHERE``, already compiled, each AND-ed before the records are ranked. The
+    distance is :func:`exact_distance`'s and only the records the scan scores are ranked (:func:`scored_vector`), so
+    without a tie at the ``K``-th place the ids are the ones SurrealDB's scan returns, and with one the tied records
+    kept are the first by id, on every call. SurrealDB orders a ``NaN`` distance (a zero vector with ``COSINE``) first,
+    as its scan does.
+    """
+    if search.dist is None:
+        raise ValueError("exact_scan_select() ranks an exact scan: the search has no distance.")
+    where = " AND ".join([*conditions, scored_vector(search.column, len(search.vector))])
+    distance = exact_distance(search.column, search.dist, variable)
+    return (
+        f"(SELECT id, {distance} AS {DISTANCE_ALIAS} FROM {table} WHERE {where} ORDER BY {DISTANCE_ALIAS}, id "
+        f"LIMIT {checked_limit(search.k)}).id"
+    )
 
 
 def id_subquery_part(part: str) -> bool:
