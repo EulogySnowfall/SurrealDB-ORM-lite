@@ -39,7 +39,7 @@ _MISSING = dataclasses.MISSING
 _PARITY: dict[type, list[tuple[str, object, bool]]] = {
     SchemaState: [
         ("tables", _FACTORY, False),
-        # the full ORM's 2nd attribute, applied_migrations, is not provided: everything after is keyword-only
+        ("applied_migrations", (), False),  # the full ORM's 2nd attribute (v0.38.0)
         ("connection", "default", True),
         ("analyzers", _FACTORY, True),
         ("accesses", _FACTORY, True),
@@ -65,6 +65,7 @@ _PARITY: dict[type, list[tuple[str, object, bool]]] = {
         ("comment", None, True),
         ("drop", False, True),
         ("changefeed_include_original", False, True),
+        ("undeclared", frozenset(), True),  # the migrations' mark (v0.38.0)
         ("other", _FACTORY, True),
         ("raw", "", True),
     ],
@@ -86,6 +87,8 @@ _PARITY: dict[type, list[tuple[str, object, bool]]] = {
         ("default_always", False, True),
         ("computed", None, True),
         ("permissions", _FACTORY, True),
+        ("server", False, True),  # the migrations' marks (v0.38.0)
+        ("undeclared", frozenset(), True),
         ("raw", "", True),
     ],
     IndexState: [
@@ -541,8 +544,9 @@ class TestFullOrmCallShapes:
         with pytest.raises(TypeError):
             any_cls("t", "SCHEMAFULL", "normal", {}, {}, {}, None, {}, None)  # the full ORM's 9th: access
         any_cls = SchemaState
+        assert any_cls({}, ["0001_a"]).applied_migrations == ("0001_a",)  # the full ORM's 2nd (v0.38.0)
         with pytest.raises(TypeError):
-            any_cls({}, [])  # the full ORM's 2nd: applied_migrations
+            any_cls({}, [], "default")  # a 3rd positional argument: connection is keyword-only
 
 
 class TestConversions:

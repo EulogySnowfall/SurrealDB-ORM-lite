@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 from ..schema_state import SchemaState
 from ..search import checked_line
+from . import state as _state
 from .operations import AddField, AlterField, AlterTable, DataMigration, Operation, RawSQL
 
 #: A migration's name: a number, an underscore, then ASCII letters, digits or underscores (``0001_initial``).
@@ -94,9 +95,7 @@ class Migration:
         the fields the migration defines itself (``skip_fields``).
         """
         checked = checked_line(line)
-        after = SchemaState() if state is None else state
-        for operation in self.operations:
-            after = operation.state_forwards(after)
+        after = _state.advance(self, SchemaState() if state is None else state, strict=False)
         return [text for _, text in _statements(self, line=checked, state=after)]
 
     def backwards_sql(self, *, line: Literal[2, 3] = 3, state: SchemaState | None = None) -> list[str]:
