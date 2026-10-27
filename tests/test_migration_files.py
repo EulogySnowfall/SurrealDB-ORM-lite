@@ -9,23 +9,40 @@ helpers. ``MigrationStatementError`` is caught by ``except SurrealDbError`` (the
 full ORM's layout, each argument equal to its default left out, each value written as Python source (escaped data for
 a ``str``), each import only when used, a call longer than 120 columns wrapped; an existing file is never replaced and a
 value the file cannot write raises before the file exists. A generated file imported back gives the operations it was
-written from, exactly (``TestGeneratedRoundTrip``, AC-7). Unit tests only (no server).
+written from, exactly (``TestGeneratedRoundTrip``, AC-7).
+
+``MigrationExecutor``'s pure part (spec §5.5, §5.6 "Loading and order"): the files a directory holds
+(``TestLoader``: discovery, ``load_migration()`` and its texts), their application order (``TestOrder``: the dependency
+graph, ties by name, an unknown dependency, a cycle), the history checks of each caller (``TestHistory``: E-H1, an
+applied name without a file — raised, warned once or ``FileNotFoundError`` per spec §5.6's table, D30 as amended, C10),
+the files' state (``TestMigrationState``: the file replay, ``strict=False``, C9, M28) and ``show_sql()`` (``TestShowSql``:
+both lines' forms, ``backwards=True``, R14, R25, R33). ``makemigrations(from_db=False)`` (``TestMakemigrationsOffline``,
+AC-5, AC-6, AC-30's offline part): the files' state diffed against the models, written once — a second call with the
+same models writes nothing —, removals only with ``drop_missing=True``. Unit tests only (no server): an executor is
+built without a connection call.
 """
 
 import dataclasses
 import enum
 import importlib.util
+import inspect
+import itertools
+import logging
 import math
 import pickle
 import re
+import sys
+import textwrap
+import types
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, Literal
 
 import pytest
 
 import surreal_orm_lite.migrations as migrations
-from surreal_orm_lite import SurrealFunc
+from surreal_orm_lite import BaseSurrealModel, SurrealFunc
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.migrations import (
     MIGRATIONS_TABLE,
@@ -44,6 +61,7 @@ from surreal_orm_lite.migrations import (
     DropIndex,
     DropTable,
     Migration,
+    MigrationExecutor,
     MigrationGenerator,
     MigrationStatementError,
     Operation,
@@ -55,13 +73,18 @@ from surreal_orm_lite.migrations import (
     RemoveFunction,
     generate_empty_migration,
     introspect_models,
+    loader,
+    makemigrations,
+    state,
 )
+from surreal_orm_lite.migrations import executor as executor_module
 from surreal_orm_lite.migrations import generator as generator_module
 from surreal_orm_lite.migrations.constants import MIGRATIONS_TABLE as CONSTANTS_TABLE
 from surreal_orm_lite.migrations.executor import MigrationStatementError as ExecutorError
 from surreal_orm_lite.migrations.migration import generate_migration_name, parse_migration_name
 from surreal_orm_lite.schema_state import FieldState, SchemaState, TableState
-from tests.test_migration_diff import _MODEL_SET
+from tests.test_migration_diff import _MODEL_SET, MiBare, MiOther
+from tests.test_migration_operations import _R33_LINES, R33
 
 
 class _SubclassedError(MigrationStatementError):
@@ -305,7 +328,7 @@ class TestMigrationStatementError:
 
 
 def test_the_package_exports() -> None:
-    # The names that exist after Task 6 of v0.38.0's plan; the later tasks add the rest of spec §5.1.
+    # The names that exist after Task 7 of v0.38.0's plan; the later tasks add the rest of spec §5.1.
     assert set(migrations.__all__) == {
         "MIGRATIONS_TABLE",
         "Migration",
@@ -336,6 +359,8 @@ def test_the_package_exports() -> None:
         "introspect_models",
         "MigrationGenerator",
         "generate_empty_migration",
+        "MigrationExecutor",
+        "makemigrations",
     }
     for name in migrations.__all__:
         assert getattr(migrations, name) is not None
@@ -1099,3 +1124,857 @@ class TestGeneratedRoundTrip:
         assert kinds.count("AlterField") == 3 and "AlterTable" in kinds and "AddField" in kinds and "DropField" in kinds
         path = MigrationGenerator(tmp_path).generate("changes", operations)
         assert _load(path).operations == tuple(operations)
+
+
+# --- loading the files, their order and the history checks (spec §5.5, §5.6) -----------------------------------------
+
+
+def _migration_file(directory: Path, name: str, *dependencies: str, operations: str = "") -> Path:
+    """Write ``<directory>/<name>.py`` by hand: a migration named *name* depending on *dependencies*, whose
+    operations are the Python source *operations* (``"CreateTable('t'), AddField('t', 'a', 'int')"``)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}.py"
+    path.write_text(
+        "from surreal_orm_lite.migrations import AddField, CreateTable, DropField, DropTable, Migration\n\n"
+        f"migration = Migration(name={name!r}, dependencies={list(dependencies)!r}, operations=[{operations}])\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _not_found(directory: Path, name: str) -> str:
+    """The full ORM's text for a migration file that does not exist."""
+    return f"Migration file not found: {directory / f'{name}.py'}"
+
+
+class TestLoader:
+    """Spec §5.5: ``get_available_migrations()`` and ``load_migration()``, with their texts."""
+
+    def test_the_discovery_rules(self, tmp_path: Path) -> None:
+        for name in ("0002_b", "0010_c", "0001_a"):
+            _migration_file(tmp_path, name)
+        for other in ("__init__.py", "_draft.py", "_0003_x.py", "helper.py", "x_y.py", "notes.txt", "0004_d.txt"):
+            (tmp_path / other).write_text("raise RuntimeError('never imported')\n", encoding="utf-8")
+        executor = MigrationExecutor(tmp_path)
+        assert executor.get_available_migrations() == ["0001_a", "0002_b", "0010_c"]
+        assert executor.get_pending_migrations([]) == ["0001_a", "0002_b", "0010_c"]
+
+    def test_a_missing_directory(self, tmp_path: Path) -> None:
+        directory = tmp_path / "missing"
+        executor = MigrationExecutor(directory)
+        assert executor.get_available_migrations() == []
+        assert executor.get_pending_migrations([]) == []
+        assert executor.migration_state() == SchemaState()
+        assert not directory.exists()
+
+    def test_the_directory_as_a_str_or_a_path_like(self, tmp_path: Path) -> None:
+        assert MigrationExecutor(str(tmp_path)).migrations_dir == tmp_path
+        assert MigrationExecutor(tmp_path).migrations_dir == tmp_path
+
+    def test_load_migration(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0002_b", "0001_a", operations="CreateTable('t'), AddField('t', 'a', 'int')")
+        migration = MigrationExecutor(tmp_path).load_migration("0002_b")
+        assert type(migration) is Migration
+        assert migration.name == "0002_b"
+        assert migration.dependencies == ("0001_a",)
+        assert migration.operations == (CreateTable("t"), AddField("t", "a", "int"))
+
+    def test_the_file_is_not_inserted_in_sys_modules(self, tmp_path: Path) -> None:
+        path = _migration_file(tmp_path, "0001_a")
+        before = set(sys.modules)
+        MigrationExecutor(tmp_path).load_migration("0001_a")
+        assert set(sys.modules) == before
+        assert not any(getattr(module, "__file__", None) == str(path) for module in list(sys.modules.values()))
+
+    def test_each_load_runs_the_file_again(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a")
+        executor = MigrationExecutor(tmp_path)
+        assert executor.load_migration("0001_a") is not executor.load_migration("0001_a")
+
+    def test_a_missing_file(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError) as caught:
+            MigrationExecutor(tmp_path).load_migration("0001_a")
+        assert str(caught.value) == _not_found(tmp_path, "0001_a")
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "x = 1\n",
+            "migration = 1\n",
+            "migration = None\n",
+            # A class named like the full ORM's: the lite accepts its own Migration only.
+            "class Migration:\n    name = '0001_a'\n\nmigration = Migration()\n",
+        ],
+        ids=["no migration", "an int", "None", "another Migration class"],
+    )
+    def test_a_file_without_a_migration(self, tmp_path: Path, source: str) -> None:
+        (tmp_path / "0001_a.py").write_text(source, encoding="utf-8")
+        with pytest.raises(ImportError) as caught:
+            MigrationExecutor(tmp_path).load_migration("0001_a")
+        assert str(caught.value) == "Migration file must define 'migration' variable: 0001_a"
+
+    def test_a_file_that_cannot_be_loaded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _migration_file(tmp_path, "0001_a")
+        monkeypatch.setattr(importlib.util, "spec_from_file_location", lambda *args, **kwargs: None)
+        with pytest.raises(ImportError) as caught:
+            MigrationExecutor(tmp_path).load_migration("0001_a")
+        assert str(caught.value) == "Could not load migration: 0001_a"
+
+    def test_a_name_mismatch(self, tmp_path: Path) -> None:
+        source = _migration_file(tmp_path, "0001_a").read_text(encoding="utf-8")
+        (tmp_path / "0002_b.py").write_text(source, encoding="utf-8")
+        with pytest.raises(ValueError) as caught:
+            MigrationExecutor(tmp_path).load_migration("0002_b")
+        assert str(caught.value) == (
+            "Migration file '0002_b.py' defines migration '0001_a'; a migration's name must be its file name."
+        )
+
+    def test_an_error_of_the_file_propagates(self, tmp_path: Path) -> None:
+        (tmp_path / "0001_a.py").write_text("raise LookupError('the file failed')\n", encoding="utf-8")
+        with pytest.raises(LookupError, match="the file failed"):
+            MigrationExecutor(tmp_path).load_migration("0001_a")
+        (tmp_path / "0001_a.py").unlink()
+        (tmp_path / "0002_b.py").write_text("migration = (\n", encoding="utf-8")
+        with pytest.raises(SyntaxError):
+            MigrationExecutor(tmp_path).load_migration("0002_b")
+
+    @pytest.mark.parametrize("name", ["../outside", "0001_a/../../outside", "0001_a.py", "outside", "0001_a b", ""])
+    def test_a_name_that_is_no_migration_name_is_refused_before_any_file_runs(self, tmp_path: Path, name: str) -> None:
+        (tmp_path / "outside.py").write_text("raise RuntimeError('must not run')\n", encoding="utf-8")
+        directory = tmp_path / "migrations"
+        directory.mkdir()
+        with pytest.raises(ValueError, match="^Invalid migration name"):
+            MigrationExecutor(directory).load_migration(name)
+
+    def test_a_name_of_another_type_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(TypeError, match="^Migration name must be a str, not int"):
+            MigrationExecutor(tmp_path).load_migration(1)  # type: ignore[arg-type]
+
+    def test_the_connection_is_checked_without_a_connection_call(self, tmp_path: Path) -> None:
+        assert MigrationExecutor(tmp_path, connection="other").migrations_dir == tmp_path
+        with pytest.raises(ValueError, match="Connection name must not be empty"):
+            MigrationExecutor(tmp_path, connection="")
+        with pytest.raises(TypeError, match="Connection name must be a str, not int"):
+            MigrationExecutor(tmp_path, connection=1)  # type: ignore[arg-type]
+
+        class _Client:
+            async def query(self, text: str) -> None:
+                """A client object: it has a ``query()``."""
+
+        with pytest.raises(TypeError, match="takes the name of a registered connection, not a client object"):
+            MigrationExecutor(tmp_path, connection=_Client())  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="positional argument"):
+            MigrationExecutor(tmp_path, "other")  # type: ignore[misc]
+
+    def test_the_module_exports(self) -> None:
+        assert executor_module.__all__ == ["MigrationExecutor", "MigrationStatementError"]
+        assert migrations.MigrationExecutor is executor_module.MigrationExecutor
+
+
+class TestOrder:
+    """Spec §5.6 "Loading and order": the topological order of the dependency graph, ties broken by name."""
+
+    def test_the_dependency_order_ties_broken_by_name(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a", "0003_c")
+        _migration_file(tmp_path, "0002_b")
+        _migration_file(tmp_path, "0003_c")
+        _migration_file(tmp_path, "0004_d", "0001_a", "0002_b")
+        executor = MigrationExecutor(tmp_path)
+        assert executor.get_available_migrations() == ["0001_a", "0002_b", "0003_c", "0004_d"]
+        assert executor.get_pending_migrations([]) == ["0002_b", "0003_c", "0001_a", "0004_d"]
+        assert executor.get_pending_migrations(["0003_c", "0002_b"]) == ["0001_a", "0004_d"]
+        assert executor.get_pending_migrations(["0001_a", "0002_b", "0003_c", "0004_d"]) == []
+        # Applied names without a file are not pending: they are the history checks' (TestHistory).
+        assert executor.get_pending_migrations(["0009_z"]) == ["0002_b", "0003_c", "0001_a", "0004_d"]
+
+    def test_a_dependency_listed_twice(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a")
+        _migration_file(tmp_path, "0002_b", "0001_a", "0001_a")
+        assert MigrationExecutor(tmp_path).get_pending_migrations([]) == ["0001_a", "0002_b"]
+
+    def test_the_order_is_the_loader_s(self, tmp_path: Path) -> None:
+        first = Migration(name="0002_b")
+        second = Migration(name="0001_a", dependencies=["0002_b"])
+        assert loader.order([second, first], tmp_path) == [first, second]
+        assert loader.order([], tmp_path) == []
+
+    def test_an_unknown_dependency(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a")
+        _migration_file(tmp_path, "0002_b", "0001_a", "0001_x")
+        with pytest.raises(ValueError) as caught:
+            MigrationExecutor(tmp_path).get_pending_migrations([])
+        assert str(caught.value) == f"Migration '0002_b' depends on '0001_x', which is not a migration file of {tmp_path}."
+
+    def test_a_cycle(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a", "0003_c")
+        _migration_file(tmp_path, "0002_b")
+        _migration_file(tmp_path, "0003_c", "0001_a")
+        with pytest.raises(ValueError) as caught:
+            MigrationExecutor(tmp_path).get_pending_migrations([])
+        assert str(caught.value) == "Circular dependency detected in migrations: ['0001_a', '0003_c']"
+
+    def test_a_cycle_lists_what_could_not_be_ordered(self, tmp_path: Path) -> None:
+        # The full ORM's text: the migrations left once nothing more can be ordered, by name.
+        _migration_file(tmp_path, "0001_a", "0002_b")
+        _migration_file(tmp_path, "0002_b", "0001_a")
+        _migration_file(tmp_path, "0003_c", "0002_b")
+        _migration_file(tmp_path, "0004_d")
+        with pytest.raises(ValueError) as caught:
+            MigrationExecutor(tmp_path).migration_state()
+        assert str(caught.value) == "Circular dependency detected in migrations: ['0001_a', '0002_b', '0003_c']"
+
+    def test_the_leaves(self) -> None:
+        migrations_ = [
+            Migration(name="0001_a"),
+            Migration(name="0002_b", dependencies=["0001_a"]),
+            Migration(name="0003_c", dependencies=["0001_a"]),
+        ]
+        assert loader.leaves(migrations_) == ["0002_b", "0003_c"]
+        assert loader.leaves(migrations_[:1]) == ["0001_a"]
+        assert loader.leaves([]) == []
+
+
+#: Spec §5.6's table: each caller's history checks (D30 as amended, C10) — ``(dependency, unknown)``.
+_CALLERS: dict[str, tuple[Literal["raise", "warn"], Literal["raise", "warn", "missing"]]] = {
+    "makemigrations(from_db=True)": ("raise", "raise"),
+    "migrate()": ("raise", "warn"),
+    "upgrade()": ("raise", "missing"),
+    "rollback()": ("raise", "missing"),
+    "get_migration_status()": ("warn", "warn"),
+}
+
+
+def _history() -> list[Migration]:
+    """``0001_a`` ← ``0002_b`` ← ``0003_c``, in their order."""
+    return [
+        Migration(name="0001_a"),
+        Migration(name="0002_b", dependencies=["0001_a"]),
+        Migration(name="0003_c", dependencies=["0002_b"]),
+    ]
+
+
+def _e_h1(directory: Path) -> str:
+    return (
+        f"Migration '0002_b' is applied but its dependency '0001_a' is not: the database's history does not match {directory}."
+    )
+
+
+def _e_h2(directory: Path) -> str:
+    return f"Migration '0009_z' is applied but has no file in {directory}: the database's history does not match {directory}."
+
+
+def _unknown_warning(directory: Path) -> str:
+    return f"Migration 0009_z is recorded as applied but has no file in {directory}; it is ignored."
+
+
+def _logged(caplog: pytest.LogCaptureFixture) -> list[tuple[str, int, str]]:
+    return [(record.name, record.levelno, record.getMessage()) for record in caplog.records]
+
+
+class TestHistory:
+    """Spec §5.6's history checks and §7's E-H1/E-H2 (D30 as amended, C10): ``loader.check_history()`` in its modes,
+    and each caller's modes (``loader.HISTORY``), so a caller cannot pick the wrong one silently."""
+
+    @pytest.mark.parametrize("applied", [[], ["0001_a"], ["0001_a", "0002_b"], ["0002_b", "0001_a", "0003_c"]])
+    def test_a_consistent_history(self, tmp_path: Path, caplog: pytest.LogCaptureFixture, applied: list[str]) -> None:
+        caplog.set_level(logging.DEBUG)
+        for dependency, unknown in _CALLERS.values():
+            loader.check_history(_history(), applied, tmp_path, dependency=dependency, unknown=unknown)
+        assert caplog.records == []
+
+    def test_e_h1_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError) as caught:
+            loader.check_history(_history(), ["0002_b"], tmp_path, dependency="raise", unknown="warn")
+        assert str(caught.value) == _e_h1(tmp_path)
+
+    def test_e_h1_warns_once(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG)
+        order = [Migration(name="0001_a"), Migration(name="0002_b", dependencies=["0001_a", "0001_a"])]
+        assert loader.check_history(order, ["0002_b"], tmp_path, dependency="warn", unknown="raise") is None
+        assert _logged(caplog) == [("surreal_orm_lite.migrations", logging.WARNING, _e_h1(tmp_path))]
+
+    def test_e_h1_names_the_first_in_the_order(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG)
+        loader.check_history(_history(), ["0003_c", "0002_b"], tmp_path, dependency="warn", unknown="warn")
+        assert [message for _, _, message in _logged(caplog)] == [_e_h1(tmp_path)]
+        with pytest.raises(ValueError) as caught:
+            loader.check_history(_history(), ["0003_c"], tmp_path, dependency="raise", unknown="warn")
+        assert str(caught.value) == (
+            f"Migration '0003_c' is applied but its dependency '0002_b' is not: the database's history does not match "
+            f"{tmp_path}."
+        )
+
+    def test_an_unknown_name_raises_e_h2(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError) as caught:
+            loader.check_history(_history(), ["0001_a", "0009_z"], tmp_path, dependency="raise", unknown="raise")
+        assert str(caught.value) == _e_h2(tmp_path)
+
+    def test_an_unknown_name_warns_once(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG)
+        applied = ["0001_a", "0009_z", "0009_z"]
+        assert loader.check_history(_history(), applied, tmp_path, dependency="raise", unknown="warn") is None
+        assert _logged(caplog) == [("surreal_orm_lite.migrations", logging.WARNING, _unknown_warning(tmp_path))]
+
+    def test_an_unknown_name_s_file_is_missing(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError) as caught:
+            loader.check_history(_history(), ["0009_z"], tmp_path, dependency="raise", unknown="missing")
+        assert str(caught.value) == _not_found(tmp_path, "0009_z")
+
+    def test_e_h1_comes_first(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError) as caught:
+            loader.check_history(_history(), ["0009_z", "0002_b"], tmp_path, dependency="raise", unknown="missing")
+        assert str(caught.value) == _e_h1(tmp_path)
+
+    def test_the_warnings_of_one_call(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG)
+        for _ in range(2):  # once per call: a second call logs them again
+            loader.check_history(_history(), ["0009_z", "0002_b"], tmp_path, dependency="warn", unknown="warn")
+        assert [message for _, _, message in _logged(caplog)] == [_e_h1(tmp_path), _unknown_warning(tmp_path)] * 2
+
+    def test_every_caller_has_a_mode(self) -> None:
+        assert set(loader.HISTORY) == {"makemigrations", "migrate", "upgrade", "rollback", "get_migration_status"}
+
+    @pytest.mark.parametrize(("caller", "expected"), list(_CALLERS.items()), ids=list(_CALLERS))
+    def test_each_caller(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, caller: str, expected: tuple[str, str]
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        mode = loader.HISTORY[caller.split("(")[0]]
+        assert (mode.dependency, mode.unknown) == expected
+        order = _history()
+        # E-H1: an applied migration depending on a pending one.
+        if mode.dependency == "raise":
+            with pytest.raises(ValueError) as raised:
+                loader.check_history(order, ["0002_b"], tmp_path, dependency=mode.dependency, unknown=mode.unknown)
+            assert str(raised.value) == _e_h1(tmp_path)
+        else:
+            loader.check_history(order, ["0002_b"], tmp_path, dependency=mode.dependency, unknown=mode.unknown)
+            assert [message for _, _, message in _logged(caplog)] == [_e_h1(tmp_path)]
+        caplog.clear()
+        # An applied name without a file.
+        unknown: type[BaseException] | None = {"raise": ValueError, "missing": FileNotFoundError, "warn": None}[mode.unknown]
+        if unknown is None:
+            loader.check_history(order, ["0001_a", "0009_z"], tmp_path, dependency=mode.dependency, unknown=mode.unknown)
+            assert [message for _, _, message in _logged(caplog)] == [_unknown_warning(tmp_path)]
+        else:
+            with pytest.raises(unknown) as missing:
+                loader.check_history(order, ["0001_a", "0009_z"], tmp_path, dependency=mode.dependency, unknown=mode.unknown)
+            assert str(missing.value) == (_e_h2(tmp_path) if unknown is ValueError else _not_found(tmp_path, "0009_z"))
+
+
+# --- the files' state and show_sql() (spec §5.5) --------------------------------------------------------------------
+
+
+def _unmarked(value: SchemaState) -> bool:
+    """Whether no definition of *value* carries a mark (spec §5.9: only ``ModelIntrospector`` sets them)."""
+    for table in value.tables.values():
+        if table.undeclared or any(field.undeclared or field.server for field in table.fields.values()):
+            return False
+    return True
+
+
+class TestMigrationState:
+    """Spec §5.5: ``migration_state(target=None)`` — the state the files build, by file replay (``strict=False``)."""
+
+    def test_two_files(self, tmp_path: Path) -> None:
+        generator = MigrationGenerator(tmp_path)
+        generator.generate("initial", [CreateTable("person"), AddField("person", "name", "string")])
+        index = CreateIndex(table="person", name="person_email", fields=["email"], unique=True)
+        generator.generate("email", [AddField("person", "email", "string"), index], ["0001_initial"])
+        executor = MigrationExecutor(tmp_path)
+        everything = executor.migration_state()
+        assert everything.applied_migrations == ("0001_initial", "0002_email")
+        assert sorted(everything.tables) == ["person"]
+        assert sorted(everything.tables["person"].fields) == ["email", "name"]
+        assert list(everything.tables["person"].indexes) == ["person_email"]
+        assert _unmarked(everything)
+        loaded = [executor.load_migration(name) for name in ("0001_initial", "0002_email")]
+        assert everything == state.replay(loaded, strict=False)
+        assert executor.migration_state("0002_email") == everything
+        first = executor.migration_state("0001_initial")
+        assert first.applied_migrations == ("0001_initial",)
+        assert sorted(first.tables["person"].fields) == ["name"]
+        assert first.tables["person"].indexes == {}
+
+    def test_the_target_stops_in_the_order(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a", "0002_b", operations="AddField('t', 'a', 'int')")
+        _migration_file(tmp_path, "0002_b", operations="CreateTable('t')")
+        _migration_file(tmp_path, "0003_c", operations="AddField('t', 'c', 'int')")
+        executor = MigrationExecutor(tmp_path)
+        assert executor.migration_state("0002_b").applied_migrations == ("0002_b",)
+        assert executor.migration_state("0001_a").applied_migrations == ("0002_b", "0001_a")
+        assert sorted(executor.migration_state("0001_a").tables["t"].fields) == ["a"]
+        assert executor.migration_state().applied_migrations == ("0002_b", "0001_a", "0003_c")
+
+    def test_an_unknown_target(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a")
+        with pytest.raises(ValueError) as caught:
+            MigrationExecutor(tmp_path).migration_state("0002_b")
+        assert str(caught.value) == f"Unknown migration target '0002_b': no such migration file in {tmp_path}."
+
+    def test_a_removal_of_a_definition_no_file_made(self, tmp_path: Path) -> None:
+        # A file replay cannot know what was defined outside migrations: the removal is a no-op (C9).
+        _migration_file(tmp_path, "0001_a", operations="CreateTable('person'), AddField('person', 'name', 'string')")
+        _migration_file(tmp_path, "0002_b", "0001_a", operations="DropField('person', 'age'), DropTable('ghost')")
+        result = MigrationExecutor(tmp_path).migration_state()
+        assert result.applied_migrations == ("0001_a", "0002_b")
+        assert sorted(result.tables) == ["person"]
+        assert sorted(result.tables["person"].fields) == ["name"]
+
+    def test_a_field_on_a_table_no_file_creates(self, tmp_path: Path) -> None:
+        # SurrealDB creates the table TYPE ANY SCHEMALESS (M28).
+        _migration_file(tmp_path, "0001_a", operations="AddField('log', 'msg', 'string')")
+        table = MigrationExecutor(tmp_path).migration_state().tables["log"]
+        assert (table.schema_mode, table.table_type) == ("SCHEMALESS", "any")
+        assert sorted(table.fields) == ["msg"]
+
+    def test_no_file(self, tmp_path: Path) -> None:
+        assert MigrationExecutor(tmp_path).migration_state() == SchemaState()
+
+
+#: A migration with a full-text index (R14) and an ``any`` column on a SCHEMAFULL table (R25).
+_POSTS: list[Operation] = [
+    CreateTable("post"),
+    AddField("post", "body", "string"),
+    AddField("post", "bag", "any"),
+    CreateIndex(table="post", name="post_body", fields=["body"], search_analyzer="english", bm25=True, highlights=True),
+]
+
+
+class TestShowSql:
+    """Spec §5.5: ``show_sql(name, *, backwards=False, line=3)`` — pure despite ``async``: the statements of
+    ``forwards_sql()`` (``backwards_sql()``) from the files' state before the migration, joined by blank lines."""
+
+    async def test_the_3x_form(self, tmp_path: Path) -> None:
+        MigrationGenerator(tmp_path).generate("posts", _POSTS)
+        assert await MigrationExecutor(tmp_path).show_sql("0001_posts") == (
+            "DEFINE TABLE `post` SCHEMAFULL;\n\n"
+            "DEFINE FIELD `body` ON `post` TYPE string;\n\n"
+            "DEFINE FIELD `bag` ON `post` TYPE any;\n\n"
+            "DEFINE INDEX `post_body` ON `post` FIELDS `body` FULLTEXT ANALYZER `english` BM25 HIGHLIGHTS;"
+        )
+
+    async def test_the_2x_form(self, tmp_path: Path) -> None:
+        MigrationGenerator(tmp_path).generate("posts", _POSTS)
+        assert await MigrationExecutor(tmp_path).show_sql("0001_posts", line=2) == (
+            "DEFINE TABLE `post` SCHEMAFULL;\n\n"
+            "DEFINE FIELD `body` ON `post` TYPE string;\n\n"
+            "DEFINE FIELD `bag` ON `post` TYPE any FLEXIBLE;\n\n"
+            "DEFINE INDEX `post_body` ON `post` FIELDS `body` SEARCH ANALYZER `english` BM25 HIGHLIGHTS;"
+        )
+
+    async def test_backwards(self, tmp_path: Path) -> None:
+        MigrationGenerator(tmp_path).generate("posts", _POSTS)
+        expected = (
+            "REMOVE INDEX IF EXISTS `post_body` ON `post`;\n\n"
+            "REMOVE FIELD IF EXISTS `bag` ON `post`;\n\n"
+            "REMOVE FIELD IF EXISTS `body` ON `post`;\n\n"
+            "REMOVE TABLE IF EXISTS `post`;"
+        )
+        executor = MigrationExecutor(tmp_path)
+        assert await executor.show_sql("0001_posts", backwards=True) == expected
+        assert await executor.show_sql("0001_posts", backwards=True, line=2) == expected
+
+    async def test_the_state_before_is_the_files(self, tmp_path: Path) -> None:
+        # R33: the AlterTable making `t` SCHEMAFULL redefines its `any` columns FLEXIBLE on line 2 — those the files
+        # hold before it —, not the one the migration adds itself (skip_fields, AC-2).
+        generator = MigrationGenerator(tmp_path)
+        generator.generate(
+            "t",
+            [
+                CreateTable(name="t", schema_mode="SCHEMALESS", table_type="normal"),
+                AddField("t", "name", "string"),
+                AddField("t", "bag", "any"),
+                AddField("t", "tags", "array"),
+                AddField("t", "tags.*", "any"),
+            ],
+        )
+        generator.generate("strict", [R33, AddField("t", "bag2", "any")], ["0001_t"])
+        executor = MigrationExecutor(tmp_path)
+        assert await executor.show_sql("0002_strict", line=2) == (
+            "\n".join(_R33_LINES) + "\n\nDEFINE FIELD `bag2` ON `t` TYPE any FLEXIBLE;"
+        )
+        assert await executor.show_sql("0002_strict") == _R33_LINES[0] + "\n\nDEFINE FIELD `bag2` ON `t` TYPE any;"
+        before = executor.migration_state("0001_t")
+        migration = executor.load_migration("0002_strict")
+        assert await executor.show_sql("0002_strict", line=2) == "\n\n".join(migration.forwards_sql(line=2, state=before))
+        assert await executor.show_sql("0002_strict", backwards=True, line=2) == "\n\n".join(
+            migration.backwards_sql(line=2, state=before)
+        )
+
+    async def test_an_empty_migration(self, tmp_path: Path) -> None:
+        generate_empty_migration(tmp_path, "nothing")
+        assert await MigrationExecutor(tmp_path).show_sql("0001_nothing") == ""
+
+    async def test_an_unknown_name(self, tmp_path: Path) -> None:
+        MigrationGenerator(tmp_path).generate("posts", _POSTS)
+        with pytest.raises(FileNotFoundError) as caught:
+            await MigrationExecutor(tmp_path).show_sql("0002_other")
+        assert str(caught.value) == _not_found(tmp_path, "0002_other")
+        with pytest.raises(ValueError, match="^Invalid migration name"):
+            await MigrationExecutor(tmp_path).show_sql("../posts")
+
+    async def test_the_line_is_checked_first(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="line= must be 2 or 3"):
+            await MigrationExecutor(tmp_path).show_sql("0001_posts", line=4)  # type: ignore[arg-type]
+
+
+# --- makemigrations(from_db=False) (spec §5.10, AC-5, AC-6, AC-30) ---------------------------------------------------
+
+_MODULES = itertools.count()
+
+#: The imports of the models each test defines in a module of its own.
+_MODELS_HEADER = """
+from typing import Any
+
+from surreal_orm_lite import (
+    Analyzer,
+    AuthenticatedUserMixin,
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    Event,
+    Index,
+    SchemaMode,
+    SurrealConfigDict,
+    TableType,
+)
+"""
+
+
+@pytest.fixture
+def define_models(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """``define_models(source)``: runs *source* in a module created for the test (registered in ``sys.modules`` while
+    the test runs) and returns the model classes it defines, in their order — models redefined with the same table
+    names as an earlier call's."""
+
+    def define(source: str) -> list[type[BaseSurrealModel]]:
+        module = types.ModuleType(f"mig_files_models_{next(_MODULES)}")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(textwrap.dedent(_MODELS_HEADER) + textwrap.dedent(source), module.__dict__)
+        return [
+            value
+            for value in vars(module).values()
+            if isinstance(value, type) and issubclass(value, BaseSurrealModel) and value.__module__ == module.__name__
+        ]
+
+    return define
+
+
+def _node(config: str = "", fields: str = "age: int = 0") -> str:
+    """The source of a SCHEMAFULL node model ``M`` of table ``mk_t``: *config* appended to its ``SurrealConfigDict``,
+    *fields* its fields separated by ``;``."""
+    lines = "".join(f"    {line}\n" for line in fields.split(";"))
+    return (
+        "class M(BaseSurrealModel):\n"
+        f'    model_config = SurrealConfigDict(table_name="mk_t", schema_mode=SchemaMode.SCHEMAFULL{config})\n'
+        f"    id: str | None = None\n{lines}"
+    )
+
+
+def _view(query: str) -> str:
+    return (
+        "class V(BaseSurrealModel):\n"
+        f'    model_config = SurrealConfigDict(table_name="mk_v", view_query="{query}")\n'
+        "    id: str | None = None\n"
+        "    n: int = 0\n"
+    )
+
+
+def _edge(out: str) -> str:
+    return (
+        "class E(BaseSurrealEdge):\n"
+        "    model_config = SurrealConfigDict(\n"
+        f'        table_name="mk_e", table_type=TableType.RELATION, relation_in="mk_t", relation_out={out}\n'
+        "    )\n"
+        "    weight: int = 1\n"
+    )
+
+
+def _user(session: str) -> str:
+    return (
+        "class U(AuthenticatedUserMixin, BaseSurrealModel):\n"
+        "    model_config = SurrealConfigDict(\n"
+        f'        table_name="mk_user", access_name="mk_account", auth_duration_session="{session}"\n'
+        "    )\n"
+        "    email: str\n"
+        "    password: str\n"
+    )
+
+
+def _analyzer(filters: str, highlights: str) -> str:
+    indexes = (
+        ', indexes=[Index("mk_t_a", "a", search_analyzer=EN, bm25=True), '
+        f'Index("mk_t_b", "b", search_analyzer=EN, bm25=True{highlights})]'
+    )
+    return f'EN = Analyzer("mk_en", ["blank"], {filters})\n' + _node(indexes, "a: str = '';b: str = ''")
+
+
+_INDEX = ', indexes=[Index("mk_t_age", "age")]'
+_EVENT = ', events=[Event("mk_audit", then="CREATE mk_log SET a = 1")]'
+_COUNT = "SELECT count() AS n FROM mk_t GROUP ALL"
+
+#: AC-6: a model change of each kind — the models before, after, and the operations ``0002`` holds (``describe()``),
+#: in spec §5.7's order. A removal is written with ``drop_missing=True`` only (``TestMakemigrationsOffline``).
+_CHANGES: dict[str, tuple[str, str, list[str]]] = {
+    "a field added": (_node(), _node(fields="age: int = 0;nick: str = ''"), ["Add field nick to mk_t"]),
+    "a field retyped": (_node(), _node(fields="age: float = 0.0"), ["Alter field age on mk_t"]),
+    "a field made optional": (_node(fields="nick: str"), _node(fields="nick: str | None = None"), ["Alter field nick on mk_t"]),
+    "a field given a default": (_node(fields="nick: str"), _node(fields="nick: str = 'x'"), ["Alter field nick on mk_t"]),
+    "a field removed": (_node(fields="age: int = 0;nick: str"), _node(), ["Drop field nick from mk_t"]),
+    "the schema mode": (_node(), _node().replace("SCHEMAFULL", "SCHEMALESS"), ["Alter table mk_t"]),
+    "the comment": (_node(), _node(', comment="People"'), ["Alter table mk_t"]),
+    "the change feed": (_node(), _node(', changefeed="1d"'), ["Alter table mk_t"]),
+    "the permissions": (_node(), _node(', permissions={"select": "FULL"}'), ["Alter table mk_t"]),
+    "an index added": (_node(), _node(_INDEX), ["Create index mk_t_age on mk_t"]),
+    "an index changed": (
+        _node(_INDEX),
+        _node(_INDEX.replace('"age")', '"age", unique=True)')),
+        ["Create index mk_t_age on mk_t"],
+    ),
+    "an index removed": (_node(_INDEX), _node(), ["Drop index mk_t_age from mk_t"]),
+    "an analyzer changed": (
+        _analyzer('["lowercase"]', ""),
+        _analyzer('["lowercase", "ascii"]', ", highlights=True"),
+        ["Define analyzer mk_en", "Create index mk_t_b on mk_t", "Rebuild index mk_t_a on mk_t"],
+    ),
+    "an event added": (_node(), _node(_EVENT), ["Define event mk_audit on mk_t"]),
+    "an event changed": (_node(_EVENT), _node(_EVENT.replace("a = 1", "a = 2")), ["Define event mk_audit on mk_t"]),
+    "an event removed": (_node(_EVENT), _node(), ["Remove event mk_audit from mk_t"]),
+    "a view's query": (
+        _node() + _view(_COUNT),
+        _node() + _view(_COUNT.replace(" GROUP", " WHERE age > 1 GROUP")),
+        ["Alter table mk_v"],
+    ),
+    "a relation's ends": (_node() + _edge('"mk_t"'), _node() + _edge('["mk_t", "mk_u"]'), ["Alter table mk_e"]),
+    "a user model's durations": (_user("1h"), _user("2h"), ["Define access mk_account for mk_user"]),
+}
+
+#: The models of the flows below: a node holding a default with a ``;`` (AC-30).
+_PERSON = """
+class P(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="mk_person", schema_mode=SchemaMode.SCHEMAFULL)
+    id: str | None = None
+    name: str
+    sep: str = "a;b"
+"""
+_OTHER = """
+class O(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="mk_other")
+    id: str | None = None
+    label: str = ""
+"""
+
+_LOGGER = "surreal_orm_lite.migrations"
+
+
+def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == _LOGGER]
+
+
+class TestMakemigrationsOffline:
+    """Spec §5.10 with ``from_db=False``: the files' state (``migration_state()``) diffed against the models, removals
+    only with ``drop_missing=True``; nothing written when nothing changed. Every call passes ``from_db=False`` (no
+    server), but ``empty=True``'s, which returns before reading any state."""
+
+    async def test_twice_in_a_row(self, tmp_path: Path, caplog: pytest.LogCaptureFixture, define_models: Any) -> None:
+        # AC-5: the second call writes nothing.
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        models = define_models(_PERSON)
+        path = await makemigrations("initial", migrations_dir=tmp_path, models=models, from_db=False)
+        assert path == tmp_path / "0001_initial.py"
+        files = sorted(path.name for path in tmp_path.iterdir() if path.is_file())
+        assert files == ["0001_initial.py", "__init__.py"]
+        migration = MigrationExecutor(tmp_path).load_migration("0001_initial")
+        assert migration.operations == tuple(SchemaState().diff(introspect_models(models)))
+        assert migration.dependencies == ()
+        caplog.clear()
+        assert await makemigrations("again", migrations_dir=tmp_path, models=models, from_db=False) is None
+        assert _messages(caplog) == ["No changes detected."]
+        assert sorted(path.name for path in tmp_path.iterdir() if path.is_file()) == files
+
+    async def test_a_default_holding_a_semicolon(self, tmp_path: Path, define_models: Any) -> None:
+        # AC-30's offline part: the default is data, written as such; the file loads; nothing to write after it.
+        models = define_models(_PERSON)
+        path = await makemigrations("initial", migrations_dir=tmp_path, models=models, from_db=False)
+        assert path is not None
+        assert "AddField(table='mk_person', name='sep', field_type='string', default='a;b')," in path.read_text(
+            encoding="utf-8"
+        )
+        operations = MigrationExecutor(tmp_path).load_migration("0001_initial").operations
+        assert AddField(table="mk_person", name="sep", field_type="string", default="a;b") in operations
+        assert await makemigrations("again", migrations_dir=tmp_path, models=models, from_db=False) is None
+
+    @pytest.mark.parametrize(("before", "after", "expected"), list(_CHANGES.values()), ids=list(_CHANGES))
+    async def test_each_model_change(
+        self, tmp_path: Path, define_models: Any, before: str, after: str, expected: list[str]
+    ) -> None:
+        # AC-6: models redefined with the same table names.
+        assert await makemigrations("initial", migrations_dir=tmp_path, models=define_models(before), from_db=False)
+        changed = define_models(after)
+        path = await makemigrations("change", migrations_dir=tmp_path, models=changed, from_db=False, drop_missing=True)
+        assert path == tmp_path / "0002_change.py"
+        migration = MigrationExecutor(tmp_path).load_migration("0002_change")
+        assert migration.dependencies == ("0001_initial",)
+        assert [operation.describe() for operation in migration.operations] == expected
+        current = MigrationExecutor(tmp_path).migration_state("0001_initial")
+        assert list(migration.operations) == current.diff(introspect_models(changed))
+        again = await makemigrations("again", migrations_dir=tmp_path, models=changed, from_db=False, drop_missing=True)
+        assert again is None
+
+    async def test_a_change_keeps_the_previous_definitions(self, tmp_path: Path, define_models: Any) -> None:
+        # The redefinitions carry the files' definition as previous= (reversible), read back from the files.
+        await makemigrations("initial", migrations_dir=tmp_path, models=define_models(_node(_EVENT)), from_db=False)
+        changed = define_models(_node(_EVENT.replace("a = 1", "a = 2")))
+        await makemigrations("change", migrations_dir=tmp_path, models=changed, from_db=False)
+        (event,) = MigrationExecutor(tmp_path).load_migration("0002_change").operations
+        assert isinstance(event, DefineEvent)
+        assert isinstance(event.previous, DefineEvent)
+        assert event.previous.then == "CREATE mk_log SET a = 1"
+        assert event.reversible
+
+    @pytest.mark.parametrize(
+        ("before", "after", "skipped"),
+        [
+            (_node(fields="age: int = 0;nick: str"), _node(), "Drop field nick from mk_t"),
+            (_node(_EVENT), _node(), "Remove event mk_audit from mk_t"),
+            (_node(_INDEX), _node(), "Drop index mk_t_age from mk_t"),
+        ],
+        ids=["a field", "an event", "an index"],
+    )
+    async def test_a_removal_is_left_out_by_default(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, define_models: Any, before: str, after: str, skipped: str
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        await makemigrations("initial", migrations_dir=tmp_path, models=define_models(before), from_db=False)
+        changed = define_models(after)
+        caplog.clear()
+        assert await makemigrations("change", migrations_dir=tmp_path, models=changed, from_db=False) is None
+        assert _messages(caplog) == [
+            f"Skipped 1 removal(s) with no model to justify them: {skipped}; pass drop_missing=True to write them.",
+            "No changes detected.",
+        ]
+        assert not (tmp_path / "0002_change.py").exists()
+
+    async def test_the_removals_left_out_beside_a_change(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, define_models: Any
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        await makemigrations("initial", migrations_dir=tmp_path, models=define_models(_node(_EVENT + _INDEX)), from_db=False)
+        changed = define_models(_node(', comment="People"', fields="nick: str = ''"))
+        caplog.clear()
+        path = await makemigrations("change", migrations_dir=tmp_path, models=changed, from_db=False)
+        assert path is not None
+        operations = MigrationExecutor(tmp_path).load_migration("0002_change").operations
+        assert [operation.describe() for operation in operations] == ["Alter table mk_t", "Add field nick to mk_t"]
+        assert _messages(caplog) == [
+            "Skipped 3 removal(s) with no model to justify them: Drop field age from mk_t, Drop index mk_t_age from mk_t, "
+            "Remove event mk_audit from mk_t; pass drop_missing=True to write them."
+        ]
+
+    async def test_a_removal_with_drop_missing_carries_its_previous(self, tmp_path: Path, define_models: Any) -> None:
+        await makemigrations("initial", migrations_dir=tmp_path, models=define_models(_node(_EVENT)), from_db=False)
+        path = await makemigrations(
+            "change", migrations_dir=tmp_path, models=define_models(_node()), from_db=False, drop_missing=True
+        )
+        assert path is not None
+        (removal,) = MigrationExecutor(tmp_path).load_migration("0002_change").operations
+        assert isinstance(removal, RemoveEvent)
+        assert isinstance(removal.previous, DefineEvent)
+        assert removal.previous.then == "CREATE mk_log SET a = 1"
+
+    async def test_a_model_deleted_since_the_first_migration(self, tmp_path: Path, define_models: Any) -> None:
+        both = define_models(_PERSON + _OTHER)
+        await makemigrations("initial", migrations_dir=tmp_path, models=both, from_db=False)
+        assert await makemigrations("change", migrations_dir=tmp_path, models=both[:1], from_db=False) is None
+        path = await makemigrations("change", migrations_dir=tmp_path, models=both[:1], from_db=False, drop_missing=True)
+        assert path == tmp_path / "0002_change.py"
+        assert MigrationExecutor(tmp_path).load_migration("0002_change").operations == (DropTable("mk_other"),)
+
+    async def test_the_dependencies_are_every_leaf(self, tmp_path: Path, define_models: Any) -> None:
+        models = define_models(_PERSON)
+        await makemigrations("initial", migrations_dir=tmp_path, models=models, from_db=False)
+        # A hand-written branch: two migrations after 0001_initial.
+        _migration_file(tmp_path, "0003_b", "0001_initial", operations="AddField('mk_person', 'b', 'int')")
+        _migration_file(tmp_path, "0002_a", "0001_initial", operations="AddField('mk_person', 'a', 'int')")
+        path = await makemigrations("merge", migrations_dir=tmp_path, models=models, from_db=False, drop_missing=True)
+        assert path == tmp_path / "0004_merge.py"
+        migration = MigrationExecutor(tmp_path).load_migration("0004_merge")
+        assert migration.dependencies == ("0002_a", "0003_b")
+        # The diff's order: the extra fields children before parents (reverse name order).
+        assert migration.operations == (DropField("mk_person", "b"), DropField("mk_person", "a"))
+
+    async def test_empty(self, tmp_path: Path) -> None:
+        # No model, no request — with the default from_db=True too.
+        path = await makemigrations("first", migrations_dir=tmp_path, empty=True)
+        assert path == tmp_path / "0001_first.py"
+        _migration_file(tmp_path, "0002_a", "0001_first")
+        _migration_file(tmp_path, "0003_b", "0001_first")
+        path = await makemigrations("data", migrations_dir=tmp_path, empty=True, models=[])
+        assert path == tmp_path / "0004_data.py"
+        migration = MigrationExecutor(tmp_path).load_migration("0004_data")
+        assert (migration.dependencies, migration.operations) == (("0002_a", "0003_b"), ())
+
+    async def test_empty_checks_the_files(self, tmp_path: Path) -> None:
+        _migration_file(tmp_path, "0001_a", "0000_missing")
+        with pytest.raises(ValueError, match="depends on '0000_missing', which is not a migration file"):
+            await makemigrations("first", migrations_dir=tmp_path, empty=True)
+        assert not (tmp_path / "0002_first.py").exists()
+
+    async def test_no_models(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError) as caught:
+            await makemigrations("initial", migrations_dir=tmp_path, models=[], from_db=False)
+        assert str(caught.value) == "No models found: pass models=, or import the modules that define them."
+        assert not tmp_path.joinpath("0001_initial.py").exists()
+
+    async def test_the_models_of_the_connection(self, tmp_path: Path) -> None:
+        # MiOther is of the connection "other": left out of the current connection's ("default") models.
+        path = await makemigrations("initial", migrations_dir=tmp_path, models=[MiBare, MiOther], from_db=False)
+        assert path is not None
+        tables = {
+            operation.name
+            for operation in MigrationExecutor(tmp_path).load_migration("0001_initial").operations
+            if isinstance(operation, CreateTable)
+        }
+        assert tables == {"mi_bare"}
+        with pytest.raises(ValueError, match="^No models found"):
+            await makemigrations("other", migrations_dir=tmp_path / "x", models=[MiBare], connection="other", from_db=False)
+        path = await makemigrations(
+            "other", migrations_dir=tmp_path / "x", models=[MiBare, MiOther], connection="other", from_db=False
+        )
+        assert path is not None
+        operations = MigrationExecutor(tmp_path / "x").load_migration("0001_other").operations
+        assert {operation.name for operation in operations if isinstance(operation, CreateTable)} == {"mi_other"}
+
+    async def test_the_files_are_checked_before_the_diff(self, tmp_path: Path, define_models: Any) -> None:
+        _migration_file(tmp_path, "0001_a", "0002_b")
+        _migration_file(tmp_path, "0002_b", "0001_a")
+        with pytest.raises(ValueError, match="^Circular dependency detected in migrations"):
+            await makemigrations("initial", migrations_dir=tmp_path, models=define_models(_PERSON), from_db=False)
+
+    async def test_the_arguments_are_checked(self, tmp_path: Path, define_models: Any) -> None:
+        models = define_models(_PERSON)
+        with pytest.raises(TypeError, match=r"^makemigrations\(\): name must be a str, not int"):
+            await makemigrations(1, migrations_dir=tmp_path, models=models, from_db=False)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Connection name must not be empty"):
+            await makemigrations("x", migrations_dir=tmp_path, models=models, connection="", from_db=False)
+        with pytest.raises(TypeError, match="takes an iterable of model classes, not a str"):
+            await makemigrations("x", migrations_dir=tmp_path, models="P", from_db=False)  # type: ignore[arg-type]
+        assert not tmp_path.joinpath("0001_x.py").exists()
+
+    def test_the_signature(self) -> None:
+        signature = inspect.signature(makemigrations)
+        assert list(signature.parameters) == [
+            "name",
+            "migrations_dir",
+            "models",
+            "connection",
+            "empty",
+            "from_db",
+            "drop_missing",
+        ]
+        defaults = {name: parameter.default for name, parameter in signature.parameters.items()}
+        assert defaults["migrations_dir"] == "migrations"
+        assert (defaults["models"], defaults["connection"]) == (None, None)
+        assert (defaults["empty"], defaults["from_db"], defaults["drop_missing"]) == (False, True, False)
+        kinds = {parameter.kind for name, parameter in signature.parameters.items() if name != "name"}
+        assert kinds == {inspect.Parameter.KEYWORD_ONLY}
