@@ -5,11 +5,13 @@ depends on and its operations — :class:`CreateTable`, :class:`AddField`, :clas
 rendering its SurrealQL with the renderers ``define_table()`` and the other appliers use. :class:`MigrationStatementError`
 reports a statement SurrealDB refused, without quoting it. The executor records the applied migrations in the table
 :data:`MIGRATIONS_TABLE`. :func:`introspect_models` (:class:`ModelIntrospector`) builds the schema state the models
-describe, which ``SchemaState.diff()`` compares with a database's.
+describe, which ``SchemaState.diff()`` compares with a database's. :class:`MigrationGenerator` writes a migration's file
+from its operations, and :func:`generate_empty_migration` one to fill in by hand.
 """
 
 from .constants import MIGRATIONS_TABLE
 from .executor import MigrationStatementError
+from .generator import MigrationGenerator, generate_empty_migration
 from .introspector import ModelIntrospector, introspect_models
 from .migration import Migration
 from .operations import (
@@ -54,6 +56,7 @@ __all__ = [
     "DropIndex",
     "DropTable",
     "Migration",
+    "MigrationGenerator",
     "MigrationStatementError",
     "ModelIntrospector",
     "Operation",
@@ -63,6 +66,7 @@ __all__ = [
     "RemoveAnalyzer",
     "RemoveEvent",
     "RemoveFunction",
+    "generate_empty_migration",
     "introspect_models",
     "split_destructive",
 ]
