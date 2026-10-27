@@ -19,7 +19,8 @@ they do not write:
   :func:`flexible_redefinitions` writes the columns an ``AlterTable`` making a table ``SCHEMAFULL`` redefines on line 2
   (SurrealDB 3.x refuses ``FLEXIBLE`` on a kind holding no object and keeps the values without it);
 - :func:`removal` — ``REMOVE …`` statements, every name in backticks (``surql_literal._identifier()``: any name
-  SurrealDB accepts there, ``user-events`` included), a field's path through ``model_ddl.field_path()``;
+  SurrealDB accepts there, ``user-events`` included), a field's path through ``model_ddl.field_path()``; and
+  :func:`rebuild` — ``REBUILD INDEX`` (``RebuildIndex``'s, and the executor's after a failed migration);
 - :func:`check_statements` — the count of top-level statements of a ``RawSQL``/``DataMigration`` text, and its checks;
 - :func:`read_own` — a statement the ORM wrote read into its state by ``define_parser`` (M17), and
   :func:`literal_value` — a ``DEFAULT`` text read back as the Python value the ORM writes it from.
@@ -85,6 +86,7 @@ __all__ = [
     "literal_value",
     "plain",
     "read_own",
+    "rebuild",
     "removal",
     "table_statement",
 ]
@@ -517,6 +519,18 @@ def removal(
     for segment in segments:
         _removal_name(segment, what="a path segment")
     return f"REMOVE FIELD{exists} {field_path(segments)} ON {on};"
+
+
+def rebuild(table: str, name: str, *, if_exists: bool = False) -> str:
+    """``REBUILD INDEX[ IF EXISTS] `<name>` ON `<table>`;`` — pure. Names in backticks, as :func:`removal` writes them
+    (an index the database holds may have any name SurrealDB accepts there).
+
+    :raises ValueError: an empty name or table, or one holding a NUL character.
+    :raises TypeError: a name or a table that is not a ``str``.
+    """
+    exists = " IF EXISTS" if if_exists else ""
+    index = _identifier(_removal_name(name, what="the name"))
+    return f"REBUILD INDEX{exists} {index} ON {_identifier(_removal_name(table, what='table='))};"
 
 
 # --- the statements of a RawSQL or a DataMigration -------------------------------------------------------------------

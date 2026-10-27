@@ -2,23 +2,69 @@
 
 :class:`MigrationExecutor` works on a migrations directory: its files (``get_available_migrations()``,
 ``load_migration()``), their application order (``get_pending_migrations()``), the state they build
-(``migration_state()``) and the statements of one of them (``show_sql()``) — all pure: no database is read.
-``MigrationStatementError`` is raised when SurrealDB refuses a statement of a migration.
+(``migration_state()``) and the statements of one of them (``show_sql()``) — all pure: no database is read. It applies
+the pending ones (``migrate()``, spec §5.6) and records them in the tracking table ``_surreal_orm_migrations``
+(``ensure_migrations_table()``, ``get_applied_migrations()``).
+
+``migrate()`` is anchored on the database's schema (D35): it reads it once, before any DDL, replays the planned
+migrations over it strictly (E-R1) and renders every statement from those states before the first batch is sent. Each
+migration is one ``BEGIN … COMMIT`` batch holding its tracking record first (phase B); its analyzer definitions are
+committed in a batch of their own just before (phase A, M4, M26) and restored to the definitions the database held when
+phase B fails (D38). A failed batch is read through the line's status layout (§5.6.1), and the tracking table is read
+again before anything else is decided: a migration a concurrent run recorded is skipped, a retryable conflict raises
+``SurrealDbConflictError``, a refusal ``MigrationStatementError`` — whose message names the migration, the operation and
+the server's reason, never a statement. Logs (logger ``surreal_orm_lite.migrations``) name migrations, operations and
+reasons only.
 """
 
+import asyncio
+import logging
 import os
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from ..exceptions import SurrealDbError
+from .. import _sdk
+from .. import cache as _cache
+from .. import encoding as _encoding
+from ..concurrency import is_conflict_error
+from ..connection_manager import SurrealDBConnectionManager
+from ..exceptions import SurrealDbConflictError, SurrealDbError
+from ..introspection import DatabaseIntrospector
 from ..routing import check_name
-from ..schema_state import SchemaState
+from ..schema_state import SchemaIssue, SchemaState
 from ..search import checked_line
-from . import loader
+from ..time_travel import cached_major
+from ..transaction import _is_pure_filler, _server_reason
+from . import loader, render
 from . import state as _state
-from .migration import Migration
+from .constants import MIGRATIONS_TABLE
+from .migration import Migration, _statements
+from .operations import DataMigration, DefineAnalyzer
 
 __all__ = ["MigrationExecutor", "MigrationStatementError"]
+
+logger = logging.getLogger("surreal_orm_lite.migrations")
+
+#: The tracking table, its fields and its unique index (the full ORM's, D5), each ``IF NOT EXISTS`` (M8).
+_TRACKING_DEFINITIONS = (
+    f"DEFINE TABLE IF NOT EXISTS `{MIGRATIONS_TABLE}` SCHEMAFULL;",
+    f"DEFINE FIELD IF NOT EXISTS `name` ON `{MIGRATIONS_TABLE}` TYPE string;",
+    f"DEFINE FIELD IF NOT EXISTS `applied_at` ON `{MIGRATIONS_TABLE}` TYPE datetime DEFAULT time::now();",
+    f"DEFINE INDEX IF NOT EXISTS `migration_name` ON `{MIGRATIONS_TABLE}` FIELDS `name` UNIQUE;",
+)
+#: The tracking record of phase B, first in its batch: a ``LET`` in a later ``RawSQL`` cannot change the name (M25).
+_RECORD = f"CREATE `{MIGRATIONS_TABLE}` SET name = $surreal_orm_migration;"
+#: The applied names, in the order they were applied (the full ORM's query, ties broken by name).
+_APPLIED = f"SELECT name, applied_at FROM `{MIGRATIONS_TABLE}` ORDER BY applied_at, name;"
+#: 3.x's text for the statements after the failing one (M2): filler, as ``transaction._is_pure_filler()``'s.
+_CANCELLED_FILLER = "The query was not executed due to a cancelled transaction"
+#: How many times ``ensure_migrations_table()`` sends its batch when a concurrent first run conflicts with it.
+_ENSURE_ATTEMPTS = 3
+#: The compensation sentences (spec §7), appended after a space.
+_RESTORED = "The analyzer definitions it committed first were restored."
+_KEPT = "Its analyzer definitions, committed first, were kept: retry migrate()."
 
 #: The refusal of a client object as ``connection=`` (v0.30.0's rule).
 _CLIENT_OBJECT = (
@@ -82,6 +128,349 @@ class MigrationStatementError(SurrealDbError, RuntimeError):
         return _rebuild_statement_error, arguments, self.__dict__
 
 
+# --- the batches and their answers (spec §5.6.1) ------------------------------------------------------------------
+
+
+def _terminated(statement: str) -> str:
+    """*statement* without trailing blanks, ending with ``;`` (a ``RawSQL`` may be written without it)."""
+    text = statement.rstrip()
+    return text if text.endswith(";") else f"{text};"
+
+
+class _Batch:
+    """One ``BEGIN … COMMIT`` batch: its statements — each an operation's text, which may hold several statements (an
+    ``AlterTable``'s line-2 redefinitions, a ``RawSQL``), on its own lines — and the operation each belongs to (its
+    index in the migration's operations; ``None`` for the tracking statement and a compensation's).
+
+    Attributes:
+        statements: The texts, each ending with ``;``.
+        owners: The operation of each text.
+        counts: The statements of each text, as SurrealDB answers them (``render.check_statements()``: an empty
+            statement has no entry, M2).
+    """
+
+    __slots__ = ("counts", "owners", "statements")
+
+    def __init__(self, statements: Sequence[str], owners: Sequence[int | None]) -> None:
+        self.statements = tuple(_terminated(statement) for statement in statements)
+        self.owners = tuple(owners)
+        self.counts = tuple(render.check_statements(statement, what="Migration") for statement in self.statements)
+
+    @property
+    def size(self) -> int:
+        """The statements of the batch, as SurrealDB answers them."""
+        return sum(self.counts)
+
+    def text(self) -> str:
+        """The query sent: ``BEGIN TRANSACTION;``, each text on the lines after it, ``COMMIT TRANSACTION;``."""
+        return "\n".join(("BEGIN TRANSACTION;", *self.statements, "COMMIT TRANSACTION;"))
+
+    def statement_of(self, entry: int) -> int:
+        """The text the *entry*-th statement answered (0-based, ``BEGIN`` not counted) belongs to."""
+        end = 0
+        for index, count in enumerate(self.counts):
+            end += count
+            if entry < end:
+                return index
+        return len(self.counts) - 1  # pragma: no cover - the caller checked the layout's length
+
+    def locate(self, line: int) -> tuple[int, int] | None:
+        """The text *line* of :meth:`text` falls in, and the line in that text (1-based); ``None`` outside every text
+        (line 1 is ``BEGIN TRANSACTION;``, as ``BufferedTransaction._locate()`` counts)."""
+        first = 2
+        for index, statement in enumerate(self.statements):
+            last = first + statement.count("\n")
+            if first <= line <= last:
+                return index, line - first + 1
+            first = last + 1
+        return None
+
+
+@dataclass(frozen=True)
+class _Failure:
+    """What a refused batch's answer says: the text that failed (``None`` when the answer names none), its operation
+    (``None`` for the tracking statement, or no text), the server's reason without its excerpt of the statement, and
+    whether the refusal is a retryable conflict."""
+
+    statement: int | None
+    owner: int | None
+    reason: str
+    conflict: bool
+
+
+def _entry_text(entry: Any) -> str:
+    return str(entry.get("result") or "") if isinstance(entry, dict) else ""
+
+
+def _refused_entry(entry: Any) -> bool:
+    return isinstance(entry, dict) and entry.get("status") == "ERR"
+
+
+def _filler(text: str) -> bool:
+    """Whether a status text only says that the statement was not executed because another one failed (2.x and 3.x
+    before the failing one, 3.x's cancelled text after it, M2)."""
+    return _is_pure_filler(text) or text.strip().rstrip(".") == _CANCELLED_FILLER
+
+
+def _not_executed(entry: Any) -> bool:
+    details = entry.get("details") if isinstance(entry, dict) else None
+    return isinstance(details, dict) and details.get("kind") == "NotExecuted"
+
+
+def _reason(text: str) -> str:
+    """The server's reason in a status text, without any excerpt of the statement (``transaction._server_reason()``)."""
+    return _server_reason(text)[0] or "the transaction failed"
+
+
+def _conflicting(reason: str) -> bool:
+    return is_conflict_error(SurrealDbError(reason))
+
+
+def _failure(answer: Any, batch: _Batch, line: int) -> _Failure | None:
+    """What *answer* — ``query_raw()``'s envelope for *batch* on the SurrealDB major *line* — says went wrong, or
+    ``None`` when the batch committed (spec §5.6.1).
+
+    A result list holds ``BEGIN``, one entry per statement and ``COMMIT`` on line 3, one entry per statement below
+    (M2); a list of another length names no statement. The failing statement is the first statement entry whose
+    ``details.kind`` is not ``NotExecuted`` and whose text is not filler, else the first whose text is not filler
+    (``transaction._raise_for_status()``'s rule, on the statement entries). A retryable conflict in any entry — the
+    3.x ``COMMIT`` entry's included — makes the failure a conflict. An ``error`` envelope (a parse error refuses the
+    whole batch, M3) names the statement its last position in a statement falls in (:func:`_refused`).
+    """
+    if not (isinstance(answer, dict) and isinstance(answer.get("result"), list)):
+        envelope = answer.get("error") if isinstance(answer, dict) else None
+        message = envelope.get("message") if isinstance(envelope, dict) else None
+        if isinstance(message, str) and message:
+            return _refused(message, batch)
+        return _Failure(None, None, f"unrecognized query_raw() response shape ({type(answer).__name__})", False)
+    entries = answer["result"]
+    errors = [entry for entry in entries if _refused_entry(entry)]
+    if not errors:
+        return None
+    conflict = any(_conflicting(_reason(_entry_text(entry))) for entry in errors)
+    root = next((entry for entry in errors if not _filler(_entry_text(entry))), errors[0])
+    if len(entries) != batch.size + (2 if line >= 3 else 0):
+        return _Failure(None, None, _reason(_entry_text(root)), conflict)
+    statements = entries[1:-1] if line >= 3 else entries
+    failed = [(position, entry) for position, entry in enumerate(statements) if _refused_entry(entry)]
+    chosen = next((pair for pair in failed if not _not_executed(pair[1]) and not _filler(_entry_text(pair[1]))), None) or next(
+        (pair for pair in failed if not _filler(_entry_text(pair[1]))), None
+    )
+    if chosen is None:
+        return _Failure(None, None, _reason(_entry_text(root)), conflict)
+    index = batch.statement_of(chosen[0])
+    return _Failure(index, batch.owners[index], _reason(_entry_text(chosen[1])), conflict)
+
+
+def _refused(message: str, batch: _Batch) -> _Failure:
+    """The failure of a batch refused as a whole with *message* (an ``error`` envelope, or the embedded engine's
+    ``RuntimeError``, M3): the reason without the server's excerpt; the text named is the one holding the last
+    position falling in a text, and the position kept — the first the server gives in that text — is relative to it
+    (an unclosed delimiter gives where the parser stopped, then where it opens; ``transaction._refusal()``'s rule)."""
+    reason, positions = _server_reason(message)
+    conflict = _conflicting(reason)
+    located = [(column, place) for line, column in positions if (place := batch.locate(line)) is not None]
+    if not located:
+        return _Failure(None, None, reason, conflict)
+    statement = located[-1][1][0]
+    column, (_, own_line) = next(pair for pair in located if pair[1][0] == statement)
+    at = f"(at line {own_line}, column {column} of the statement)"
+    return _Failure(statement, batch.owners[statement], f"{reason} {at}", conflict)
+
+
+async def _send(client: Any, batch: _Batch, line: int, name: str | None) -> _Failure | None:
+    """Send *batch* with ``query_raw()`` — the tracking statement's ``$surreal_orm_migration`` bound to *name* — and
+    read its answer (:func:`_failure`); ``None`` when it committed. Every cached read of the ORM is dropped around it
+    (``cache.writing(None)``: a migration may change any table).
+
+    The embedded engine's ``RuntimeError`` is its refusal of the whole batch (``transaction.py``'s rule); any other
+    error — a server client's ``RuntimeError`` included — is a transport error and propagates.
+    """
+    variables = _encoding.encode({} if name is None else {"surreal_orm_migration": name})
+    async with _cache.writing(None):
+        try:
+            answer = await client.query_raw(batch.text(), variables)
+        except RuntimeError as error:
+            embedded = _sdk.SdkAsyncEmbeddedConnection
+            if embedded is None or not isinstance(client, embedded):
+                raise
+            return _refused(str(error), batch)
+    return _failure(answer, batch, line)
+
+
+async def _line(client: Any) -> Literal[2, 3]:
+    """The renderers' line for *client*: 3 from SurrealDB 3 on, else 2 (``cached_major()`` answers any major)."""
+    return 3 if await cached_major(client) >= 3 else 2
+
+
+def _statement_error(
+    migration: Migration, failure: _Failure, *, sentence: str = "", restored: bool | None = None
+) -> "MigrationStatementError":
+    """E-X1, E-X2 or E-X6 (spec §7) for *failure* of *migration*, *sentence* (the compensation's) appended."""
+    name = migration.name
+    tail = f" {sentence}" if sentence else ""
+    if failure.statement is None:
+        message = f"Migration '{name}' was refused by SurrealDB: {failure.reason}{tail}"
+        return MigrationStatementError(message, migration=name, analyzers_restored=restored)
+    if failure.owner is None:
+        message = f"Migration '{name}' could not be recorded as applied: {failure.reason}{tail}"
+        return MigrationStatementError(message, migration=name, analyzers_restored=restored)
+    operation = migration.operations[failure.owner]
+    description = operation.describe()
+    position = failure.owner + 1
+    message = (
+        f"Migration '{name}' failed at operation {position} of {len(migration.operations)} ({description}): "
+        f"{failure.reason}{tail}"
+    )
+    return MigrationStatementError(
+        message, migration=name, operation=position, description=description, analyzers_restored=restored
+    )
+
+
+@dataclass(frozen=True)
+class _Compensated:
+    """The outcome of phase A's compensation: why the analyzers could not be restored (``None``: they were), and why
+    the indexes using them could not be rebuilt afterwards (``None``: they were, or there were none)."""
+
+    analyzers: str | None
+    rebuilds: str | None = None
+
+    @property
+    def restored(self) -> bool:
+        return self.analyzers is None
+
+
+def _compensation_sentence(outcome: _Compensated, names: Sequence[str]) -> str:
+    """The sentence phase A's compensation adds (spec §7): restored, or not with its reason."""
+    if outcome.analyzers is not None:
+        shown = ", ".join(f"'{name}'" for name in names)
+        return (
+            f"The analyzer definitions it committed first could not be restored ({outcome.analyzers}): {shown} keep this "
+            "migration's definitions; run schema_diff() to see them."
+        )
+    if outcome.rebuilds is not None:
+        return (
+            "The analyzer definitions it committed first were restored, but the indexes that use them could not be "
+            f"rebuilt ({outcome.rebuilds}): rebuild them (REBUILD INDEX) before searching them."
+        )
+    return _RESTORED
+
+
+# --- the pre-pass: every batch rendered before the first is sent (spec §5.6 step 3) ----------------------------------
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """One planned migration, rendered: its phase-A batch (its ``DefineAnalyzer`` statements, ``None`` without one),
+    its phase-B batch (the tracking record, then every other schema operation's statements), and phase A's
+    compensation — the statements restoring the analyzers it defines, their names, and the rebuilds of the indexes the
+    database holds that use them."""
+
+    migration: Migration
+    analyzers: _Batch | None
+    main: _Batch
+    compensation: tuple[str, ...] = ()
+    restored: tuple[str, ...] = ()
+    rebuilds: tuple[str, ...] = ()
+
+
+def _unreadable(issues: Sequence[SchemaIssue], name: str) -> bool:
+    """Whether the read could not read the analyzer *name*: an ``analyzer`` issue under that name, or the
+    ``analyzers`` section issue (the read then lists no analyzer, P1)."""
+    return any(
+        (issue.kind == "analyzer" and issue.name == name) or (issue.kind == "section" and issue.name == "analyzers")
+        for issue in issues
+    )
+
+
+def _unrestorable(migration: Migration, position: int, operation: DefineAnalyzer) -> SurrealDbError:
+    """E-I2 (spec §7, D38, P1, P3)."""
+    return SurrealDbError(
+        f"Migration '{migration.name}', operation {position} ({operation.describe()}): the database's definition of "
+        f"analyzer '{operation.name}' cannot be read or written by the ORM, so it could not be restored if the "
+        "migration failed; nothing was applied. Redefine the analyzer in a form search.Analyzer accepts (by hand, or "
+        "with define_indexes()), then run the call again."
+    )
+
+
+def _compensation(migration: Migration, before: SchemaState) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Phase A's compensation for *migration*, rendered from *before* — the database's schema with the planned
+    migrations before it replayed (D38): for each analyzer phase A defines, in reverse order, its definition there
+    (``DefineAnalyzer.from_analyzer_state(…).forwards()``, ``OVERWRITE``), or ``REMOVE ANALYZER IF EXISTS`` when the
+    database held none. ``previous=`` plays no part. Also the analyzers' names, in definition order, and a ``REBUILD
+    INDEX IF EXISTS`` of each index of *before* that uses one of them: SurrealDB 3.x and 2.x servers keep what a
+    ``REBUILD INDEX`` of the failed batch built (and 2.x what a full-text ``DEFINE INDEX OVERWRITE`` built) with phase
+    A's analyzers, so the index is built again with the restored ones, once they are committed.
+
+    :raises SurrealDbError: E-I2 — the definition cannot be read (an issue of the read) or written (a form
+        ``search.Analyzer`` refuses, M32).
+    """
+    defined: dict[str, tuple[int, DefineAnalyzer]] = {}
+    for position, operation in enumerate(migration.operations, 1):
+        if isinstance(operation, DefineAnalyzer) and operation.name not in defined:
+            defined[operation.name] = (position, operation)
+    statements: list[str] = []
+    for name, (position, operation) in reversed(defined.items()):
+        held = before.analyzers.get(name)
+        if held is not None:
+            restoring = DefineAnalyzer.from_analyzer_state(held)
+            if restoring is None:
+                raise _unrestorable(migration, position, operation)
+            statements.append(restoring.forwards())
+        elif _unreadable(before.issues, name):
+            raise _unrestorable(migration, position, operation)
+        else:
+            statements.append(render.removal("analyzer", name, if_exists=True))
+    rebuilds = tuple(
+        render.rebuild(table.name, index.name, if_exists=True)
+        for table in before.tables.values()
+        for index in table.indexes.values()
+        if index.search_analyzer in defined
+    )
+    return tuple(statements), tuple(defined), rebuilds
+
+
+def _prepared(migration: Migration, *, line: Literal[2, 3], before: SchemaState, after: SchemaState) -> _Prepared:
+    """*migration* rendered for *line*: each operation's forwards from *after*, the state after the migration (an
+    ``AlterTable`` given ``skip_fields``, ``migration._statements()``), the ``DefineAnalyzer`` ones in phase A, the
+    ``DataMigration`` ones left out (phase C), the rest in phase B after the tracking record; phase A's compensation
+    from *before*."""
+    analyzers: list[str] = []
+    analyzer_owners: list[int | None] = []
+    main = [_RECORD]
+    main_owners: list[int | None] = [None]
+    for index, text in _statements(migration, line=line, state=after):
+        operation = migration.operations[index]
+        if isinstance(operation, DataMigration):
+            continue
+        if isinstance(operation, DefineAnalyzer):
+            analyzers.append(text)
+            analyzer_owners.append(index)
+        else:
+            main.append(text)
+            main_owners.append(index)
+    if not analyzers:
+        return _Prepared(migration, None, _Batch(main, main_owners))
+    compensation, restored, rebuilds = _compensation(migration, before)
+    phase_a = _Batch(analyzers, analyzer_owners)
+    return _Prepared(migration, phase_a, _Batch(main, main_owners), compensation, restored, rebuilds)
+
+
+def _plan(migrations: Sequence[Migration], applied: Sequence[str], target: str | None) -> list[Migration]:
+    """The migrations ``migrate()`` applies: the pending ones in application order, up to and including *target*;
+    none when *target* is applied."""
+    recorded = set(applied)
+    if target is not None and target in recorded:
+        return []
+    plan: list[Migration] = []
+    for migration in migrations:
+        if migration.name not in recorded:
+            plan.append(migration)
+        if migration.name == target:
+            break
+    return plan
+
+
 class MigrationExecutor:
     """Applies, undoes and inspects the migrations of a directory (the full SurrealDB-ORM's class).
 
@@ -106,6 +495,39 @@ class MigrationExecutor:
             raise TypeError(_CLIENT_OBJECT)
         self.migrations_dir = Path(migrations_dir)
         self._connection = None if connection is None else check_name(connection)
+
+    async def ensure_migrations_table(self) -> None:
+        """Define the tracking table ``_surreal_orm_migrations`` when it is missing — the full ORM's table, fields and
+        unique index (``name`` string, ``applied_at`` datetime defaulting to ``time::now()``, index ``migration_name``
+        on ``name``), each ``IF NOT EXISTS``, in one batch. A retryable conflict (two first runs at once) is retried,
+        three attempts in all.
+
+        :raises SurrealDbConflictError: the third attempt conflicted too.
+        :raises SurrealDbError: SurrealDB refused the batch (a session not allowed to define, for instance).
+        """
+        client = await self._client()
+        line = await _line(client)
+        batch = _Batch(_TRACKING_DEFINITIONS, (None,) * len(_TRACKING_DEFINITIONS))
+        attempt = 1
+        while (failure := await _send(client, batch, line, None)) is not None:
+            if not failure.conflict or attempt == _ENSURE_ATTEMPTS:
+                error = SurrealDbConflictError if failure.conflict else SurrealDbError
+                raise error(f"The tracking table {MIGRATIONS_TABLE} could not be defined: {failure.reason}")
+            await asyncio.sleep(0.05 * attempt)
+            attempt += 1
+
+    async def get_applied_migrations(self) -> list[str]:
+        """The names of the applied migrations, in the order they were applied (``applied_at``, then name) — the
+        tracking table defined first when it is missing (the full ORM's, D20).
+
+        :raises SurrealDbError: the read did not answer a list of records; see :meth:`ensure_migrations_table`.
+        """
+        await self.ensure_migrations_table()
+        client = await self._client()
+        rows = await client.query(_APPLIED, {})
+        if not isinstance(rows, list):
+            raise SurrealDbError(f"The tracking table {MIGRATIONS_TABLE} could not be read: unexpected answer.")
+        return [row["name"] for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)]
 
     def get_available_migrations(self) -> list[str]:
         """The names of the directory's migration files, sorted: the stems of its ``*.py`` files that do not start
@@ -175,6 +597,170 @@ class MigrationExecutor:
         if backwards:
             return "\n\n".join(migration.backwards_sql(line=checked, state=before))
         return "\n\n".join(migration.forwards_sql(line=checked, state=before))
+
+    async def migrate(self, target: str | None = None, fake: bool = False, schema_only: bool = True) -> list[str]:
+        """Apply the pending migrations, in application order, up to and including *target* (all when ``None``), and
+        return the names applied — the full ORM's method, each migration applied atomically (spec §5.6).
+
+        1. Every file is loaded and ordered, *target* checked, the tracking table ensured and read, and the history
+           checked (an applied migration depending on a pending one raises; an applied name without a file is logged
+           as a warning and ignored). Nothing to apply: ``No migrations to apply.`` is logged, ``[]`` returned.
+        2. With *fake*, each migration is only recorded as applied, in a batch of its own — no DDL, no schema read.
+        3. Otherwise the database's schema is read **once** (``DatabaseIntrospector``), before any DDL: definitions made
+           by ``define_table()`` and the other appliers, or by hand, are part of it. The planned migrations are
+           replayed over it strictly, and every statement is rendered from those states — on SurrealDB 2.x and the
+           embedded engine the ``FLEXIBLE`` choices are the database's —, all before the first batch is sent.
+        4. Each migration: its ``DefineAnalyzer`` statements in a batch committed first (an index built in the same
+           transaction would not use a redefined analyzer, M4, M26), then one batch holding its tracking record and
+           every other schema statement, in order — applied whole or not at all. ``DataMigration`` operations are not
+           run (``upgrade()``).
+
+        When a batch fails, the tracking table is read again: a migration recorded meanwhile (a concurrent run, a lost
+        answer) is skipped with a warning and left out of the names returned; otherwise a retryable conflict raises
+        ``SurrealDbConflictError`` (the analyzers committed first are kept: running ``migrate()`` again converges), and a
+        refusal ``MigrationStatementError``, after the analyzers committed first are restored to the database's
+        definitions (``analyzers_restored``). The migrations after a failed one are not attempted.
+
+        :param target: The last migration to apply.
+        :param fake: Record the migrations as applied without running them.
+        :param schema_only: ``True`` only, for now: running the data operations after the schema comes with
+            ``upgrade()``.
+        :raises ValueError: *target* names no migration file; an applied migration depends on a pending one (E-H1); a
+            removal of a definition neither the database nor an earlier planned operation holds (E-R1); see
+            :meth:`get_pending_migrations`.
+        :raises SurrealDbError: an analyzer phase A redefines whose database definition cannot be restored (E-I2).
+        :raises SurrealDbConflictError: a retryable conflict (E-C1).
+        :raises MigrationStatementError: SurrealDB refused a statement (E-X1), the tracking record (E-X2) or the batch
+            as a whole (E-X6).
+        :raises NotImplementedError: *schema_only* is ``False``.
+        """
+        if not schema_only:
+            raise NotImplementedError("migrate(schema_only=False) is not available yet: run upgrade() after migrate().")
+        migrations = self._ordered()
+        if target is not None and all(migration.name != target for migration in migrations):
+            raise ValueError(f"Unknown migration target {target!r}: no such migration file in {self.migrations_dir}.")
+        applied = await self.get_applied_migrations()
+        mode = loader.HISTORY["migrate"]
+        loader.check_history(migrations, applied, self.migrations_dir, dependency=mode.dependency, unknown=mode.unknown)
+        plan = _plan(migrations, applied, target)
+        if not plan:
+            logger.info("No migrations to apply.")
+            return []
+        line = await _line(await self._client())
+        if fake:
+            prepared = [_Prepared(migration, None, _Batch([_RECORD], [None])) for migration in plan]
+        else:
+            prepared = await self._prepare(plan, line)
+        done: list[str] = []
+        for item in prepared:
+            if await self._apply(item, line):
+                done.append(item.migration.name)
+        return done
+
+    async def _client(self) -> Any:
+        """The SDK client of the executor's connection, resolved now (the current one when it has no name)."""
+        return await SurrealDBConnectionManager._manager_for(self._connection).get_client()
+
+    async def _prepare(self, plan: Sequence[Migration], line: Literal[2, 3]) -> list[_Prepared]:
+        """The pre-pass of ``migrate()`` (spec §5.6 step 3, §6.4): the one read of the database's schema, the strict
+        replay of *plan* over it — E-R1 raised here —, and each migration's batches and compensation rendered from the
+        states before and after it; nothing is sent."""
+        before = await DatabaseIntrospector(self._connection).introspect()
+        prepared: list[_Prepared] = []
+        for migration in plan:
+            after = _state.advance(migration, before, strict=True)
+            prepared.append(_prepared(migration, line=line, before=before, after=after))
+            before = after
+        return prepared
+
+    async def _apply(self, item: _Prepared, line: Literal[2, 3]) -> bool:
+        """Apply one prepared migration: phase A, then phase B (spec §5.6 step 4). ``True`` when applied, ``False``
+        when a failed batch finds the migration recorded (skipped, with the warning).
+
+        :raises SurrealDbConflictError: E-C1.
+        :raises MigrationStatementError: E-X1, E-X2, E-X6 (after the compensation, when phase A was committed).
+        :raises Exception: a transport error (no answer) propagates unchanged, after the compensation when the
+            migration is not recorded.
+        """
+        name = item.migration.name
+        logger.info("Applying migration: %s", name)
+        committed = False
+        for batch in (item.analyzers, item.main):
+            if batch is None:
+                continue
+            phase_a = batch is item.analyzers
+            try:
+                failure = await _send(await self._client(), batch, line, None if phase_a else name)
+            except Exception:
+                recorded = await self._recorded(name)
+                if recorded:
+                    self._skipped(name, "a lost answer")
+                    return False
+                if recorded is not None and item.compensation and (committed or phase_a):
+                    # Phase A may have committed before its answer was lost: restoring is idempotent.
+                    lost = await self._compensate(item, line)
+                    logger.warning("Migration %s: %s", name, _compensation_sentence(lost, item.restored))
+                raise
+            if failure is None:
+                committed = committed or phase_a
+                continue
+            recorded = await self._recorded(name)
+            if recorded:
+                self._skipped(name, "a conflict" if failure.conflict else "a refusal")
+                return False
+            if failure.conflict:
+                kept = f" {_KEPT}" if committed else ""
+                raise SurrealDbConflictError(
+                    f"Migration '{name}' was not applied: a concurrent transaction conflicted (retryable): "
+                    f"{failure.reason}{kept}"
+                )
+            if not committed:
+                raise _statement_error(item.migration, failure)
+            if recorded is None:
+                outcome = _Compensated("the tracking table could not be read again")  # never compensated unverified
+            else:
+                outcome = await self._compensate(item, line)
+            sentence = _compensation_sentence(outcome, item.restored)
+            raise _statement_error(item.migration, failure, sentence=sentence, restored=outcome.restored)
+        logger.info("Applied: %s", name)
+        return True
+
+    async def _recorded(self, name: str) -> bool | None:
+        """Whether the tracking table records *name*, read again after a failed batch; ``None`` when that read fails
+        (the connection is gone)."""
+        try:
+            return name in await self.get_applied_migrations()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _skipped(name: str, cause: str) -> None:
+        logger.warning(
+            "Migration %s is recorded as applied although this run's batch failed (%s): a concurrent run applied it, or "
+            "the answer was lost; it is not applied again, and its data operations were not run here — run upgrade() if "
+            "they must.",
+            name,
+            cause,
+        )
+
+    async def _compensate(self, item: _Prepared, line: Literal[2, 3]) -> _Compensated:
+        """Send phase A's compensation of *item* (spec §5.6, D38): the analyzers' batch, then, once it is committed,
+        the rebuild of the indexes that use them (an index is built with the committed analyzer only, M26). Each
+        failure is the server's reason, or ``the connection failed``."""
+        try:
+            client = await self._client()
+            failure = await _send(client, _Batch(item.compensation, (None,) * len(item.compensation)), line, None)
+        except Exception:
+            return _Compensated("the connection failed")
+        if failure is not None:
+            return _Compensated(failure.reason)
+        if not item.rebuilds:
+            return _Compensated(None)
+        try:
+            failure = await _send(client, _Batch(item.rebuilds, (None,) * len(item.rebuilds)), line, None)
+        except Exception:
+            return _Compensated(None, "the connection failed")
+        return _Compensated(None, None if failure is None else failure.reason)
 
     def _ordered(self) -> list[Migration]:
         """Every migration file of the directory, loaded, in application order (spec §5.6 "Loading and order")."""

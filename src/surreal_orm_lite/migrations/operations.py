@@ -56,7 +56,7 @@ from ..schema import (
 )
 from ..schema_state import AccessState, AnalyzerState, EventState, FieldState, IndexState, SchemaState, TableState
 from ..search import Analyzer, Index, checked_line
-from ..surql_literal import _identifier, to_surql_literal
+from ..surql_literal import to_surql_literal
 from ..types import SchemaMode, TableType
 from ..utils import VALID_ALIAS_PATTERN, validate_field_name
 from . import compare, render
@@ -1226,8 +1226,7 @@ class RebuildIndex(Operation):
 
     def forwards(self, *, line: Literal[2, 3] = 3, state: SchemaState | None = None) -> str:
         checked_line(line)
-        exists = " IF EXISTS" if self.if_exists else ""
-        return f"REBUILD INDEX{exists} {_identifier(self.name)} ON {_identifier(self.table)};"
+        return render.rebuild(self.table, self.name, if_exists=self.if_exists)
 
     def backwards(self, *, line: Literal[2, 3] = 3, state: SchemaState | None = None) -> str:
         return self.forwards(line=line)
