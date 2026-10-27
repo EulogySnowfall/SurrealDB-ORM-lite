@@ -28,7 +28,7 @@ import logging
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 from pydantic import AliasChoices, AliasPath, ValidationError
 
@@ -38,7 +38,7 @@ from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_manager import SurrealDBConnectionManager
 from .embedded import model_auth_unsupported
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError
-from .schema import TableClauses, declared_clauses, signup_excluded_refused
+from .schema import AccessParts, TableClauses, access_statement, declared_clauses, signup_excluded_refused
 from .transaction import Transaction
 from .types import SchemaMode
 from .utils import apply_ddl_statements, validate_alias_name, validate_field_name
@@ -393,6 +393,10 @@ class AuthenticatedUserMixin:
         would not be: 3.x refuses ``type::thing`` at ``DEFINE``, and 2.x reads
         ``type::record(table, key)`` as a type check that fails every signup.
 
+        The access statement is ``schema.access_statement()`` of the model's
+        :meth:`_access_parts` (v0.38.0), so a migration of the model's access writes the same
+        text.
+
         Args:
             overwrite: ``True`` (default) emits ``OVERWRITE`` — the model is the source of
                 truth, so re-running converges the database onto the code. ``False`` emits
@@ -441,11 +445,12 @@ class AuthenticatedUserMixin:
         """
         table = cls.get_table_name()  # type: ignore[attr-defined]
         validate_alias_name(table)
-        identifier = cls.get_identifier_field()
-        password = cls.get_password_field()
-        algorithm = cls._get_algorithm()
-        access = cls.get_access_name()
-        clause = "OVERWRITE" if overwrite else "IF NOT EXISTS"
+        # The checks of _access_parts() that come before the table's statements, in their order (each pure).
+        cls.get_identifier_field()
+        cls.get_password_field()
+        cls._get_algorithm()
+        cls.get_access_name()
+        clause: Literal["OVERWRITE", "IF NOT EXISTS"] = "OVERWRITE" if overwrite else "IF NOT EXISTS"
 
         statements: list[str] = []
         if with_table and cls._schemafull_access():
@@ -454,6 +459,30 @@ class AuthenticatedUserMixin:
             statements.extend(table_ddl)
         elif with_table:
             statements.append(cls._access_table_statement(table, clause))
+        statements.append(access_statement(cls._access_parts(), clause=clause))
+        return statements
+
+    @classmethod
+    def _access_parts(cls) -> AccessParts:
+        """The parts of this model's ``DEFINE ACCESS`` statement (v0.38.0): what :meth:`access_ddl` writes through
+        ``schema.access_statement()``, and what a migration of the model's access holds. Pure.
+
+        The checks of :meth:`access_ddl`, in its order: the table name, the identifier and password fields, the hashing
+        family, the access name, SG1 (a field SIGNUP writes that ``Field(exclude=True)`` keeps out of
+        ``model_dump()``, whatever the schema mode), the primary key SIGNUP binds, then the durations — the grant's
+        only with ``with_refresh``.
+
+        Raises:
+            TypeError: SG1 (``schema.signup_excluded_refused()``).
+            ValueError: an auth key naming no field of the model, an unknown hashing family or duration, a primary key
+                SIGNUP cannot bind.
+        """
+        table = cls.get_table_name()  # type: ignore[attr-defined]
+        validate_alias_name(table)
+        identifier = cls.get_identifier_field()
+        password = cls.get_password_field()
+        algorithm = cls._get_algorithm()
+        access = cls.get_access_name()
         # SG1 whatever the schema mode and with_table (#299): update() and upsert() would drop what SIGNUP wrote.
         cls._refuse_signup_fields_excluded()
 
@@ -465,7 +494,7 @@ class AuthenticatedUserMixin:
         # (#338), while the assignment gives the record id `<table>:<key>` on both lines and on
         # the embedded engine.
         primary_key = cls._signup_primary_key()
-        items = [] if primary_key is None else [f"id = ${primary_key}"]
+        signup_fields = {} if primary_key is None else {"id": f"${primary_key}"}
 
         # Column on the left of each assignment, bound variable on the right: the variable
         # keeps the Python name the caller passes as a keyword argument, while the column is
@@ -474,34 +503,24 @@ class AuthenticatedUserMixin:
         # `password_hash` — signin would then keep validating against a hash no ORM write ever
         # updates.
         to_column = cls.to_db_field  # type: ignore[attr-defined]
-        items += [
-            f"{to_column(name)} = crypto::{algorithm}::generate(${name})"
-            if name == password
-            else f"{to_column(name)} = ${name}"
-            for name in cls._signup_fields()
-        ]
-
-        parts = [
-            f"DEFINE ACCESS {clause} {access} ON DATABASE TYPE RECORD",
-            f"SIGNUP ( CREATE {table} SET {', '.join(items)} )",
-            f"SIGNIN ( SELECT * FROM {table} WHERE {to_column(identifier)} = ${identifier} "
-            f"AND crypto::{algorithm}::compare({to_column(password)}, ${password}) )",
-        ]
+        for name in cls._signup_fields():
+            signup_fields[to_column(name)] = f"crypto::{algorithm}::generate(${name})" if name == password else f"${name}"
 
         with_refresh = bool(cls._auth_setting("with_refresh", False))
-        if with_refresh:
-            parts.append("WITH REFRESH")
-
-        duration = (
-            f"DURATION FOR TOKEN {cls._auth_duration('auth_duration_token', '15m')}, "
-            f"FOR SESSION {cls._auth_duration('auth_duration_session', '12h')}"
+        duration_token = cls._auth_duration("auth_duration_token", "15m")
+        duration_session = cls._auth_duration("auth_duration_session", "12h")
+        return AccessParts(
+            name=access,
+            table=table,
+            signup_fields=signup_fields,
+            signin_where=(
+                f"{to_column(identifier)} = ${identifier} AND crypto::{algorithm}::compare({to_column(password)}, ${password})"
+            ),
+            duration_token=duration_token,
+            duration_session=duration_session,
+            duration_grant=cls._auth_duration("auth_duration_grant", "30d") if with_refresh else None,
+            with_refresh=with_refresh,
         )
-        if with_refresh:
-            duration += f", FOR GRANT {cls._auth_duration('auth_duration_grant', '30d')}"
-        parts.append(f"{duration};")
-
-        statements.append(" ".join(parts))
-        return statements
 
     @classmethod
     @_cache.invalidates("cls", records=False)
