@@ -499,9 +499,8 @@ class AccessParts:
     def __post_init__(self) -> None:
         """Keep a read-only copy of ``signup_fields``, its ``id`` item first."""
         fields = dict(self.signup_fields)
-        ordered = {"id": fields.pop("id")} if "id" in fields else {}
-        ordered.update(fields)
-        object.__setattr__(self, "signup_fields", MappingProxyType(ordered))
+        first = {"id": fields.pop("id")} if "id" in fields else {}
+        object.__setattr__(self, "signup_fields", MappingProxyType({**first, **fields}))
 
 
 def access_statement(
