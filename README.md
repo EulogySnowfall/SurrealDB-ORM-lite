@@ -1246,7 +1246,9 @@ a concurrent server).
 
 The model must declare either an `id` field or a `primary_key`, as every ORM model must. Prefer
 `id` here so the server mints the record id during SIGNUP; configure `primary_key` when identity
-_is_ a column, and the SIGNUP clause targets `type::thing(…)` to match.
+_is_ a column, and the SIGNUP clause sets the record id from it to match
+(`CREATE User SET id = $email, email = $email, …`): the same statement on SurrealDB 2.x, 3.x and the embedded engine,
+and the record id is the key on all of them.
 
 #### Configuration
 
@@ -4454,10 +4456,11 @@ reads, stores, logs or writes them.
   for a field without `TYPE`, as in the full ORM.
 - **Accesses are database-level**: they are in `schema.accesses`, and `TableState` has no `access` attribute; find
   a table's with `[a for a in schema.accesses.values() if a.table == "user"]`. `table`, `signup_fields` and
-  `signin_where` are read from `SIGNUP (CREATE <table> SET …)` (also `CREATE type::thing('<table>', …) SET …` and
-  `CREATE type::record('<table>', …) SET …`, the forms `define_access()` uses for a `primary_key`) and
-  `SIGNIN (SELECT … FROM <table> WHERE …)`. The full ORM reads the first form only, and another shape leaves them
-  empty, with field names unescaped; durations are kept as rendered, `'NONE'` included.
+  `signin_where` are read from `SIGNUP (CREATE <table> SET …)` (the form `define_access()` uses, whose
+  `id = $<key>` for a `primary_key` is one of the `signup_fields`; also `CREATE type::thing('<table>', …) SET …` and
+  `CREATE type::record('<table>', …) SET …`) and `SIGNIN (SELECT … FROM <table> WHERE …)`. The full ORM reads the
+  first form only, and another shape leaves them empty, with field names unescaped; durations are kept as rendered,
+  `'NONE'` included.
 - **`encrypted` is not provided**: the lite has no `Encrypted` type, so a hashing `VALUE`
   (`crypto::argon2::generate($value)`) stays in `FieldState.value` and the field is generated as a writable field.
 - **APIs and the GraphQL config are not typed**: their definitions are in `SchemaState.other["apis"]` and
@@ -6815,6 +6818,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Signing in as a system user while a record session is open                                                                             | permissions change, `$auth` still points at the record — only `invalidate()` clears it                                                                                        | 3.2.x: same as 2.x. **3.3.0**: the identity is cleared and `info()` returns `None`; `invalidate()` stays the portable log-out                                                       | v0.16.0                              |
 | Duplicate signin identifier in the record table                                                                                        | signin fails (`No record was returned`)                                                                                                                                       | signin succeeds, picking one record                                                                                                                                                 | v0.16.0                              |
 | Model auth (`signup`/`signin`/`authenticate`, `access_ddl`/`define_access`)                                                            | same on both lines (verified on 2.6.5)                                                                                                                                        | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.17.0                              |
+| Model auth with a `primary_key` (`access_ddl()`, `define_access()`)                                                                    | same on both lines: SIGNUP runs `CREATE <table> SET id = $<key>, …`, so the record id is the key (verified on 2.7.0)                                                          | same on both lines (verified on 3.3.4 and 3.1.5)                                                                                                                                    | v0.17.0                              |
 | Model auth session isolation (each call on its own ephemeral connection)                                                               | same on both lines (an SDK/connection property, not a server one)                                                                                                             | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.17.0                              |
 | Hydrated instance's password field after `signup`/`signin`                                                                             | holds the stored **hash**, never the plaintext                                                                                                                                | same on both lines                                                                                                                                                                  | v0.17.0                              |
 | Model config `with_refresh=True` → `define_access()`                                                                                   | raises `SurrealDbError` (clause does not parse; message names the 3.x requirement)                                                                                            | applies, and `AuthResult.tokens.refresh` is populated                                                                                                                               | v0.17.0                              |
