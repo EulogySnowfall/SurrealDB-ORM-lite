@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.4] - 2026-10-27
+
+Follow-up to the review of v0.37.0 (#340): the exact scan (`dist=`) of `similar_to()` and
+`hybrid_search()` now keeps the same records on every identical call on SurrealDB 2.x and the
+embedded engine. No new public API.
+
+### Fixed
+
+- **The exact scan keeps records at an equal distance by id below SurrealDB 3** (#341). On
+  SurrealDB 2.x and the embedded engine, the engine's own exact scan picks among the records at an
+  equal distance at the `limit`-th place in no fixed order, so identical calls of
+  `similar_to(dist=...)` and `hybrid_search(dist=...)` could return other records, and a page
+  (`offset()`/`limit()`) or a bulk write (`bulk_update()`, `bulk_delete()`, `patch()`) could take
+  others than the read. Below 3 the ORM now selects the nearest records first, ranked by distance
+  then id, and the KNN operator searches exactly those ids: each `_knn_distance` is still
+  `vector::distance::knn()`'s, and without a tie at the last place the records and distances are
+  those the scan alone returned. The read ends `ORDER BY _knn_distance, id` when its projection
+  reads `id`. The statement sent to SurrealDB 3.x, whose exact scan gives one answer, is unchanged.
+  An exact scan now reads the server line (once per client) even without another condition.
+
+### Changed
+
+- The README documents the exact scan's ties in section 37 (*What SurrealDB decides*) and section 38,
+  and in the "ORM behaviour: SurrealDB 2.x vs 3.x" table; the embedded engine's hybrid row says the
+  tied records are kept by id. The `v0.37.0` hybrid notebook no longer describes an exact scan that
+  changes between two identical calls.
+
+### Notes
+
+- `TestExactScanTiesE2E` now expects one answer on every engine. Measured on SurrealDB 2.7.0 and
+  3.3.4 over WebSocket and HTTP, and on the embedded engine; 3.1.5 behaves as 3.3.4.
+
 ## [0.37.2] - 2026-10-27
 
 A model with a `primary_key` can have its access defined on SurrealDB 3.x. No new public API.
