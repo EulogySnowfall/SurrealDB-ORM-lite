@@ -179,7 +179,7 @@ embedded engine), and fails with a clear message when the compaction outlasts it
 
 The documentation (``TestReadmeSection37``): README section 37 — its place after section 36, its seven subsections,
 its examples (run on ``mem://`` as written, each printed line equal to its comment; the search annotations' block
-printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences, the paragraph on the union spellings and thirteen "Coming from"
+printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its ten sentences, the paragraph on the union spellings and thirteen "Coming from"
 bullets word for word —, the eight rows of the 2.x/3.x table and the row of the embedded engine's, cell by cell within
 the tables' widths, the header sentence, and the features, roadmap and comparison rows. ``TestRoadmap36``:
 ``docs/ROADMAP.md`` records v0.36.0 as planned, or — once its Phase G row carries ✅ — as released.
@@ -6223,6 +6223,13 @@ _S37_PRECISION = (
     "Distances are computed in the index's `vector_type` (`F32` by default: single precision), so they can differ "
     "from Python's in the last digits; `dist=` computes in double precision."
 )
+#: What *What SurrealDB decides* says of the exact scan's records at an equal distance at the last place (v0.37.2).
+_S37_TIES = (
+    "SurrealDB 2.x's and the embedded engine's exact scan (`dist=`) picks among records at an equal distance at the "
+    "`limit`-th place in no fixed order, so there the ORM ranks it by distance, then id: identical calls return the "
+    "same records in the same order, the tied ones by id, and a page, a `Subquery` and the bulk writes take the same "
+    "records. SurrealDB 3.x's own scan gives one answer."
+)
 #: What *Type checkers* says of the union spellings of a vector field (issue #318).
 _S37_UNION = (
     "`VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or "
@@ -6234,7 +6241,7 @@ _S37_UNION = (
     "`None`, or two different `Vector` markers, has no single dimension: the class statement refuses it, naming the "
     "field, and `get_vector_info()` and `is_vector_field()` raise `ValueError` for such a field or annotation."
 )
-#: The nine sentences section 37 says word for word (whitespace normalised), with their subsection.
+#: The ten sentences section 37 says word for word (whitespace normalised), with their subsection.
 _SENTENCES_37 = [
     ("Declare and apply", _S37_TYPE),
     ("Type checkers", _S37_TYPED),
@@ -6245,6 +6252,7 @@ _SENTENCES_37 = [
     ("With other conditions", _S37_SCORES),
     ("What SurrealDB decides", _S37_APPROX),
     ("What SurrealDB decides", _S37_PRECISION),
+    ("What SurrealDB decides", _S37_TIES),
 ]
 #: What each part of section 37 says (key phrases, whitespace normalised); the intro under ``""``.
 _PART_NEEDLES_37 = {
@@ -6554,10 +6562,10 @@ class TestReadmeSection37:
         missing = [needle for needle in _PART_NEEDLES_37[heading] if needle not in text]
         assert not missing, missing
 
-    @pytest.mark.parametrize(("heading", "sentence"), _SENTENCES_37, ids=[f"s{index}" for index in range(1, 10)])
+    @pytest.mark.parametrize(("heading", "sentence"), _SENTENCES_37, ids=[f"s{index}" for index in range(1, 11)])
     def test_sentences_word_for_word(self, heading: str, sentence: str) -> None:
-        """Each of the nine sentences exactly once in its subsection, and nowhere else in the section."""
-        assert len(_SENTENCES_37) == 9
+        """Each of the ten sentences exactly once in its subsection, and nowhere else in the section."""
+        assert len(_SENTENCES_37) == 10
         assert _normalised(_part_37(heading)).count(sentence) == 1, sentence
         assert _normalised(_section_37()).count(sentence) == 1, sentence
 

@@ -54,7 +54,8 @@ the scan by distance then id, so the tied records kept are the first by id, in t
 The documentation (``TestReadmeSection38``, ``TestRoadmap37``), with no server: README section 38 — its place, its
 examples run as written on the embedded engine, each printed line equal to its comment, its texts word for word —, the
 bullets of sections 36 and 37 that point to it, the rows v0.37.0 adds to the features, roadmap, comparison and both
-behaviour tables; ``docs/ROADMAP.md`` recording v0.37.0 as planned or, once its Phase G row carries ✅, as released.
+behaviour tables, and v0.37.2's row of the exact scan's ties with its sentence; ``docs/ROADMAP.md`` recording v0.37.0 as
+planned or, once its Phase G row carries ✅, as released.
 """
 
 import ast
@@ -3221,11 +3222,11 @@ _BULLETS_38 = {
         "found in more than half the documents scores `0.0` on SurrealDB 3.x and below zero on 2.x and the embedded "
         "engine ([2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x)), so the full-text list, and the fused ranking with "
         "it, can differ between lines.",
-        "**An exact scan (`dist=`) on SurrealDB 2.x and the embedded engine** picks among records at an equal distance "
-        "at the `vector_limit`-th place in no fixed order, as `similar_to()`'s does: the vector list, and the fused "
-        "records with it, can change between two identical calls, and a page read with `offset()` and `limit()` can "
-        "then skip or repeat a record. The HNSW index (no `dist=`), and SurrealDB 3.x's exact scan, return the same "
-        "list on every call.",
+        "**An exact scan (`dist=`) returns the same vector list on every call**, on every line. SurrealDB 2.x's and the "
+        "embedded engine's own scan picks among records at an equal distance at the `vector_limit`-th place in no fixed "
+        "order, so there the ORM ranks it by distance, then id, as for `similar_to()` (section 37): the tied records are "
+        "kept by id, and a page read with `offset()` and `limit()` never skips nor repeats one. The HNSW index (no "
+        "`dist=`) returns the same list on every call too.",
         "Each search needs its index. Without a full-text index on `text_field`, SurrealDB 3.3, 2.x and the embedded "
         "engine refuse the search, and `hybrid_search()` raises `SurrealDbError` naming the field, as above; SurrealDB "
         "3.1 and 3.2 match nothing, so the vector list alone is fused.",
@@ -3258,8 +3259,7 @@ _BULLETS_38 = {
         "them on 2.x and the embedded engine; the full ORM calls `search::rrf()` with arguments SurrealDB 3.3 refuses, "
         "and runs on 3.x only.",
         "**Equal fused scores have a fixed order** (the vector list's first), so the same two lists always give the "
-        "same page; on SurrealDB 2.x and the embedded engine, an exact scan (`dist=`) can change the vector list itself "
-        "between two identical calls, as above.",
+        "same page, and an exact scan (`dist=`) gives the same vector list on every line, as above.",
         "**Checked before any request**: both fields, the vector, `vector_limit` and `text_limit` (1 to 10 000), "
         "`rrf_k` (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.",
         "**Reciprocal Rank Fusion only**: `search::linear()` (weights and score normalisation) is not offered yet.",
@@ -3279,8 +3279,8 @@ _HEADER_SENTENCE_37 = (
     "Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where "
     "they differ from 3.3.4."
 )
-#: Exactly the four rows v0.37.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths: the last
-#: documents ``similar_to(dist=…)`` too, whose behaviour is older (v0.36.0).
+#: Exactly the three rows v0.37.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths. Its fourth
+#: row, the exact scan's records at an equal distance, is v0.37.2's since the ORM ranks that scan below 3 (``_TIE_ROW``).
 _HYBRID_ROWS = [
     [
         "`hybrid_search()`: the fusion",
@@ -3303,20 +3303,26 @@ _HYBRID_ROWS = [
         "match no record for the text",
         "v0.37.0",
     ],
-    [
-        "An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at the last place",
-        "the scan picks among them in no fixed order: the records, and a page of them, can change between two identical "
-        "calls; the HNSW index (no `dist=`) returns the same ones",
-        "the same records on every call, as with the HNSW index",
-        "pre-existing (documented in v0.37.0)",
-    ],
 ]
+#: The row of the exact scan's records at an equal distance at the last place, rewritten by v0.37.2 (it documents
+#: ``similar_to(dist=…)`` too), and the sentence v0.37.2 adds to the table's intro.
+_TIE_ROW = [
+    "An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at the last place",
+    "the ORM ranks the scan by distance, then id: the same records on every call, the tied ones by id (2.x's own scan "
+    "picks among them in no fixed order)",
+    "the same records on every call, as with the HNSW index",
+    "v0.37.2",
+]
+_HEADER_SENTENCE_TIES = (
+    "The row added in v0.37.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
+    "identical on 3.1.5."
+)
 #: The row v0.37.0 adds to the embedded engine's table, cell by cell.
 _EMBEDDED_HYBRID_ROW = [
     "Hybrid search (v0.37.0)",
     "as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, "
-    "and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) picks among records at "
-    "an equal distance at the `vector_limit`-th place in no fixed order, as `similar_to(dist=…)` does",
+    "and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) keeps the records at an "
+    "equal distance at the `vector_limit`-th place by id (since v0.37.2), as `similar_to(dist=…)` does",
     "3.x fuses with `search::rrf()`, each list applying the conditions; its exact scan returns the same list",
     "v0.37.0",
 ]
@@ -3447,12 +3453,12 @@ class TestReadmeSection38:
         assert _prose(part) == _normalised(" ".join([f"#### {heading}", *(f"- {bullet}" for bullet in bullets)]))
 
     def test_the_pins_name_section_38(self) -> None:
-        """The README rows and sentence the line pins of this module name are the first and last rows and the "Search"
-        prose."""
+        """The README rows and sentence the line pins of this module name are the first row of v0.37.0, the row of
+        v0.37.2 and the "Search" prose."""
         row = _ROW_FUSION.removeprefix("README row '").removesuffix("'")
         assert row == _HYBRID_ROWS[0][0], row
         ties = _ROW_TIES.removeprefix("README row '").removesuffix("'")
-        assert ties == _HYBRID_ROWS[-1][0], ties
+        assert ties == _TIE_ROW[0], ties
         quoted = _S38_FORMULA.split(", '", 1)[1].removesuffix("'")
         assert _S38_RANKS.startswith(quoted), quoted
 
@@ -3495,12 +3501,18 @@ class TestReadmeSection38:
         assert [link for link in links if link not in anchors] == []
 
     def test_server_behaviour_rows(self) -> None:
-        """Exactly four rows, Since v0.37.0 (the last pre-existing, documented in v0.37.0), together and in version
-        order before the table's last row; the table keeps its widths."""
+        """Exactly three rows, Since v0.37.0, together and in version order before the table's last row; the table
+        keeps its widths."""
         assert_server_rows(_HYBRID_ROWS)
 
     def test_server_behaviour_header_sentence(self) -> None:
         assert_server_header_sentence(_HEADER_SENTENCE_37)
+
+    def test_the_exact_scan_row(self) -> None:
+        """v0.37.2's one row, the exact scan's records at an equal distance (``TestExactScanTiesE2E``), Since v0.37.2,
+        in version order before the table's last row, and its sentence in the table's intro."""
+        assert_server_rows([_TIE_ROW])
+        assert_server_header_sentence(_HEADER_SENTENCE_TIES)
 
     def test_embedded_table_row(self) -> None:
         """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
