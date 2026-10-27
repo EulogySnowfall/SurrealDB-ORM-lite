@@ -193,14 +193,14 @@ def _effective_table(current: TableState, target: TableState) -> TableState:
     if "schema_mode" in marks:
         changes["schema_mode"] = current.schema_mode
     if "table_type" in marks:
-        changes.update(
-            table_type=current.table_type,
-            relation_in=current.relation_in,
-            relation_out=current.relation_out,
-            enforced=current.enforced,
-        )
+        changes |= {
+            "table_type": current.table_type,
+            "relation_in": current.relation_in,
+            "relation_out": current.relation_out,
+            "enforced": current.enforced,
+        }
     if "changefeed" in marks:
-        changes.update(changefeed=current.changefeed, changefeed_include_original=current.changefeed_include_original)
+        changes |= {"changefeed": current.changefeed, "changefeed_include_original": current.changefeed_include_original}
     for key in ("drop", "comment", "permissions"):
         if key in marks:
             changes[key] = getattr(current, key)
@@ -223,19 +223,19 @@ def _effective_field(current: FieldState, target: FieldState) -> FieldState:
         if key in marks:
             changes[key] = getattr(current, key)
     if "reference" in marks:
-        changes.update(reference=current.reference, on_delete=current.on_delete)
+        changes |= {"reference": current.reference, "on_delete": current.on_delete}
     if "flexible" in marks:
         changes["flexible"] = target.flexible or (current.flexible and _holds_object(target.field_type))
     if target.server and (current.default is not None or current.value is not None or current.computed is not None):
-        changes.update(
-            default=current.default,
-            default_always=current.default_always,
-            value=current.value,
-            computed=current.computed,
-        )
+        changes |= {
+            "default": current.default,
+            "default_always": current.default_always,
+            "value": current.value,
+            "computed": current.computed,
+        }
     elif "computed" in marks and current.computed is not None:
         computed = target.value if target.value is not None else current.computed
-        changes.update(default=None, default_always=False, value=None, computed=computed)
+        changes |= {"default": None, "default_always": False, "value": None, "computed": computed}
     else:
         if "default" in marks:
             changes["default"] = current.default

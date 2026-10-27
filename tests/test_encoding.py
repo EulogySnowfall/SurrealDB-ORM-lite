@@ -1057,11 +1057,17 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
     return report
 
 
+def _package_modules() -> list[pathlib.Path]:
+    """The modules the boundary covers: ``src/surreal_orm_lite/*.py`` and the migrations package's (v0.38.0)."""
+    package = pathlib.Path(surreal_orm_lite.__file__).parent
+    return sorted([*package.glob("*.py"), *package.glob("migrations/*.py")])
+
+
 def _package_report() -> _BoundaryReport:
     report = _BoundaryReport()
     package = pathlib.Path(surreal_orm_lite.__file__).parent
-    for path in sorted(package.glob("*.py")):
-        report.add(_boundary_report(path.read_text(encoding="utf-8"), path.name))
+    for path in _package_modules():
+        report.add(_boundary_report(path.read_text(encoding="utf-8"), path.relative_to(package).as_posix()))
     return report
 
 
@@ -1283,9 +1289,10 @@ class TestBoundary:
         assert (report.inline, report.named, report.bare) == counts
 
     def test_encode_is_never_imported_by_name(self) -> None:
-        package = pathlib.Path(surreal_orm_lite.__file__).parent
         wrapping = []
-        for path in sorted(package.glob("*.py")):
+        for path in _package_modules():
+            # A module of the migrations package imports it one level up: ``from .. import encoding as _encoding``.
+            level = 2 if path.parent.name == "migrations" else 1
             tree = ast.parse(path.read_text(encoding="utf-8"), path.name)
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "encoding":
@@ -1296,7 +1303,7 @@ class TestBoundary:
                 wrapping.append(path.name)
                 assert any(
                     isinstance(node, ast.ImportFrom)
-                    and node.level == 1
+                    and node.level == level
                     and node.module is None
                     and any(alias.name == "encoding" and alias.asname == "_encoding" for alias in node.names)
                     for node in ast.walk(tree)
