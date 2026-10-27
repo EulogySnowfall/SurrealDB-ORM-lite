@@ -54,7 +54,7 @@ the scan by distance then id, so the tied records kept are the first by id, in t
 The documentation (``TestReadmeSection38``, ``TestRoadmap37``), with no server: README section 38 — its place, its
 examples run as written on the embedded engine, each printed line equal to its comment, its texts word for word —, the
 bullets of sections 36 and 37 that point to it, the rows v0.37.0 adds to the features, roadmap, comparison and both
-behaviour tables, and v0.37.2's row of the exact scan's ties with its sentence; ``docs/ROADMAP.md`` recording v0.37.0 as
+behaviour tables, and v0.37.4's row of the exact scan's ties with its sentence; ``docs/ROADMAP.md`` recording v0.37.0 as
 planned or, once its Phase G row carries ✅, as released.
 """
 
@@ -3280,7 +3280,7 @@ _HEADER_SENTENCE_37 = (
     "they differ from 3.3.4."
 )
 #: Exactly the three rows v0.37.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths. Its fourth
-#: row, the exact scan's records at an equal distance, is v0.37.2's since the ORM ranks that scan below 3 (``_TIE_ROW``).
+#: row, the exact scan's records at an equal distance, is v0.37.4's since the ORM ranks that scan below 3 (``_TIE_ROW``).
 _HYBRID_ROWS = [
     [
         "`hybrid_search()`: the fusion",
@@ -3304,17 +3304,17 @@ _HYBRID_ROWS = [
         "v0.37.0",
     ],
 ]
-#: The row of the exact scan's records at an equal distance at the last place, rewritten by v0.37.2 (it documents
-#: ``similar_to(dist=…)`` too), and the sentence v0.37.2 adds to the table's intro.
+#: The row of the exact scan's records at an equal distance at the last place, rewritten by v0.37.4 (it documents
+#: ``similar_to(dist=…)`` too), and the sentence v0.37.4 adds to the table's intro.
 _TIE_ROW = [
     "An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at the last place",
     "the ORM ranks the scan by distance, then id: the same records on every call, the tied ones by id (2.x's own scan "
     "picks among them in no fixed order)",
     "the same records on every call, as with the HNSW index",
-    "v0.37.2",
+    "v0.37.4",
 ]
 _HEADER_SENTENCE_TIES = (
-    "The row added in v0.37.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
+    "The row added in v0.37.4 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, "
     "identical on 3.1.5."
 )
 #: The row v0.37.0 adds to the embedded engine's table, cell by cell.
@@ -3322,7 +3322,7 @@ _EMBEDDED_HYBRID_ROW = [
     "Hybrid search (v0.37.0)",
     "as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, "
     "and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) keeps the records at an "
-    "equal distance at the `vector_limit`-th place by id (since v0.37.2), as `similar_to(dist=…)` does",
+    "equal distance at the `vector_limit`-th place by id (since v0.37.4), as `similar_to(dist=…)` does",
     "3.x fuses with `search::rrf()`, each list applying the conditions; its exact scan returns the same list",
     "v0.37.0",
 ]
@@ -3454,7 +3454,7 @@ class TestReadmeSection38:
 
     def test_the_pins_name_section_38(self) -> None:
         """The README rows and sentence the line pins of this module name are the first row of v0.37.0, the row of
-        v0.37.2 and the "Search" prose."""
+        v0.37.4 and the "Search" prose."""
         row = _ROW_FUSION.removeprefix("README row '").removesuffix("'")
         assert row == _HYBRID_ROWS[0][0], row
         ties = _ROW_TIES.removeprefix("README row '").removesuffix("'")
@@ -3509,7 +3509,7 @@ class TestReadmeSection38:
         assert_server_header_sentence(_HEADER_SENTENCE_37)
 
     def test_the_exact_scan_row(self) -> None:
-        """v0.37.2's one row, the exact scan's records at an equal distance (``TestExactScanTiesE2E``), Since v0.37.2,
+        """v0.37.4's one row, the exact scan's records at an equal distance (``TestExactScanTiesE2E``), Since v0.37.4,
         in version order before the table's last row, and its sentence in the table's intro."""
         assert_server_rows([_TIE_ROW])
         assert_server_header_sentence(_HEADER_SENTENCE_TIES)

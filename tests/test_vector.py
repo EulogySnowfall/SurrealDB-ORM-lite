@@ -6223,7 +6223,7 @@ _S37_PRECISION = (
     "Distances are computed in the index's `vector_type` (`F32` by default: single precision), so they can differ "
     "from Python's in the last digits; `dist=` computes in double precision."
 )
-#: What *What SurrealDB decides* says of the exact scan's records at an equal distance at the last place (v0.37.2).
+#: What *What SurrealDB decides* says of the exact scan's records at an equal distance at the last place (v0.37.4).
 _S37_TIES = (
     "SurrealDB 2.x's and the embedded engine's exact scan (`dist=`) picks among records at an equal distance at the "
     "`limit`-th place in no fixed order, so there the ORM ranks it by distance, then id: identical calls return the "
