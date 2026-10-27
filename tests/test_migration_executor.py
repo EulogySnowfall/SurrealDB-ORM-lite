@@ -1,4 +1,4 @@
-"""Migration system (v0.38.0): ``MigrationExecutor.migrate()`` — applying migrations atomically.
+"""Migration system (v0.38.0): ``MigrationExecutor`` — applying migrations atomically, rolling them back, upgrading.
 
 ``migrate()`` (spec §5.6) loads and orders the migration files, ensures the tracking table ``_surreal_orm_migrations``,
 reads the applied names and checks the history, then reads the database's schema **once** (``DatabaseIntrospector``),
@@ -9,16 +9,26 @@ the definitions the database held when phase B fails (D38). A failed batch is re
 (``TestBatchStatus``: envelopes recorded on 3.3.4, 2.7.0 and the embedded engine), and the tracking table is read again
 before anything else is decided: a concurrent run may have applied the migration, or the answer may have been lost.
 
-Unit: ``TestBatchStatus``, ``TestLine``, ``TestCompensationUnit`` (a fake client replaying envelopes, a hand-built read).
-E2E — the line under test over WebSocket and HTTP, and the embedded engine, each test in a database of its own
-(``migration_database()``, spec §9.2): ``TestMigrateE2E`` (AC-8, AC-13), ``TestSchemaAnchorE2E`` (AC-8 bis's
-hand-written part, AC-29's ``migrate()`` part), ``TestAtomicityE2E`` (AC-9), ``TestAnalyzerPhaseE2E`` (AC-10),
-``TestCompensationE2E`` (AC-9, AC-9 +), ``TestConcurrencyE2E`` (AC-14), ``TestCacheE2E`` (AC-21),
-``TestNoStatementLeakE2E`` (AC-22). Each E2E test chooses its expectation per line from ``cached_major()``; none skips.
+``rollback()`` reads the schema once too, rewinds it migration by migration (``Operation.state_backwards()``) and renders
+every backwards from those states: phase A restores analyzer definitions, phase B deletes the tracking record first and
+runs the other backwards in reverse order. ``upgrade()`` and ``migrate(schema_only=False)`` run the data operations
+(phase C); ``get_migration_status()`` lists every file and never raises on the history.
+
+Unit: ``TestBatchStatus``, ``TestLine``, ``TestCompensationUnit``, ``TestRollbackUnit``, ``TestDataUnit`` (a fake
+client replaying envelopes, a hand-built read). E2E — the line under test over WebSocket and HTTP, and the embedded
+engine, each test in a database of its own (``migration_database()``, spec §9.2): ``TestMigrateE2E`` (AC-8, AC-13),
+``TestSchemaAnchorE2E`` (AC-8 bis's hand-written part, AC-29's ``migrate()`` part), ``TestAtomicityE2E`` (AC-9),
+``TestAnalyzerPhaseE2E`` (AC-10), ``TestCompensationE2E`` (AC-9, AC-9 +), ``TestConcurrencyE2E`` (AC-14),
+``TestCacheE2E`` (AC-21), ``TestNoStatementLeakE2E`` (AC-22), ``TestRollbackE2E`` (AC-11, AC-18); over WebSocket and
+the embedded engine only: ``TestRollbackStatesE2E`` (AC-11), ``TestReversibleE2E`` (AC-12),
+``TestRollbackCompensationE2E`` (AC-9's rollback part), ``TestEventsAndFunctionsE2E`` (AC-27), ``TestDataE2E`` (AC-15,
+AC-18), ``TestStatusE2E`` (AC-13, AC-18). Each E2E test chooses its expectation per line from ``cached_major()``; none
+skips.
 """
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import sys
@@ -49,8 +59,12 @@ from surreal_orm_lite.migrations import (
     CreateIndex,
     CreateTable,
     DataMigration,
+    DefineAccess,
     DefineAnalyzer,
+    DefineEvent,
+    DefineFunction,
     DropField,
+    DropIndex,
     DropTable,
     Migration,
     MigrationExecutor,
@@ -59,6 +73,10 @@ from surreal_orm_lite.migrations import (
     Operation,
     RawSQL,
     RebuildIndex,
+    RemoveAccess,
+    RemoveAnalyzer,
+    RemoveEvent,
+    RemoveFunction,
     introspect_models,
     makemigrations,
 )
@@ -77,6 +95,7 @@ from tests.test_migration_diff import _MODEL_SET, MiBare, MiCommented, MiServer
 from tests.test_migration_operations import (
     _R33_LINES,
     R33,
+    R33_REVERSE,
     AdRefresh,
     AdUserTable,
     MigLikes,
@@ -832,6 +851,368 @@ class TestMigrateArguments:
         assert str(raised.value) == f"Unknown migration target '0009_x': no such migration file in {tmp_path}."
 
 
+# === rollback(), upgrade(), data operations, get_migration_status() ==================================================
+
+_UNRECORD = f"DELETE `{MIGRATIONS_TABLE}` WHERE name = $surreal_orm_migration;"
+_KEPT_ROLLBACK = "Its analyzer definitions, committed first, were kept: retry rollback()."
+#: ``english`` as the database held it before ``_rollback_pair()``'s second migration (its ``previous=``).
+_ENGLISH_BEFORE = DefineAnalyzer("english", ["class"], ["uppercase"])
+
+
+def _rolled_back_warning(name: str, cause: str) -> str:
+    return (
+        f"Migration {name} is no longer recorded as applied although this run's batch failed ({cause}): a concurrent "
+        "run rolled it back, or the answer was lost; skipped."
+    )
+
+
+def _rollback_pair(directory: Path) -> tuple[str, str]:
+    """``0001_a`` creates ``doc``; ``0002_b`` redefines ``english`` (``previous=``), adds a field and holds a data
+    migration whose ``backwards_sql`` throws — rolled back: phase A, then the ``DELETE`` and two statements."""
+    first = _write(directory, "a", [CreateTable("doc", "SCHEMALESS")])
+    second = _write(
+        directory,
+        "b",
+        [
+            DefineAnalyzer("english", ["blank"], ["lowercase"], previous=_ENGLISH_BEFORE),
+            AddField("doc", "a", "int"),
+            DataMigration(forwards_sql="UPDATE doc SET a = 1;", backwards_sql="THROW 'x';"),
+        ],
+        [first],
+    )
+    return first, second
+
+
+def _read_applied() -> SchemaState:
+    """The unit tests' read with ``_rollback_pair()``'s two migrations applied: ``doc`` holds ``a``; ``english`` is the
+    database's definition."""
+    fields = {"a": FieldState("a", "int", table="doc")}
+    return SchemaState({"doc": TableState("doc", "SCHEMALESS", "normal", fields=fields)}, analyzers={"english": _ENGLISH_READ})
+
+
+def _recording(answers: Sequence[_Answer], *recorded: str, version: str = "surrealdb-3.3.4") -> _FakeClient:
+    """A fake client whose tracking table records *recorded*."""
+    client = _FakeClient(answers, version=version)
+    client.recorded = list(recorded)
+    return client
+
+
+def _restoring() -> str:
+    restoring = DefineAnalyzer.from_analyzer_state(_ENGLISH_READ)
+    assert restoring is not None
+    return restoring.forwards()
+
+
+class TestRollbackUnit:
+    """Spec §5.6 ``rollback()``, §7 E-X3, D38: each migration undone in phase A — the analyzer definitions its
+    backwards restore (``previous=``) — then phase B — the record's ``DELETE`` first, then every other backwards in
+    reverse order, a ``DataMigration``'s ``backwards_sql`` in its position —, all rendered from the read rewound; a
+    failure handled as ``migrate()``'s, with the rollback's texts; phase A's compensation restores the definition the
+    database held with the migration applied."""
+
+    async def test_the_batches_and_the_compensation(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        first, second = _rollback_pair(tmp_path)
+        client = _recording([_ok(1), _thrown(3, 1), _ok(1)], first, second)
+        _offline(monkeypatch, client, _read_applied())
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).rollback(first)
+        assert _sent(client.sent[0]) == [_ENGLISH_BEFORE.forwards()]
+        assert _sent(client.sent[1]) == [_UNRECORD, "THROW 'x';", "REMOVE FIELD IF EXISTS `a` ON `doc`;"]
+        assert _sent(client.sent[2]) == [_restoring()]
+        assert str(raised.value) == (
+            f"Rollback of migration '{second}' failed at operation 3 of 3 (Data migration): An error occurred: x {_RESTORED}"
+        )
+        error = raised.value
+        assert (error.migration, error.operation, error.description, error.analyzers_restored) == (
+            second,
+            3,
+            "Data migration",
+            True,
+        )
+
+    async def test_a_refused_compensation_keeps_the_restored_definitions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        first, second = _rollback_pair(tmp_path)
+        refused = {"result": [_OK, _err_3("The analyzer is locked"), _ABORTED_3]}
+        client = _recording([_ok(1), _thrown(3, 1), refused], first, second)
+        _offline(monkeypatch, client, _read_applied())
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).rollback(first)
+        assert str(raised.value) == (
+            f"Rollback of migration '{second}' failed at operation 3 of 3 (Data migration): An error occurred: x The "
+            "analyzer definitions it committed first could not be restored (The analyzer is locked): 'english' keep the "
+            "definitions this rollback restored; run schema_diff() to see them."
+        )
+        assert raised.value.analyzers_restored is False
+
+    async def test_a_conflict_is_retryable_and_never_compensated(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        first, second = _rollback_pair(tmp_path)
+        client = _recording([_ok(1), _conflicted(3)], first, second)
+        _offline(monkeypatch, client, _read_applied())
+        with pytest.raises(SurrealDbConflictError) as raised:
+            await MigrationExecutor(tmp_path).rollback(first)
+        assert not isinstance(raised.value, MigrationStatementError)
+        assert str(raised.value) == (
+            f"Migration '{second}' was not rolled back: a concurrent transaction conflicted (retryable): "
+            f"{_CONFLICT_COMMIT_3['result']} {_KEPT_ROLLBACK}"
+        )
+        assert len(client.sent) == 2
+
+    async def test_a_refused_delete_is_reported(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        first, second = _rollback_pair(tmp_path)
+        refused = {"result": [_OK, _err_3("Not enough permissions"), _CANCELLED_3, _CANCELLED_3, _ABORTED_3]}
+        client = _recording([_ok(1), refused, _ok(1)], first, second)
+        _offline(monkeypatch, client, _read_applied())
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).rollback(first)
+        assert str(raised.value) == (
+            f"Migration '{second}' could not be recorded as rolled back: Not enough permissions {_RESTORED}"
+        )
+        assert (raised.value.operation, raised.value.analyzers_restored) == (None, True)
+
+    async def test_a_refused_batch_without_phase_a(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        first = _write(tmp_path, "a", [CreateTable("doc", "SCHEMALESS"), CreateTable("log", "SCHEMALESS")])
+        client = _recording([_thrown(3, 2)], first)
+        _offline(monkeypatch, client, SchemaState())
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).rollback("")
+        assert _sent(client.sent[0]) == [_UNRECORD, "REMOVE TABLE IF EXISTS `log`;", "REMOVE TABLE IF EXISTS `doc`;"]
+        assert str(raised.value) == (
+            f"Rollback of migration '{first}' failed at operation 1 of 2 (Create table doc): An error occurred: x"
+        )
+        assert (raised.value.operation, raised.value.analyzers_restored) == (1, None)
+
+    @pytest.mark.parametrize("cause", ["a conflict", "a refusal"])
+    async def test_no_longer_recorded_after_the_failure_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, cause: str
+    ) -> None:
+        first, second = _rollback_pair(tmp_path)
+
+        def rolled_back_meanwhile(client: _FakeClient) -> Any:
+            client.recorded.remove(second)
+            return _conflicted(3) if cause == "a conflict" else _thrown(3, 1)
+
+        client = _recording([_ok(1), rolled_back_meanwhile], first, second)
+        _offline(monkeypatch, client, _read_applied())
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        assert await MigrationExecutor(tmp_path).rollback(first) == []
+        assert _rolled_back_warning(second, cause) in caplog.messages
+        assert f"Rolled back: {second}" not in caplog.messages
+        assert len(client.sent) == 2
+
+    async def test_a_lost_answer_no_longer_recorded_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        first, second = _rollback_pair(tmp_path)
+
+        def lost(client: _FakeClient) -> Any:
+            client.recorded.remove(second)
+            return ConnectionError("the answer was lost")
+
+        client = _recording([_ok(1), lost], first, second)
+        _offline(monkeypatch, client, _read_applied())
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        assert await MigrationExecutor(tmp_path).rollback(first) == []
+        assert _rolled_back_warning(second, "a lost answer") in caplog.messages
+
+    async def test_a_lost_answer_still_recorded_compensates_then_propagates(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        first, second = _rollback_pair(tmp_path)
+        error = ConnectionError("the answer was lost")
+        client = _recording([_ok(1), error, _ok(1)], first, second)
+        _offline(monkeypatch, client, _read_applied())
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        with pytest.raises(ConnectionError) as raised:
+            await MigrationExecutor(tmp_path).rollback(first)
+        assert raised.value is error
+        assert _sent(client.sent[2]) == [_restoring()]
+        assert f"Migration {second}: {_RESTORED}" in caplog.messages
+
+    @pytest.mark.parametrize(
+        ("operation", "issue"),
+        [
+            (
+                DefineAnalyzer("english", ["blank"], previous=_ENGLISH_BEFORE),
+                SchemaIssue("analyzer", "english", None, "unreadable"),
+            ),
+            (RemoveAnalyzer("english", previous=_ENGLISH_BEFORE), SchemaIssue("section", "analyzers", None, "unreadable")),
+        ],
+        ids=["define", "remove"],
+    )
+    async def test_an_unrestorable_definition_refuses_before_any_ddl(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: Operation, issue: SchemaIssue
+    ) -> None:
+        name = _write(tmp_path, "a", [CreateTable("doc", "SCHEMALESS"), operation])
+        client = _recording([], name)
+        _offline(monkeypatch, client, SchemaState(issues=[issue]))
+        with pytest.raises(SurrealDbError) as raised:
+            await MigrationExecutor(tmp_path).rollback("")
+        assert str(raised.value) == (
+            f"Migration '{name}', operation 2 ({operation.describe()}): the database's definition of analyzer "
+            "'english' cannot be read or written by the ORM, so it could not be restored if the migration failed; "
+            "nothing was applied. Redefine the analyzer in a form search.Analyzer accepts (by hand, or with "
+            "define_indexes()), then run the call again."
+        )
+        assert client.sent == []
+
+    async def test_a_removed_analyzer_is_compensated_by_its_removal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        name = _write(tmp_path, "a", [RemoveAnalyzer("english", previous=_ENGLISH_BEFORE), RawSQL("UPDATE a;", "THROW 'x';")])
+        client = _recording([_ok(1), _thrown(2, 1), _ok(1)], name)
+        _offline(monkeypatch, client, SchemaState())
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).rollback("")
+        assert _sent(client.sent[0]) == [_ENGLISH_BEFORE.forwards()]
+        assert _sent(client.sent[2]) == ["REMOVE ANALYZER IF EXISTS `english`;"]
+        assert raised.value.analyzers_restored is True
+
+    @pytest.mark.parametrize("version", ["surrealdb-2.7.0", "surrealdb-3.3.4"])
+    async def test_the_backwards_render_from_the_read_rewound(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, version: str
+    ) -> None:
+        """D35: the read holds ``t``'s columns — no migration file defines them —, so on line 2 the backwards that
+        restores ``SCHEMAFULL`` redefines them ``FLEXIBLE`` (R33's lines); on line 3 the table statement comes alone."""
+        name = _write(tmp_path, "schemaless", [R33_REVERSE])
+        line = 3 if version.startswith("surrealdb-3") else 2
+        lines = _R33_LINES if line == 2 else _R33_LINES[:1]
+        client = _recording([_ok(1 + len(lines), line=line)], name, version=version)
+        _offline(monkeypatch, client, _read_t())
+        assert await MigrationExecutor(tmp_path).rollback("") == [name]
+        assert _sent(client.sent[0]) == [_UNRECORD, *lines]
+
+    async def test_an_irreversible_migration_refuses_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        first = _write(tmp_path, "a", [CreateTable("doc", "SCHEMALESS")])
+        second = _write(tmp_path, "b", [CreateTable("x", "SCHEMALESS"), DropTable("x")], [first])
+        client = _recording([], first, second)
+        _offline(monkeypatch, client, SchemaState())
+        with pytest.raises(ValueError) as raised:
+            await MigrationExecutor(tmp_path).rollback("")
+        assert str(raised.value) == f"Migration {second} is not reversible: operation 2 (Drop table x) cannot be rolled back."
+        assert client.sent == []
+
+    async def test_a_target_that_is_not_a_str(self, tmp_path: Path) -> None:
+        with pytest.raises(TypeError) as raised:
+            await MigrationExecutor(tmp_path).rollback(None)  # type: ignore[arg-type]
+        assert str(raised.value) == (
+            "rollback(): target must be a str — a migration name, or '' to roll back every migration —, not NoneType."
+        )
+
+    async def test_a_data_migration_without_a_backwards_function(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        name = _write(
+            tmp_path,
+            "a",
+            [
+                CreateTable("doc", "SCHEMALESS"),
+                DataMigration(forwards_sql="UPDATE doc SET a = 1;", backwards_sql="UPDATE doc SET a = 0;"),
+            ],
+        )
+        client = _recording([_ok(3)], name)
+        _offline(monkeypatch, client, SchemaState())
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        assert await MigrationExecutor(tmp_path).rollback("") == [name]
+        assert _sent(client.sent[0]) == [_UNRECORD, "UPDATE doc SET a = 0;", "REMOVE TABLE IF EXISTS `doc`;"]
+        assert caplog.messages == [f"Rolling back: {name}", f"Rolled back: {name}"]
+
+    async def test_one_compensation_per_analyzer_name(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Two operations of one migration on the same analyzer: one restoring statement, named after the first."""
+        name = _write(
+            tmp_path,
+            "a",
+            [
+                DefineAnalyzer("english", ["blank"], ["lowercase"], previous=_ENGLISH_BEFORE),
+                DefineAnalyzer("english", ["blank"], ["ascii"], previous=DefineAnalyzer("english", ["blank"], ["lowercase"])),
+                RawSQL("UPDATE a;", "THROW 'x';"),
+            ],
+        )
+        client = _recording([_ok(2), _thrown(2, 1), _ok(1)], name)
+        _offline(monkeypatch, client, SchemaState(analyzers={"english": _ENGLISH_READ}))
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).rollback("")
+        assert _sent(client.sent[2]) == [_restoring()]
+        assert raised.value.analyzers_restored is True
+
+
+class TestDataUnit:
+    """Spec §5.6 phase C, §7 E-X5: the data operations' SQL in one batch, then their functions; a refusal names the
+    operation; a batch refused as a whole names none."""
+
+    async def test_a_refused_statement_names_its_operation(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        name = _write(
+            tmp_path,
+            "a",
+            [
+                CreateTable("doc", "SCHEMALESS"),
+                DataMigration(forwards_sql="UPDATE doc SET a = 1;", description="Set a"),
+                DataMigration(forwards_sql="THROW 'x';", description="Throw"),
+            ],
+        )
+        client = _recording([_thrown(2, 1)], name)
+        _offline(monkeypatch, client, SchemaState())
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).upgrade()
+        assert _sent(client.sent[0]) == ["UPDATE doc SET a = 1;", "THROW 'x';"]
+        assert str(raised.value) == f"Data migration of '{name}' failed at operation 3 of 3 (Throw): An error occurred: x"
+        assert (raised.value.migration, raised.value.operation, raised.value.description) == (name, 3, "Throw")
+
+    async def test_a_batch_refused_as_a_whole(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        name = _write(tmp_path, "a", [DataMigration(forwards_sql="UPDATE doc SET a = 1;")])
+        client = _recording([{"result": [_err_3("x")]}], name)
+        _offline(monkeypatch, client, SchemaState())
+        with pytest.raises(MigrationStatementError) as raised:
+            await MigrationExecutor(tmp_path).upgrade()
+        assert str(raised.value) == f"Migration '{name}' was refused by SurrealDB: x"
+        assert raised.value.operation is None
+
+    async def test_upgrade_with_an_unknown_target(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _write(tmp_path, "a", [CreateTable("t")])
+
+        async def no_client(self: MigrationExecutor) -> Any:
+            raise AssertionError("no request expected")
+
+        monkeypatch.setattr(MigrationExecutor, "_client", no_client)
+        with pytest.raises(ValueError) as raised:
+            await MigrationExecutor(tmp_path).upgrade(target="0009_x")
+        assert str(raised.value) == f"Unknown migration target '0009_x': no such migration file in {tmp_path}."
+
+    async def test_a_function_alone_sends_no_batch(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A ``DataMigration`` holding only a function sends no SQL; the function runs inside ``using()`` of the
+        executor's connection (it records the active connection name next to its file)."""
+        name = "0001_data"
+        (tmp_path / f"{name}.py").write_text(_FUNCTION_FILE.format(name=name), encoding="utf-8")
+        SurrealDBConnectionManager.add_connection(
+            "du_other", url="ws://localhost:1/rpc", user="root", password="root", namespace="ns", database="db"
+        )
+        client = _recording([], name)
+        _offline(monkeypatch, client, SchemaState())
+        assert await MigrationExecutor(tmp_path, connection="du_other").upgrade() == [name]
+        assert client.sent == []
+        assert (tmp_path / f"{name}.ran").read_text(encoding="utf-8") == "du_other"
+
+
+#: A hand-written migration whose only operation is a data function: it writes the active connection's name to
+#: ``<file>.ran``.
+_FUNCTION_FILE = """from pathlib import Path
+
+from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite.migrations import Migration
+from surreal_orm_lite.migrations.operations import DataMigration
+
+
+async def forwards() -> None:
+    Path(__file__).with_suffix(".ran").write_text(str(SurrealDBConnectionManager.get_active_connection_name()), encoding="utf-8")
+
+
+migration = Migration(name={name!r}, operations=[DataMigration(forwards_func=forwards)])
+"""
+
+
 # === E2E: the line under test over WebSocket and HTTP, and the embedded engine ========================================
 
 #: The engines every E2E class runs on.
@@ -1473,3 +1854,663 @@ class TestNoStatementLeakE2E:
             assert "Parse error" in str(raised.value)
             for text in (str(raised.value), repr(raised.value), caplog.text, *map(repr, operations)):
                 assert _MARKER not in text
+
+
+# --- E2E: rollback(), upgrade(), the data operations, get_migration_status() -----------------------------------------
+
+#: The engines of the rollback, data and status classes but ``TestRollbackE2E``: WebSocket, and the embedded engine.
+_WS_KINDS = ["ws", "mem"]
+
+
+def _rolled_back_logs(*names: str) -> list[str]:
+    return [message for name in names for message in (f"Rolling back: {name}", f"Rolled back: {name}")]
+
+
+class TestRollbackE2E:
+    """AC-11, AC-18 (``rollback()``'s part): ``rollback(<first>)`` undoes the later migrations, newest first — their
+    definitions and tracking records gone —, ``rollback("")`` every one; an irreversible migration, a target not
+    applied, an applied name without a file and an applied migration whose dependency is pending refuse before any
+    DDL; a definition removed by hand meanwhile still rolls back (``REMOVE … IF EXISTS``)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_back_to_the_first_then_all(self, kind: str, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "a", [CreateTable("rb_a", "SCHEMAFULL"), AddField("rb_a", "name", "string")])
+            second = _write(
+                tmp_path,
+                "b",
+                [CreateTable("rb_b", "SCHEMALESS"), AddField("rb_b", "n", "int"), CreateIndex("rb_b", "rb_n", ["n"])],
+                [first],
+            )
+            third = _write(tmp_path, "c", [AddField("rb_a", "age", "int")], [second])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second, third]
+            caplog.set_level(logging.INFO, logger=_LOGGER)
+            assert await executor.rollback(first) == [third, second]
+            assert caplog.messages == _rolled_back_logs(third, second)
+            assert await executor.get_applied_migrations() == [first]
+            assert "rb_b" not in await _tables(client)
+            assert set(await _fields(client, "rb_a")) == {"name"}
+            caplog.clear()
+            assert await executor.rollback(first) == []
+            assert caplog.messages == ["No migrations to rollback."]
+            assert await executor.rollback("") == [first]
+            assert await executor.get_applied_migrations() == []
+            assert not {"rb_a", "rb_b"} & await _tables(client)
+            assert await executor.migrate() == [first, second, third]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_irreversible_migration_refuses_before_any_ddl(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "a", [CreateTable("rb_x", "SCHEMALESS"), CreateTable("rb_y", "SCHEMALESS")])
+            second = _write(tmp_path, "b", [AddField("rb_x", "n", "int"), DropTable("rb_y")], [first])
+            third = _write(tmp_path, "c", [AddField("rb_x", "m", "int")], [second])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second, third]
+            before = await _info_db(client)
+            fields = await _fields(client, "rb_x")
+            reads = _read_spy(monkeypatch)
+            with pytest.raises(ValueError) as raised:
+                await executor.rollback("")
+            assert str(raised.value) == (
+                f"Migration {second} is not reversible: operation 2 (Drop table rb_y) cannot be rolled back."
+            )
+            assert reads == []
+            assert await _info_db(client) == before
+            assert await _fields(client, "rb_x") == fields
+            assert await executor.get_applied_migrations() == [first, second, third]
+            assert await executor.rollback(second) == [third]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_target_that_is_not_applied(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            first = _write(tmp_path, "a", [CreateTable("rb_t", "SCHEMALESS")])
+            second = _write(tmp_path, "b", [AddField("rb_t", "n", "int")], [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first) == [first]
+            for target in (second, "0009_x"):
+                with pytest.raises(ValueError) as raised:
+                    await executor.rollback(target)
+                assert str(raised.value) == f"Cannot roll back to {target!r}: it is not applied."
+            assert await executor.get_applied_migrations() == [first]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_applied_name_without_a_file_refuses_before_any_ddl(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "a", [CreateTable("rb_f", "SCHEMALESS")])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first]
+            await _record(client, "0099_gone")
+            before = await _info_db(client)
+            with pytest.raises(FileNotFoundError) as raised:
+                await executor.rollback("")
+            assert str(raised.value) == f"Migration file not found: {tmp_path / '0099_gone.py'}"
+            assert await _info_db(client) == before
+            assert await executor.get_applied_migrations() == [first, "0099_gone"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_applied_migration_whose_dependency_is_pending(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "a", [CreateTable("rb_d", "SCHEMALESS")])
+            second = _write(tmp_path, "b", [CreateTable("rb_e", "SCHEMALESS")], [first])
+            executor = MigrationExecutor(tmp_path)
+            await executor.ensure_migrations_table()
+            await _record(client, second)
+            before = await _info_db(client)
+            with pytest.raises(ValueError) as raised:
+                await executor.rollback("")
+            assert str(raised.value) == (
+                f"Migration '{second}' is applied but its dependency '{first}' is not: the database's history does not "
+                f"match {tmp_path}."
+            )
+            assert await _info_db(client) == before
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_creation_removed_by_hand_still_rolls_back(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(
+                tmp_path,
+                "a",
+                [CreateTable("rb_h", "SCHEMALESS"), AddField("rb_h", "n", "int"), CreateIndex("rb_h", "rb_hn", ["n"])],
+            )
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first]
+            await _run(client, "REMOVE TABLE rb_h;")
+            assert await executor.rollback("") == [first]
+            assert await executor.get_applied_migrations() == []
+            assert "rb_h" not in await _tables(client)
+
+
+class RsLoose(BaseSurrealModel):
+    """A SCHEMALESS model with an ``Any`` column: ``define_table()`` adds ``bag TYPE any`` to ``rs_t``, outside every
+    migration."""
+
+    model_config = SurrealConfigDict(table_name="rs_t", schema_mode=SchemaMode.SCHEMALESS)
+
+    id: str | None = None
+    bag: Any = None
+
+
+def _send_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The text of every batch the executor sends; the real batch is sent."""
+    texts: list[str] = []
+    real = executor_module._send
+
+    async def spy(client: Any, batch: "executor_module._Batch", line: int, name: str | None) -> Any:
+        texts.append(batch.text())
+        return await real(client, batch, line, name)
+
+    monkeypatch.setattr(executor_module, "_send", spy)
+    return texts
+
+
+class TestRollbackStatesE2E:
+    """C8, D35 (AC-11): a rollback reads the database's schema exactly once — never when nothing is to be undone —
+    and each backwards renders from that read rewound, so a column ``define_table()`` added outside migrations is
+    redefined ``FLEXIBLE`` below 3 when the table becomes ``SCHEMAFULL`` again."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_one_read_per_rollback(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind):
+            first = _write(tmp_path, "a", [CreateTable("rs_a", "SCHEMALESS")])
+            second = _write(tmp_path, "b", [AddField("rs_a", "n", "int")], [first])
+            third = _write(tmp_path, "c", [CreateTable("rs_c", "SCHEMALESS")], [second])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second, third]
+            reads = _read_spy(monkeypatch)
+            assert await executor.rollback("") == [third, second, first]
+            assert len(reads) == 1
+            assert await executor.rollback("") == []
+            assert len(reads) == 1
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_the_backwards_render_from_the_read_rewound(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with migration_database(kind) as client:
+            line = await _line(client)
+            first = _write(tmp_path, "a", [CreateTable("rs_t", "SCHEMAFULL")])
+            second = _write(tmp_path, "b", [AlterTable("rs_t", "SCHEMALESS", previous_schema_mode="SCHEMAFULL")], [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second]
+            await RsLoose.define_table()
+            assert "FLEXIBLE" not in (await _fields(client, "rs_t"))["bag"]
+            sent = _send_spy(monkeypatch)
+            assert await executor.rollback(first) == [second]
+            (batch,) = [text for text in sent if _UNRECORD in text]
+            statements = _sent(batch)
+            assert statements[:2] == [_UNRECORD, "DEFINE TABLE OVERWRITE `rs_t` SCHEMAFULL;"]
+            redefined = [statement for statement in statements if statement.startswith("DEFINE FIELD")]
+            fields = await _fields(client, "rs_t")
+            if line < 3:
+                assert redefined == ["DEFINE FIELD OVERWRITE `bag` ON `rs_t` TYPE any FLEXIBLE;"]
+                assert "FLEXIBLE" in fields["bag"]
+            else:
+                assert redefined == []
+                assert "FLEXIBLE" not in fields["bag"]
+            assert "SCHEMAFULL" in (await _info_db(client))["tables"]["rs_t"]
+            await _run(client, "UPSERT rs_t:one SET bag = { a: { b: 1 } };")
+            assert await client.query("SELECT VALUE bag FROM rs_t:one;", {}) == [{"a": {"b": 1}}]
+
+
+class RvDoc(BaseSurrealModel):
+    """The full-text indexed table of ``TestReversibleE2E``'s analyzer cases (migrations define it)."""
+
+    model_config = SurrealConfigDict(table_name="rv_doc", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    title: str = ""
+
+
+_RV_ANALYZER = DefineAnalyzer("rv_an", ["blank"], ["lowercase"])
+_RV_SEARCH = CreateIndex("rv_doc", "rv_title", ["title"], search_analyzer="rv_an", bm25=True)
+_RV_INDEX = CreateIndex("rv_t", "rv_i", ["a"])
+_RV_EVENT = DefineEvent("rv_e", "rv_t", None, "CREATE rv_log SET at = time::now()")
+_RV_ACCESS = DefineAccess(
+    "rv_acc",
+    "rv_user",
+    {"email": "$email", "password": "crypto::argon2::generate($password)"},
+    "email = $email AND crypto::argon2::compare(password, $password)",
+)
+#: Each case: the first migration (what the second changes), the second, and whether a search on ``rv_doc`` runs.
+_REVERSIBLE: dict[str, tuple[list[Operation], list[Operation], bool]] = {
+    "alter_field": (
+        [CreateTable("rv_t", "SCHEMAFULL"), AddField("rv_t", "a", "int", 1, "$value > 0")],
+        [
+            AlterField(
+                "rv_t", "a", "int", 2, "$value > 1", previous_type="int", previous_default=1, previous_assertion="$value > 0"
+            )
+        ],
+        False,
+    ),
+    "alter_table": (
+        [CreateTable("rv_t", "SCHEMAFULL", comment="one")],
+        [
+            AlterTable(
+                "rv_t",
+                "SCHEMALESS",
+                "normal",
+                comment="two",
+                previous_schema_mode="SCHEMAFULL",
+                previous_comment="one",
+                drop=True,
+            )
+        ],
+        False,
+    ),
+    "create_index": (
+        [CreateTable("rv_t", "SCHEMAFULL"), AddField("rv_t", "a", "int"), _RV_INDEX],
+        [CreateIndex("rv_t", "rv_i", ["a"], unique=True, previous=_RV_INDEX)],
+        False,
+    ),
+    "define_event": (
+        [CreateTable("rv_t", "SCHEMALESS"), _RV_EVENT],
+        [DefineEvent("rv_e", "rv_t", "$event = 'CREATE'", "CREATE rv_log SET at = time::now(), k = 1", previous=_RV_EVENT)],
+        False,
+    ),
+    "define_analyzer": (
+        [_RV_ANALYZER, CreateTable("rv_doc", "SCHEMAFULL"), AddField("rv_doc", "title", "string"), _RV_SEARCH],
+        [DefineAnalyzer("rv_an", ["blank"], ["lowercase", "ascii"], previous=_RV_ANALYZER), RebuildIndex("rv_doc", "rv_title")],
+        True,
+    ),
+    "define_access": (
+        [
+            CreateTable("rv_user", "SCHEMAFULL"),
+            AddField("rv_user", "email", "string"),
+            AddField("rv_user", "password", "string"),
+            _RV_ACCESS,
+        ],
+        [
+            DefineAccess(
+                "rv_acc",
+                "rv_user",
+                {"email": "$email", "password": "crypto::argon2::generate($password)"},
+                "email = $email AND crypto::argon2::compare(password, $password)",
+                "30m",
+                "1h",
+                previous=_RV_ACCESS,
+            )
+        ],
+        False,
+    ),
+    "drop_index": (
+        [CreateTable("rv_t", "SCHEMAFULL"), AddField("rv_t", "a", "int"), _RV_INDEX],
+        [DropIndex("rv_t", "rv_i", previous=_RV_INDEX)],
+        False,
+    ),
+    "remove_analyzer": (
+        [_RV_ANALYZER, CreateTable("rv_doc", "SCHEMAFULL"), AddField("rv_doc", "title", "string"), _RV_SEARCH],
+        [DropIndex("rv_doc", "rv_title", previous=_RV_SEARCH), RemoveAnalyzer("rv_an", previous=_RV_ANALYZER)],
+        True,
+    ),
+    "remove_access": (
+        [
+            CreateTable("rv_user", "SCHEMAFULL"),
+            AddField("rv_user", "email", "string"),
+            AddField("rv_user", "password", "string"),
+            _RV_ACCESS,
+        ],
+        [RemoveAccess("rv_acc", previous=_RV_ACCESS)],
+        False,
+    ),
+}
+
+
+class TestReversibleE2E:
+    """AC-12: a reversible redefinition (or a removal with ``previous=``) migrated then rolled back leaves the
+    database's schema as it was — ``diff()`` between the reads before and after is ``[]`` both ways, every clause
+    compared (unmarked states) —, while the read right after ``migrate()`` differs from it; a search on a full-text
+    index whose analyzer the migration changed or removed matches again after the rollback."""
+
+    @pytest.mark.parametrize("case", list(_REVERSIBLE))
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_migrate_then_rollback_restores_the_schema(self, kind: str, case: str, tmp_path: Path) -> None:
+        setup, change, searched = _REVERSIBLE[case]
+        async with migration_database(kind):
+            first = _write(tmp_path, "setup", setup)
+            second = _write(tmp_path, "change", change, [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first) == [first]
+            if searched:
+                await RvDoc(id="one", title="Hello World").save()
+                assert await _hello(RvDoc) == 1
+            before = await DatabaseIntrospector().introspect()
+            assert list(before.issues) == []
+            assert await executor.migrate() == [second]
+            changed = await DatabaseIntrospector().introspect()
+            assert before.diff(changed) != []
+            assert await executor.rollback(first) == [second]
+            await _unchanged(before)
+            if searched:
+                assert await _hello(RvDoc) == 1
+            assert await executor.get_applied_migrations() == [first]
+
+
+_RC_ANALYZER = DefineAnalyzer("rc_an", ["blank"], ["lowercase"])
+
+
+class RcDoc(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rc_doc", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    title: str = ""
+
+
+class TestRollbackCompensationE2E:
+    """AC-9 (rollback part), D38: a rollback whose phase B is refused — its table altered by hand so that the
+    ``AlterField`` backwards is refused — restores the analyzer definitions its phase A committed to the ones the
+    database held before the rollback (the migration's own), and says so (E-X3)."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_the_analyzer_is_restored_to_the_databases_definition(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(
+                tmp_path,
+                "docs",
+                [
+                    _RC_ANALYZER,
+                    CreateTable("rc_doc", "SCHEMAFULL"),
+                    AddField("rc_doc", "title", "string"),
+                    CreateIndex("rc_doc", "rc_title", ["title"], search_analyzer="rc_an", bm25=True),
+                    CreateTable("rc_t", "SCHEMALESS"),
+                    AddField("rc_t", "in", "int"),
+                ],
+            )
+            second = _write(
+                tmp_path,
+                "change",
+                [
+                    DefineAnalyzer("rc_an", ["blank"], ["lowercase", "ascii"], previous=_RC_ANALYZER),
+                    RebuildIndex("rc_doc", "rc_title"),
+                    AlterField("rc_t", "in", "record<rc_a>", previous_type="int"),
+                ],
+                [first],
+            )
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second]
+            await RcDoc(id="one", title="Hello World").save()
+            # By hand: rc_t becomes a relation, whose `in` must be a record — the AlterField's backwards is refused.
+            await _run(client, "DEFINE TABLE OVERWRITE rc_t TYPE RELATION IN rc_a OUT rc_b;")
+            before = await DatabaseIntrospector().introspect()
+            with pytest.raises(MigrationStatementError) as raised:
+                await executor.rollback(first)
+            assert str(raised.value) == (
+                f"Rollback of migration '{second}' failed at operation 3 of 3 (Alter field in on rc_t): An error "
+                f"occurred: in field on a relation must be a record {_RESTORED}"
+            )
+            assert (raised.value.operation, raised.value.analyzers_restored) == (3, True)
+            await _unchanged(before)
+            assert await _hello(RcDoc) == 1
+            assert await executor.get_applied_migrations() == [first, second]
+
+
+_EF_EVENT = DefineEvent("ef_e", "ef_t", None, "CREATE ef_log SET k = 1")
+_EF_EVENT_CHANGED = DefineEvent("ef_e", "ef_t", "$event = 'CREATE'", "CREATE ef_log SET k = 2")
+_EF_FUNCTION = DefineFunction("fn::ef_greet", "RETURN 'hi ' + $n;", parameters={"n": "string"}, returns="string")
+_EF_FUNCTION_CHANGED = DefineFunction("fn::ef_greet", "RETURN 'hello ' + $n;", parameters={"n": "string"}, returns="string")
+
+
+class TestEventsAndFunctionsE2E:
+    """AC-27 (#276): an event and a function added, then changed (``previous=``), then removed
+    (``RemoveEvent``/``RemoveFunction(previous=…)``) by three migrations; ``rollback()`` one step at a time restores
+    each earlier state, the function's definition included (which the diff does not compare)."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_three_steps_rolled_back_one_by_one(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "add", [CreateTable("ef_t", "SCHEMALESS"), _EF_EVENT, _EF_FUNCTION])
+            changes = [
+                dataclasses.replace(_EF_EVENT_CHANGED, previous=_EF_EVENT),
+                dataclasses.replace(_EF_FUNCTION_CHANGED, previous=_EF_FUNCTION),
+            ]
+            second = _write(tmp_path, "change", changes, [first])
+            third = _write(
+                tmp_path,
+                "remove",
+                [
+                    RemoveEvent("ef_e", "ef_t", previous=_EF_EVENT_CHANGED),
+                    RemoveFunction("fn::ef_greet", previous=_EF_FUNCTION_CHANGED),
+                ],
+                [second],
+            )
+            executor = MigrationExecutor(tmp_path)
+            reads: list[SchemaState] = [await DatabaseIntrospector().introspect()]
+            for name in (first, second, third):
+                assert await executor.migrate(target=name) == [name]
+                reads.append(await DatabaseIntrospector().introspect())
+            assert reads[1].functions != reads[2].functions
+            assert "ef_e" not in reads[3].tables["ef_t"].events
+            assert reads[3].functions == {}
+            greetings = {second: "hello x", first: "hi x"}
+            for target, expected, undone in ((second, reads[2], third), (first, reads[1], second), ("", reads[0], first)):
+                assert await executor.rollback(target) == [undone]
+                now = await DatabaseIntrospector().introspect()
+                assert now.diff(expected) == []
+                assert expected.diff(now) == []
+                assert now.functions == expected.functions
+                if target:
+                    assert await client.query("RETURN fn::ef_greet('x');", {}) == greetings[target]
+
+
+#: A hand-written migration file: ``AddField`` then a ``DataMigration`` whose functions (which a generated file cannot
+#: hold) record what its SQL wrote — ``seen = a`` after ``a = n + 1``, ``back_seen = back`` after ``back = 10`` — so
+#: the record shows that each function ran after its SQL.
+_DATA_FILE = """from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite.migrations import Migration
+from surreal_orm_lite.migrations.operations import AddField, DataMigration
+
+
+async def forwards() -> None:
+    client = await SurrealDBConnectionManager.get_client()
+    await client.query("UPDATE dm_item SET seen = a;", {{}})
+
+
+async def backwards() -> None:
+    client = await SurrealDBConnectionManager.get_client()
+    await client.query("UPDATE dm_item SET back_seen = back;", {{}})
+
+
+migration = Migration(
+    name={name!r},
+    dependencies={dependencies!r},
+    operations=[
+        AddField("dm_item", "a", "int", nullable=True),
+        DataMigration(
+            forwards_sql={forwards_sql!r},
+            backwards_sql="UPDATE dm_item SET back = 10;",
+            forwards_func=forwards,
+            backwards_func=backwards,
+        ),
+    ],
+)
+"""
+
+
+def _data_files(directory: Path, *, forwards_sql: str = "UPDATE dm_item SET a = n + 1;") -> tuple[str, str]:
+    """``0001_items`` (the table ``dm_item``) and the hand-written ``0002_data`` of :data:`_DATA_FILE`."""
+    first = _write(directory, "items", [CreateTable("dm_item", "SCHEMALESS")])
+    second = "0002_data"
+    text = _DATA_FILE.format(name=second, dependencies=[first], forwards_sql=forwards_sql)
+    (directory / f"{second}.py").write_text(text, encoding="utf-8")
+    return first, second
+
+
+async def _item(client: Any) -> dict[str, Any]:
+    rows = await client.query("SELECT * OMIT id FROM dm_item:one;", {})
+    assert isinstance(rows, list) and len(rows) == 1, rows
+    return dict(rows[0])
+
+
+class TestDataE2E:
+    """AC-15, AC-18 (``upgrade()``'s part): a ``DataMigration`` is not run by ``migrate()``; ``upgrade()`` runs its SQL
+    (one batch per migration) then its function and returns the name; ``migrate(schema_only=False)`` runs them after
+    the schema (phase C); ``rollback()`` runs ``backwards_sql`` then ``backwards_func``; a refused data SQL raises E-X5
+    and the migration stays recorded; ``upgrade()``'s history checks run before any data operation."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_migrate_upgrade_then_rollback(self, kind: str, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        async with migration_database(kind) as client:
+            first, second = _data_files(tmp_path)
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first) == [first]
+            await _run(client, "CREATE dm_item:one SET n = 1;")
+            assert await executor.migrate() == [second]
+            assert await _item(client) == {"n": 1}
+            assert "a" in await _fields(client, "dm_item")
+            caplog.set_level(logging.INFO, logger=_LOGGER)
+            assert await executor.upgrade() == [second]
+            assert caplog.messages == [f"Running data migrations for: {second}"]
+            assert await _item(client) == {"n": 1, "a": 2, "seen": 2}
+            assert await executor.upgrade(target=first) == []
+            assert await executor.rollback(first) == [second]
+            assert await _item(client) == {"n": 1, "a": 2, "seen": 2, "back": 10, "back_seen": 10}
+            assert "a" not in await _fields(client, "dm_item")
+            assert await executor.get_applied_migrations() == [first]
+            assert await executor.upgrade() == []
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_migrate_runs_the_data_after_the_schema(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first, second = _data_files(tmp_path)
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first, schema_only=False) == [first]
+            await _run(client, "CREATE dm_item:one SET n = 1;")
+            assert await executor.migrate(schema_only=False) == [second]
+            assert await _item(client) == {"n": 1, "a": 2, "seen": 2}
+            assert await executor.get_applied_migrations() == [first, second]
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_refused_data_sql_raises_and_stays_recorded(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first, second = _data_files(tmp_path, forwards_sql="THROW 'data';")
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first) == [first]
+            await _run(client, "CREATE dm_item:one SET n = 1;")
+            expected = f"Data migration of '{second}' failed at operation 2 of 2 (Data migration): An error occurred: data"
+            with pytest.raises(MigrationStatementError) as raised:
+                await executor.migrate(schema_only=False)
+            assert str(raised.value) == expected
+            assert (raised.value.migration, raised.value.operation, raised.value.description) == (
+                second,
+                2,
+                "Data migration",
+            )
+            assert await executor.get_applied_migrations() == [first, second]
+            assert "a" in await _fields(client, "dm_item")
+            assert await _item(client) == {"n": 1}
+            with pytest.raises(MigrationStatementError) as again:
+                await executor.upgrade()
+            assert str(again.value) == expected
+            assert await _item(client) == {"n": 1}
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_upgrade_with_an_applied_name_without_a_file(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first, second = _data_files(tmp_path)
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second]
+            await _run(client, "CREATE dm_item:one SET n = 1;")
+            await _record(client, "0099_gone")
+            with pytest.raises(FileNotFoundError) as raised:
+                await executor.upgrade()
+            assert str(raised.value) == f"Migration file not found: {tmp_path / '0099_gone.py'}"
+            assert await _item(client) == {"n": 1}
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_upgrade_with_an_applied_migration_whose_dependency_is_pending(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first, second = _data_files(tmp_path)
+            executor = MigrationExecutor(tmp_path)
+            await executor.ensure_migrations_table()
+            await _run(client, "DEFINE TABLE dm_item SCHEMALESS; CREATE dm_item:one SET n = 1;")
+            await _record(client, second)
+            with pytest.raises(ValueError) as raised:
+                await executor.upgrade()
+            assert str(raised.value) == (
+                f"Migration '{second}' is applied but its dependency '{first}' is not: the database's history does not "
+                f"match {tmp_path}."
+            )
+            assert await _item(client) == {"n": 1}
+
+    async def test_the_functions_run_on_the_executors_connection(self, tmp_path: Path) -> None:
+        """The executor's named connection is the one its data functions talk to (``using()``), not the default."""
+        other = _database_name()
+        async with migration_database("ws") as client:
+            await client.query(f"DEFINE DATABASE {other};", {})
+            try:
+                SurrealDBConnectionManager.add_connection(
+                    "dm_other", url=_url("ws"), user="root", password="root", namespace="ns", database=other
+                )
+                first, second = _data_files(tmp_path)
+                executor = MigrationExecutor(tmp_path, connection="dm_other")
+                assert await executor.migrate(target=first) == [first]
+                named = await SurrealDBConnectionManager.get_client("dm_other")
+                await _run(named, "CREATE dm_item:one SET n = 1;")
+                assert await executor.migrate(schema_only=False) == [second]
+                assert await _item(named) == {"n": 1, "a": 2, "seen": 2}
+                assert "dm_item" not in await _tables(client)
+            finally:
+                await client.query(f"REMOVE DATABASE IF EXISTS {other};", {})
+
+
+class TestStatusE2E:
+    """AC-13, AC-18 (``get_migration_status()``'s part): the full ORM's dict for every file, in application order,
+    before and after ``migrate()``; it never raises on the history — an applied name without a file is warned about
+    and not listed, an applied migration whose dependency is pending gives E-H1's text as a warning —; no schema
+    read."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_the_status_before_and_after(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind):
+            first, second = _data_files(tmp_path)
+            third = _write(tmp_path, "drop", [CreateTable("st_x", "SCHEMALESS"), DropTable("st_x")], [second])
+            executor = MigrationExecutor(tmp_path)
+            reads = _read_spy(monkeypatch)
+            status = await executor.get_migration_status()
+            assert list(status) == [first, second, third]
+            assert status == {
+                first: {"applied": False, "reversible": True, "has_data": False, "operations": 1},
+                second: {"applied": False, "reversible": True, "has_data": True, "operations": 2},
+                third: {"applied": False, "reversible": False, "has_data": False, "operations": 2},
+            }
+            assert reads == []
+            assert await executor.migrate(target=second) == [first, second]
+            reads.clear()
+            status = await executor.get_migration_status()
+            assert [entry["applied"] for entry in status.values()] == [True, True, False]
+            assert reads == []
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_applied_name_without_a_file_is_not_listed(
+        self, kind: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "a", [CreateTable("st_a", "SCHEMALESS")])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first]
+            await _record(client, "0099_gone")
+            caplog.set_level(logging.WARNING, logger=_LOGGER)
+            status = await executor.get_migration_status()
+            assert status == {first: {"applied": True, "reversible": True, "has_data": False, "operations": 1}}
+            warning = f"Migration 0099_gone is recorded as applied but has no file in {tmp_path}; it is ignored."
+            assert caplog.messages == [warning]
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_applied_migration_whose_dependency_is_pending_is_warned(
+        self, kind: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "a", [CreateTable("st_d", "SCHEMALESS")])
+            second = _write(tmp_path, "b", [CreateTable("st_e", "SCHEMALESS")], [first])
+            executor = MigrationExecutor(tmp_path)
+            await executor.ensure_migrations_table()
+            await _record(client, second)
+            caplog.set_level(logging.WARNING, logger=_LOGGER)
+            status = await executor.get_migration_status()
+            assert [entry["applied"] for entry in status.values()] == [False, True]
+            assert caplog.messages == [
+                f"Migration '{second}' is applied but its dependency '{first}' is not: the database's history does not "
+                f"match {tmp_path}."
+            ]

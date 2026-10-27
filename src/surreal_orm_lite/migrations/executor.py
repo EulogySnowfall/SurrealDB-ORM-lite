@@ -3,15 +3,18 @@
 :class:`MigrationExecutor` works on a migrations directory: its files (``get_available_migrations()``,
 ``load_migration()``), their application order (``get_pending_migrations()``), the state they build
 (``migration_state()``) and the statements of one of them (``show_sql()``) — all pure: no database is read. It applies
-the pending ones (``migrate()``, spec §5.6) and records them in the tracking table ``_surreal_orm_migrations``
-(``ensure_migrations_table()``, ``get_applied_migrations()``).
+the pending ones (``migrate()``, spec §5.6), undoes the latest ones (``rollback()``), runs the data operations of the
+applied ones (``upgrade()``), reports every file (``get_migration_status()``) and records the applied names in the
+tracking table ``_surreal_orm_migrations`` (``ensure_migrations_table()``, ``get_applied_migrations()``).
 
-``migrate()`` is anchored on the database's schema (D35): it reads it once, before any DDL, replays the planned
-migrations over it strictly (E-R1) and renders every statement from those states before the first batch is sent. Each
-migration is one ``BEGIN … COMMIT`` batch holding its tracking record first (phase B); its analyzer definitions are
-committed in a batch of their own just before (phase A, M4, M26) and restored to the definitions the database held when
-phase B fails (D38). A failed batch is read through the line's status layout (§5.6.1), and the tracking table is read
-again before anything else is decided: a migration a concurrent run recorded is skipped, a retryable conflict raises
+``migrate()`` and ``rollback()`` are anchored on the database's schema (D35): each reads it once, before any DDL —
+``migrate()`` replays the planned migrations over it strictly (E-R1), ``rollback()`` rewinds it migration by migration —
+and renders every statement from those states before the first batch is sent. Each migration is one ``BEGIN … COMMIT``
+batch holding its tracking statement first (phase B: the record's ``CREATE``, or its ``DELETE`` for a rollback); the
+analyzer definitions it commits are sent in a batch of their own just before (phase A, M4, M26) and restored to the
+definitions the database held when phase B fails (D38). The data operations run after the schema (phase C). A failed
+batch is read through the line's status layout (§5.6.1), and the tracking table is read again before anything else is
+decided: a migration a concurrent run applied (or rolled back) is skipped, a retryable conflict raises
 ``SurrealDbConflictError``, a refusal ``MigrationStatementError`` — whose message names the migration, the operation and
 the server's reason, never a statement. Logs (logger ``surreal_orm_lite.migrations``) name migrations, operations and
 reasons only.
@@ -20,7 +23,7 @@ reasons only.
 import asyncio
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -41,7 +44,7 @@ from . import loader, render
 from . import state as _state
 from .constants import MIGRATIONS_TABLE
 from .migration import Migration, _statements
-from .operations import DataMigration, DefineAnalyzer
+from .operations import DataMigration, DefineAnalyzer, RemoveAnalyzer
 
 __all__ = ["MigrationExecutor", "MigrationStatementError"]
 
@@ -56,15 +59,16 @@ _TRACKING_DEFINITIONS = (
 )
 #: The tracking record of phase B, first in its batch: a ``LET`` in a later ``RawSQL`` cannot change the name (M25).
 _RECORD = f"CREATE `{MIGRATIONS_TABLE}` SET name = $surreal_orm_migration;"
+#: The tracking record's removal, first in a rollback's phase-B batch.
+_UNRECORD = f"DELETE `{MIGRATIONS_TABLE}` WHERE name = $surreal_orm_migration;"
 #: The applied names, in the order they were applied (the full ORM's query, ties broken by name).
 _APPLIED = f"SELECT name, applied_at FROM `{MIGRATIONS_TABLE}` ORDER BY applied_at, name;"
 #: 3.x's text for the statements after the failing one (M2): filler, as ``transaction._is_pure_filler()``'s.
 _CANCELLED_FILLER = "The query was not executed due to a cancelled transaction"
 #: How many times ``ensure_migrations_table()`` sends its batch when a concurrent first run conflicts with it.
 _ENSURE_ATTEMPTS = 3
-#: The compensation sentences (spec §7), appended after a space.
+#: The compensation sentence (spec §7), appended after a space.
 _RESTORED = "The analyzer definitions it committed first were restored."
-_KEPT = "Its analyzer definitions, committed first, were kept: retry migrate()."
 
 #: The refusal of a client object as ``connection=`` (v0.30.0's rule).
 _CLIENT_OBJECT = (
@@ -303,28 +307,101 @@ async def _line(client: Any) -> Literal[2, 3]:
     return 3 if await cached_major(client) >= 3 else 2
 
 
+@dataclass(frozen=True)
+class _Way:
+    """What differs between applying a migration and rolling it back (spec §5.6, §7): the logs, the error texts, and
+    which answer of the tracking table, read again after a failed batch, says that the work was done meanwhile."""
+
+    #: ``True`` when a migration recorded as applied is done (``migrate()``), ``False`` when one no longer recorded is
+    #: (``rollback()``).
+    done_when_recorded: bool
+    #: The log line before a migration's batches.
+    doing: str
+    #: The warning when the tracking table says the work was done meanwhile: the name, then the cause.
+    skipped: str
+    #: E-X1/E-X3's beginning, before ``at operation``.
+    failed: str
+    #: E-X2/E-X3's ``could not be recorded as …``.
+    recorded_as: str
+    #: E-C1's ``was not …``.
+    not_done: str
+    #: The method a retry runs again (E-C1's sentence).
+    retry: str
+    #: Who keeps the analyzer definitions phase A committed, when they could not be restored.
+    keep: str
+
+
+_APPLYING = _Way(
+    done_when_recorded=True,
+    doing="Applying migration: %s",
+    skipped=(
+        "Migration %s is recorded as applied although this run's batch failed (%s): a concurrent run applied it, or the "
+        "answer was lost; it is not applied again, and its data operations were not run here — run upgrade() if they "
+        "must."
+    ),
+    failed="Migration '{name}' failed",
+    recorded_as="applied",
+    not_done="applied",
+    retry="migrate()",
+    keep="this migration's definitions",
+)
+_ROLLING_BACK = _Way(
+    done_when_recorded=False,
+    doing="Rolling back: %s",
+    skipped=(
+        "Migration %s is no longer recorded as applied although this run's batch failed (%s): a concurrent run rolled it "
+        "back, or the answer was lost; skipped."
+    ),
+    failed="Rollback of migration '{name}' failed",
+    recorded_as="rolled back",
+    not_done="rolled back",
+    retry="rollback()",
+    keep="the definitions this rollback restored",
+)
+
+
 def _statement_error(
-    migration: Migration, failure: _Failure, *, sentence: str = "", restored: bool | None = None
+    migration: Migration,
+    failure: _Failure,
+    *,
+    sentence: str = "",
+    restored: bool | None = None,
+    way: _Way = _APPLYING,
 ) -> "MigrationStatementError":
-    """E-X1, E-X2 or E-X6 (spec §7) for *failure* of *migration*, *sentence* (the compensation's) appended."""
+    """E-X1, E-X2, E-X3 or E-X6 (spec §7) for *failure* of *migration* — applied, or rolled back with *way*
+    ``_ROLLING_BACK`` —, *sentence* (the compensation's) appended."""
     name = migration.name
     tail = f" {sentence}" if sentence else ""
     if failure.statement is None:
         message = f"Migration '{name}' was refused by SurrealDB: {failure.reason}{tail}"
         return MigrationStatementError(message, migration=name, analyzers_restored=restored)
     if failure.owner is None:
-        message = f"Migration '{name}' could not be recorded as applied: {failure.reason}{tail}"
+        message = f"Migration '{name}' could not be recorded as {way.recorded_as}: {failure.reason}{tail}"
         return MigrationStatementError(message, migration=name, analyzers_restored=restored)
     operation = migration.operations[failure.owner]
     description = operation.describe()
     position = failure.owner + 1
     message = (
-        f"Migration '{name}' failed at operation {position} of {len(migration.operations)} ({description}): "
+        f"{way.failed.format(name=name)} at operation {position} of {len(migration.operations)} ({description}): "
         f"{failure.reason}{tail}"
     )
     return MigrationStatementError(
         message, migration=name, operation=position, description=description, analyzers_restored=restored
     )
+
+
+def _data_error(migration: Migration, failure: _Failure) -> "MigrationStatementError":
+    """E-X5 (spec §7) for *failure* of *migration*'s phase C; E-X6 when the answer names no statement."""
+    if failure.owner is None:
+        return _statement_error(migration, _Failure(None, None, failure.reason, failure.conflict))
+    operation = migration.operations[failure.owner]
+    description = operation.describe()
+    position = failure.owner + 1
+    message = (
+        f"Data migration of '{migration.name}' failed at operation {position} of {len(migration.operations)} "
+        f"({description}): {failure.reason}"
+    )
+    return MigrationStatementError(message, migration=migration.name, operation=position, description=description)
 
 
 @dataclass(frozen=True)
@@ -340,13 +417,13 @@ class _Compensated:
         return self.analyzers is None
 
 
-def _compensation_sentence(outcome: _Compensated, names: Sequence[str]) -> str:
+def _compensation_sentence(outcome: _Compensated, names: Sequence[str], way: _Way = _APPLYING) -> str:
     """The sentence phase A's compensation adds (spec §7): restored, or not with its reason."""
     if outcome.analyzers is not None:
         shown = ", ".join(f"'{name}'" for name in names)
         return (
-            f"The analyzer definitions it committed first could not be restored ({outcome.analyzers}): {shown} keep this "
-            "migration's definitions; run schema_diff() to see them."
+            f"The analyzer definitions it committed first could not be restored ({outcome.analyzers}): {shown} keep "
+            f"{way.keep}; run schema_diff() to see them."
         )
     if outcome.rebuilds is not None:
         return (
@@ -356,15 +433,15 @@ def _compensation_sentence(outcome: _Compensated, names: Sequence[str]) -> str:
     return _RESTORED
 
 
-# --- the pre-pass: every batch rendered before the first is sent (spec §5.6 step 3) ----------------------------------
+# --- the pre-pass: every batch rendered before the first is sent (spec §5.6 step 3, rollback()) -----------------------
 
 
 @dataclass(frozen=True)
 class _Prepared:
-    """One planned migration, rendered: its phase-A batch (its ``DefineAnalyzer`` statements, ``None`` without one),
-    its phase-B batch (the tracking record, then every other schema operation's statements), and phase A's
-    compensation — the statements restoring the analyzers it defines, their names, and the rebuilds of the indexes the
-    database holds that use them."""
+    """One planned migration, rendered: its phase-A batch (the statements that define analyzers, ``None`` without
+    one), its phase-B batch (the tracking statement, then every other schema statement), and phase A's compensation —
+    the statements restoring the analyzers phase A defines, their names, and the rebuilds of the indexes the database
+    holds that use them."""
 
     migration: Migration
     analyzers: _Batch | None
@@ -383,7 +460,7 @@ def _unreadable(issues: Sequence[SchemaIssue], name: str) -> bool:
     )
 
 
-def _unrestorable(migration: Migration, position: int, operation: DefineAnalyzer) -> SurrealDbError:
+def _unrestorable(migration: Migration, position: int, operation: DefineAnalyzer | RemoveAnalyzer) -> SurrealDbError:
     """E-I2 (spec §7, D38, P1, P3)."""
     return SurrealDbError(
         f"Migration '{migration.name}', operation {position} ({operation.describe()}): the database's definition of "
@@ -393,57 +470,77 @@ def _unrestorable(migration: Migration, position: int, operation: DefineAnalyzer
     )
 
 
-def _compensation(migration: Migration, before: SchemaState) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Phase A's compensation for *migration*, rendered from *before* — the database's schema with the planned
-    migrations before it replayed (D38): for each analyzer phase A defines, in reverse order, its definition there
-    (``DefineAnalyzer.from_analyzer_state(…).forwards()``, ``OVERWRITE``), or ``REMOVE ANALYZER IF EXISTS`` when the
-    database held none. ``previous=`` plays no part. Also the analyzers' names, in definition order, and a ``REBUILD
-    INDEX IF EXISTS`` of each index of *before* that uses one of them: SurrealDB 3.x and 2.x servers keep what a
+def _compensation(
+    migration: Migration, held: SchemaState, owners: Sequence[int]
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Phase A's compensation for *migration*, rendered from *held* — the database's schema as phase A finds it (D38):
+    for ``migrate()``, the read with the planned migrations before it replayed; for ``rollback()``, the read rewound to
+    the migration applied. *owners* are the operations (indexes in ``migration.operations``) whose statements phase A
+    sends. For each analyzer they define, in reverse order, its definition in *held*
+    (``DefineAnalyzer.from_analyzer_state(…).forwards()``, ``OVERWRITE``), or ``REMOVE ANALYZER IF EXISTS`` when
+    *held* has none. ``previous=`` plays no part. Also the analyzers' names, in the migration's order, and a ``REBUILD
+    INDEX IF EXISTS`` of each index of *held* that uses one of them: SurrealDB 3.x and 2.x servers keep what a
     ``REBUILD INDEX`` of the failed batch built (and 2.x what a full-text ``DEFINE INDEX OVERWRITE`` built) with phase
     A's analyzers, so the index is built again with the restored ones, once they are committed.
 
     :raises SurrealDbError: E-I2 — the definition cannot be read (an issue of the read) or written (a form
         ``search.Analyzer`` refuses, M32).
     """
-    defined: dict[str, tuple[int, DefineAnalyzer]] = {}
-    for position, operation in enumerate(migration.operations, 1):
-        if isinstance(operation, DefineAnalyzer) and operation.name not in defined:
-            defined[operation.name] = (position, operation)
+    defined: dict[str, tuple[int, DefineAnalyzer | RemoveAnalyzer]] = {}
+    for index in sorted(set(owners)):
+        operation = migration.operations[index]
+        if isinstance(operation, DefineAnalyzer | RemoveAnalyzer) and operation.name not in defined:
+            defined[operation.name] = (index + 1, operation)
     statements: list[str] = []
     for name, (position, operation) in reversed(defined.items()):
-        held = before.analyzers.get(name)
-        if held is not None:
-            restoring = DefineAnalyzer.from_analyzer_state(held)
+        found = held.analyzers.get(name)
+        if found is not None:
+            restoring = DefineAnalyzer.from_analyzer_state(found)
             if restoring is None:
                 raise _unrestorable(migration, position, operation)
             statements.append(restoring.forwards())
-        elif _unreadable(before.issues, name):
+        elif _unreadable(held.issues, name):
             raise _unrestorable(migration, position, operation)
         else:
             statements.append(render.removal("analyzer", name, if_exists=True))
     rebuilds = tuple(
         render.rebuild(table.name, index.name, if_exists=True)
-        for table in before.tables.values()
+        for table in held.tables.values()
         for index in table.indexes.values()
         if index.search_analyzer in defined
     )
     return tuple(statements), tuple(defined), rebuilds
 
 
-def _prepared(migration: Migration, *, line: Literal[2, 3], before: SchemaState, after: SchemaState) -> _Prepared:
-    """*migration* rendered for *line*: each operation's forwards from *after*, the state after the migration (an
-    ``AlterTable`` given ``skip_fields``, ``migration._statements()``), the ``DefineAnalyzer`` ones in phase A, the
-    ``DataMigration`` ones left out (phase C), the rest in phase B after the tracking record; phase A's compensation
-    from *before*."""
+def _restores_analyzer(operation: object) -> bool:
+    """Whether *operation*'s backwards defines an analyzer — a ``DefineAnalyzer`` or ``RemoveAnalyzer`` with
+    ``previous=`` —, which a rollback sends in phase A (a ``DefineAnalyzer`` without one is removed in phase B, after
+    the indexes that use it, M6)."""
+    return isinstance(operation, DefineAnalyzer | RemoveAnalyzer) and operation.previous is not None
+
+
+def _prepared(
+    migration: Migration, *, line: Literal[2, 3], before: SchemaState, after: SchemaState, backwards: bool = False
+) -> _Prepared:
+    """*migration* rendered for *line* (``migration._statements()``: an ``AlterTable`` given ``skip_fields``).
+
+    Forwards: each operation's ``forwards()`` from *after*, the state after the migration; the ``DefineAnalyzer`` ones
+    in phase A; the ``DataMigration`` ones left out (phase C); the rest in phase B after the tracking record; phase A's
+    compensation from *before*. Backwards (*backwards*): each operation's ``backwards()`` in reverse order from
+    *before*, the state the migration is undone to; those that define an analyzer in phase A; the rest — a
+    ``DataMigration``'s ``backwards_sql`` in its position — in phase B after the record's ``DELETE``; phase A's
+    compensation from *after*, the state with the migration applied.
+    """
     analyzers: list[str] = []
-    analyzer_owners: list[int | None] = []
-    main = [_RECORD]
+    analyzer_owners: list[int] = []
+    main = [_UNRECORD if backwards else _RECORD]
     main_owners: list[int | None] = [None]
-    for index, text in _statements(migration, line=line, state=after):
+    rendered = _statements(migration, line=line, state=before if backwards else after, backwards=backwards)
+    for index, text in rendered:
         operation = migration.operations[index]
-        if isinstance(operation, DataMigration):
+        if not backwards and isinstance(operation, DataMigration):
             continue
-        if isinstance(operation, DefineAnalyzer):
+        if _restores_analyzer(operation) if backwards else isinstance(operation, DefineAnalyzer):
             analyzers.append(text)
             analyzer_owners.append(index)
         else:
@@ -451,7 +548,7 @@ def _prepared(migration: Migration, *, line: Literal[2, 3], before: SchemaState,
             main_owners.append(index)
     if not analyzers:
         return _Prepared(migration, None, _Batch(main, main_owners))
-    compensation, restored, rebuilds = _compensation(migration, before)
+    compensation, restored, rebuilds = _compensation(migration, after if backwards else before, analyzer_owners)
     phase_a = _Batch(analyzers, analyzer_owners)
     return _Prepared(migration, phase_a, _Batch(main, main_owners), compensation, restored, rebuilds)
 
@@ -469,6 +566,28 @@ def _plan(migrations: Sequence[Migration], applied: Sequence[str], target: str |
         if migration.name == target:
             break
     return plan
+
+
+def _undo(migrations: Sequence[Migration], applied: Sequence[str], target: str) -> list[Migration]:
+    """The migrations ``rollback()`` undoes: the applied ones after *target* in application order (every applied one
+    for ``""``), newest first."""
+    recorded = set(applied)
+    order = [migration for migration in migrations if migration.name in recorded]
+    if target:
+        order = order[[migration.name for migration in order].index(target) + 1 :]
+    return order[::-1]
+
+
+def _irreversible(migration: Migration) -> ValueError | None:
+    """The refusal of a rollback of *migration* (spec §5.6): its first irreversible operation; ``None`` when every
+    operation is reversible."""
+    for position, operation in enumerate(migration.operations, 1):
+        if not operation.reversible:
+            return ValueError(
+                f"Migration {migration.name} is not reversible: operation {position} ({operation.describe()}) cannot "
+                "be rolled back."
+            )
+    return None
 
 
 class MigrationExecutor:
@@ -605,15 +724,16 @@ class MigrationExecutor:
         1. Every file is loaded and ordered, *target* checked, the tracking table ensured and read, and the history
            checked (an applied migration depending on a pending one raises; an applied name without a file is logged
            as a warning and ignored). Nothing to apply: ``No migrations to apply.`` is logged, ``[]`` returned.
-        2. With *fake*, each migration is only recorded as applied, in a batch of its own — no DDL, no schema read.
+        2. With *fake*, each migration is only recorded as applied, in a batch of its own — no DDL, no schema read, no
+           data operation.
         3. Otherwise the database's schema is read **once** (``DatabaseIntrospector``), before any DDL: definitions made
            by ``define_table()`` and the other appliers, or by hand, are part of it. The planned migrations are
            replayed over it strictly, and every statement is rendered from those states — on SurrealDB 2.x and the
            embedded engine the ``FLEXIBLE`` choices are the database's —, all before the first batch is sent.
         4. Each migration: its ``DefineAnalyzer`` statements in a batch committed first (an index built in the same
            transaction would not use a redefined analyzer, M4, M26), then one batch holding its tracking record and
-           every other schema statement, in order — applied whole or not at all. ``DataMigration`` operations are not
-           run (``upgrade()``).
+           every other schema statement, in order — applied whole or not at all. Its ``DataMigration`` operations run
+           after, with *schema_only* ``False`` only (phase C, as :meth:`upgrade` runs them).
 
         When a batch fails, the tracking table is read again: a migration recorded meanwhile (a concurrent run, a lost
         answer) is skipped with a warning and left out of the names returned; otherwise a retryable conflict raises
@@ -623,25 +743,20 @@ class MigrationExecutor:
 
         :param target: The last migration to apply.
         :param fake: Record the migrations as applied without running them.
-        :param schema_only: ``True`` only, for now: running the data operations after the schema comes with
-            ``upgrade()``.
+        :param schema_only: ``False`` also runs each applied migration's data operations, after its schema.
         :raises ValueError: *target* names no migration file; an applied migration depends on a pending one (E-H1); a
             removal of a definition neither the database nor an earlier planned operation holds (E-R1); see
             :meth:`get_pending_migrations`.
         :raises SurrealDbError: an analyzer phase A redefines whose database definition cannot be restored (E-I2).
         :raises SurrealDbConflictError: a retryable conflict (E-C1).
-        :raises MigrationStatementError: SurrealDB refused a statement (E-X1), the tracking record (E-X2) or the batch
-            as a whole (E-X6).
-        :raises NotImplementedError: *schema_only* is ``False``.
+        :raises MigrationStatementError: SurrealDB refused a statement (E-X1), the tracking record (E-X2), the batch
+            as a whole (E-X6) or a data operation's SQL (E-X5: the migration stays applied — run :meth:`upgrade` once
+            the cause is fixed). An exception a data function raises propagates unchanged.
         """
-        if not schema_only:
-            raise NotImplementedError("migrate(schema_only=False) is not available yet: run upgrade() after migrate().")
         migrations = self._ordered()
-        if target is not None and all(migration.name != target for migration in migrations):
-            raise ValueError(f"Unknown migration target {target!r}: no such migration file in {self.migrations_dir}.")
+        self._check_target(migrations, target)
         applied = await self.get_applied_migrations()
-        mode = loader.HISTORY["migrate"]
-        loader.check_history(migrations, applied, self.migrations_dir, dependency=mode.dependency, unknown=mode.unknown)
+        self._check_history("migrate", migrations, applied)
         plan = _plan(migrations, applied, target)
         if not plan:
             logger.info("No migrations to apply.")
@@ -650,40 +765,184 @@ class MigrationExecutor:
         if fake:
             prepared = [_Prepared(migration, None, _Batch([_RECORD], [None])) for migration in plan]
         else:
-            prepared = await self._prepare(plan, line)
+            prepared = await self._prepare(plan, line, backwards=False)
         done: list[str] = []
         for item in prepared:
-            if await self._apply(item, line):
-                done.append(item.migration.name)
+            if not await self._apply(item, line, _APPLYING):
+                continue
+            if not (fake or schema_only):
+                await self._data(item.migration, line)
+            logger.info("Applied: %s", item.migration.name)
+            done.append(item.migration.name)
         return done
+
+    async def rollback(self, target: str) -> list[str]:
+        """Undo the applied migrations after *target* in application order — newest first — and return their names:
+        *target* is an applied migration (kept, with every migration before it), or ``""`` to undo every applied
+        migration (the full ORM's method; spec §5.6).
+
+        Before any DDL: every file is loaded and ordered, the tracking table ensured and read, and the history checked
+        (an applied migration depending on a pending one raises, an applied name without a file too — its place in the
+        order is unknown); each migration to undo must be reversible. Nothing to undo: ``[]``, no schema read. Then the
+        database's schema is read **once** and rewound migration by migration (each operation's
+        ``state_backwards()``), and every backwards renders from the state its migration is undone to — so on SurrealDB
+        2.x and the embedded engine a table made ``SCHEMAFULL`` again redefines ``FLEXIBLE`` the columns the database
+        holds, whoever defined them.
+
+        Each migration: the analyzer definitions its backwards restore (``previous=``) in a batch committed first, then
+        one batch holding the deletion of its tracking record and every other backwards in reverse order — a
+        ``DataMigration``'s ``backwards_sql`` in its position —, undone whole or not at all; then each
+        ``DataMigration``'s ``backwards_func``, in reverse order. A failed batch is handled as :meth:`migrate`'s: a
+        migration no longer recorded meanwhile is skipped with a warning, a retryable conflict raises
+        ``SurrealDbConflictError``, a refusal ``MigrationStatementError`` (E-X3) after the analyzers committed first
+        are restored to the definitions the database held. The migrations after a failed one are not undone.
+
+        :param target: The last migration to keep applied, or ``""``.
+        :raises TypeError: *target* is not a ``str``.
+        :raises ValueError: *target* is not applied; an applied migration depends on a pending one (E-H1); a migration
+            to undo holds an irreversible operation; see :meth:`get_pending_migrations`.
+        :raises FileNotFoundError: an applied migration has no file.
+        :raises SurrealDbError: an analyzer the backwards restore whose database definition could not be restored
+            (E-I2).
+        :raises SurrealDbConflictError: a retryable conflict (E-C1).
+        :raises MigrationStatementError: SurrealDB refused a statement or the record's deletion (E-X3), or the batch as
+            a whole (E-X6). An exception a data function raises propagates unchanged.
+        """
+        if not isinstance(target, str):
+            raise TypeError(
+                "rollback(): target must be a str — a migration name, or '' to roll back every migration —, not "
+                f"{type(target).__name__}."
+            )
+        migrations = self._ordered()
+        applied = await self.get_applied_migrations()
+        self._check_history("rollback", migrations, applied)
+        if target and target not in applied:
+            raise ValueError(f"Cannot roll back to {target!r}: it is not applied.")
+        undo = _undo(migrations, applied, target)
+        for migration in undo:
+            if (refusal := _irreversible(migration)) is not None:
+                raise refusal
+        if not undo:
+            logger.info("No migrations to rollback.")
+            return []
+        line = await _line(await self._client())
+        done: list[str] = []
+        for item in await self._prepare(undo, line, backwards=True):
+            if not await self._apply(item, line, _ROLLING_BACK):
+                continue
+            for operation in reversed(item.migration.data_operations):
+                if isinstance(operation, DataMigration) and operation.backwards_func is not None:
+                    await self._call(operation.backwards_func)
+            logger.info("Rolled back: %s", item.migration.name)
+            done.append(item.migration.name)
+        return done
+
+    async def upgrade(self, target: str | None = None) -> list[str]:
+        """Run the data operations of the applied migrations, in application order up to and including *target* (all
+        when ``None``), and return the names of those that hold some — the full ORM's method (spec §5.6).
+
+        Before any data operation: every file is loaded and ordered, *target* checked, the tracking table ensured and
+        read, and the history checked (an applied migration depending on a pending one raises; an applied name without
+        a file raises ``FileNotFoundError``). For each migration, the SQL of its ``DataMigration`` operations runs in
+        one transaction, then each ``forwards_func`` in order — on the executor's connection. Nothing is recorded:
+        running ``upgrade()`` again runs them again (write idempotent data migrations); no schema is read.
+
+        :param target: The last migration whose data operations run.
+        :raises ValueError: *target* names no migration file; an applied migration depends on a pending one (E-H1); see
+            :meth:`get_pending_migrations`.
+        :raises FileNotFoundError: an applied migration has no file.
+        :raises MigrationStatementError: SurrealDB refused a data operation's SQL (E-X5) or the batch as a whole (E-X6).
+            An exception a data function raises propagates unchanged.
+        """
+        migrations = self._ordered()
+        self._check_target(migrations, target)
+        applied = await self.get_applied_migrations()
+        self._check_history("upgrade", migrations, applied)
+        recorded = set(applied)
+        line: Literal[2, 3] | None = None
+        upgraded: list[str] = []
+        for migration in migrations:
+            if migration.name in recorded and migration.has_data_migrations:
+                line = line or await _line(await self._client())
+                logger.info("Running data migrations for: %s", migration.name)
+                await self._data(migration, line)
+                upgraded.append(migration.name)
+            if migration.name == target:
+                break
+        return upgraded
+
+    async def get_migration_status(self) -> dict[str, dict[str, bool | int]]:
+        """Every migration file, in application order, with ``applied``, ``reversible``, ``has_data`` (whether it holds
+        a ``DataMigration``) and ``operations`` (their number) — the full ORM's method. No schema is read.
+
+        It never raises on the history: an applied migration whose dependency is pending, and an applied name without
+        a file (which is not listed), are logged as warnings.
+
+        :raises ValueError: a dependency names no migration file; a dependency cycle; see :meth:`load_migration`.
+        """
+        migrations = self._ordered()
+        applied = await self.get_applied_migrations()
+        self._check_history("get_migration_status", migrations, applied)
+        recorded = set(applied)
+        return {
+            migration.name: {
+                "applied": migration.name in recorded,
+                "reversible": migration.is_reversible,
+                "has_data": migration.has_data_migrations,
+                "operations": len(migration.operations),
+            }
+            for migration in migrations
+        }
 
     async def _client(self) -> Any:
         """The SDK client of the executor's connection, resolved now (the current one when it has no name)."""
         return await SurrealDBConnectionManager._manager_for(self._connection).get_client()
 
-    async def _prepare(self, plan: Sequence[Migration], line: Literal[2, 3]) -> list[_Prepared]:
-        """The pre-pass of ``migrate()`` (spec §5.6 step 3, §6.4): the one read of the database's schema, the strict
-        replay of *plan* over it — E-R1 raised here —, and each migration's batches and compensation rendered from the
-        states before and after it; nothing is sent."""
-        before = await DatabaseIntrospector(self._connection).introspect()
+    def _check_target(self, migrations: Sequence[Migration], target: str | None) -> None:
+        """Refuse a *target* that names no migration file (``migrate()``, ``upgrade()``), before any request."""
+        if target is not None and all(migration.name != target for migration in migrations):
+            raise ValueError(f"Unknown migration target {target!r}: no such migration file in {self.migrations_dir}.")
+
+    def _check_history(self, caller: str, migrations: Sequence[Migration], applied: Sequence[str]) -> None:
+        """The history checks of *caller*'s row (spec §5.6, ``loader.HISTORY``), before any write."""
+        mode = loader.HISTORY[caller]
+        loader.check_history(migrations, applied, self.migrations_dir, dependency=mode.dependency, unknown=mode.unknown)
+
+    async def _prepare(self, plan: Sequence[Migration], line: Literal[2, 3], *, backwards: bool) -> list[_Prepared]:
+        """The pre-pass of ``migrate()`` and ``rollback()`` (spec §5.6, §6.4): the one read of the database's schema,
+        then each migration of *plan* rendered, before anything is sent.
+
+        Forwards, *plan* is replayed over the read strictly — E-R1 raised here —: each migration renders from the state
+        after it, its compensation from the state before it. Backwards, *plan* (in undo order) rewinds the read: the
+        state with each migration applied is the read rewound through the migrations undone before it, and its
+        backwards render from that state rewound through it (``state.rewind()``), its compensation from the state with
+        it applied.
+        """
+        current = await DatabaseIntrospector(self._connection).introspect()
         prepared: list[_Prepared] = []
         for migration in plan:
-            after = _state.advance(migration, before, strict=True)
-            prepared.append(_prepared(migration, line=line, before=before, after=after))
-            before = after
+            if backwards:
+                before = _state.rewind(migration, current)
+                prepared.append(_prepared(migration, line=line, before=before, after=current, backwards=True))
+                current = before
+            else:
+                after = _state.advance(migration, current, strict=True)
+                prepared.append(_prepared(migration, line=line, before=current, after=after))
+                current = after
         return prepared
 
-    async def _apply(self, item: _Prepared, line: Literal[2, 3]) -> bool:
-        """Apply one prepared migration: phase A, then phase B (spec §5.6 step 4). ``True`` when applied, ``False``
-        when a failed batch finds the migration recorded (skipped, with the warning).
+    async def _apply(self, item: _Prepared, line: Literal[2, 3], way: _Way) -> bool:
+        """Send one prepared migration's batches — phase A, then phase B (spec §5.6) — applying it or, with *way*
+        ``_ROLLING_BACK``, undoing it. ``True`` when done, ``False`` when a failed batch finds the work done meanwhile
+        in the tracking table (skipped, with the warning).
 
         :raises SurrealDbConflictError: E-C1.
-        :raises MigrationStatementError: E-X1, E-X2, E-X6 (after the compensation, when phase A was committed).
-        :raises Exception: a transport error (no answer) propagates unchanged, after the compensation when the
-            migration is not recorded.
+        :raises MigrationStatementError: E-X1/E-X3, E-X2, E-X6 (after the compensation, when phase A was committed).
+        :raises Exception: a transport error (no answer) propagates unchanged, after the compensation when the work is
+            not found done.
         """
         name = item.migration.name
-        logger.info("Applying migration: %s", name)
+        logger.info(way.doing, name)
         committed = False
         for batch in (item.analyzers, item.main):
             if batch is None:
@@ -693,37 +952,69 @@ class MigrationExecutor:
                 failure = await _send(await self._client(), batch, line, None if phase_a else name)
             except Exception:
                 recorded = await self._recorded(name)
-                if recorded:
-                    self._skipped(name, "a lost answer")
+                if recorded is way.done_when_recorded:
+                    logger.warning(way.skipped, name, "a lost answer")
                     return False
                 if recorded is not None and item.compensation and (committed or phase_a):
                     # Phase A may have committed before its answer was lost: restoring is idempotent.
                     lost = await self._compensate(item, line)
-                    logger.warning("Migration %s: %s", name, _compensation_sentence(lost, item.restored))
+                    logger.warning("Migration %s: %s", name, _compensation_sentence(lost, item.restored, way))
                 raise
             if failure is None:
                 committed = committed or phase_a
                 continue
             recorded = await self._recorded(name)
-            if recorded:
-                self._skipped(name, "a conflict" if failure.conflict else "a refusal")
+            if recorded is way.done_when_recorded:
+                logger.warning(way.skipped, name, "a conflict" if failure.conflict else "a refusal")
                 return False
             if failure.conflict:
-                kept = f" {_KEPT}" if committed else ""
+                kept = f" Its analyzer definitions, committed first, were kept: retry {way.retry}." if committed else ""
                 raise SurrealDbConflictError(
-                    f"Migration '{name}' was not applied: a concurrent transaction conflicted (retryable): "
+                    f"Migration '{name}' was not {way.not_done}: a concurrent transaction conflicted (retryable): "
                     f"{failure.reason}{kept}"
                 )
             if not committed:
-                raise _statement_error(item.migration, failure)
+                raise _statement_error(item.migration, failure, way=way)
             if recorded is None:
                 outcome = _Compensated("the tracking table could not be read again")  # never compensated unverified
             else:
                 outcome = await self._compensate(item, line)
-            sentence = _compensation_sentence(outcome, item.restored)
-            raise _statement_error(item.migration, failure, sentence=sentence, restored=outcome.restored)
-        logger.info("Applied: %s", name)
+            sentence = _compensation_sentence(outcome, item.restored, way)
+            raise _statement_error(item.migration, failure, sentence=sentence, restored=outcome.restored, way=way)
         return True
+
+    async def _data(self, migration: Migration, line: Literal[2, 3]) -> None:
+        """Phase C of *migration* (spec §5.6): its ``DataMigration`` operations' SQL in one batch — no tracking
+        statement —, then each ``forwards_func`` in order, on the executor's connection.
+
+        :raises MigrationStatementError: E-X5, or E-X6 for a batch refused as a whole.
+        """
+        texts: list[str] = []
+        owners: list[int | None] = []
+        functions: list[Callable[[], Awaitable[None]]] = []
+        for index, operation in enumerate(migration.operations):
+            if not isinstance(operation, DataMigration):
+                continue
+            if text := operation.forwards(line=line):
+                texts.append(text)
+                owners.append(index)
+            if operation.forwards_func is not None:
+                functions.append(operation.forwards_func)
+        if texts:
+            failure = await _send(await self._client(), _Batch(texts, owners), line, None)
+            if failure is not None:
+                raise _data_error(migration, failure)
+        for function in functions:
+            await self._call(function)
+
+    async def _call(self, function: Callable[[], Awaitable[None]]) -> None:
+        """Await a data migration's *function* — inside ``using(<connection>)`` when the executor names one, so that
+        the ORM calls it makes reach that connection."""
+        if self._connection is None:
+            await function()
+            return
+        async with SurrealDBConnectionManager.using(self._connection):
+            await function()
 
     async def _recorded(self, name: str) -> bool | None:
         """Whether the tracking table records *name*, read again after a failed batch; ``None`` when that read fails
@@ -732,16 +1023,6 @@ class MigrationExecutor:
             return name in await self.get_applied_migrations()
         except Exception:
             return None
-
-    @staticmethod
-    def _skipped(name: str, cause: str) -> None:
-        logger.warning(
-            "Migration %s is recorded as applied although this run's batch failed (%s): a concurrent run applied it, or "
-            "the answer was lost; it is not applied again, and its data operations were not run here — run upgrade() if "
-            "they must.",
-            name,
-            cause,
-        )
 
     async def _compensate(self, item: _Prepared, line: Literal[2, 3]) -> _Compensated:
         """Send phase A's compensation of *item* (spec §5.6, D38): the analyzers' batch, then, once it is committed,
