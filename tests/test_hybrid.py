@@ -52,11 +52,13 @@ HNSW index and the exact scan (``dist=``, in ``hybrid_search()`` as in ``similar
 on every engine; below SurrealDB 3, whose own exact scan picks among the tied records in no fixed order, the ORM ranks
 the scan by distance then id, so the tied records kept are the first by id, in that order.
 
-The documentation (``TestReadmeSection38``, ``TestRoadmap37``), with no server: README section 38 — its place, its
-examples run as written on the embedded engine, each printed line equal to its comment, its texts word for word —, the
-bullets of sections 36 and 37 that point to it, the rows v0.37.0 adds to the features, roadmap, comparison and both
-behaviour tables, and v0.37.4's row of the exact scan's ties with its sentence; ``docs/ROADMAP.md`` recording v0.37.0 as
-planned or, once its Phase G row carries ✅, as released.
+The documentation (``TestHybridSearchDocstring``, ``TestReadmeSection38``, ``TestRoadmap37``), with no server: the
+method's docstring — the cross-line guarantee for the same two lists, as README section 38 words it, and the exact
+scan's ties in its ``dist`` argument —; README section 38 — its place, its examples run as written on the embedded
+engine, each printed line equal to its comment, its texts word for word —, the bullets of sections 36 and 37 that point
+to it, the rows v0.37.0 adds to the features, roadmap, comparison and both behaviour tables, and v0.37.4's row of the
+exact scan's ties with its sentence; ``docs/ROADMAP.md`` recording v0.37.0 as planned or, once its Phase G row carries
+✅, as released.
 """
 
 import ast
@@ -3415,6 +3417,50 @@ def _hybrid_search_numbers(block: str) -> list[tuple[str, object]]:
                     value = keyword.value
                     found.append((keyword.arg, value.value if isinstance(value, ast.Constant) else ast.unparse(value)))
     return found
+
+
+#: The cross-line guarantee, word for word in README section 38's intro and in ``hybrid_search()``'s docstring.
+_SAME_TWO_LISTS = "the same two lists give the same records, scores and order on every line."
+
+#: What may make the two lists differ between lines, in ``hybrid_search()``'s docstring right after the guarantee.
+_EACH_LIST_DOC = (
+    "Each list is SurrealDB's own, so the lists themselves can differ between lines: the HNSW search is approximate, "
+    "and the full-text list follows the line's BM25 scores (a term found in more than half the documents scores "
+    "``0.0`` on SurrealDB 3.x and below zero on 2.x and the embedded engine, README section 36)."
+)
+
+#: The ``dist`` argument of ``hybrid_search()``'s docstring, whitespace normalised.
+_DIST_ARG_DOC = (
+    "An exact scan by this distance instead of the index's search: ``EUCLIDEAN``, ``COSINE``, ``MANHATTAN``, "
+    "``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``. SurrealDB 2.x's and the embedded engine's own scan "
+    "picks among records at an equal distance at the ``vector_limit``-th place in no fixed order, so there the ORM "
+    "ranks it by distance, then id, as ``similar_to(dist=...)`` does: the tied records are kept by id, and identical "
+    "calls get one vector list on every line."
+)
+
+
+class TestHybridSearchDocstring:
+    """``help(QuerySet.hybrid_search)``: the cross-line guarantee worded as README section 38 words it — the same two
+    lists give the same records, scores and order on every line —, followed by what makes the lists differ; the
+    ``dist`` argument naming the exact scan's ties at the ``vector_limit``-th place on SurrealDB 2.x and the embedded
+    engine, which the ORM keeps by id."""
+
+    def test_the_guarantee_holds_for_the_same_two_lists(self) -> None:
+        doc = _normalised(inspect.getdoc(QuerySet.hybrid_search) or "")
+        assert _SAME_TWO_LISTS in _normalised(_part_38(""))
+        assert (
+            "SurrealDB 2.x and the embedded engine have no such function, so the ORM fuses them with the same formula: "
+            f"{_SAME_TWO_LISTS} {_EACH_LIST_DOC}"
+        ) in doc
+        assert "the records, scores and order are the same on every line" not in doc
+
+    def test_dist_names_the_ties_of_the_exact_scan(self) -> None:
+        doc = inspect.getdoc(QuerySet.hybrid_search) or ""
+        match = re.search(r"^    dist: (.*?)\n\n", doc, re.MULTILINE | re.DOTALL)
+        assert match is not None
+        assert _normalised(match.group(1)) == _DIST_ARG_DOC
+        # The ties are said once, in the argument they belong to.
+        assert _normalised(doc).count("in no fixed order") == 1
 
 
 class TestReadmeSection38:

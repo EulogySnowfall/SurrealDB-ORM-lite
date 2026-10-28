@@ -2159,14 +2159,15 @@ class QuerySet:
         counted from 1, and the records come back best first; equal scores keep the vector list's order first, then
         the full-text list's for the records it alone found. SurrealDB 3.x fuses the lists with its ``search::rrf()``;
         SurrealDB 2.x and the embedded engine have no such function, so the ORM fuses them with the same formula: the
-        records, scores and order are the same on every line. The vector and the text are bound as query variables,
-        never written into the statement.
+        same two lists give the same records, scores and order on every line. Each list is SurrealDB's own, so the
+        lists themselves can differ between lines: the HNSW search is approximate, and the full-text list follows the
+        line's BM25 scores (a term found in more than half the documents scores ``0.0`` on SurrealDB 3.x and below
+        zero on 2.x and the embedded engine, README section 36). The vector and the text are bound as query
+        variables, never written into the statement.
 
         Each record is a dict — the full SurrealDB-ORM's result: its fields keyed by their Python names and
         ``_rrf_score``, plus ``_knn_distance`` (its distance, ``None`` when only the full-text search found it) and
-        ``_search_score`` (its BM25 score, ``None`` when only the vector search found it). An exact scan (``dist=``)
-        gives identical calls one vector list on every line: records at an equal distance at the ``vector_limit``-th
-        place are kept by id on SurrealDB 2.x and the embedded engine, as ``similar_to(dist=...)`` keeps them.
+        ``_search_score`` (its BM25 score, ``None`` when only the vector search found it).
 
         Each search needs its index. Without a full-text index on ``text_field``, SurrealDB 3.3, 2.x and the embedded
         engine refuse the search (``SurrealDbError`` naming the field), while SurrealDB 3.1 and 3.2 match nothing.
@@ -2197,7 +2198,10 @@ class QuerySet:
             ef: The HNSW search's candidate list: ``None`` (100) or an ``int`` from 1 to 10000, raised to
                 ``vector_limit``.
             dist: An exact scan by this distance instead of the index's search: ``EUCLIDEAN``, ``COSINE``,
-                ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``.
+                ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``. SurrealDB 2.x's and the
+                embedded engine's own scan picks among records at an equal distance at the ``vector_limit``-th place
+                in no fixed order, so there the ORM ranks it by distance, then id, as ``similar_to(dist=...)`` does:
+                the tied records are kept by id, and identical calls get one vector list on every line.
 
         Returns:
             list[dict[str, Any]]: The fused records, best first, each a dict of its fields and ``_rrf_score``,
