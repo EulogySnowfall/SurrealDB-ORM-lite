@@ -24,17 +24,33 @@ The models' state (spec §5.9, ``migrations/introspector.py``): ``introspect_mod
 appliers write (``TestModelState``), with the marks — ``TableState.undeclared`` (``TestUndeclared``),
 ``FieldState.undeclared`` and ``FieldState.server`` (``TestFieldMarks``, AC-33) —; the operations its diff from an empty
 state gives replay to a state that diffs ``[]`` against it in both directions, marks removed (``TestRoundTrip``, AC-4);
-``get_registered_models()`` walks the model classes depth first (``TestRegistryWalk``, AC-32). Unit tests only (no
-server).
+``get_registered_models()`` walks the model classes depth first (``TestRegistryWalk``, AC-32).
+
+Against the database (spec §5.10, §6.5), over WebSocket and HTTP on the line under test and the embedded engine, each
+test in a database of its own: ``schema_diff()`` (``TestSchemaDiffE2E``, AC-8), ``makemigrations()`` reading the
+current state from the database by default (``TestFromDbE2E``, AC-19; ``TestExistingTablesE2E``, C8, AC-8 bis, AC-16
++), what models leave to the database kept (``TestUndeclaredE2E``, ``TestCarriedE2E``, AC-28), names in backticks
+(``TestNamesE2E``, AC-29), defaults holding ``;`` (``TestDefaultsE2E``, AC-30), ``applied_migrations`` read
+(``TestAppliedMigrationsE2E``, AC-31, AC-33), named connections (``TestNamedConnectionE2E``, AC-20, WebSocket and HTTP)
+and the tracking table skipped by the model generator (``TestGenerateSkipsTrackingTableE2E``, AC-23). Unit, without a
+server: the history checks of ``makemigrations()`` on a fake read (``TestFromDbHistory``, E-H1–E-H3), the applied
+names' reader on a fake client (``TestAppliedMigrationsReader``), the exports (``TestExports``) and the import layering
+in fresh interpreters (``TestLayering``, AC-1).
 """
 
+import ast
 import dataclasses
+import inspect
 import itertools
+import logging
 import re
+import shutil
+import subprocess
 import sys
 import textwrap
 import types
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 import pytest
@@ -46,19 +62,29 @@ from surreal_orm_lite import (
     AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
+    Computed,
+    DatabaseIntrospector,
     Index,
+    ModelCodeGenerator,
     SchemaMode,
     SurrealConfigDict,
+    SurrealDBConnectionManager,
     TableType,
+    _sdk,
+    computed,
+    generate_models_from_db,
     get_registered_models,
+    schema_diff,
 )
 from surreal_orm_lite.define_parser import parse_define_access, parse_define_event, parse_define_field, parse_define_table
+from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbError
 from surreal_orm_lite.migrations import (
     AddField,
     AlterField,
     AlterTable,
     CreateIndex,
     CreateTable,
+    DefaultExpression,
     DefineAccess,
     DefineAnalyzer,
     DefineEvent,
@@ -67,6 +93,8 @@ from surreal_orm_lite.migrations import (
     DropIndex,
     DropTable,
     Migration,
+    MigrationExecutor,
+    MigrationGenerator,
     ModelIntrospector,
     Operation,
     RawSQL,
@@ -76,8 +104,10 @@ from surreal_orm_lite.migrations import (
     RemoveEvent,
     RemoveFunction,
     compare,
+    executor,
     introspect_models,
     introspector,
+    makemigrations,
     render,
     state,
 )
@@ -95,6 +125,8 @@ from surreal_orm_lite.schema_state import (
     SchemaState,
     TableState,
 )
+from surreal_orm_lite.time_travel import cached_major
+from tests.conftest import _migration_url, migration_database, new_database_name
 from tests.test_migration_operations import (
     AdPlain,
     AdRefresh,
@@ -2157,3 +2189,914 @@ class TestRegistryWalk:
         monkeypatch.setattr(introspector, "get_registered_models", lambda: _of(module, walk()))
         assert ModelIntrospector(connection="other").models == [module.There]
         assert set(introspect_models(connection="other").tables) == {"mi_walk_there"}
+
+
+# === Task 11: schema_diff(), makemigrations() against the database, applied_migrations, exports (spec §5.10, §6.5) ===
+#
+# E2E over WebSocket and HTTP on the line under test and the embedded engine, each test in a database of its own
+# (``migration_database()``, spec §9.2), each choosing its expectation per line from ``cached_major()``.
+
+#: The engines of the E2E classes below.
+_KINDS = ["ws", "http", "mem"]
+
+
+async def _major(client: Any) -> int:
+    return 3 if await cached_major(client) >= 3 else 2
+
+
+async def _run(client: Any, statements: str) -> None:
+    """Run *statements* by hand, every status checked."""
+    answer = await client.query_raw(statements, {})
+    assert "error" not in answer, answer["error"]
+    assert all(entry["status"] == "OK" for entry in answer["result"]), answer["result"]
+
+
+async def _info_table(client: Any, table: str) -> dict[str, Any]:
+    info = await client.query(f"INFO FOR TABLE `{table}`;", {})
+    assert isinstance(info, dict)
+    return info
+
+
+async def _table_text(client: Any, table: str) -> str:
+    info = await client.query("INFO FOR DB;", {})
+    assert isinstance(info, dict)
+    return str(info["tables"][table])
+
+
+async def _apply(*models: type[BaseSurrealModel]) -> None:
+    """Every applier of each model, in order: ``define_view()`` or ``define_table()``, ``define_access()`` for a user
+    model, ``define_indexes()``, ``define_events()``."""
+    for model in models:
+        if model.model_config.get("view_query"):
+            await model.define_view()
+        else:
+            await model.define_table()
+        if issubclass(model, AuthenticatedUserMixin):
+            await model.define_access()
+        await model.define_indexes()
+        await model.define_events()
+
+
+def _files(directory: Path) -> list[str]:
+    """The migration files of *directory*, by name."""
+    return sorted(path.stem for path in directory.glob("*.py") if not path.name.startswith("_"))
+
+
+def _operations(directory: Path, name: str) -> list[Operation]:
+    return list(MigrationExecutor(directory).load_migration(name).operations)
+
+
+def _models_for(line: int) -> list[type[BaseSurrealModel]]:
+    """Task 5's model set; refresh tokens (``WITH REFRESH``) need SurrealDB 3.x, so ``AdRefresh`` is left out below."""
+    return [model for model in _MODEL_SET if line >= 3 or model is not AdRefresh]
+
+
+class SdItem(BaseSurrealModel):
+    """Two required columns: ``define_table()`` writes their ``TYPE`` only."""
+
+    model_config = SurrealConfigDict(table_name="sd_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    age: int
+
+
+class TestSchemaDiffE2E:
+    """AC-8 (``schema_diff()``'s half): ``[]`` when the models and the database agree — after their appliers, after
+    ``migrate()`` —; a hand redefinition the models describe differently gives its operation, one they cannot declare
+    is carried (C2)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_after_the_appliers(self, kind: str) -> None:
+        async with migration_database(kind) as client:
+            models = _models_for(await _major(client))
+            await _apply(*models)
+            assert await schema_diff(models=models) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_after_migrate(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            models = _models_for(await _major(client))
+            assert await makemigrations("initial", migrations_dir=tmp_path, models=models) is not None
+            assert await MigrationExecutor(tmp_path).migrate() == ["0001_initial"]
+            assert await schema_diff(models=models) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_type_changed_by_hand(self, kind: str) -> None:
+        async with migration_database(kind) as client:
+            await SdItem.define_table()
+            await _run(client, "DEFINE FIELD OVERWRITE age ON sd_item TYPE string;")
+            operations = await schema_diff(models=[SdItem])
+            assert len(operations) == 1
+            operation = operations[0]
+            assert isinstance(operation, AlterField)
+            assert (operation.table, operation.name, operation.field_type) == ("sd_item", "age", "int")
+            assert operation.previous_type == "string"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_assert_set_by_hand_is_carried(self, kind: str) -> None:
+        async with migration_database(kind) as client:
+            await SdItem.define_table()
+            before = await DatabaseIntrospector().introspect()
+            await _run(client, "DEFINE FIELD OVERWRITE age ON sd_item TYPE int ASSERT $value >= 0;")
+            assert await schema_diff(models=[SdItem]) == []
+            # Two database states carry no mark: every clause is compared (C2).
+            after = await DatabaseIntrospector().introspect()
+            operations = before.diff(after)
+            assert len(operations) == 1 and isinstance(operations[0], AlterField)
+            assert operations[0].assertion is not None and "$value >= 0" in operations[0].assertion
+
+
+class FdItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="fd_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    name: str = ""
+    age: int = 0
+
+
+class FdItemChanged(BaseSurrealModel):
+    """``FdItem`` with ``age`` retyped and a column added."""
+
+    model_config = SurrealConfigDict(table_name="fd_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    name: str = ""
+    age: float = 0.0
+    email: str = ""
+
+
+def _e_r1(name: str, position: int, operation: Operation, what: str) -> str:
+    return (
+        f"Migration '{name}', operation {position} ({operation.describe()}): {what} is neither in the database nor "
+        "defined by an earlier migration, so SurrealDB would refuse the removal. A RawSQL that defines it declares that "
+        "in state_operations=."
+    )
+
+
+class TestFromDbE2E:
+    """AC-19: ``makemigrations()`` reads the current state from the database by default — the applied migrations' and
+    the appliers' definitions, the pending files replayed over them strictly (§5.10, C9, D31)."""
+
+    def test_from_db_is_the_default(self) -> None:
+        assert inspect.signature(makemigrations).parameters["from_db"].default is True
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_nothing_right_after_migrate(self, kind: str, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        async with migration_database(kind):
+            assert await makemigrations("initial", migrations_dir=tmp_path, models=[FdItem]) is not None
+            assert await MigrationExecutor(tmp_path).migrate() == ["0001_initial"]
+            caplog.set_level(logging.INFO, logger="surreal_orm_lite.migrations")
+            assert await makemigrations("again", migrations_dir=tmp_path, models=[FdItem]) is None
+            assert "No changes detected." in caplog.messages
+            assert _files(tmp_path) == ["0001_initial"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_change_gives_the_files_operations(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            database_dir, files_dir = tmp_path / "db", tmp_path / "files"
+            assert await makemigrations("initial", migrations_dir=database_dir, models=[FdItem]) is not None
+            assert await MigrationExecutor(database_dir).migrate() == ["0001_initial"]
+            shutil.copytree(database_dir, files_dir)
+            from_db = await makemigrations("change", migrations_dir=database_dir, models=[FdItemChanged])
+            offline = await makemigrations("change", migrations_dir=files_dir, models=[FdItemChanged], from_db=False)
+            assert from_db is not None and offline is not None
+            operations = _operations(database_dir, from_db.stem)
+            assert operations == _operations(files_dir, offline.stem)
+            assert {type(operation) for operation in operations} == {AddField, AlterField}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_two_calls_before_migrate(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            assert await makemigrations("initial", migrations_dir=tmp_path, models=[FdItem]) is not None
+            assert await makemigrations("again", migrations_dir=tmp_path, models=[FdItem]) is None
+            assert _files(tmp_path) == ["0001_initial"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_tables_define_table_made_and_a_file_creating_them(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await FdItem.define_table()
+            assert await makemigrations("initial", migrations_dir=tmp_path, models=[FdItem], from_db=False) is not None
+            # No tracking table: the file is pending, replayed over the database's definitions without error.
+            assert await makemigrations("again", migrations_dir=tmp_path, models=[FdItem]) is None
+            assert _files(tmp_path) == ["0001_initial"]
+            assert MIGRATIONS_TABLE not in (await client.query("INFO FOR DB;", {}))["tables"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_pending_removal_of_a_missing_field(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            assert await makemigrations("initial", migrations_dir=tmp_path, models=[FdItem]) is not None
+            assert await MigrationExecutor(tmp_path).migrate() == ["0001_initial"]
+            drop = DropField("fd_item", "nope")
+            MigrationGenerator(tmp_path).generate("drop_nope", [drop], ["0001_initial"])
+            with pytest.raises(ValueError) as raised:
+                await makemigrations("next", migrations_dir=tmp_path, models=[FdItemChanged])
+            assert str(raised.value) == _e_r1("0002_drop_nope", 1, drop, "field 'nope' of table 'fd_item'")
+            assert _files(tmp_path) == ["0001_initial", "0002_drop_nope"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_pending_alteration_of_a_missing_field_is_placed(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            assert await makemigrations("initial", migrations_dir=tmp_path, models=[FdItem]) is not None
+            assert await MigrationExecutor(tmp_path).migrate() == ["0001_initial"]
+            alter = AlterField("fd_item", "email", "string", default="")
+            MigrationGenerator(tmp_path).generate("email", [alter], ["0001_initial"])
+            # OVERWRITE defines it: the replay places it, and the models then declare it as written.
+            assert await makemigrations("next", migrations_dir=tmp_path, models=[FdItemChanged]) is not None
+            operations = _operations(tmp_path, "0003_next")
+            assert [type(operation) for operation in operations] == [AlterField]
+            assert operations[0].name == "age"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_recorded_name_without_a_file(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await MigrationExecutor(tmp_path).ensure_migrations_table()
+            answer = await client.query_raw(f"CREATE `{MIGRATIONS_TABLE}` SET name = $name;", {"name": "0099_gone"})
+            assert [entry["status"] for entry in answer["result"]] == ["OK"], answer
+            with pytest.raises(ValueError) as raised:
+                await makemigrations("initial", migrations_dir=tmp_path, models=[FdItem])
+            assert str(raised.value) == (
+                f"Migration '0099_gone' is applied but has no file in {tmp_path}: the database's history does not "
+                f"match {tmp_path}."
+            )
+            assert _files(tmp_path) == []
+
+
+class ExItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ex_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    name: str = ""
+
+
+class ExItemEmail(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ex_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    name: str = ""
+    email: str = ""
+
+
+class ExLoose(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ex_loose")
+
+    id: str | None = None
+    bag: Any = None
+
+
+class ExLooseFull(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ex_loose", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    bag: Any = None
+
+
+def _batches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The text of every batch the executor sends; the real batch is sent."""
+    texts: list[str] = []
+    real = executor._send
+
+    async def spy(client: Any, batch: Any, line: int, name: str | None) -> Any:
+        texts.append(batch.text())
+        return await real(client, batch, line, name)
+
+    monkeypatch.setattr(executor, "_send", spy)
+    return texts
+
+
+class TestExistingTablesE2E:
+    """C8 (AC-8 bis, AC-16 +): a table ``define_table()`` made, with no migration file creating it — the default
+    ``makemigrations()`` writes what the models changed only, ``migrate()`` applies it."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_field_added_to_the_model(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            await ExItem.define_table()
+            path = await makemigrations("add_email", migrations_dir=tmp_path, models=[ExItemEmail])
+            assert path is not None and path.stem == "0001_add_email"
+            operations = _operations(tmp_path, path.stem)
+            assert len(operations) == 1 and isinstance(operations[0], AddField)
+            assert (operations[0].table, operations[0].name) == ("ex_item", "email")
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            assert await schema_diff(models=[ExItemEmail]) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_schemaless_table_made_schemafull(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind) as client:
+            line = await _major(client)
+            await ExLoose.define_table()
+            await _run(client, "CREATE ex_loose:1 SET bag = {a: 1, b: {c: 2}};")
+            path = await makemigrations("schemafull", migrations_dir=tmp_path, models=[ExLooseFull])
+            assert path is not None
+            operations = _operations(tmp_path, path.stem)
+            assert len(operations) == 1 and isinstance(operations[0], AlterTable)
+            batches = _batches(monkeypatch)
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            sent = [text for text in batches if "`ex_loose`" in text]
+            assert len(sent) == 1
+            # Below 3 the batch redefines the any column FLEXIBLE (chosen from the read); on 3.x the table statement only.
+            assert ("DEFINE FIELD OVERWRITE `bag` ON `ex_loose`" in sent[0]) is (line < 3)
+            bag = (await _info_table(client, "ex_loose"))["fields"]["bag"]
+            assert ("FLEXIBLE" in bag) is (line < 3)
+            await _run(client, "UPDATE ex_loose:1;")  # a write: the SCHEMAFULL table re-checks the record
+            assert await client.query("SELECT VALUE bag FROM ex_loose:1;", {}) == [{"a": 1, "b": {"c": 2}}]
+            # The files hold no column of ex_loose: on line 2 the table statement comes alone.
+            shown = await MigrationExecutor(tmp_path).show_sql(path.stem, line=2)
+            assert shown == operations[0].forwards(line=2)
+            assert "DEFINE FIELD" not in shown
+
+
+def _fake_read(monkeypatch: pytest.MonkeyPatch, read: SchemaState) -> None:
+    async def introspect(self: DatabaseIntrospector) -> SchemaState:
+        return read
+
+    monkeypatch.setattr(DatabaseIntrospector, "introspect", introspect)
+
+
+class TestFromDbHistory:
+    """AC-19, AC-18 (``makemigrations()``'s row, spec §5.6, §5.10): a fake database read — E-H1, E-H2 and E-H3 raise
+    before any file is written. No server."""
+
+    def _write(self, directory: Path) -> None:
+        first = MigrationGenerator(directory).generate("a", [CreateTable("hi_a")], []).stem
+        MigrationGenerator(directory).generate("b", [CreateTable("hi_b")], [first])
+
+    async def test_an_applied_name_without_a_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._write(tmp_path)
+        _fake_read(monkeypatch, SchemaState({}, ["0001_a", "0099_gone"]))
+        with pytest.raises(ValueError) as raised:
+            await makemigrations("c", migrations_dir=tmp_path, models=[FdItem])
+        assert str(raised.value) == (
+            f"Migration '0099_gone' is applied but has no file in {tmp_path}: the database's history does not match {tmp_path}."
+        )
+        assert _files(tmp_path) == ["0001_a", "0002_b"]
+
+    async def test_an_applied_migration_whose_dependency_is_pending(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._write(tmp_path)
+        _fake_read(monkeypatch, SchemaState({}, ["0002_b"]))
+        with pytest.raises(ValueError) as raised:
+            await makemigrations("c", migrations_dir=tmp_path, models=[FdItem])
+        assert str(raised.value) == (
+            f"Migration '0002_b' is applied but its dependency '0001_a' is not: the database's history does not match "
+            f"{tmp_path}."
+        )
+        assert _files(tmp_path) == ["0001_a", "0002_b"]
+
+    async def test_the_tracking_table_could_not_be_read(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._write(tmp_path)
+        issue = SchemaIssue("table", MIGRATIONS_TABLE, MIGRATIONS_TABLE, "could not read the applied migrations")
+        _fake_read(monkeypatch, SchemaState({}, issues=[issue]))
+        with pytest.raises(SurrealDbError) as raised:
+            await makemigrations("c", migrations_dir=tmp_path, models=[FdItem])
+        assert str(raised.value) == (
+            "makemigrations() could not read the applied migrations from _surreal_orm_migrations; nothing was written."
+        )
+        assert _files(tmp_path) == ["0001_a", "0002_b"]
+
+    async def test_another_issue_of_the_tracking_table_is_no_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        issue = SchemaIssue("table", MIGRATIONS_TABLE, MIGRATIONS_TABLE, "INFO FOR TABLE failed: boom")
+        _fake_read(monkeypatch, SchemaState({}, issues=[issue]))
+        path = await makemigrations("initial", migrations_dir=tmp_path, models=[FdItem])
+        assert path is not None and path.stem == "0001_initial"
+
+    async def test_the_pending_files_are_replayed_over_the_read(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._write(tmp_path)
+        _fake_read(monkeypatch, SchemaState({}, ["0001_a"]))
+        path = await makemigrations("c", migrations_dir=tmp_path, models=[FdItem])
+        assert path is not None
+        migration = MigrationExecutor(tmp_path).load_migration(path.stem)
+        assert list(migration.dependencies) == ["0002_b"]
+        # hi_a and hi_b are the database's (applied) and the files' (pending): their removals are left out.
+        assert [type(operation) for operation in migration.operations][0] is CreateTable
+
+
+class UdItem(BaseSurrealModel):
+    """A model declaring none of the table's permissions, comment and change feed."""
+
+    model_config = SurrealConfigDict(table_name="ud_item")
+
+    id: str | None = None
+    n: int = 0
+
+
+class UdItemCommented(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ud_item", comment="x")
+
+    id: str | None = None
+    n: int = 0
+
+
+_UD_HAND = (
+    "DEFINE TABLE ud_item TYPE NORMAL SCHEMALESS CHANGEFEED 1h INCLUDE ORIGINAL COMMENT 'hand' PERMISSIONS FOR select FULL;"
+)
+
+
+class TestUndeclaredE2E:
+    """AC-28 (the table part, D12): the clauses a model leaves to the database are kept — ``schema_diff()`` ``[]``,
+    nothing to write —, and an ``AlterTable`` for a clause the model declares keeps them, forwards and backwards."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_hand_set_clauses_are_kept(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, _UD_HAND)
+            await UdItem.define_table()
+            assert await schema_diff(models=[UdItem]) == []
+            assert await makemigrations("nothing", migrations_dir=tmp_path, models=[UdItem]) is None
+            path = await makemigrations("comment", migrations_dir=tmp_path, models=[UdItemCommented])
+            assert path is not None
+            operations = _operations(tmp_path, path.stem)
+            assert len(operations) == 1 and isinstance(operations[0], AlterTable)
+            alter = operations[0]
+            assert (alter.comment, alter.changefeed, alter.previous_comment) == ("x", "1h INCLUDE ORIGINAL", "hand")
+            assert alter.permissions is not None and alter.permissions["select"] == "FULL"
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [path.stem]
+            table = parse_define_table(await _table_text(client, "ud_item"))
+            assert (table.comment, table.changefeed, table.changefeed_include_original) == ("x", "1h", True)
+            assert table.permissions["select"] == "FULL"
+            assert await executor.rollback("") == [path.stem]
+            table = parse_define_table(await _table_text(client, "ud_item"))
+            assert (table.comment, table.changefeed, table.changefeed_include_original) == ("hand", "1h", True)
+            assert table.permissions["select"] == "FULL"
+
+
+class CrItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cr_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    n: int
+
+
+class CrItemFloat(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cr_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    n: float
+
+
+class CpItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cp_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    a: str = ""
+    full: Computed[str] = computed("string::concat(a, 'x')")
+
+
+class CpItemChanged(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cp_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    a: str = ""
+    full: Computed[str] = computed("string::concat(a, 'y')")
+
+
+class DrItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="dr_item", comment="a")
+
+    id: str | None = None
+    n: int = 0
+
+
+class DrItemChanged(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="dr_item", comment="b")
+
+    id: str | None = None
+    n: int = 0
+
+
+class TestCarriedE2E:
+    """AC-28 (the field part, D12): a clause set by hand that the models cannot declare is kept through the operation
+    the models' change writes — each file then applied by ``migrate()``."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_default_always_through_a_type_change(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await CrItem.define_table()
+            await _run(client, "DEFINE FIELD OVERWRITE n ON cr_item TYPE int DEFAULT ALWAYS 1;")
+            assert await schema_diff(models=[CrItem]) == []
+            path = await makemigrations("float", migrations_dir=tmp_path, models=[CrItemFloat])
+            assert path is not None
+            operations = _operations(tmp_path, path.stem)
+            assert len(operations) == 1 and isinstance(operations[0], AlterField)
+            assert operations[0].default_always is True
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            field = parse_define_field((await _info_table(client, "cr_item"))["fields"]["n"]).state
+            assert (field.field_type, field.default, field.default_always) == ("float", "1", True)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_computed_field_stays_computed(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            if await _major(client) < 3:
+                # Below 3, COMPUTED is not parsed: a hand-written AddField(computed=…) is refused before any DDL (E-D3).
+                operation = AddField("cp_item", "c", "int", computed="1")
+                name = MigrationGenerator(tmp_path).generate("computed", [operation], []).stem
+                with pytest.raises(SurrealDbError) as raised:
+                    await MigrationExecutor(tmp_path).migrate()
+                assert str(raised.value) == (
+                    f"Migration '{name}', operation 1 ({operation.describe()}): COMPUTED fields need SurrealDB 3.x; "
+                    "this connection runs SurrealDB 2.x or the embedded engine."
+                )
+                return
+            await CpItem.define_table()
+            await _run(client, "DEFINE FIELD OVERWRITE full ON cp_item TYPE option<string> COMPUTED string::concat(a, 'x');")
+            assert await schema_diff(models=[CpItem]) == []
+            path = await makemigrations("computed", migrations_dir=tmp_path, models=[CpItemChanged])
+            assert path is not None
+            operations = _operations(tmp_path, path.stem)
+            assert len(operations) == 1 and isinstance(operations[0], AlterField)
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            field = parse_define_field((await _info_table(client, "cp_item"))["fields"]["full"]).state
+            assert field.computed == "string::concat(a, 'y')"
+            assert field.value is None
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_drop_table_stays_drop(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await DrItem.define_table()
+            await _run(client, "DEFINE TABLE OVERWRITE dr_item TYPE NORMAL DROP SCHEMALESS COMMENT 'a' PERMISSIONS NONE;")
+            assert await schema_diff(models=[DrItem]) == []
+            path = await makemigrations("comment", migrations_dir=tmp_path, models=[DrItemChanged])
+            assert path is not None
+            operations = _operations(tmp_path, path.stem)
+            assert len(operations) == 1 and isinstance(operations[0], AlterTable)
+            assert operations[0].drop is True
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            table = parse_define_table(await _table_text(client, "dr_item"))
+            assert (table.drop, table.comment) == (True, "b")
+
+
+class NmItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="nm_item")
+
+    id: str | None = None
+
+
+class TestNamesE2E:
+    """AC-29 (D26): definitions under names SurrealDB accepts only in backticks appear as removals, never an error."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_non_identifier_names(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await NmItem.define_table()
+            await _run(
+                client,
+                "DEFINE TABLE `user-events` SCHEMAFULL; DEFINE FIELD `first-name` ON `user-events` TYPE string; "
+                "DEFINE INDEX `idx-x` ON `user-events` FIELDS `first-name`; DEFINE TABLE `2024_sales`;",
+            )
+            operations = await schema_diff(models=[NmItem])
+            assert sorted(operation.describe() for operation in operations) == [
+                "Drop table '2024_sales'",
+                "Drop table 'user-events'",
+            ]
+            assert await makemigrations("keep", migrations_dir=tmp_path, models=[NmItem]) is None
+            path = await makemigrations("drop", migrations_dir=tmp_path, models=[NmItem], drop_missing=True, from_db=True)
+            assert path is not None
+            assert {operation.describe() for operation in _operations(tmp_path, path.stem)} == {
+                "Drop table '2024_sales'",
+                "Drop table 'user-events'",
+            }
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            tables = set((await client.query("INFO FOR DB;", {}))["tables"])
+            assert not {"user-events", "2024_sales"} & tables
+            assert await schema_diff(models=[NmItem]) == []
+
+
+class DfItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="df_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    sep: str = "a;b"
+
+
+class DfBlock(BaseSurrealModel):
+    """``x`` retyped: the database's ``DEFAULT`` block, which no model can declare, is carried into the file."""
+
+    model_config = SurrealConfigDict(table_name="df_block")
+
+    id: str | None = None
+    x: float
+
+
+class TestDefaultsE2E:
+    """AC-30 (D23): a default holding ``;`` — the model's literal, the database's block — is written, loads and
+    applies."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_literal_default_holding_a_semicolon(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            path = await makemigrations("initial", migrations_dir=tmp_path, models=[DfItem])
+            assert path is not None
+            assert "default='a;b'" in path.read_text(encoding="utf-8")
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            assert await schema_diff(models=[DfItem]) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_database_block_default(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await _run(
+                client,
+                "DEFINE TABLE df_block SCHEMALESS; DEFINE FIELD x ON df_block TYPE int DEFAULT { LET $x = 1; RETURN $x; };",
+            )
+            path = await makemigrations("block", migrations_dir=tmp_path, models=[DfBlock])
+            assert path is not None
+            assert "DefaultExpression(" in path.read_text(encoding="utf-8")
+            operations = _operations(tmp_path, path.stem)
+            alter = next(operation for operation in operations if isinstance(operation, AlterField))
+            assert isinstance(alter.default, DefaultExpression)
+            # Applied on a database without the table: the field statement defines it.
+            await _run(client, "REMOVE TABLE df_block;")
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            await _run(client, "CREATE df_block:1;")
+            assert await client.query("SELECT VALUE x FROM df_block:1;", {}) == [1.0]
+
+
+class TestAppliedMigrationsE2E:
+    """AC-31, AC-33 (the database part): ``DatabaseIntrospector().introspect().applied_migrations`` lists the applied
+    names in order — whatever ``tables=`` says —, ``()`` without the tracking table; a read carries no mark."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_applied_names(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            assert (await DatabaseIntrospector().introspect()).applied_migrations == ()
+            first = MigrationGenerator(tmp_path).generate("a", [CreateTable("am_t", "SCHEMAFULL")], []).stem
+            second = MigrationGenerator(tmp_path).generate("b", [AddField("am_t", "n", "int")], [first]).stem
+            assert await MigrationExecutor(tmp_path).migrate() == [first, second]
+            read = await DatabaseIntrospector().introspect()
+            assert read.applied_migrations == (first, second)
+            assert (await DatabaseIntrospector(tables=["am_t"]).introspect()).applied_migrations == (first, second)
+            assert list(read.issues) == []
+            for table in read.tables.values():
+                assert table.undeclared == frozenset()
+                for column in table.fields.values():
+                    assert (column.undeclared, column.server) == (frozenset(), False)
+            replayed = MigrationExecutor(tmp_path).migration_state()
+            assert replayed.applied_migrations == (first, second)
+            assert all(table.undeclared == frozenset() for table in replayed.tables.values())
+
+
+class _AppliedClient:
+    """An SDK-like client whose database lists the tracking table; the applied names' read answers *answer* (an
+    exception is raised)."""
+
+    def __init__(self, answer: object) -> None:
+        self.answer = answer
+        self.statements: list[str] = []
+
+    async def query(self, sql: str, vars: object = None) -> object:
+        self.statements.append(sql)
+        if sql == "INFO FOR DB;":
+            return {"tables": {MIGRATIONS_TABLE: f"DEFINE TABLE {MIGRATIONS_TABLE} TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"}}
+        if sql.startswith("INFO FOR TABLE"):
+            return {"events": {}, "fields": {}, "indexes": {}, "lives": {}, "tables": {}}
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+def _client_of(monkeypatch: pytest.MonkeyPatch, client: object) -> None:
+    async def get_client(*args: object, **kwargs: object) -> object:
+        return client
+
+    monkeypatch.setattr(SurrealDBConnectionManager._manager_for("default"), "get_client", get_client)
+
+
+class TestAppliedMigrationsReader:
+    """Spec §5.10 (D22): the reader's error rules, with a fake client — no server."""
+
+    async def test_the_names_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _AppliedClient([{"name": "0001_a", "applied_at": "x"}, {"name": "0002_b", "applied_at": "y"}])
+        _client_of(monkeypatch, client)
+        read = await DatabaseIntrospector(tables=[]).introspect()
+        assert read.applied_migrations == ("0001_a", "0002_b")
+        assert client.statements == [
+            "INFO FOR DB;",
+            f"SELECT name, applied_at FROM `{MIGRATIONS_TABLE}` ORDER BY applied_at, name;",
+        ]
+
+    async def test_a_server_failure_is_an_issue(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _client_of(monkeypatch, _AppliedClient(_sdk.ServerError("Internal", "boom")))
+        read = await DatabaseIntrospector().introspect()
+        assert read.applied_migrations == ()
+        assert [(issue.kind, issue.name, issue.message) for issue in read.issues] == [
+            ("table", MIGRATIONS_TABLE, "could not read the applied migrations")
+        ]
+
+    async def test_an_answer_that_is_not_a_list_is_an_issue(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _client_of(monkeypatch, _AppliedClient("nope"))
+        read = await DatabaseIntrospector().introspect()
+        assert read.applied_migrations == ()
+        assert [issue.message for issue in read.issues] == ["could not read the applied migrations"]
+
+    async def test_a_refusal_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _client_of(monkeypatch, _AppliedClient(_sdk.ServerError("Internal", "Not enough permissions to perform this action")))
+        with pytest.raises(SurrealDbAuthenticationError):
+            await DatabaseIntrospector().introspect()
+
+    async def test_a_transport_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _client_of(monkeypatch, _AppliedClient(ConnectionResetError("gone")))
+        with pytest.raises(ConnectionResetError):
+            await DatabaseIntrospector().introspect()
+
+
+class NcItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="nc_item", connection="mig_other")
+
+    id: str | None = None
+    n: int = 0
+
+
+class NcHere(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="nc_here")
+
+    id: str | None = None
+
+
+class TestNamedConnectionE2E:
+    """AC-20: ``connection="mig_other"`` (a second database) — the executor, ``makemigrations()`` and
+    ``schema_diff()`` touch only it; a model of another connection is left out."""
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_second_database(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            other = new_database_name()
+            SurrealDBConnectionManager.add_connection(
+                "mig_other", url=_migration_url(kind), user="root", password="root", namespace="ns", database=other
+            )
+            try:
+                models = [NcItem, NcHere]
+                path = await makemigrations("initial", migrations_dir=tmp_path, models=models, connection="mig_other")
+                assert path is not None
+                assert [operation.describe() for operation in _operations(tmp_path, path.stem)][0] == "Create table nc_item"
+                assert not any("nc_here" in operation.describe() for operation in _operations(tmp_path, path.stem))
+                executor = MigrationExecutor(tmp_path, connection="mig_other")
+                assert await executor.migrate() == [path.stem]
+                assert await schema_diff(models=models, connection="mig_other") == []
+                assert await makemigrations("again", migrations_dir=tmp_path, models=models, connection="mig_other") is None
+                assert (await DatabaseIntrospector("mig_other").introspect()).applied_migrations == (path.stem,)
+                # The default connection's database was not touched.
+                assert (await client.query("INFO FOR DB;", {}))["tables"] == {}
+                assert [operation.describe() for operation in await schema_diff(models=models)] == ["Create table nc_here"]
+            finally:
+                async with SurrealDBConnectionManager.using("mig_other"):
+                    cleanup = await SurrealDBConnectionManager.get_client()
+                    await cleanup.query(f"REMOVE DATABASE IF EXISTS {other};", {})
+
+
+class TestGenerateSkipsTrackingTableE2E:
+    """AC-23 (D19): ``generate_models_from_db()`` and ``ModelCodeGenerator`` skip the tracking table, with a comment
+    line."""
+
+    _LINE = "# _surreal_orm_migrations: the migrations' tracking table (not modelled)"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_generate_models_from_db(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind):
+            MigrationGenerator(tmp_path).generate("a", [CreateTable("gs_t", "SCHEMAFULL"), AddField("gs_t", "n", "int")], [])
+            assert await MigrationExecutor(tmp_path).migrate() == ["0001_a"]
+            source = await generate_models_from_db()
+            assert self._LINE in source.splitlines()
+            assert MIGRATIONS_TABLE not in source.replace(self._LINE, "")
+            assert "class GsT(" in source
+
+    def test_the_generator_alone(self) -> None:
+        tracking = TableState(MIGRATIONS_TABLE, fields={"name": FieldState("name", "string", table=MIGRATIONS_TABLE)})
+        issue = SchemaIssue("table", MIGRATIONS_TABLE, MIGRATIONS_TABLE, "could not read the applied migrations")
+        source = ModelCodeGenerator().generate(SchemaState({MIGRATIONS_TABLE: tracking}, issues=[issue]))
+        assert self._LINE in source.splitlines()
+        assert MIGRATIONS_TABLE not in source.replace(self._LINE, "")
+        assert "Not generated" not in source
+        assert self._LINE not in ModelCodeGenerator().generate(SchemaState())
+
+
+#: Spec §5.1's ``surreal_orm_lite.migrations.__all__``.
+_MIGRATIONS_ALL = {
+    "Migration",
+    "Operation",
+    "CreateTable",
+    "AlterTable",
+    "DropTable",
+    "AddField",
+    "AlterField",
+    "DropField",
+    "CreateIndex",
+    "DropIndex",
+    "RebuildIndex",
+    "DefineAnalyzer",
+    "RemoveAnalyzer",
+    "DefineEvent",
+    "RemoveEvent",
+    "DefineAccess",
+    "RemoveAccess",
+    "DefineFunction",
+    "RemoveFunction",
+    "DataMigration",
+    "RawSQL",
+    "DefaultExpression",
+    "split_destructive",
+    "MigrationGenerator",
+    "generate_empty_migration",
+    "MigrationExecutor",
+    "MigrationStatementError",
+    "ModelIntrospector",
+    "introspect_models",
+    "makemigrations",
+    "DatabaseIntrospector",
+    "ModelCodeGenerator",
+    "MIGRATIONS_TABLE",
+}
+#: Spec §5.1's top-level additions from the migrations package.
+_TOP_LEVEL = ("schema_diff", "DefineAnalyzer", "DefineEvent", "RebuildIndex", "RemoveEvent")
+
+
+class TestExports:
+    """AC-1: spec §5.1's names, exactly."""
+
+    def test_the_migrations_package(self) -> None:
+        import surreal_orm_lite.migrations as migrations
+
+        assert len(migrations.__all__) == len(set(migrations.__all__)) == 33
+        assert set(migrations.__all__) == _MIGRATIONS_ALL
+        for name in _MIGRATIONS_ALL:
+            assert getattr(migrations, name) is not None, name
+        assert migrations.DatabaseIntrospector is DatabaseIntrospector
+        assert migrations.ModelCodeGenerator is ModelCodeGenerator
+
+    def test_the_top_level(self) -> None:
+        import surreal_orm_lite.introspection as introspection_module
+        import surreal_orm_lite.migrations as migrations
+
+        for name in _TOP_LEVEL[1:]:
+            assert name in surreal_orm_lite.__all__, name
+            assert getattr(surreal_orm_lite, name) is getattr(migrations, name)
+        assert "schema_diff" in surreal_orm_lite.__all__
+        assert surreal_orm_lite.schema_diff is introspection_module.schema_diff
+        assert "schema_diff" in introspection_module.__all__
+        # The other migration names stay in the sub-package.
+        for name in _MIGRATIONS_ALL - {"DatabaseIntrospector", "ModelCodeGenerator", *_TOP_LEVEL}:
+            assert name not in surreal_orm_lite.__all__, name
+
+    def test_the_names_import(self) -> None:
+        namespace: dict[str, Any] = {}
+        exec(f"from surreal_orm_lite.migrations import {', '.join(sorted(_MIGRATIONS_ALL))}", namespace)
+        exec(f"from surreal_orm_lite import {', '.join(_TOP_LEVEL)}, get_registered_models", namespace)
+        exec("from surreal_orm_lite.introspection import schema_diff", namespace)
+        assert all(name in namespace for name in (*_MIGRATIONS_ALL, *_TOP_LEVEL))
+
+
+_SRC = Path(surreal_orm_lite.__file__).parent
+
+
+def _imports_migrations(node: ast.stmt) -> bool:
+    """Whether the module-level statement *node* imports the ``migrations`` package or one of its modules."""
+    if isinstance(node, ast.Import):
+        return any(alias.name.startswith("surreal_orm_lite.migrations") for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        module = node.module or ""
+        if node.level == 0:
+            return module.startswith("surreal_orm_lite.migrations")
+        return module.split(".")[0] == "migrations" or (module == "" and any(a.name == "migrations" for a in node.names))
+    return False
+
+
+def _type_checking(node: ast.stmt) -> bool:
+    return isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+
+
+class TestLayering:
+    """AC-1 (spec §5.1): no import cycle — four fresh interpreters —, and no core module imports the ``migrations``
+    package at module level (``surreal_orm_lite/__init__.py`` imports it last, after every other import)."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "import surreal_orm_lite",
+            "import surreal_orm_lite.model_auth",
+            "import surreal_orm_lite.migrations.render",
+            "from surreal_orm_lite.migrations import introspector",
+        ],
+    )
+    def test_a_fresh_interpreter(self, statement: str) -> None:
+        completed = subprocess.run([sys.executable, "-c", statement], capture_output=True, text=True, check=False)
+        assert completed.returncode == 0, completed.stderr
+
+    def test_no_core_module_imports_migrations(self) -> None:
+        offenders = []
+        for path in sorted(_SRC.glob("*.py")):
+            if path.name == "__init__.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if not _type_checking(node) and _imports_migrations(node):
+                    offenders.append(path.name)
+        assert offenders == []
+
+    def test_the_package_init_imports_migrations_last(self) -> None:
+        tree = ast.parse((_SRC / "__init__.py").read_text(encoding="utf-8"))
+        imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+        flags = [_imports_migrations(node) for node in imports]
+        assert any(flags)
+        first = flags.index(True)
+        assert all(flags[first:]), "every import after the first migrations import is a migrations import"

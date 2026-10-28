@@ -327,45 +327,6 @@ class TestMigrationStatementError:
         assert (str(clone), clone.migration, clone.operation) == ("z", "0001_a", 1)
 
 
-def test_the_package_exports() -> None:
-    # The names that exist after Task 7 of v0.38.0's plan; the later tasks add the rest of spec §5.1.
-    assert set(migrations.__all__) == {
-        "MIGRATIONS_TABLE",
-        "Migration",
-        "MigrationStatementError",
-        "Operation",
-        "CreateTable",
-        "AlterTable",
-        "DropTable",
-        "AddField",
-        "AlterField",
-        "DropField",
-        "CreateIndex",
-        "DropIndex",
-        "RebuildIndex",
-        "DefineAnalyzer",
-        "RemoveAnalyzer",
-        "DefineEvent",
-        "RemoveEvent",
-        "DefineAccess",
-        "RemoveAccess",
-        "DefineFunction",
-        "RemoveFunction",
-        "DataMigration",
-        "RawSQL",
-        "DefaultExpression",
-        "split_destructive",
-        "ModelIntrospector",
-        "introspect_models",
-        "MigrationGenerator",
-        "generate_empty_migration",
-        "MigrationExecutor",
-        "makemigrations",
-    }
-    for name in migrations.__all__:
-        assert getattr(migrations, name) is not None
-
-
 # --- the writer: MigrationGenerator, generate_empty_migration() --------------------------------------------------------
 
 #: Spec §5.8's file, without its ``Generated:`` line.

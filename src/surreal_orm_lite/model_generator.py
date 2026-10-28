@@ -21,7 +21,8 @@ source in exactly three ways, and through no format placeholder of the generator
 
 **Tables.** A table is modelled when its name is an identifier (``table_name`` refuses anything else) and is not
 one of the SurrealQL words the ORM's unescaped statements cannot use as a table name, whatever the case (``select``,
-``Select``, ``only`` …); the others are listed in the module's header instead.
+``Select``, ``only`` …); the others are listed in the module's header instead. The migrations' tracking table
+``_surreal_orm_migrations`` (v0.38.0) is never modelled: the header says so in a comment line of its own.
 
 **Names are allocated in two passes**, so that no attribute can shadow a class of the module: first the class names —
 tables in codepoint order of their names, each followed by its sub-model candidates (an ``object`` field with
@@ -507,6 +508,11 @@ _DOCSTRING = (
     "define_computed_fields() on them, it would replace the database's field definitions.\n"
     '"""'
 )
+
+#: The migrations' tracking table (``surreal_orm_lite.migrations.MIGRATIONS_TABLE``, written out: no core module imports
+#: the ``migrations`` package at module level) and the header line that replaces its model (v0.38.0, D19).
+_MIGRATIONS_TABLE = "_surreal_orm_migrations"
+_MIGRATIONS_LINE = "# _surreal_orm_migrations: the migrations' tracking table (not modelled)"
 
 #: Why a table or a field is not generated, from what the reader found (the reasons by name are above).
 _S2_NOT_READ = "it could not be read (see SchemaState.issues)"
@@ -1414,8 +1420,8 @@ def _index_label(index: IndexState) -> str:
 def _skipped_tables(state: SchemaState) -> dict[str, str]:
     """Table name → why it is not generated: its name, else ``INFO FOR TABLE`` failed (the table is kept without
     definitions) or its definition could not be parsed (it is not in ``state.tables``)."""
-    present = {table.name for table in state.tables.values()}
-    with_issue = {issue.name for issue in state.issues if issue.kind == "table"}
+    present = {table.name for table in state.tables.values()} - {_MIGRATIONS_TABLE}
+    with_issue = {issue.name for issue in state.issues if issue.kind == "table"} - {_MIGRATIONS_TABLE}
     reasons = {}
     for name in sorted(present | with_issue):
         reason = _skip_reason(name)
@@ -1467,7 +1473,7 @@ class ModelCodeGenerator:
         """
         skipped = _skipped_tables(state)
         tables = sorted(
-            (table for table in state.tables.values() if table.name not in skipped),
+            (table for table in state.tables.values() if table.name not in skipped and table.name != _MIGRATIONS_TABLE),
             key=lambda table: table.name,
         )
         names = _Names(tables)
@@ -1491,6 +1497,10 @@ class ModelCodeGenerator:
             lines = [_comment("Not generated:", indent=0)]
             lines.extend(_comment(text, indent=0) for _, _, text in sorted(skips))
             header.append("\n".join(lines))
+        if _MIGRATIONS_TABLE in state.tables or any(
+            issue.kind == "table" and issue.name == _MIGRATIONS_TABLE for issue in state.issues
+        ):
+            header.append(_MIGRATIONS_LINE)
         source = "\n\n".join(header)
         if body:
             source += "\n\n\n" + body

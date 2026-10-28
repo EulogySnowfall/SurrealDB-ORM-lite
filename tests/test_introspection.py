@@ -115,6 +115,7 @@ _EXPORTS = (
     "FunctionState",
     "ParamState",
     "SchemaIssue",
+    "schema_diff",
 )
 
 #: E9 (spec §5.6), exactly.
@@ -255,7 +256,7 @@ class TestExports:
     """AC-1: the 13 names of spec §5.8 import from the package and from ``introspection``, with their signatures."""
 
     def test_names_are_exported(self) -> None:
-        assert len(_EXPORTS) == 13
+        assert len(_EXPORTS) == 14
         for name in _EXPORTS:
             assert name in surreal_orm_lite.__all__, name
             assert name in introspection_module.__all__, name

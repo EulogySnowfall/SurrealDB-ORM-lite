@@ -68,6 +68,7 @@ from .introspection import (
     SchemaState,
     TableState,
     generate_models_from_db,
+    schema_diff,
 )
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
@@ -94,6 +95,11 @@ from .subquery import Subquery
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 from .types import Duration, Range, SchemaMode, TableType
 from .vector import Vector, VectorField
+
+# isort: split
+# The migrations (v0.38.0) last, after every other import: their modules import the core modules above, which must be
+# fully initialised first; no core module imports them at module level (no import cycle).
+from .migrations import DefineAnalyzer, DefineEvent, RebuildIndex, RemoveEvent
 
 __all__ = [
     "__version__",
@@ -202,6 +208,12 @@ __all__ = [
     "FunctionState",
     "ParamState",
     "SchemaIssue",
+    # Migrations (v0.38.0): the rest is in surreal_orm_lite.migrations
+    "schema_diff",
+    "DefineAnalyzer",
+    "DefineEvent",
+    "RebuildIndex",
+    "RemoveEvent",
     # Server-side events and DDL (v0.31.0)
     "Event",
     "function_ddl",

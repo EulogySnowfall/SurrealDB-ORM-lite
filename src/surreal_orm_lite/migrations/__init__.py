@@ -8,9 +8,12 @@ reports a statement SurrealDB refused, without quoting it. The executor records 
 describe, which ``SchemaState.diff()`` compares with a database's. :class:`MigrationGenerator` writes a migration's file
 from its operations, and :func:`generate_empty_migration` one to fill in by hand. :class:`MigrationExecutor` loads the
 files of a migrations directory in their dependency order, gives the state they build and the statements of each one;
-:func:`makemigrations` writes the next file from the models.
+:func:`makemigrations` writes the next file from the models — by default against the database's schema, which
+:class:`DatabaseIntrospector` reads (:class:`ModelCodeGenerator` turns such a read into models; both re-exported from
+``surreal_orm_lite.introspection``, as the full ORM's ``migrations`` package exports them).
 """
 
+from ..introspection import DatabaseIntrospector, ModelCodeGenerator
 from .autodetect import makemigrations
 from .constants import MIGRATIONS_TABLE
 from .executor import MigrationExecutor, MigrationStatementError
@@ -50,6 +53,7 @@ __all__ = [
     "CreateIndex",
     "CreateTable",
     "DataMigration",
+    "DatabaseIntrospector",
     "DefaultExpression",
     "DefineAccess",
     "DefineAnalyzer",
@@ -62,6 +66,7 @@ __all__ = [
     "MigrationExecutor",
     "MigrationGenerator",
     "MigrationStatementError",
+    "ModelCodeGenerator",
     "ModelIntrospector",
     "Operation",
     "RawSQL",

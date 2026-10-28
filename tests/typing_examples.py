@@ -64,6 +64,16 @@ from surreal_orm_lite import (
     computed,
     function_ddl,
     generate_models_from_db,
+    get_registered_models,
+    schema_diff,
+)
+from surreal_orm_lite.migrations import (
+    AddField,
+    DefaultExpression,
+    Migration,
+    MigrationExecutor,
+    Operation,
+    makemigrations,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
@@ -780,3 +790,24 @@ async def uses_fixture() -> str:
         assert_type(data, Typed)
         assert_type(data.alice, TypedMember)
         return data.alice.name
+
+
+async def migration_forms() -> None:
+    """v0.38.0: the migration system's public API, as a user writes it."""
+    written: Path | None = await makemigrations("add email", models=[TypedMember])
+    assert_type(written, Path | None)
+    offline = await makemigrations("add email", migrations_dir=Path("migrations"), models=[TypedMember], from_db=False)
+    assert_type(offline, Path | None)
+    applied: list[str] = await MigrationExecutor("migrations").migrate()
+    assert_type(applied, list[str])
+    operations = await schema_diff(models=[TypedMember], connection="default")
+    assert_type(operations, list[Operation])
+    models = get_registered_models()
+    assert_type(models, list[type[BaseSurrealModel]])
+    state = SchemaState({}, ["0001_a"])
+    assert_type(state.applied_migrations, Sequence[str])
+    operation = AddField("member", "email", "string", default=DefaultExpression("time::now()"))
+    migration = Migration(name="0002_email", dependencies=["0001_a"], operations=[operation])
+    assert_type(migration.operations[0], Operation)
+    assert_type(operation.state_forwards(state), SchemaState)
+    assert_type(operation.state_backwards(state), SchemaState)
