@@ -3335,7 +3335,7 @@ _COMPARISON_ROWS_34 = [
     ["Full-Text Search", "✅ v0.35.0 (`search()`)", "✅"],
     ["Vector Search (KNN/HNSW)", "✅ v0.36.0 (`similar_to()`)", "✅"],
     ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"],
-    ["Migrations & CLI", "v0.38 – v0.39", "✅"],
+    ["Migrations & CLI", "✅ v0.38.0 (migrations), CLI v0.39.0", "✅"],
     ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.40.0", "✅"],
     ["Retry, Logging, Metrics", "v0.41.0", "✅"],
     ["Connection Pool", "post-GA (tentative)", "✅"],
@@ -3416,7 +3416,8 @@ class TestReadmeSection34:
 
     def test_section_34_follows_section_33(self) -> None:
         """Right after section 33 (after its "Coming from" bullets), then section 35 (v0.34.0), section 36 (v0.35.0),
-        section 37 (v0.36.0) and section 38 (v0.37.0), and before the ``---`` of "Configuration Options"."""
+        section 37 (v0.36.0), section 38 (v0.37.0) and section 39 (v0.38.0), and before the ``---`` of "Configuration
+        Options"."""
         text = _readme()
         start_33 = text.index(f"\n{_SECTION_33}\n")
         start_34 = text.index(f"\n{_SECTION_34}\n")
@@ -3429,6 +3430,7 @@ class TestReadmeSection34:
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -3487,9 +3489,10 @@ class TestReadmeSection34:
             "derive the model from `BaseSurrealEdge`, import `TableType`",
         ):
             assert needle in upgrade, needle
-        # Issue #292: `define_table()` is v0.34.0's and goes through the carried statement; migrations are v0.38.0's.
+        # Issue #292: `define_table()` is v0.34.0's and goes through the carried statement; migrations are v0.38.0's
+        # (section 39).
         assert _DEFINE_TABLE_ON_AN_EDGE_34 in bullets[2], bullets[2]
-        assert "migrations come with v0.38.0" in bullets[2], bullets[2]
+        assert "migrations (`CreateTable`/`AlterTable` with the relation keys) are in [section 39]" in bullets[2], bullets[2]
         assert "`QueryError` for both" in bullets[7], bullets[7]
 
     def test_links_resolve(self) -> None:

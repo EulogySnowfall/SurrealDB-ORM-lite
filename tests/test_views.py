@@ -5340,8 +5340,8 @@ class TestReadmeSection33:
 
     def test_section_33_follows_section_32(self) -> None:
         """Right after section 32 (after its "Coming from" bullets), then section 34 (v0.33.0), section 35 (v0.34.0),
-        section 36 (v0.35.0), section 37 (v0.36.0) and section 38 (v0.37.0), and before the ``---`` of
-        "Configuration Options"."""
+        section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0) and section 39 (v0.38.0), and before the
+        ``---`` of "Configuration Options"."""
         text = _readme()
         start_32 = text.index(f"\n{_SECTION_32}\n")
         start_33 = text.index(f"\n{_SECTION_33}\n")
@@ -5355,6 +5355,7 @@ class TestReadmeSection33:
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -5393,13 +5394,13 @@ class TestReadmeSection33:
 
     def test_coming_from_the_full_orm(self) -> None:
         """One key phrase per bullet, in order; D2: ``define_table()`` accepts a view model, in v0.34.0 (issue #292),
-        and the migrations come with v0.38.0."""
+        and the migrations are in section 39 (v0.38.0)."""
         bullets = _readme_bullets(_part_33("Coming from the full SurrealDB-ORM"))
         assert len(bullets) == len(_COMING_FROM_PHRASES_33), bullets
         for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_33, strict=True):
             assert phrase.lower() in bullet.lower(), (phrase, bullet)
         assert _DEFINE_TABLE_ON_A_VIEW_33 in bullets[2], bullets[2]
-        assert "Migrations come with v0.38.0." in bullets[2], bullets[2]
+        assert "Migrations (`CreateTable`/`AlterTable` with `view_query`) are in [section 39]" in bullets[2], bullets[2]
         assert "`CreateTable`/`AlterTable`" in bullets[2], bullets[2]
         assert "`get_view_query()`" in bullets[0] and "`_is_view()`" in bullets[0], bullets[0]
         assert "`save()`, `update()`, `merge()`, `delete()` only" in bullets[1], bullets[1]

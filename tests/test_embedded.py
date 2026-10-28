@@ -2575,8 +2575,8 @@ class TestReadmeEmbeddedWording:
     def test_section_26_follows_section_25(self) -> None:
         """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0), section 29
         (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34
-        (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0) and section 38 (v0.37.0), up to
-        "Configuration Options"."""
+        (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0) and section 39
+        (v0.38.0), up to "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
@@ -2596,6 +2596,7 @@ class TestReadmeEmbeddedWording:
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
         ]
 
     def test_subsections_in_order(self) -> None:

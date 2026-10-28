@@ -3455,7 +3455,7 @@ _PART_NEEDLES_32 = {
         '`Account.remove_event("email_audit")`',
         "`missing_ok=False`",
         "`SurrealDbNotFoundError`",
-        "(that comes with migrations, v0.38.0)",
+        "the migrations do",
         "`BaseSurrealEdge`",
         "`SCHEMALESS`",
         "`InternalError`",
@@ -3559,7 +3559,7 @@ _COMING_FROM_PHRASES_32 = (
     "`then` is a block",
     "comments escaped with a backslash",
     "`define_function()` has no full-ORM equivalent",
-    "come with migrations (v0.38.0)",
+    "are in `surreal_orm_lite.migrations`",
 )
 #: Spec §11.1 items 3–5: the features row, the roadmap split and the comparison rows.
 _FEATURES_ROW_32 = ["Server-side events & function DDL (`Event`, `define_function()`)", "✅"]
@@ -3679,8 +3679,8 @@ class TestReadmeSection32:
 
     def test_section_32_follows_section_31(self) -> None:
         """Right after section 31 (after its "Coming from" bullets), then section 33 (v0.32.0), section 34 (v0.33.0),
-        section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0) and section 38 (v0.37.0), and before the
-        ``---`` of "Configuration Options"."""
+        section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0) and section 39 (v0.38.0),
+        and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_31 = readme.index(f"\n{_SECTION_31}\n")
         start_32 = readme.index(f"\n{_SECTION_32}\n")
@@ -3695,6 +3695,7 @@ class TestReadmeSection32:
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

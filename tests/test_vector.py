@@ -6180,7 +6180,7 @@ _ROADMAP_ROWS_37 = [
     ["v0.35.0", "Tier 3 — Full-text search", "✅ Released"],
     ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
     ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
-    ["v0.38.0 – v0.40.0", "Tier 3 — Advanced (migrations, CLI)", "📋 Planned"],
+    ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
 ]
 _COMPARISON_ROW_37 = ["Vector Search (KNN/HNSW)", "✅ v0.36.0 (`similar_to()`)", "✅"]
 #: The rows the pins of this module name in their messages (each must be one of ``_VECTOR_ROWS``).
@@ -6240,8 +6240,8 @@ class TestReadmeSection37:
     features, roadmap, comparison and both behaviour tables."""
 
     def test_section_37_follows_section_36(self) -> None:
-        """Right after section 36 (after its "Coming from" bullets), then section 38 (v0.37.0), and before the ``---``
-        of "Configuration Options"."""
+        """Right after section 36 (after its "Coming from" bullets), then section 38 (v0.37.0), section 39 (v0.38.0),
+        and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_36 = text.index(f"\n{_SECTION_36}\n")
         start_37 = text.index(f"\n{_SECTION_37}\n")
@@ -6251,6 +6251,7 @@ class TestReadmeSection37:
             _SECTION_36,
             _SECTION_37,
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
