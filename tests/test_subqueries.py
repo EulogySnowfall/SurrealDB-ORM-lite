@@ -2812,8 +2812,8 @@ class TestSubqueryDocs:
     def test_section_28_follows_section_27(self) -> None:
         """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0), section 30 (v0.29.0),
         section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0),
-        section 36 (v0.35.0), section 37 (v0.36.0) and section 38 (v0.37.0), and before the ``---`` of
-        "Configuration Options"."""
+        section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0) and section 39 (v0.38.0), and before the
+        ``---`` of "Configuration Options"."""
         readme = _readme()
         start_27 = readme.index("\n### 27. Time travel (`as_of()`)\n")
         start_28 = readme.index(f"\n{_SECTION_28}\n")
@@ -2832,6 +2832,7 @@ class TestSubqueryDocs:
             "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

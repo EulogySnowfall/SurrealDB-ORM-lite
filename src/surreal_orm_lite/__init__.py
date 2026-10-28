@@ -1,4 +1,4 @@
-__version__ = "0.37.7"
+__version__ = "0.38.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
@@ -68,10 +68,11 @@ from .introspection import (
     SchemaState,
     TableState,
     generate_models_from_db,
+    schema_diff,
 )
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
-from .model_base import BaseSurrealModel, SurrealConfigDict
+from .model_base import BaseSurrealModel, SurrealConfigDict, get_registered_models
 from .q import Q
 from .query_set import QuerySet
 from .schema import Event, function_ddl
@@ -95,6 +96,11 @@ from .transaction import BufferedTransaction, InteractiveTransaction, Transactio
 from .types import Duration, Range, SchemaMode, TableType
 from .vector import Vector, VectorField
 
+# isort: split
+# The migrations (v0.38.0) last, after every other import: their modules import the core modules above, which must be
+# fully initialised first; no core module imports them at module level (no import cycle).
+from .migrations import DefineAnalyzer, DefineEvent, RebuildIndex, RemoveEvent
+
 __all__ = [
     "__version__",
     # Connection
@@ -109,6 +115,7 @@ __all__ = [
     "SurrealConfigDict",
     "TableType",
     "SchemaMode",
+    "get_registered_models",
     # QuerySet
     "QuerySet",
     "Q",
@@ -201,6 +208,12 @@ __all__ = [
     "FunctionState",
     "ParamState",
     "SchemaIssue",
+    # Migrations (v0.38.0): the rest is in surreal_orm_lite.migrations
+    "schema_diff",
+    "DefineAnalyzer",
+    "DefineEvent",
+    "RebuildIndex",
+    "RemoveEvent",
     # Server-side events and DDL (v0.31.0)
     "Event",
     "function_ddl",

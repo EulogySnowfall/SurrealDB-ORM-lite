@@ -3352,12 +3352,13 @@ _EMBEDDED_HYBRID_ROW = [
     "v0.37.0",
 ]
 _FEATURES_ROW_38 = ["Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)", "✅"]
-#: The roadmap from v0.36.0: v0.37.0 ships hybrid search, so the planned range starts at v0.38.0.
+#: The roadmap from v0.36.0: v0.37.0 ships hybrid search, then v0.38.0 the migrations, so the planned range starts at
+#: v0.39.0.
 _ROADMAP_ROWS_38 = [
     ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
     ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
-    ["v0.38.0 – v0.40.0", "Tier 3 — Advanced (migrations, CLI)", "📋 Planned"],
-    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
+    ["v0.39.0 – v0.40.0", "Tier 3 — Advanced (CLI, test factories)", "📋 Planned"],
 ]
 _COMPARISON_ROW_38 = ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"]
 #: The arguments of ``hybrid_search()`` a README example may give as numbers, with the range each accepts.
@@ -3365,10 +3366,8 @@ _HYBRID_BOUNDS = {"vector_limit": (1, 10_000), "text_limit": (1, 10_000), "rrf_k
 
 
 def _section_38() -> str:
-    """Section 38, as written, without the ``---`` that ends it."""
-    body, separator, rest = _readme_part(_SECTION_38).rpartition("\n---\n")
-    assert separator and not rest.strip(), "section 38 ends with the --- of the next part"
-    return f"{body}\n"
+    """Section 38, as written, up to section 39's heading (v0.38.0)."""
+    return _readme_part(_SECTION_38)
 
 
 def _part_38(heading: str) -> str:
@@ -3469,15 +3468,19 @@ class TestReadmeSection38:
     the bullets of sections 36 and 37 that point to it; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_38_follows_section_37(self) -> None:
-        """Right after section 37 (after its "Coming from" bullets), the last section before the ``---`` of
-        "Configuration Options"."""
+        """Right after section 37 (after its "Coming from" bullets), then section 39 (v0.38.0), and before the ``---``
+        of "Configuration Options"."""
         text = _readme()
         start_37 = text.index(f"\n{_SECTION_37}\n")
         start_38 = text.index(f"\n{_SECTION_38}\n")
         configuration = text.index("\n## Configuration Options\n")
         assert start_37 < start_38 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_37 + 1 : configuration], re.MULTILINE) == [_SECTION_37, _SECTION_38]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 38 ends before the --- of the next part"
+        assert re.findall(r"^#{2,3} .*$", text[start_37 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_37,
+            _SECTION_38,
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         assert re.findall(r"^#### (.*)$", _section_38(), re.MULTILINE) == _SUBSECTIONS_38
@@ -3689,6 +3692,10 @@ class TestRoadmap37:
     def test_overview(self) -> None:
         overview = _roadmap_rows("## Overview")
         start = [cells[0] for cells in overview].index("v0.36.0") + 1
+        if _roadmap_rows("### 🛠️ Phase H — Tooling")[0][0] == "✅ v0.38.0":
+            assert overview[start] == _OVERVIEW_37[0], overview
+            assert overview[start + 1][0] == "v0.38.0", overview
+            return
         expected = _OVERVIEW_37 if _released_37() else _PLANNED_OVERVIEW_37
         assert overview[start : start + len(expected)] == expected, overview
         assert overview[start + len(expected)][0] == "v0.41.0", overview

@@ -6654,8 +6654,8 @@ class TestReadmeSection36:
     "Supported Filter Lookups" sentence; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_36_follows_section_35(self) -> None:
-        """Right after section 35 (after its "Coming from" bullets), then section 37 (v0.36.0) and section 38
-        (v0.37.0), and before the ``---`` of "Configuration Options"."""
+        """Right after section 35 (after its "Coming from" bullets), then section 37 (v0.36.0), section 38 (v0.37.0) and
+        section 39 (v0.38.0), and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_35 = text.index(f"\n{_SECTION_35}\n")
         start_36 = text.index(f"\n{_SECTION_36}\n")
@@ -6666,6 +6666,7 @@ class TestReadmeSection36:
             _SECTION_36,
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

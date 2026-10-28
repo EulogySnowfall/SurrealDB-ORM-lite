@@ -91,6 +91,11 @@ any request, and ``signup_excluded_refused()`` that of SG1, an auth model with a
 access DDL, ``signup()`` and ``signin()`` (#299), ``authenticate()``, ``refresh()``, ``update()`` and ``upsert()``
 (#310).
 
+**The access statement (v0.38.0).** ``access_statement()`` writes a record access's ``DEFINE ACCESS`` statement from
+its ``AccessParts`` — ``AuthenticatedUserMixin.access_ddl()``'s last statement and the migration operation
+``DefineAccess``'s, the same text on every server line. It lives here, a core module, so that ``model_auth`` and the
+``migrations`` package both import it and neither imports the other.
+
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
 """
@@ -98,6 +103,7 @@ it.
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, Literal
 
 from ._sdk import ServerError
@@ -460,6 +466,83 @@ def remove_function_statement(function: str, missing_ok: bool) -> str:
     """
     name = normalize_function_name(function)
     return f"REMOVE FUNCTION{_missing_clause(missing_ok)} {name};"
+
+
+#: The clauses ``access_statement()`` writes after ``DEFINE ACCESS``.
+_ACCESS_CLAUSES = ("OVERWRITE", "IF NOT EXISTS", "")
+
+
+@dataclass(frozen=True, slots=True)
+class AccessParts:
+    """The parts of a record access's ``DEFINE ACCESS`` statement (v0.38.0), as :func:`access_statement` writes them.
+
+    ``name``: the access method; ``table``: the table SIGNUP creates the record in and SIGNIN selects it from;
+    ``signup_fields``: each column SIGNUP sets and its SurrealQL expression, in the order written — the record id's
+    ``id`` item of a ``primary_key`` model (``"id": "$email"``, #338) moved first, the others kept in order; a read-only
+    mapping; ``signin_where``: the condition SIGNIN selects the record with; the durations as SurrealQL duration
+    literals, ``duration_grant`` the refresh grant's (``None``: ``30d`` with ``with_refresh``).
+
+    A container: the values are written as they are, so its producers check them —
+    ``AuthenticatedUserMixin._access_parts()`` (the model's names, fields, hashing family and durations) and the
+    migration operation ``DefineAccess``.
+    """
+
+    name: str
+    table: str
+    signup_fields: Mapping[str, str]
+    signin_where: str
+    duration_token: str = "15m"
+    duration_session: str = "12h"
+    duration_grant: str | None = None
+    with_refresh: bool = False
+
+    def __post_init__(self) -> None:
+        """Keep a read-only copy of ``signup_fields``, its ``id`` item first."""
+        fields = dict(self.signup_fields)
+        first = {"id": fields.pop("id")} if "id" in fields else {}
+        object.__setattr__(self, "signup_fields", MappingProxyType({**first, **fields}))
+
+
+def access_statement(
+    parts: AccessParts, *, clause: Literal["OVERWRITE", "IF NOT EXISTS", ""], comment: str | None = None
+) -> str:
+    """The ``DEFINE ACCESS`` statement of a record access (v0.38.0) — pure: no connection, the same text every time.
+
+    ::
+
+        DEFINE ACCESS <clause> <name> ON DATABASE TYPE RECORD SIGNUP ( CREATE <table> SET <column> = <expr>, … )
+            SIGNIN ( SELECT * FROM <table> WHERE <signin_where> )[ WITH REFRESH] DURATION FOR TOKEN <token>,
+            FOR SESSION <session>[, FOR GRANT <grant>][ COMMENT '<comment>'];   (one line)
+
+    ``AuthenticatedUserMixin.access_ddl()``'s last statement and the forward statement of the migration operation
+    ``DefineAccess``: the same text on SurrealDB 3.x, 2.x and the embedded engine. *clause* is ``"OVERWRITE"``,
+    ``"IF NOT EXISTS"`` or ``""`` (the creation form); the names are written as they are, unquoted, as ``access_ddl()``
+    has always written them. The ``SET`` items follow ``parts.signup_fields``, the ``id`` item first (#338: the record id
+    is assigned from the bound key). ``WITH REFRESH`` writes the grant's duration, ``30d`` unless ``parts`` gives one.
+    *comment* (``DefineAccess`` only; ``access_ddl()`` writes none) is a string literal after the durations.
+
+    :raises ValueError: *clause* is not one of the three; *comment* holds a NUL character.
+    :raises TypeError: *comment* is neither a ``str`` nor ``None``.
+    """
+    if clause not in _ACCESS_CLAUSES:
+        raise ValueError(f"access_statement(): clause= must be 'OVERWRITE', 'IF NOT EXISTS' or '', got {clause!r}.")
+    note = _comment_text(comment, subject=f"access_statement({parts.name!r})")
+    head = f"DEFINE ACCESS {clause} {parts.name}" if clause else f"DEFINE ACCESS {parts.name}"
+    items = ", ".join(f"{column} = {expression}" for column, expression in parts.signup_fields.items())
+    clauses = [
+        f"{head} ON DATABASE TYPE RECORD",
+        f"SIGNUP ( CREATE {parts.table} SET {items} )",
+        f"SIGNIN ( SELECT * FROM {parts.table} WHERE {parts.signin_where} )",
+    ]
+    if parts.with_refresh:
+        clauses.append("WITH REFRESH")
+    duration = f"DURATION FOR TOKEN {parts.duration_token}, FOR SESSION {parts.duration_session}"
+    if parts.with_refresh:
+        duration += f", FOR GRANT {parts.duration_grant or '30d'}"
+    clauses.append(duration)
+    if note is not None:
+        clauses.append(f"COMMENT {_quoted(note)}")
+    return " ".join(clauses) + ";"
 
 
 def event_subject(name: str, table: str) -> str:

@@ -14,9 +14,10 @@
     await generate_models_from_db("app/models_generated.py")  # read, generate, write the file (replacing it)
 
 **Read-only.** ``introspect()`` sends ``INFO FOR DB;`` and then one ``INFO FOR TABLE `<name>`;`` per table (in
-codepoint order of the names, each name escaped as an identifier) on the connection's client, and nothing else: no
-record is read, nothing is defined or written. It never goes through a transaction — inside an open
-``transaction()`` block it reads the committed schema, without the block's own ``DEFINE`` statements.
+codepoint order of the names, each name escaped as an identifier) on the connection's client — and, when the database
+holds the migrations' tracking table ``_surreal_orm_migrations`` (v0.38.0), one read of the applied migrations' names,
+the only records it ever reads —, and nothing else: nothing is defined or written. It never goes through a transaction
+— inside an open ``transaction()`` block it reads the committed schema, without the block's own ``DEFINE`` statements.
 
 **What is read.** ``INFO FOR DB``: ``tables`` (each then read with ``INFO FOR TABLE``: its fields,
 indexes and events), ``analyzers``, ``accesses``, ``functions`` and ``params`` become the typed states of
@@ -26,6 +27,11 @@ indexes and events), ``analyzers``, ``accesses``, ``functions`` and ``params`` b
 ``lives`` (running live queries) and ``tables`` (views fed by the table) sections are ignored and any other section
 goes to ``TableState.other``. Kinds, nullability, field paths, flags and names are normalised to one form on
 SurrealDB 2.x, 3.x and the embedded engine; expression texts are kept as each line rendered them.
+``SchemaState.applied_migrations`` lists the migrations the tracking table records, in the order they were applied
+(``()`` without the table), whatever ``tables=`` says: the history is the database's.
+
+**Against models** (``schema_diff()``, v0.38.0): the operations that turn the database's schema into the one the
+models describe — the full SurrealDB-ORM's function, ``[]`` when they agree.
 
 **Nothing is guessed.** A definition the parser cannot read exactly, a section of the wrong shape, an ``INFO FOR
 TABLE`` the server answers with an error: each becomes a :class:`SchemaIssue` in ``SchemaState.issues`` (in the order
@@ -33,7 +39,8 @@ found) and one WARNING on this module's logger — the reader never raises for t
 with names only, never a definition's text, which may hold a credential (``DEFINE PARAM $api_key VALUE '…'``); the
 statement is kept in ``SchemaIssue.statement``, out of its ``repr``.
 
-**Errors.** ``INFO FOR DB`` refused (a record user, an anonymous session) raises ``SurrealDbAuthenticationError``;
+**Errors.** ``INFO FOR DB`` refused (a record user, an anonymous session) raises ``SurrealDbAuthenticationError``, and
+so does the read of the applied migrations refused (any other failure of the server there is an issue);
 failing otherwise, or answering something other than an object, ``SurrealDbError`` — ORM errors (a connection that
 cannot be opened …) propagate unchanged. A ``tables=`` name the database does not define raises
 ``SurrealDbNotFoundError`` before any ``INFO FOR TABLE``. An ``INFO FOR TABLE`` refused after ``INFO FOR DB``
@@ -55,7 +62,7 @@ import os
 import pathlib
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from ._sdk import ServerError
 from .connection_manager import SurrealDBConnectionManager
@@ -87,6 +94,10 @@ from .schema_state import (
 )
 from .surql_literal import _identifier
 
+if TYPE_CHECKING:
+    from .migrations.operations import Operation
+    from .model_base import BaseSurrealModel
+
 __all__ = [
     "AccessState",
     "AnalyzerState",
@@ -101,6 +112,7 @@ __all__ = [
     "SchemaState",
     "TableState",
     "generate_models_from_db",
+    "schema_diff",
 ]
 
 logger = logging.getLogger(__name__)
@@ -119,6 +131,15 @@ _IGNORED_TABLE_SECTIONS = frozenset({"lives", "tables"})
 #: The issue texts of a ``TYPE`` kept as written and of a second definition with the same name.
 _TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written"
 _SAME_NAME = "two definitions have the same name"
+
+#: The migrations' tracking table — ``surreal_orm_lite.migrations.MIGRATIONS_TABLE``, written out here: no core module
+#: imports the ``migrations`` package at module level (its modules import this one).
+_MIGRATIONS_TABLE = "_surreal_orm_migrations"
+#: The read of the applied migrations' names (v0.38.0): ``SELECT VALUE name … ORDER BY applied_at`` is refused by
+#: SurrealDB 2.x and the embedded engine (the ``ORDER BY`` idiom must be selected), so both columns are read.
+_APPLIED = f"SELECT name, applied_at FROM `{_MIGRATIONS_TABLE}` ORDER BY applied_at, name;"
+#: The issue of a tracking table whose records could not be read (``makemigrations()`` refuses it, E-H3).
+_APPLIED_UNREAD = "could not read the applied migrations"
 
 
 class _Named(Protocol):
@@ -291,6 +312,26 @@ class _Reader:
                 other[section] = definitions
         return dataclasses.replace(state, fields=fields, indexes=indexes, events=events, other=other)
 
+    async def applied(self) -> tuple[str, ...]:
+        """The names the tracking table records, in the order they were applied (``applied_at``, then name). A refusal
+        raises ``SurrealDbAuthenticationError``; any other answer of the server that is not a list of records is an
+        issue (``kind="table"``, the table's name) and ``()``; an error that is not the server's answer propagates."""
+        try:
+            rows = await self.client.query(_APPLIED, {})
+        except SurrealORMError:
+            raise
+        except (ServerError, RuntimeError) as exc:  # the server's answer (the embedded engine's: a RuntimeError)
+            if _refused(exc):
+                raise SurrealDbAuthenticationError(
+                    f"Cannot read the schema of connection {self.name!r}: the applied migrations in "
+                    f"{_MIGRATIONS_TABLE} could not be read by this session. Server said: {exc}"
+                ) from exc
+            rows = None
+        if not isinstance(rows, list):
+            self.issue("table", _MIGRATIONS_TABLE, _MIGRATIONS_TABLE, _APPLIED_UNREAD)
+            return ()
+        return tuple(row["name"] for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str))
+
     async def read(self, info: Mapping[str, Any], wanted_names: tuple[str, ...] | None) -> SchemaState:
         """The schema from the ``INFO FOR DB`` answer *info*, reading each wanted table."""
         if "tables" in info:
@@ -335,8 +376,10 @@ class _Reader:
             state = await self.table(name, tables_section[name])
             if state is not None:
                 tables[name] = state
+        applied = await self.applied() if _MIGRATIONS_TABLE in tables_section else ()
         return SchemaState(
             tables=tables,
+            applied_migrations=applied,
             connection=self.name,
             analyzers=analyzers,
             accesses=accesses,
@@ -381,8 +424,8 @@ class DatabaseIntrospector:
 
         :raises ValueError: the connection is not registered, or not configured.
         :raises SurrealDbAuthenticationError: the session may not run ``INFO FOR DB`` (a record user, an anonymous
-            session), or was refused an ``INFO FOR TABLE`` after ``INFO FOR DB`` succeeded (it lost its rights
-            meanwhile).
+            session), or was refused an ``INFO FOR TABLE`` or the read of the applied migrations after ``INFO FOR DB``
+            succeeded (it lost its rights meanwhile).
         :raises SurrealDbNotFoundError: a ``tables=`` name is not a table of the database.
         :raises SurrealDbError: ``INFO FOR DB`` failed otherwise, or did not answer an object.
         :raises SurrealDbConnectionError: what ``get_client()`` raises, unchanged.
@@ -482,3 +525,41 @@ async def generate_models_from_db(
         else:
             _create(path, source)
     return source
+
+
+async def schema_diff(
+    models: "Iterable[type[BaseSurrealModel]] | None" = None, connection: str | None = None
+) -> "list[Operation]":
+    """The operations that turn the database's schema into the one the models describe — the full SurrealDB-ORM's
+    ``schema_diff()`` (v0.38.0); ``[]`` when they agree.
+
+    ::
+
+        operations = await schema_diff(models=[Person, Order])
+        for operation in operations:
+            print(operation.describe())
+
+    ``(await DatabaseIntrospector(connection).introspect()).diff(introspect_models(models, connection=…))`` with the
+    same connection: the models of that connection only. The models' state carries the marks of what they leave to
+    the database (``ModelIntrospector``), so a clause set by hand that no model declares — table permissions, a
+    field's ``ASSERT`` — is kept, not reported. A definition the database holds under a name SurrealDB accepts only in
+    backticks (``user-events``) appears as a removal; it never makes the call raise. Read-only.
+
+    :param models: The model classes, any iterable of them; ``None`` for every registered model
+        (``get_registered_models()``).
+    :param connection: The **name** of a registered connection, or ``None`` for the current one (the innermost
+        ``using()`` block's, else ``"default"``).
+    :raises TypeError: *connection* is a client object or not a ``str``; *models* is a ``str`` or holds something
+        that is not a model class.
+    :raises ValueError: *connection* is empty, or not registered; *models* declare a definition no migration
+        operation can write.
+    :raises SurrealDbAuthenticationError, SurrealDbError: as :meth:`DatabaseIntrospector.introspect`.
+    """
+    from .migrations.introspector import introspect_models
+
+    name = _connection_name(connection)
+    if name is None:
+        name = SurrealDBConnectionManager.get_active_connection_name() or "default"
+    target = introspect_models(models, connection=name)
+    current = await DatabaseIntrospector(name).introspect()
+    return current.diff(target)

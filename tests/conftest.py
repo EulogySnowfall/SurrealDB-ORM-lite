@@ -50,6 +50,7 @@ module to that set.
 import asyncio
 import contextlib
 import os
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -57,6 +58,7 @@ import pytest
 import pytest_asyncio
 
 from surreal_orm_lite import SurrealDBConnectionManager, connection_manager, encoding
+from surreal_orm_lite.testing import embedded_database
 
 #: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
 #: hook, v0.25.0's embedded engine, v0.26.0's time travel, v0.27.0's subqueries, v0.28.0's query cache,
@@ -173,6 +175,42 @@ async def change_feed_database(database: str) -> AsyncIterator[Any]:
     ``database`` is a constant identifier of the calling test module, never user input.
     """
     SurrealDBConnectionManager.set_connection(url=_ws_url(), user="root", password="root", namespace="ns", database=database)
+    client = await SurrealDBConnectionManager.get_client()
+    await client.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client()
+            await cleanup.query(f"REMOVE DATABASE IF EXISTS {database};", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+def _migration_url(kind: str) -> str:
+    """The line under test's URL over WebSocket (*kind* ``"ws"``) or HTTP (``"http"``)."""
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def new_database_name() -> str:
+    """A database name of its own, ``mig_<uuid8>``."""
+    return f"mig_{uuid.uuid4().hex[:8]}"
+
+
+@contextlib.asynccontextmanager
+async def migration_database(kind: str, database: str | None = None) -> AsyncIterator[Any]:
+    """The default connection on a database of its own (the migration tests, v0.38.0 spec §9.2): ``ns``/*database*
+    (``mig_<uuid8>`` when ``None``) over WebSocket or HTTP on the line under test, removed on exit; or a fresh embedded
+    engine (*kind* ``"mem"``). Yields the SDK client."""
+    database = database or new_database_name()
+    if kind == "mem":
+        async with embedded_database(namespace="ns", database=database) as client:
+            yield client
+        return
+    SurrealDBConnectionManager.set_connection(
+        url=_migration_url(kind), user="root", password="root", namespace="ns", database=database
+    )
     client = await SurrealDBConnectionManager.get_client()
     await client.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
     try:

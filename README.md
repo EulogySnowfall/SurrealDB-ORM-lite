@@ -221,6 +221,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Full-text search (`search()`, BM25 score and highlights)                      | ✅     |
 | Vector search (`similar_to()`, KNN, HNSW indexes)                             | ✅     |
 | Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)                     | ✅     |
+| Migrations (makemigrations / migrate / rollback)                              | ✅     |
 
 ### Supported Filter Lookups
 
@@ -4470,8 +4471,9 @@ reads, stores, logs or writes them.
   (`crypto::argon2::generate($value)`) stays in `FieldState.value` and the field is generated as a writable field.
 - **APIs and the GraphQL config are not typed**: their definitions are in `SchemaState.other["apis"]` and
   `SchemaState.other["configs"]`, as SurrealDB returns them (full ORM: `ApiState`, `GraphQLConfigState`).
-- **`SchemaState.diff()` and `schema_diff()` come with v0.38.0** (migrations), as does `applied_migrations`; the
-  `inspectdb` command comes with v0.39.0.
+- **`SchemaState.diff()`, `schema_diff()` and `applied_migrations`** come with the migrations ([section 39](#39-migrations-makemigrations-migrationexecutor-operations)):
+  `applied_migrations` is filled from the tracking table when the database has one (full ORM: declared, never
+  filled; it is the 2nd attribute, positional as in the full ORM); the `inspectdb` command comes with v0.39.0.
 - **A refused or failed `INFO FOR DB` raises** `SurrealDbAuthenticationError` or `SurrealDbError`, and a
   definition that cannot be read or parsed becomes a `SchemaIssue` in `schema.issues` and a logged warning (full
   ORM: an empty state, and definitions dropped with a debug log).
@@ -4576,8 +4578,8 @@ except ServerError as exc:  # the event refused the write: nothing changed
   the statements it applied, which `event_ddl()` renders without a connection.
 - `Account.remove_event("email_audit")` removes one event (`REMOVE EVENT IF EXISTS`; with `missing_ok=False` an
   event that does not exist raises `SurrealDbNotFoundError`). An event the model no longer declares stays defined
-  until it is removed: `define_events()` does not compare the database with the model (that comes with migrations,
-  v0.38.0).
+  until it is removed: `define_events()` does not compare the database with the model; the migrations do, and
+  `makemigrations(drop_missing=True)` writes its `RemoveEvent` ([section 39](#39-migrations-makemigrations-migrationexecutor-operations)).
 - A subclass inherits `events` and defines them on its own table, unless it sets its own (`events=[]` for none).
   Typed edges (`BaseSurrealEdge`) take events too: they fire on the edge table. Defining an event on a table that
   does not exist creates the table, `SCHEMALESS`.
@@ -4753,8 +4755,8 @@ system user: run `define_events()` and `define_function()` at start-up or deploy
 - **Names are quoted, and comments escaped with a backslash** (full ORM: names as written, and a quote doubled as
   `''`, which SurrealDB refuses).
 - **`define_function()` has no full-ORM equivalent**: the full ORM declares a function with `RawSQL`.
-- **The migration operations** (`DefineEvent`, `RemoveEvent`, `RawSQL`) and the removal of the events a model no
-  longer declares **come with migrations (v0.38.0)**.
+- **The migration operations** (`DefineEvent`, `RemoveEvent`, `RawSQL`) are in `surreal_orm_lite.migrations`, and
+  `makemigrations(drop_missing=True)` removes the events a model no longer declares ([section 39](#39-migrations-makemigrations-migrationexecutor-operations)).
 
 ### 33. Materialized views (`view_query`, `define_view()`)
 
@@ -4997,7 +4999,8 @@ record user's session.
 - **`define_view()`/`remove_view()`/`view_ddl()`** apply, remove and render the view, where the full ORM applies one
   through migrations (`CreateTable`/`AlterTable`) or `define_table()`. `define_table()` (since v0.34.0,
   [section 35](#35-model-table-ddl-define_table-schema_mode-permissions)) accepts a view model and applies it through `define_view()`, so
-  full-ORM code calling `define_table()` on a view works. Migrations come with v0.38.0.
+  full-ORM code calling `define_table()` on a view works. Migrations (`CreateTable`/`AlterTable` with `view_query`)
+  are in [section 39](#39-migrations-makemigrations-migrationexecutor-operations).
 - **`AS (…)` as in the full ORM, the table name quoted** (``DEFINE TABLE OVERWRITE `order_stats` AS (…)``).
 - **Generated models write `view_query=`**, as the full ORM's do
   ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)).
@@ -5305,7 +5308,8 @@ session.
   ORM's `class Likes(BaseSurrealModel)` form) raises `TypeError`; derive it from `BaseSurrealEdge`.
 - **`relation_ddl()` and `define_relation()` on the edge model** render and apply the constraint, where the full ORM
   applies the DDL through migrations or `define_table()`. `define_table()` (since v0.34.0) applies an edge model
-  through the statement `define_relation()` carries, then its data fields; migrations come with v0.38.0.
+  through the statement `define_relation()` carries, then its data fields; migrations (`CreateTable`/`AlterTable`
+  with the relation keys) are in [section 39](#39-migrations-makemigrations-migrationexecutor-operations).
 - **The clauses the model declares (`schema_mode`, `permissions`, `changefeed`, `comment`, since v0.34.0) are
   written, the others kept from the database** (the full ORM renders every clause from the model and resets the
   others).
@@ -5578,8 +5582,10 @@ What the model declares wins; the rest is kept from the database:
 
 - Nothing is removed: the table keeps its records, the fields, clauses, indexes and events the model does not declare,
   the views that read it ([section 33](#33-materialized-views-view_query-define_view)), its live queries and its
-  change feed's history. A key left out never removes a stored clause: remove a field, a change feed or a comment with
-  raw SurrealQL (migrations come with v0.38.0). `schema_mode=SchemaMode.SCHEMALESS` turns a `SCHEMAFULL` table back,
+  change feed's history. A key left out never removes a stored clause, and the migrations' diff leaves it too
+  ([section 39](#39-migrations-makemigrations-migrationexecutor-operations)): to remove a clause the model no longer declares, write an `AlterTable` or
+  `AlterField` migration by hand; a field the model no longer declares is removed by the `DropField` that
+  `makemigrations(drop_missing=True)` writes. `schema_mode=SchemaMode.SCHEMALESS` turns a `SCHEMAFULL` table back,
   and `permissions={}` writes `PERMISSIONS NONE`.
 - Each call on a table with a change feed adds one `define_table` entry to it; `changes()` skips it, a raw
   `SHOW CHANGES` shows it.
@@ -5803,7 +5809,8 @@ Applying needs a privileged session: run `define_table()` at start-up or deploym
 - **One statement per call** (the full ORM sends one batch). A refused statement raises `SurrealDbError` naming the
   table or the field, never the statement, as every lite DDL applier does; the statements before it stay applied
   (`tx=` makes the whole call atomic). The full ORM raises `MigrationStatementError` (a `RuntimeError` from
-  `surreal_orm.migrations`) with the SQL in its message.
+  `surreal_orm.migrations`) with the SQL in its message; this library's `MigrationStatementError`
+  ([section 39](#39-migrations-makemigrations-migrationexecutor-operations)) is raised by the migrations only, and `define_table()` keeps `SurrealDbError`.
 - **`TYPE NORMAL` is written for `TableType.NORMAL` and for a model without `table_type`** (and for `USER`, `STREAM`
   and `HASH`). The full ORM writes no `TYPE` there, and SurrealDB then stores `TYPE NORMAL` for a `SCHEMAFULL` table
   (the full ORM's default) and `TYPE ANY` for a `SCHEMALESS` one. `TYPE NORMAL` refuses edges (`RELATE`) into the
@@ -6150,7 +6157,8 @@ print(await NoteV2.objects().search(text="physics").count())
 
 - **Declared on the model**: `Analyzer` and `Index` take the argument names of the full ORM's `DefineAnalyzer` and
   `CreateIndex`, a model lists its indexes in `SurrealConfigDict(indexes=[...])` and `define_indexes()` applies them;
-  the full ORM declares analyzers and indexes in migrations, which this library adds in v0.38.0.
+  the full ORM declares analyzers and indexes in migrations, which this library also has (`DefineAnalyzer`,
+  `CreateIndex`, [section 39](#39-migrations-makemigrations-migrationexecutor-operations)).
 - **`search()` applies wherever `filter()` applies**: `count()`, the aggregations, `values()` groups, `exists()`,
   `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery`; the full ORM applies it to `exec()` only.
 - **Refused where SurrealDB cannot honour it**: `search()` with `live()`/`watch()`, `as_of()` or `changes()` raises
@@ -6667,6 +6675,324 @@ except ValueError as error:
   (0 to 10 000), `ef` and `dist`; the full ORM checks the field names only.
 - **Reciprocal Rank Fusion only**: `search::linear()` (weights and score normalisation) is not offered yet.
 
+### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)
+
+Since v0.38.0 the ORM writes Django-style migration files from the models and applies them, with the full
+SurrealDB-ORM's API: `surreal_orm_lite.migrations` holds `Migration`, the operations (`CreateTable`, `AddField`,
+`CreateIndex` and the others), `MigrationGenerator`, `MigrationExecutor` and `makemigrations()`, and
+`surreal_orm_lite.schema_diff()` compares the models with a database. A migration is a Python file of a migrations
+directory; `MigrationExecutor.migrate()` applies each one atomically, in one SurrealDB transaction together with its
+record in the `_surreal_orm_migrations` table, and `rollback()` undoes them, on SurrealDB 3.x, 2.x and the embedded
+engine.
+
+#### Write a migration
+
+```python
+from surreal_orm_lite import BaseSurrealModel, SchemaMode, SurrealConfigDict
+from surreal_orm_lite.migrations import makemigrations
+
+
+class Person(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="person", schema_mode=SchemaMode.SCHEMAFULL)
+    name: str
+    age: int = 18
+
+
+class Post(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="post", schema_mode=SchemaMode.SCHEMAFULL)
+    title: str
+    body: str
+
+
+path = await makemigrations("initial", models=[Person, Post])
+print(path)
+# migrations/0001_initial.py
+```
+
+`makemigrations()` compares the models with the current schema and writes the next file of the migrations directory
+(`migrations_dir=`, `"migrations"` by default): here a `CreateTable` and its `AddField` operations for each table. It
+returns `None` and writes nothing when there is no change. By default it reads the connected database and replays on
+top the migration files not yet applied (the full ORM CLI's `--from-db`), so it needs the connection; `from_db=False`
+diffs against the migration files alone, with no request (offline). Without `models=`, it takes every model class
+defined (`get_registered_models()`); `connection=` names the connection, whose models it keeps. A file is plain
+Python, to review before applying — this one was written by `makemigrations("add_email")` once `Person` declared an
+`email: str` field and `indexes=[Index("person_email", ["email"], unique=True)]`:
+
+```python
+"""
+Migration: 0002_add_email
+Generated: 2026-10-27T12:00:00+00:00
+
+Auto-generated migration file. Review before applying.
+"""
+
+from surreal_orm_lite.migrations import Migration
+from surreal_orm_lite.migrations.operations import (
+    AddField,
+    CreateIndex,
+)
+
+
+migration = Migration(
+    name="0002_add_email",
+    dependencies=['0001_initial'],
+    operations=[
+        AddField(table='person', name='email', field_type='string'),
+        CreateIndex(table='person', name='person_email', fields=['email'], unique=True),
+    ],
+)
+```
+
+`generate_empty_migration("migrations", "backfill")` writes a file with no operation, to fill in by hand.
+
+#### Apply it
+
+```python
+from surreal_orm_lite.migrations import MigrationExecutor
+
+executor = MigrationExecutor("migrations")
+print(await executor.migrate())
+# ['0001_initial', '0002_add_email']
+print((await executor.get_migration_status())["0002_add_email"])
+# {'applied': True, 'reversible': True, 'has_data': False, 'operations': 2}
+print(await executor.show_sql("0002_add_email"))
+# DEFINE FIELD `email` ON `person` TYPE string;
+#
+# DEFINE INDEX `person_email` ON `person` FIELDS `email` UNIQUE;
+```
+
+`migrate()` first reads the database's schema (`INFO FOR DB` and `INFO FOR TABLE`, no change), replays the pending
+migrations over it and checks them, so that nothing is applied when one of them would be refused; then it applies
+each migration in one transaction with its record, so a migration is applied entirely or not at all. Because the
+statements are rendered from the database's schema, a table made by `define_table()` before any migration can be
+altered by one. A migration that defines analyzers commits them first, in a transaction of their own (SurrealDB builds
+an index with the committed analyzer only), and restores them to the definition the database held if the rest of the
+migration fails. Another process applying the same migration at the same time is safe: the tracking table's unique
+index lets one of them record it, and the other skips it with a warning. `migrate(target="0001_initial")` stops after
+that migration, and `show_sql(name)` prints a migration's statements without a request (`line=2` for SurrealDB 2.x and
+the embedded engine, `backwards=True` for its rollback). To adopt a database built before its migrations,
+`migrate(target="0001_initial", fake=True)` records the migrations up to that one without applying them, then
+`migrate()` applies the next ones. `executor = MigrationExecutor("migrations", connection="analytics")` uses a named
+connection. A refused statement raises `MigrationStatementError`, which names the migration, the operation and
+SurrealDB's reason, never the statement.
+
+#### Change the models
+
+```python
+await makemigrations("add_email", models=[Person, Post])  # 0002_add_email.py
+print(await makemigrations("add_email_again", models=[Person, Post]))
+# None
+```
+
+A second `makemigrations()`, run before `migrate()`, writes nothing: the pending file is replayed over the database,
+so a new migration never repeats a pending one. The diff compares tables (schema mode, type, change feed, permissions,
+comment, view query, relation ends), fields, indexes, events, analyzers and the access of a user model; functions are
+not compared. It carries what a model leaves to the database: a clause the model does not declare stays as the
+database has it, as with `define_table()` — [section 35](#35-model-table-ddl-define_table-schema_mode-permissions)
+says how to remove one. Without `drop_missing=True`, removals (`DropTable`, `DropField`, `DropIndex`, `RemoveEvent`,
+`RemoveAnalyzer`, `RemoveAccess`), reversible or not, are left out and named in a warning: an event added by hand,
+which no model declares, is never removed by default. With `from_db=False` a removal is relative to the files: a model
+deleted since the last migration.
+
+A removal of something neither the database nor an earlier migration holds is refused before any change, by
+`makemigrations()` and `migrate()` alike, since SurrealDB would refuse it; a `RawSQL` that defines something declares
+it in `state_operations=` (`RawSQL("DEFINE TABLE log SCHEMALESS;", state_operations=[CreateTable(name="log",
+schema_mode="SCHEMALESS")])`). The history of the database must match the files: a recorded migration whose dependency
+is not recorded is an error everywhere but in `get_migration_status()`, which warns; a recorded migration without its
+file is an error in `makemigrations()`, `upgrade()` and `rollback()`, and a warning in `migrate()` and
+`get_migration_status()`.
+
+#### Data migrations
+
+```python
+from surreal_orm_lite.migrations import AddField, DataMigration, Migration
+
+migration = Migration(
+    name="0003_person_slug",
+    dependencies=["0002_add_email"],
+    operations=[
+        AddField(table="person", name="slug", field_type="option<string>"),
+        DataMigration(
+            forwards_sql="UPDATE person SET slug = string::lowercase(name);",
+            backwards_sql="UPDATE person UNSET slug;",
+        ),
+    ],
+)
+```
+
+`DataMigration` takes SurrealQL (`forwards_sql`, `backwards_sql`) or `async def` functions taking no argument
+(`forwards_func`, `backwards_func`). `migrate()` applies the schema only (`schema_only=True`, the default); `await
+executor.upgrade()` runs the data operations of the applied migrations, and `migrate(schema_only=False)` runs a
+migration's data operations right after its schema transaction. Data operations are not recorded: running `upgrade()`
+again runs them again, so write them idempotent.
+
+#### Roll back
+
+```python
+print(await executor.rollback("0001_initial"))
+# ['0002_add_email']
+await executor.rollback("")  # undo every migration
+```
+
+`rollback(target)` undoes the migrations applied after _target_, the last first, each in one transaction that also
+deletes its record; `""` undoes them all. Every migration to undo must be reversible, or nothing is undone. Creations
+are undone with `REMOVE … IF EXISTS`; redefinitions and the removals of indexes, analyzers, events, accesses and
+functions are reversible when they carry `previous=`, the definition they replace (the diff fills it in);
+`RebuildIndex` is reversible. `DropTable` and `DropField` are irreversible (the records' values are gone), as is a
+redefinition whose previous definition the ORM cannot write.
+
+#### Operations
+
+| Operation        | Statement (SurrealDB 3.x)                                                                              | Undone by                                                          | Reversible                                     |
+| ---------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ | ---------------------------------------------- |
+| `CreateTable`    | ``DEFINE TABLE `log` SCHEMAFULL;``                                                                     | ``REMOVE TABLE IF EXISTS `log`;``                                  | yes                                            |
+| `AlterTable`     | ``DEFINE TABLE OVERWRITE `person` SCHEMALESS;``                                                        | ``DEFINE TABLE OVERWRITE `person` SCHEMAFULL;``                    | with `previous_schema_mode`                    |
+| `DropTable`      | ``REMOVE TABLE `log`;``                                                                                | —                                                                  | no                                             |
+| `AddField`       | ``DEFINE FIELD `age` ON `person` TYPE int DEFAULT 18;``                                                | ``REMOVE FIELD IF EXISTS `age` ON `person`;``                      | yes                                            |
+| `AlterField`     | ``DEFINE FIELD OVERWRITE `age` ON `person` TYPE int DEFAULT 21;``                                      | ``DEFINE FIELD OVERWRITE `age` ON `person` TYPE int DEFAULT 18;``  | with `previous_type`                           |
+| `DropField`      | ``REMOVE FIELD `age` ON `person`;``                                                                    | —                                                                  | no                                             |
+| `CreateIndex`    | ``DEFINE INDEX `person_email` ON `person` FIELDS `email` UNIQUE;``                                     | ``REMOVE INDEX IF EXISTS `person_email` ON `person`;``             | yes (`overwrite=True` without `previous=`: no) |
+| `DropIndex`      | ``REMOVE INDEX `person_email` ON `person`;``                                                           | the `previous=` definition                                         | with `previous=`                               |
+| `RebuildIndex`   | ``REBUILD INDEX `post_body` ON `post`;``                                                               | the same statement                                                 | yes                                            |
+| `DefineAnalyzer` | ``DEFINE ANALYZER OVERWRITE `english` TOKENIZERS class,blank FILTERS lowercase,snowball(english);``    | ``REMOVE ANALYZER IF EXISTS `english`;``, or `previous=`           | yes                                            |
+| `RemoveAnalyzer` | ``REMOVE ANALYZER `english`;``                                                                         | the `previous=` definition                                         | with `previous=`                               |
+| `DefineEvent`    | ``DEFINE EVENT `audit` ON `person` WHEN $event = 'CREATE' THEN { CREATE log SET who = $after.name };`` | ``REMOVE EVENT IF EXISTS `audit` ON `person`;``, or `previous=`    | yes (`overwrite=True` without `previous=`: no) |
+| `RemoveEvent`    | ``REMOVE EVENT `audit` ON `person`;``                                                                  | the `previous=` definition                                         | with `previous=`                               |
+| `DefineAccess`   | `DEFINE ACCESS account ON DATABASE TYPE RECORD SIGNUP ( … ) SIGNIN ( … ) DURATION …;`                  | ``REMOVE ACCESS IF EXISTS `account` ON DATABASE;``, or `previous=` | yes (`overwrite=True` without `previous=`: no) |
+| `RemoveAccess`   | ``REMOVE ACCESS `account` ON DATABASE;``                                                               | the `previous=` definition                                         | with `previous=`                               |
+| `DefineFunction` | `DEFINE FUNCTION fn::greet($n: string) -> string { RETURN 'hi ' + $n; };`                              | `REMOVE FUNCTION IF EXISTS fn::greet;`, or `previous=`             | yes (`overwrite=True` without `previous=`: no) |
+| `RemoveFunction` | `REMOVE FUNCTION fn::greet;`                                                                           | the `previous=` definition                                         | with `previous=`                               |
+| `DataMigration`  | its `forwards_sql` or `forwards_func`                                                                  | its `backwards_sql` or `backwards_func`                            | with one of them                               |
+| `RawSQL`         | its `sql`                                                                                              | its `reverse_sql`                                                  | with `reverse_sql`                             |
+
+Names are written in backticks, values as SurrealQL literals; expressions (`value`, `assertion`, `when`, `then`,
+permission rules), view queries, function bodies and the SurrealQL of `RawSQL` and `DataMigration` are application code
+written as is, after a check that each is one expression or whole statements: never build an operation from user
+input. Migration files are Python code, run when they are loaded: point the executor and `makemigrations()` at the
+application's own directory only.
+
+#### Drift
+
+```python
+from surreal_orm_lite import schema_diff
+
+for operation in await schema_diff(models=[Person, Post]):
+    print(operation.describe())
+```
+
+`schema_diff()` lists the operations that would bring the database to the models — `[]` when they agree — and
+`makemigrations()` writes them against the database. The comparison normalises what SurrealDB renders differently
+from the ORM (whitespace in expressions, `1.5` and `1.5f`, `7d` and `1w`, permissions equal to SurrealDB's defaults,
+`FLEXIBLE` on an `any` column, index options left at their defaults), so the diff right after `migrate()` or
+`define_table()` is empty on every line. `SchemaState.diff()` between two states read from databases
+(`DatabaseIntrospector`), or migration states (`executor.migration_state()`), compares every clause: carrying what a
+model leaves to the database applies only to a state built from models.
+
+#### Server lines
+
+The same migration applies on SurrealDB 3.x, 2.x and the embedded engine: the statements that differ are chosen
+when they are applied. A full-text `CreateIndex` writes `FULLTEXT` on 3.x and `SEARCH` on 2.x and the embedded
+engine. On SurrealDB 2.x and the embedded engine, an `AddField` or `AlterField` of an `any` column of a `SCHEMAFULL`
+table writes `FLEXIBLE`, and an `AlterTable` that makes a table `SCHEMAFULL` also redefines its `any` columns,
+untyped lists and lists of sub-models `FLEXIBLE` in the same transaction, so their object values are kept (3.x keeps
+them without it). Those columns are the database's: `migrate()` and `rollback()` render from the database's schema
+with the migrations replayed, while `show_sql()` renders from the migration files alone, so on 2.x and the embedded
+engine `migrate()`'s batch may also redefine `FLEXIBLE` columns defined outside migrations that `show_sql(line=2)`
+does not show. When the database's definition of a table cannot be read entirely, and the `FLEXIBLE` clauses of such
+an `AlterTable`, or of a field holding `any` or a list of objects, would be chosen from that reading, `migrate()` and
+`rollback()` raise `SurrealDbError` on those lines before any change
+(`DatabaseIntrospector().introspect().issues` lists what could not be read). `DefineEvent(async_mode=True)`,
+`DefineAccess(with_refresh=True)` and `COMPUTED` fields need SurrealDB 3.x: on 2.x and the embedded engine they raise
+`SurrealDbError` before any change. `AddField(reference=True)` is left to the server: SurrealDB 2.x refuses it unless
+its `record_references` capability is enabled. A `RemoveAnalyzer` of an analyzer an index still uses and a `DropTable`
+of a table a view reads raise `ValueError` before any change on every line (SurrealDB 2.x would accept them, then
+refuse every write). The embedded engine behaves as a 2.x server and applies each migration atomically too
+([embedded table](#orm-behaviour-the-embedded-engine)); the [2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) lists
+the differences.
+
+#### Limits
+
+- A migration's transaction that writes records, then defines an index on the same table: SurrealDB servers do not
+  index those records (surrealdb/surrealdb#7618, as for `define_indexes(tx=…)`); define the index in an earlier
+  migration, or run `RebuildIndex` after.
+- A migration holding `DefineAnalyzer` is atomic **except** its analyzer definitions, committed first (SurrealDB
+  builds an index with the committed analyzer only): if the rest fails they are restored, and the error says whether
+  that worked. Records other clients write in between are tokenised with the new analyzer (run `RebuildIndex`).
+- Analyzers are written with `OVERWRITE` first, so an analyzer of the same name made outside migrations is replaced,
+  and when the rest of the migration fails the definition the database held is restored (or the analyzer removed when
+  the database held none). A migration that redefines an analyzer whose current definition the ORM cannot read or
+  write is refused before any change: redefine that analyzer in a form `Analyzer` accepts, by hand or with
+  `define_indexes()`, then migrate again.
+- A redefined, removed or re-created access gets a new signing key from SurrealDB, so the tokens issued before are
+  refused: sign in again (open WebSocket sessions keep working).
+- Live queries on a table a migration or a rollback removes are killed by SurrealDB: 3.x ends the subscription, 2.x
+  goes silent. A redefinition keeps them.
+- Over HTTP the SDK gives up after 30 s, so a migration that builds a large index may be applied without an answer:
+  the executor reads the tracking table, says so in a warning and does not run its data operations. Prefer WebSocket
+  for long migrations.
+- An `AlterTable` writes the table's whole definition, and `DEFINE TABLE OVERWRITE` resets every clause it does not
+  write, so with `from_db=False` the clauses set on the database outside migrations are replaced (with the default
+  `from_db=True` they are read and kept).
+- `migrate()` and `rollback()` read the schema once, before their first change, so a definition another client
+  changes meanwhile is not seen.
+- On SurrealDB 2.x and the embedded engine, `show_sql()` shows the statements rendered from the migration files, and
+  `migrate()`'s batch may hold more `FLEXIBLE` redefinitions (see "Server lines").
+- Functions are not compared; there is no squashing and no command line yet (the CLI comes with v0.39.0).
+
+#### Coming from the full SurrealDB-ORM
+
+- **Import from `surreal_orm_lite.migrations`**: `from surreal_orm.migrations import …` becomes
+  `from surreal_orm_lite.migrations import …`; a full-ORM migration file whose operations exist here loads after that
+  change. `schema_diff`, `DefineAnalyzer`, `DefineEvent`, `RebuildIndex`, `RemoveEvent` and `get_registered_models`
+  are also at the top level, as in the full ORM.
+- **`makemigrations()` is a coroutine**: the full ORM's `makemigrations` command, with the same default — it reads the
+  database.
+- **One transaction per migration**, its record included: a failed migration leaves nothing applied (the full ORM
+  sends the statements one after the other and leaves the first ones applied).
+- **The same tracking table**: `_surreal_orm_migrations`, with the same fields and unique index, so a database
+  migrated by the full ORM keeps its history.
+- **Statements**: names in backticks, `TYPE NORMAL` where the full ORM writes no `TYPE`, `FLEXIBLE` after `TYPE`, and
+  `THEN { … }` for an event, as `define_table()` and the other appliers write them.
+- **`previous=`** on the redefinitions and on the removals of indexes, analyzers, events, accesses and functions makes
+  them reversible; the full ORM's removals are irreversible.
+- **`default=` is data**: a Python value written as a SurrealQL literal (a `str` is always a string); an expression is
+  a `SurrealFunc`, and a default read from a database is a `DefaultExpression`.
+- **Not provided**: `DefineBearerAccess`, `DefineApi`/`RemoveApi`, `DefineGraphQLConfig`/`RemoveGraphQLConfig`,
+  `encrypted=` and `CreateIndex(concurrently=True)`.
+- **`MigrationStatementError` is a `SurrealDbError`** and a `RuntimeError` (the full ORM's base): it names the
+  migration, the operation and SurrealDB's reason, never the statement.
+- **What the diff carries**: a clause a model does not declare stays as the database has it, as with `define_table()`
+  (the full ORM resets it).
+- **Creations are undone with `REMOVE … IF EXISTS`**, and removals that carry `previous=` are reversible.
+- **Operations are frozen**: `reversible` is a read-only property, and an operation is changed by building another.
+- **`SchemaState.applied_migrations` is filled** from the tracking table by `DatabaseIntrospector` and by
+  `migration_state()` (the full ORM declares it and leaves it empty).
+- **`DefineFunction` and `RemoveFunction` are added**; `parse_define_*` are not exported.
+- **Porting a migration file's defaults**: in a full-ORM migration file, a string `default=` holding `::` or starting
+  with `$` is an expression for the full ORM but a string literal here; rewrite it as `SurrealFunc('…')` (for example
+  `default="time::now()"` becomes `default=SurrealFunc("time::now()")`).
+- **Data operations run after the schema**: `migrate(schema_only=False)` runs a migration's `DataMigration`s after its
+  schema transaction, where the full ORM runs them in position; a data step that reads a field a later operation of the
+  same migration removes goes in a migration of its own.
+- **Targets are names**: an unknown `migrate()` or `rollback()` target raises `ValueError`, where the full ORM compares
+  names as strings (`n <= target`, `name > target`).
+- **`split_destructive()` partitions on removals**: a `RawSQL` without `reverse_sql` or a `RebuildIndex` stays in the
+  first list, where the full ORM's partition on `reversible` puts it in the second.
+- **The current state**: `makemigrations()` reads the database and replays the migration files it has not applied on
+  top, so a second run before `migrate()` writes nothing (the full ORM's `--from-db` writes the pending operations
+  again); `from_db=False` diffs against the migration files, where the full ORM's `--no-from-db` diffs against an empty
+  schema.
+- **The model registry**: `get_registered_models()` is provided (the model classes alive, read from the subclasses of
+  `BaseSurrealModel`; a class whose name starts with `_` is left out but its subclasses are listed, as in the full
+  ORM); they come depth first — each class's subclasses right after it, in definition order —, not in the full ORM's
+  global definition order; `clear_model_registry()` is not provided, as there is no registry to clear.
+- **`migrate()` and `rollback()` read the schema first**: before any change they read the database's schema
+  (`INFO FOR DB`, `INFO FOR TABLE`), replay the migrations over it and check them, so a removal SurrealDB would refuse,
+  an analyzer still used by an index or a table a view reads (made outside migrations or not) is refused before
+  anything is applied, and on SurrealDB 2.x the `FLEXIBLE` statements cover the columns the database holds; the full
+  ORM sends each migration's statements as written. The session needs the right to read the schema, which every
+  system user has.
+
 ---
 
 ## Configuration Options
@@ -6789,7 +7115,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.36.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where they differ from 3.3.4. The row added in v0.37.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.37.4 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.37.5 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.36.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where they differ from 3.3.4. The row added in v0.37.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.37.4 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.37.5 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.38.0 were measured on 2.7.0, 3.3.4 and the embedded engine.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -6956,6 +7282,13 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `hybrid_search()` on a field without a vector or full-text index                                                                       | no vector index: the vector list is empty, so the full-text ranking alone is fused; no full-text index: `SurrealDbError` naming the field                                     | the same; 3.1 and 3.2 put the first `vector_limit` records by id in the vector list, with no distance, and match no record for the text                                             | v0.37.0                              |
 | An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at the last place                      | the ORM ranks the scan by distance, then id: the same records on every call, the tied ones by id (2.x's own scan picks among them in no fixed order)                          | the same records on every call, as with the HNSW index                                                                                                                              | v0.37.4                              |
 | `define_indexes(tx=)` then `remove_index(tx=)` in one block, the index not stored before the block                                     | committed: the index absent after the commit, whatever the table holds                                                                                                        | the commit fails with a retryable `SurrealDbConflictError`, whatever the table holds: nothing committed                                                                             | v0.37.5                              |
+| Migrations: full-text index in `CreateIndex`                                                                                           | `SEARCH`                                                                                                                                                                      | `FULLTEXT`                                                                                                                                                                          | v0.38.0                              |
+| Migrations: `any` column of a `SCHEMAFULL` table, also when an `AlterTable` makes the table `SCHEMAFULL`                               | `FLEXIBLE` written; the `AlterTable` redefines the columns the database holds in its transaction, without which 2.x empties their object values at the next write             | not written: 3.x keeps the values and refuses `FLEXIBLE` on `any`                                                                                                                   | v0.38.0                              |
+| Migrations: `ASYNC` events, `WITH REFRESH`                                                                                             | refused before any DDL (`SurrealDbError`)                                                                                                                                     | applied                                                                                                                                                                             | v0.38.0                              |
+| Migrations: `REFERENCE`                                                                                                                | refused by the server unless `record_references` is enabled (`MigrationStatementError`)                                                                                       | applied                                                                                                                                                                             | v0.38.0                              |
+| Migrations: `COMPUTED` fields in `AddField`/`AlterField`                                                                               | refused before any DDL (`SurrealDbError`)                                                                                                                                     | applied                                                                                                                                                                             | v0.38.0                              |
+| Migrations: a live query on a table a migration removes                                                                                | no further notification                                                                                                                                                       | the subscription ends                                                                                                                                                               | v0.38.0                              |
+| Migrations: a migration's atomicity, concurrent `migrate()`                                                                            | same on both lines: each migration and its record in one transaction; a concurrent run skips a migration the other recorded                                                   | same on both lines                                                                                                                                                                  | v0.38.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -6997,6 +7330,7 @@ Capabilities not listed behave as on a 2.x server.
 | Vector search (v0.36.0)                                             | as on a 2.x server: `MTREE` accepted, at most `ef` records returned (the ORM raises `ef` to `limit`), other conditions selected first in a `LET` (search annotations refused), writes made by the ids of the nearest, fewer records with a selective condition; an index without `TYPE` is `F64` (servers: `F32`), so the ORM always writes `TYPE`    | 3.x refuses `MTREE`, applies the conditions during the index search and keeps search annotations                | v0.36.0 |
 | `remove_index(tx=)` then `define_indexes(tx=)` in one block         | the index is defined again after its removal and committed, on a table holding records too                                                                                                                                                                                                                                                            | the same on 3.x; on 2.x, on a table holding records, the commit fails with a retryable conflict                 | v0.36.2 |
 | Hybrid search (v0.37.0)                                             | as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) keeps the records at an equal distance at the `vector_limit`-th place by id (since v0.37.4), as `similar_to(dist=…)` does                   | 3.x fuses with `search::rrf()`, each list applying the conditions; its exact scan returns the same list         | v0.37.0 |
+| Migrations (v0.38.0)                                                | as on a 2.x server: `SEARCH` for a full-text `CreateIndex`, `FLEXIBLE` on `any` columns (also in the redefinitions of an `AlterTable` that makes a table `SCHEMAFULL`), `ASYNC` events, `WITH REFRESH` and `COMPUTED` fields refused before any DDL; each migration atomic, its analyzers committed first and compensated as on the servers           | 3.x writes `FULLTEXT`, no `FLEXIBLE` on `any`, and applies `ASYNC`, `WITH REFRESH` and `COMPUTED`               | v0.38.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -7049,7 +7383,8 @@ Contributions are welcome! Please:
 | v0.35.0           | Tier 3 — Full-text search                            | ✅ Released |
 | v0.36.0           | Tier 3 — Vector search                               | ✅ Released |
 | v0.37.0           | Tier 3 — Hybrid search                               | ✅ Released |
-| v0.38.0 – v0.40.0 | Tier 3 — Advanced (migrations, CLI)                  | 📋 Planned  |
+| v0.38.0           | Tier 3 — Migration system                            | ✅ Released |
+| v0.39.0 – v0.40.0 | Tier 3 — Advanced (CLI, test factories)              | 📋 Planned  |
 | v0.41.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
@@ -7111,7 +7446,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Full-Text Search              | ✅ v0.35.0 (`search()`)                                               | ✅                                        |
 | Vector Search (KNN/HNSW)      | ✅ v0.36.0 (`similar_to()`)                                           | ✅                                        |
 | Hybrid Search (RRF)           | ✅ v0.37.0 (`hybrid_search()`)                                        | ✅                                        |
-| Migrations & CLI              | v0.38 – v0.39                                                         | ✅                                        |
+| Migrations & CLI              | ✅ v0.38.0 (migrations), CLI v0.39.0                                  | ✅                                        |
 | Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.40.0                          | ✅                                        |
 | Retry, Logging, Metrics       | v0.41.0                                                               | ✅                                        |
 | Connection Pool               | post-GA (tentative)                                                   | ✅                                        |

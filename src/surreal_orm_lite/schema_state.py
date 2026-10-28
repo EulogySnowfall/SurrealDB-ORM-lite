@@ -8,11 +8,18 @@ States holding a mapping are not hashable (as the full ORM's mutable dataclasses
 **Construction parity with the full SurrealDB-ORM.** The seven classes it has (``SchemaState``, ``TableState``,
 ``FieldState``, ``IndexState``, ``EventState``, ``AccessState``, ``AnalyzerState``) keep its attribute names,
 positional order, defaults and accepted inputs (a ``list`` becomes a ``tuple``, a ``dict`` a read-only map, the
-pipe-joined ``relation_in``/``relation_out`` string a ``tuple`` of names). The lite additions come after a
-``KW_ONLY`` marker: they are keyword-only. Where the full ORM has an attribute the lite does not provide
-(``FieldState.encrypted``, ``TableState.access``, ``SchemaState.applied_migrations``), every later attribute is
-keyword-only, so a full-ORM positional call that reaches it raises ``TypeError`` instead of shifting values into the
-wrong attributes. ``FunctionState``, ``ParamState`` and ``SchemaIssue`` are lite additions.
+pipe-joined ``relation_in``/``relation_out`` string a ``tuple`` of names) — ``SchemaState.applied_migrations``
+(v0.38.0) included, its 2nd. The lite additions come after a ``KW_ONLY`` marker: they are keyword-only. Where the
+full ORM has an attribute the lite does not provide (``FieldState.encrypted``, ``TableState.access``), every later
+attribute is keyword-only, so a full-ORM positional call that reaches it raises ``TypeError`` instead of shifting
+values into the wrong attributes. ``FunctionState``, ``ParamState`` and ``SchemaIssue`` are lite additions.
+
+**The migrations' marks** (v0.38.0). ``TableState.undeclared``, ``FieldState.undeclared`` and ``FieldState.server``
+say which clauses a model leaves to the database; only the migrations' ``ModelIntrospector`` sets them, and
+``SchemaState.diff()`` reads them from its *target* only. A state read from a database, replayed from migration
+files or built by hand holds none (``frozenset()``, ``False``) unless given. Each ``undeclared`` accepts any
+iterable of ``str`` and is kept as a ``frozenset``; a bare ``str`` is a ``TypeError``, a key outside its set a
+``ValueError``.
 
 **Texts.** SurrealQL texts (``default``, ``value``, ``computed``, ``assertion``, ``when``, ``then``, ``view_query``,
 permission rules, ``signup_fields`` values, ``signin_where``) are kept as the server rendered them — only the clause
@@ -38,13 +45,18 @@ param's ``permissions``, ``ParamState.value``, ``SchemaIssue.statement``), and a
     FieldState(name="age", field_type="int").nullable            # True (the full ORM's default)
     IndexState(name="by_email", fields=["email"]).fields         # ('email',)
     FieldState("age", "int", True, None, None, False)            # TypeError: the full ORM's 6th argument (encrypted)
+    SchemaState({}, ["0001_initial"]).applied_migrations         # ('0001_initial',)
 
-A leaf module: it imports only ``dataclasses``, ``collections.abc`` and ``typing``.
+A leaf module: it imports only ``dataclasses``, ``collections.abc`` and ``typing`` — ``SchemaState.diff()`` imports
+``migrations.state`` when it is called.
 """
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
+
+if TYPE_CHECKING:
+    from .migrations.operations import Operation
 
 __all__ = [
     "AccessState",
@@ -145,6 +157,44 @@ def _names(state: object, attribute: str, value: Iterable[str]) -> tuple[str, ..
     return tuple(value)
 
 
+#: The keys of ``FieldState.undeclared``: the field clauses a model may leave to the database.
+_FIELD_UNDECLARED = frozenset(
+    {
+        "flexible",
+        "reference",
+        "default",
+        "default_always",
+        "readonly",
+        "value",
+        "computed",
+        "assertion",
+        "permissions",
+        "comment",
+    }
+)
+#: The keys of ``TableState.undeclared``: the table clauses a model may leave to the database.
+_TABLE_UNDECLARED = frozenset({"schema_mode", "table_type", "drop", "comment", "changefeed", "permissions"})
+
+
+def _marks(state: object, value: object, allowed: frozenset[str]) -> frozenset[str]:
+    """*value*, an ``undeclared`` attribute, as a ``frozenset`` of keys of *allowed*: a ``str`` (it would split into
+    characters), a value that is not iterable and an item that is not a ``str`` are refused (``TypeError``), a key
+    outside *allowed* too (``ValueError``, naming the key and the allowed ones)."""
+    owner = f"{type(state).__name__}.undeclared"
+    if isinstance(value, str):
+        raise TypeError(f"{owner} takes a collection of str, not a str: write undeclared={[value]!r}.")
+    if not isinstance(value, Iterable):
+        raise TypeError(f"{owner} takes a collection of str, not a {type(value).__name__}.")
+    keys = frozenset(value)
+    for key in sorted(keys, key=repr):
+        if not isinstance(key, str):
+            raise TypeError(f"{owner} holds a {type(key).__name__}, not a str.")
+        if key not in allowed:
+            names = ", ".join(repr(name) for name in sorted(allowed))
+            raise ValueError(f"{owner}: unknown key {key!r}; the keys are {names}.")
+    return keys
+
+
 def _relation(value: Iterable[str] | str | None) -> tuple[str, ...]:
     """``relation_in``/``relation_out`` as a ``tuple``: the full ORM's pipe-joined ``str`` and ``None`` accepted."""
     if value is None:
@@ -162,7 +212,7 @@ class FieldState:
     ``assertion``. Its 6th, ``encrypted``, is not provided (a hashing ``VALUE`` stays in ``value``), so every later
     attribute is keyword-only: ``flexible``, ``readonly``, ``value``, ``reference``, ``on_delete``, ``comment``
     (the full ORM's) and the lite additions ``path``, ``table``, ``default_always``, ``computed``, ``permissions``,
-    ``raw``.
+    ``server``, ``undeclared``, ``raw``.
 
     ``name`` joins the path segments with ``.`` and marks array items with ``*`` (``"address.city"``, ``"tags.*"``,
     ``"first-name"``); ``path`` holds the unescaped segments and is derived from ``name`` when left empty — pass
@@ -171,6 +221,14 @@ class FieldState:
     ``NONE``. ``default``, ``value``, ``assertion`` and ``computed`` are SurrealQL text as the server rendered it
     (``default="18"``, ``default="'active'"``); a Python value is refused. Those texts, ``on_delete`` and ``raw`` are
     kept out of ``repr``; ``permissions`` shows its keys only.
+
+    The migrations' marks (v0.38.0), set by ``ModelIntrospector`` only: ``server`` — a ``server_fields`` column of a
+    model (v0.18.0); ``diff()`` keeps the current ``DEFAULT``, ``VALUE`` and ``COMPUTED`` of such a field when it has
+    one. ``undeclared`` — the field clauses a model leaves to the database, any of ``'flexible'``, ``'reference'``
+    (with ``on_delete``), ``'default'``, ``'default_always'``, ``'readonly'``, ``'value'``, ``'computed'``,
+    ``'assertion'``, ``'permissions'``, ``'comment'``; ``diff()`` carries the current definition's for each, as
+    ``define_table()`` does (v0.34.0). ``False`` and empty on every state ``DatabaseIntrospector`` reads, every replayed
+    state and every hand-built state unless set.
     """
 
     name: str
@@ -190,6 +248,8 @@ class FieldState:
     default_always: bool = False
     computed: str | None = field(default=None, repr=False)  # COMPUTED expression text (SurrealDB 3.x)
     permissions: Mapping[str, str] = field(default_factory=_empty_map)  # select/create/update → rule
+    server: bool = False  # a server_fields column (the migrations' mark, v0.38.0)
+    undeclared: frozenset[str] = frozenset()  # the clauses a model leaves to the database (v0.38.0)
     raw: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
@@ -202,6 +262,7 @@ class FieldState:
         path = _names(self, "path", self.path)
         object.__setattr__(self, "path", path or tuple(self.name.split(".")))
         object.__setattr__(self, "permissions", _freeze_texts(self.permissions))
+        object.__setattr__(self, "undeclared", _marks(self, self.undeclared, _FIELD_UNDECLARED))
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,7 +442,7 @@ class TableState:
     ``indexes``, ``events``, ``changefeed``, ``permissions``. Its 9th, ``access``, is not provided (accesses are
     database-level: ``SchemaState.accesses``), so every later attribute is keyword-only: ``view_query``,
     ``relation_in``, ``relation_out``, ``enforced``, ``comment`` (the full ORM's) and the lite additions ``drop``,
-    ``changefeed_include_original``, ``other``, ``raw``.
+    ``changefeed_include_original``, ``undeclared``, ``other``, ``raw``.
 
     ``schema_mode`` is ``"SCHEMAFULL"`` or ``"SCHEMALESS"``, ``table_type`` ``"normal"``, ``"relation"`` or
     ``"any"``. ``relation_in``/``relation_out`` are the names of ``TYPE RELATION IN a | b`` (``()`` for any table or
@@ -389,6 +450,12 @@ class TableState:
     ``update``/``delete`` to ``"FULL"``, ``"NONE"`` or ``"WHERE <expr>"``; ``other`` holds the ``INFO FOR TABLE``
     sections that are not modelled. ``view_query`` and ``raw`` are kept out of ``repr``; ``permissions`` and each
     section of ``other`` show their keys only.
+
+    ``undeclared`` (the migrations' mark, v0.38.0, set by ``ModelIntrospector`` only): the table keys a model leaves to
+    the database — any of ``'schema_mode'``, ``'table_type'``, ``'drop'``, ``'comment'``, ``'changefeed'``,
+    ``'permissions'`` —; ``diff()`` keeps the current definition's value for each, as ``define_table()`` does
+    (v0.34.0). Empty on every state ``DatabaseIntrospector`` reads, every replayed state and every hand-built state
+    unless set.
     """
 
     name: str
@@ -407,6 +474,7 @@ class TableState:
     comment: str | None = None
     drop: bool = False
     changefeed_include_original: bool = False
+    undeclared: frozenset[str] = frozenset()  # the keys a model leaves to the database (v0.38.0)
     other: Mapping[str, Mapping[str, str]] = field(default_factory=_empty_map)
     raw: str = field(default="", repr=False)
 
@@ -417,6 +485,7 @@ class TableState:
         object.__setattr__(self, "permissions", _freeze_texts(self.permissions))
         object.__setattr__(self, "relation_in", _relation(self.relation_in))
         object.__setattr__(self, "relation_out", _relation(self.relation_out))
+        object.__setattr__(self, "undeclared", _marks(self, self.undeclared, _TABLE_UNDECLARED))
         object.__setattr__(self, "other", _freeze_sections(self.other))
 
 
@@ -424,8 +493,10 @@ class TableState:
 class SchemaState:
     """The schema of one database, as ``DatabaseIntrospector.introspect()`` returns it.
 
-    The full ORM's first attribute, ``tables``, is positional. Its 2nd, ``applied_migrations``, is not provided, so
-    every later attribute is keyword-only: ``connection`` (``"default"`` or the name of the connection read),
+    The full ORM's first two attributes are positional: ``tables``, and ``applied_migrations`` (v0.38.0) — the names
+    of the migrations the state reflects, in application order, any iterable of ``str`` kept as a ``tuple`` (a bare
+    ``str`` is a ``TypeError``); ``diff()`` never compares it. Every later attribute is keyword-only (lite additions):
+    ``connection`` (``"default"`` or the name of the connection read),
     ``analyzers``, ``accesses`` (database-level), ``functions`` (key ``"fn::name"``), ``params`` (key without
     ``$``), ``other`` (the ``INFO FOR DB`` sections that are not modelled, as returned — the full ORM's ``apis`` are
     ``other["apis"]``) and ``issues`` (in the order found). Table names are unescaped. ``repr`` shows each section of
@@ -433,7 +504,8 @@ class SchemaState:
     """
 
     tables: Mapping[str, TableState] = field(default_factory=_empty_map)
-    _: KW_ONLY  # the full ORM's 2nd attribute, applied_migrations, is not provided
+    applied_migrations: Sequence[str] = ()  # the full ORM's 2nd attribute (v0.38.0)
+    _: KW_ONLY
     connection: str = "default"
     analyzers: Mapping[str, AnalyzerState] = field(default_factory=_empty_map)
     accesses: Mapping[str, AccessState] = field(default_factory=_empty_map)
@@ -444,9 +516,29 @@ class SchemaState:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tables", _freeze(self.tables))
+        object.__setattr__(self, "applied_migrations", _names(self, "applied_migrations", self.applied_migrations))
         object.__setattr__(self, "analyzers", _freeze(self.analyzers))
         object.__setattr__(self, "accesses", _freeze(self.accesses))
         object.__setattr__(self, "functions", _freeze(self.functions))
         object.__setattr__(self, "params", _freeze(self.params))
         object.__setattr__(self, "other", _freeze_sections(self.other))
         object.__setattr__(self, "issues", tuple(self.issues))
+
+    def diff(self, target: "SchemaState") -> "list[Operation]":
+        """The migration operations that turn this state into *target* (the full ORM's method, v0.38.0) — pure.
+
+        In spec order: analyzers defined or redefined, new tables (views last) with their fields, indexes and events,
+        the tables both hold (each definition compared by the migrations' normalising comparator, against *target*'s
+        **effective** definition where *target* carries the marks ``ModelIntrospector`` sets), the indexes to rebuild
+        after a redefined analyzer, accesses, removed tables (views first), removed analyzers. A redefinition or a
+        removal carries the current definition as ``previous=`` when an operation can write it. Without marks — two
+        states read from databases, replayed from files or built by hand — every clause is compared. Ignored: the
+        migrations' tracking table, a relation's ``in`` and ``out``, the item field SurrealDB derives for a typed
+        array, functions, params, the sections that are not modelled, ``issues`` and ``applied_migrations``.
+
+        :raises ValueError: *target* holds a definition no migration operation can write (an ``MTREE`` or ``COUNT``
+            index, an access other than ``TYPE RECORD`` …).
+        """
+        from .migrations import state
+
+        return state.diff(self, target)
