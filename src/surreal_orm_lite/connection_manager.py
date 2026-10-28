@@ -829,6 +829,9 @@ class SurrealDBConnectionManager:
         these clients get it: a client the application builds itself with ``AsyncSurreal`` keeps the
         SDK's behaviour.
 
+        Like every way the ORM gets a client, it marks the ORM writes in progress as having reached the database
+        (``cache.reaching()``, issue #325).
+
         On an **embedded** URL the SDK's constructor opens the in-process engine and ``connect()``
         takes no argument; nobody is signed in, whatever *signin_as_configured* says: the engine
         has no system user on a fresh database, and its anonymous session is the in-process owner.
@@ -838,6 +841,7 @@ class SurrealDBConnectionManager:
         :raises SurrealDbConnectionError: the client cannot be opened; on an embedded URL the error
             quotes the engine's own message and is never retryable (a bad path stays bad).
         """
+        _cache.reaching()
         assert cls.__url is not None
         assert cls.__namespace is not None
         assert cls.__database is not None
@@ -951,7 +955,11 @@ class SurrealDBConnectionManager:
         :param still_wanted: for a background reconnect — checked again just before a new client
             is published, so a connection the application closed meanwhile is not reopened behind
             its back. Not used on an embedded URL: an in-process client never drops.
+
+        Issue #325: an ORM write in progress that asks for a client counts as having reached the database
+        (``cache.reaching()``), whatever it raises afterwards.
         """
+        _cache.reaching()
         loop = asyncio.get_running_loop()
         cls.__prune_dead_loops()
         # Before the per-loop fast path: once the URL changed to one the SDK refuses (set_url()),
@@ -1253,7 +1261,10 @@ class SurrealDBConnectionManager:
         name again with other settings, or ``remove_connection()`` removes it, while the engine opens or its session
         is selected again, the call raises a retryable ``SurrealDbConnectionError`` instead of serving the old settings
         (:meth:`_refuse_retired_embedded`).
+
+        Issue #325: an ORM write in progress counts as having reached the database (``cache.reaching()``).
         """
+        _cache.reaching()
         if not is_embedded_url(cls.__url):
             return None
         cls.require_connection()

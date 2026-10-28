@@ -138,12 +138,14 @@ async def insert_edges(
         if not tx.is_interactive:
             return []
     else:
+        guarded = any("id" in row for row in rows)
+        encoded = _encoding.encode({"data": data} if guarded else data)  # issue #325: refused before any client is asked for
         client = await manager.get_client()
         try:
-            if any("id" in row for row in rows):
-                result = await client.query(_GUARDED_INSERT.format(table=table), _encoding.encode({"data": data}))
+            if guarded:
+                result = await client.query(_GUARDED_INSERT.format(table=table), encoded)
             else:
-                result = await client.insert_relation(table, _encoding.encode(data))
+                result = await client.insert_relation(table, encoded)
         except ServerError as exc:
             raise edge_write_error(exc) from exc
     returned = _as_rows(result)
