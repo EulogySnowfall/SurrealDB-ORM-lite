@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.6] - 2026-10-27
+
+Follow-up to the review of v0.37.0 (#340): `hybrid_search()`'s docstring words its cross-line guarantee as
+README section 38 does, and an empty `text_query` is tested against a server. No new public API.
+
+### Fixed
+
+- **`hybrid_search()`'s docstring states the cross-line guarantee with its condition** (#343).
+  `help(QuerySet.hybrid_search)` said the records, scores and order are the same on every line;
+  it now says that the same two lists give the same records, scores and order on every line, and
+  that the lists themselves can differ (the HNSW search is approximate, the full-text list follows
+  the line's BM25 scores). The `dist` argument names the exact scan's ties at the `vector_limit`-th
+  place on SurrealDB 2.x and the embedded engine, which the ORM keeps by id since v0.37.4.
+
+### Changed
+
+- A server test now covers an empty `text_query`: it matches nothing, so the vector list alone is
+  fused and every `_search_score` is `None`, with the HNSW index and with an exact scan, over
+  WebSocket and HTTP and on the embedded engine. Measured on SurrealDB 2.7.0 and 3.3.4; 3.1.5
+  behaves as 3.3.4.
+
 ## [0.37.4] - 2026-10-27
 
 Follow-up to the review of v0.37.0 (#340): the exact scan (`dist=`) of `similar_to()` and
