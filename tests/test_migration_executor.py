@@ -34,13 +34,12 @@ expectation comes from the capability probe ``reference_supported()``, spec §9.
 """
 
 import asyncio
-import contextlib
 import dataclasses
 import logging
 import os
 import sys
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -96,8 +95,10 @@ from surreal_orm_lite.schema_state import (
     SchemaState,
     TableState,
 )
-from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import cached_major
+from tests.conftest import _migration_url as _url
+from tests.conftest import migration_database
+from tests.conftest import new_database_name as _database_name
 from tests.test_migration_diff import _MODEL_SET, MiBare, MiCommented, MiServer
 from tests.test_migration_operations import (
     _R33_LINES,
@@ -1224,38 +1225,6 @@ migration = Migration(name={name!r}, operations=[DataMigration(forwards_func=for
 
 #: The engines every E2E class runs on.
 _KINDS = ["ws", "http", "mem"]
-
-
-def _url(kind: str) -> str:
-    host = os.environ.get("SURREALDB_HOST", "localhost")
-    port = os.environ.get("SURREALDB_PORT", "8000")
-    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
-
-
-def _database_name() -> str:
-    return f"mig_{uuid.uuid4().hex[:8]}"
-
-
-@contextlib.asynccontextmanager
-async def migration_database(kind: str, database: str | None = None) -> AsyncIterator[Any]:
-    """The default connection on a database of its own (spec §9.2): ``ns``/*database* (``mig_<uuid8>`` when ``None``)
-    over WebSocket or HTTP on the line under test, removed on exit; or a fresh embedded engine (``mem://``). Yields the
-    SDK client."""
-    database = database or _database_name()
-    if kind == "mem":
-        async with embedded_database(namespace="ns", database=database) as client:
-            yield client
-        return
-    SurrealDBConnectionManager.set_connection(url=_url(kind), user="root", password="root", namespace="ns", database=database)
-    client = await SurrealDBConnectionManager.get_client()
-    await client.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
-    try:
-        yield client
-    finally:
-        with contextlib.suppress(Exception):
-            cleanup = await SurrealDBConnectionManager.get_client()
-            await cleanup.query(f"REMOVE DATABASE IF EXISTS {database};", {})
-        await SurrealDBConnectionManager.close_connection()
 
 
 async def _line(client: Any) -> int:
