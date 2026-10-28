@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.7] - 2026-10-28
+
+Follow-up to the review of v0.37.0 (#320): a write the ORM refuses before it reaches the database
+now leaves its transaction and the query cache as they were, wherever in the method the refusal
+comes from. No new public API.
+
+### Fixed
+
+- **A refused write no longer counts as a write** (#325). Since v0.37.0 the refusals that need no
+  request ran before the write's tables were noted; a few refusals still ran in the method's body
+  and left the table noted on the transaction (so a later `define_indexes(tx=tx)` on that table was
+  refused, and the commit dropped the table's cached reads although nothing was written) or, outside
+  a transaction, dropped its cached reads when the call ended. They are: `upsert()` without an id,
+  `save(tx=…)` without an id on a buffered transaction, a field name or an `extra_vars` key that
+  `save(server_values=…)` or `merge(server_values=…)` refuses, the checks of `relate()`,
+  `remove_relation()` and `remove_all_relations()` (an invalid edge name no longer counts as a write
+  to every table), a field or a filter refused while a QuerySet write is compiled, an edge id of
+  another table, and a value the ORM cannot send (a `field_serializer` that raises, a negative
+  duration, an `int` outside the signed 64-bit range…). A write now counts once its statement is
+  queued or sent, or once it asked the connection for a client; before that, its notes are taken
+  back, and the notes of every other write on the same tables, a concurrent or an enclosing one
+  included, stay. A write that raises after that point still counts, since what the server applied
+  is unknown. Error types, messages and their order are unchanged.
+
+### Changed
+
+- The values of a write are encoded before the connection is asked for a client, so a value the ORM
+  cannot send is refused without opening a connection.
+- The README (section 36, _Transactions_) lists the refusals that do not count as a write and drops
+  the note that they still did.
+
+### Notes
+
+- The bookkeeping is client-side: the behaviour is the same on SurrealDB 2.x and 3.x, on the
+  embedded engine and on both transaction strategies.
+
 ## [0.37.6] - 2026-10-27
 
 Follow-up to the review of v0.37.0 (#340): `hybrid_search()`'s docstring words its cross-line guarantee as
