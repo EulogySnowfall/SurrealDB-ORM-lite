@@ -31,9 +31,10 @@ too, read from a client and a transaction that fail every read.
 On a server (``TestHybridSearchE2E``, ``TestHybridDispatchE2E``), over WebSocket and HTTP on the line under test and on
 the embedded engine: the cases of an eight-record corpus fuse to the same records, order and scores on every line —
 equal scores in the vector list's order, then the full-text list's, every time —, each distance and score the one
-``similar_to()`` and ``search()`` give the same record; SurrealDB 3.x fuses with ``search::rrf()``, the ORM below 3,
-the line read once per client. Every seed of a vector index waits for the index's background compaction before the
-test reads or writes (``tests/_compaction.py``, issue #344).
+``similar_to()`` and ``search()`` give the same record; an empty text matches nothing, so the vector list alone is
+fused, each ``_search_score`` ``None``; SurrealDB 3.x fuses with ``search::rrf()``, the ORM below 3, the line read once
+per client. Every seed of a vector index waits for the index's background compaction before the test reads or writes
+(``tests/_compaction.py``, issue #344).
 
 With the rest of the queryset and what the server decides (``TestHybridCompositionE2E``,
 ``TestHybridReservedColumnsE2E``, ``TestHybridErrorsE2E``, ``TestHybridTransactionsE2E``), on the same engines:
@@ -2220,6 +2221,15 @@ _E2E_CASES: dict[str, tuple[dict[str, Any], int | None, int | None, dict[str, An
     "C7": ({}, None, None, {"vector": _Q2, "text_query": "cats", "vector_limit": 2, "text_limit": 3}, _CASES["C7"][3]),
 }
 
+#: C1's vector list alone, fused: the four nearest to ``[0, 1, 0]``, each found by the vector search only — the answer
+#: to C1's call with an empty ``text_query``, which matches nothing on every line.
+_C1_VECTOR_LIST_ALONE = [
+    ("d3", 1 / 61, True, False),
+    ("d4", 1 / 62, True, False),
+    ("d7", 1 / 63, True, False),
+    ("d6", 1 / 64, True, False),
+]
+
 
 def _case_queryset(case: str, model: type[BaseSurrealModel] = HyDoc, *, paged: bool = True) -> QuerySet:
     """*model*'s queryset of *case*: its filter, and with *paged* its ``limit()`` and ``offset()``."""
@@ -2290,9 +2300,9 @@ class TestHybridSearchE2E:
     """``hybrid_search()`` on the eight-record corpus, on every engine (the line under test over WebSocket and HTTP,
     and the embedded engine): each case fuses to the same records, order and scores — the expression SurrealDB 3.x's
     ``search::rrf()`` computes, the ORM's fusion below 3 equal to it —, equal scores in the vector list's order then
-    the full-text list's, five times in a row the same; each record a dict of its columns and the three values, its
-    distance and score those ``similar_to()`` and ``search()`` give it; the queryset unchanged, its link heads
-    included."""
+    the full-text list's, five times in a row the same; an empty text fuses the vector list alone; each record a dict
+    of its columns and the three values, its distance and score those ``similar_to()`` and ``search()`` give it; the
+    queryset unchanged, its link heads included."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_the_cases_of_the_corpus(self, kind: str) -> None:
@@ -2302,6 +2312,24 @@ class TestHybridSearchE2E:
                 rows = await _run_case(case)
                 distances, scores = await _references(case)
                 _check_answer(case, rows, expected, distances, scores)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_empty_text_fuses_the_vector_list_alone(self, kind: str) -> None:
+        """An empty ``text_query`` matches nothing on every line: the answer is the vector list alone, fused — the
+        records ``similar_to()`` finds, in its order, each with its distance and ``_search_score`` ``None`` —, with the
+        HNSW index and with an exact scan (``dist=``)."""
+        answers: dict[str | None, tuple[list[dict[str, Any]], list[Any]]] = {}
+        async with _hy_models(kind) as client:
+            await _setup(client)
+            for dist in (None, "cosine"):
+                rows = await HyDoc.objects().hybrid_search(**{**_ARGS, "text_query": "", "dist": dist})
+                near = await HyDoc.objects().similar_to("embedding", _ARGS["vector"], 4, dist=dist).exec()
+                answers[dist] = (rows, near)
+        for dist, (rows, near) in answers.items():
+            case = f"C1, an empty text, dist={dist}"
+            _check_answer(case, rows, _C1_VECTOR_LIST_ALONE, {doc.id: doc._knn_distance for doc in near}, {})
+            assert [row["id"].id for row in rows] == [doc.id for doc in near], case
+            assert all(row["_search_score"] is None for row in rows), case
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_equal_scores_keep_one_order_every_time(self, kind: str) -> None:
@@ -2541,12 +2569,7 @@ _C8_NO_DISTANCE = [
 
 #: C9 — ``HyDoc``, C1's call with ``text_field="category"`` (no full-text index) — on SurrealDB 3.1 and 3.2, which match
 #: nothing: the vector list alone is fused.
-_C9_NO_MATCH = [
-    ("d3", 1 / 61, True, False),
-    ("d4", 1 / 62, True, False),
-    ("d7", 1 / 63, True, False),
-    ("d6", 1 / 64, True, False),
-]
+_C9_NO_MATCH = _C1_VECTOR_LIST_ALONE
 
 #: The existing refusal of a read inside a buffered transaction.
 _BUFFERED_READ = (
