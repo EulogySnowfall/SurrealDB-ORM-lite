@@ -6084,7 +6084,7 @@ print(await NoteV2.objects().search(text="physics").count())
   invalid direction or target), a field or a filter refused while a QuerySet write is compiled, an edge id of another
   table, a `field_serializer` that raises, and a value the ORM cannot send in any write (a field, a filter, a patch
   operation, an atomic helper's value, a relation's data, `extra_vars`), such as one of the
-  [values refused before sending](#values-refused-before-sending). A raw `tx.add()` is not tracked. A write counts once
+  [values refused before sending](#values-refused-before-sending); a raw `tx.add()` is not tracked. A write counts once
   it reached the database: when it raises after its statement was queued or sent, or after it, or one of its `pre_*`
   handlers, asked the connection for a client, its table stays counted.
 - Prefer `define_indexes()` outside the block: on SurrealDB 2.x, a write to a table that held records, after its index
