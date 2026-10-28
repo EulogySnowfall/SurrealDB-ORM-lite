@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-10-28
+
+Migration system: the ORM writes Django-style migration files from the models and applies them,
+with the full SurrealDB-ORM's API (`makemigrations()`, `MigrationExecutor.migrate()`,
+`rollback()`, `upgrade()`, the operations). Each migration is applied atomically, in one
+SurrealDB transaction together with its record in the `_surreal_orm_migrations` tracking table,
+on SurrealDB 3.x, 2.x and the embedded engine. The first minor of Tier 3's tooling phase.
+
+### Added
+
+- **`surreal_orm_lite.migrations`**: `Migration`, `Operation` and the operations `CreateTable`,
+  `AlterTable`, `DropTable`, `AddField`, `AlterField`, `DropField`, `CreateIndex`, `DropIndex`,
+  `RebuildIndex`, `DefineAnalyzer`, `RemoveAnalyzer`, `DefineEvent`, `RemoveEvent`,
+  `DefineAccess`, `RemoveAccess`, `DefineFunction`, `RemoveFunction`, `DataMigration` and
+  `RawSQL`, with `Operation.state_forwards()`/`state_backwards()`; `DefaultExpression` (an
+  addition: a SurrealQL default for the DDL only); `split_destructive()`; `MigrationGenerator` and
+  `generate_empty_migration()`; `MigrationExecutor` (`migrate()`, `rollback()`, `upgrade()`,
+  `get_migration_status()`, `show_sql()`, `migration_state()`) and `MigrationStatementError`;
+  `ModelIntrospector` and `introspect_models()`; `makemigrations()`; `MIGRATIONS_TABLE`; and,
+  re-exported as the full ORM's `migrations` package does, `DatabaseIntrospector` and
+  `ModelCodeGenerator`.
+- **`makemigrations()`** reads the connected database by default and replays the migration files
+  not yet applied on top (the full ORM CLI's `--from-db`); `from_db=False` diffs against the files
+  alone, offline. `drop_missing=True` writes the removals of what the models no longer declare.
+- **`schema_diff()`** (top level and `surreal_orm_lite.introspection`) lists the operations that
+  would bring the database to the models, `[]` when they agree; **`get_registered_models()`**
+  (top level) lists the model classes defined. The top level also exports `DefineAnalyzer`,
+  `DefineEvent`, `RebuildIndex` and `RemoveEvent`, as the full ORM's does.
+- **`SchemaState.diff(target)`** and **`SchemaState.applied_migrations`** (the full ORM's 2nd
+  attribute, positional at its 2nd place); `FieldState.server`, `FieldState.undeclared` and
+  `TableState.undeclared` (keyword-only: the marks of a state built from models).
+- README section 39, "Migrations (`makemigrations()`, `MigrationExecutor`, operations)" (write,
+  apply, change the models, data migrations, roll back, the operations, drift, server lines,
+  limits, a note for users of the full SurrealDB-ORM), seven rows of the "ORM behaviour:
+  SurrealDB 2.x vs 3.x" table and one of the embedded engine's, and the example notebook
+  `examples/v0.38.0_migration_system.ipynb`.
+
+### Changed
+
+- `generate_models_from_db()` skips the tracking table `_surreal_orm_migrations`, with a comment
+  line in the generated module's header.
+- `DatabaseIntrospector.introspect()` reads the applied migrations' names into
+  `SchemaState.applied_migrations` when the database has the tracking table.
+- The README sentences of sections 31 to 36 that promised the migrations "with v0.38.0" now point
+  to section 39; section 35 says how to remove a clause a model no longer declares.
+
+### Notes
+
+- **`migrate()` and `rollback()` read the database's schema before any change** (`INFO FOR DB`
+  and `INFO FOR TABLE`), replay the migrations over it and render every statement from it, so
+  that nothing is applied when one of them would be refused, and a table made by
+  `define_table()` before any migration can be altered by one. A session refused `INFO FOR DB`
+  gets `SurrealDbAuthenticationError` before anything is applied. `fake=True`, `upgrade()` and
+  `get_migration_status()` read no schema.
+- **Server lines**: a full-text `CreateIndex` writes `FULLTEXT` on SurrealDB 3.x and `SEARCH` on
+  2.x and the embedded engine. On 2.x and the embedded engine an `any` column of a `SCHEMAFULL`
+  table is written `FLEXIBLE`, also in the redefinitions an `AlterTable` that makes a table
+  `SCHEMAFULL` writes in the same transaction, so their object values are kept (3.x keeps them
+  without it); `DefineEvent(async_mode=True)`, `DefineAccess(with_refresh=True)` and `COMPUTED`
+  fields raise `SurrealDbError` before any change. `AddField(reference=True)` is left to the
+  server (2.x refuses it unless `record_references` is enabled). A `RemoveAnalyzer` of an
+  analyzer an index still uses and a `DropTable` of a table a view reads raise `ValueError` before
+  any change on every line.
+- **Deviations from the full ORM**: a migration that defines analyzers commits them first, in a
+  transaction of their own (SurrealDB builds an index with the committed analyzer only), and
+  restores the definition the database held if the rest fails; `MigrationStatementError` names
+  the migration, the operation and SurrealDB's reason, never the statement. The diff of a state
+  built from models carries what a model leaves to the database (an absent key never removes a
+  stored clause, as with `define_table()`): remove a clause with an `AlterTable`/`AlterField`
+  written by hand; a field the model no longer declares is removed by the `DropField` that
+  `makemigrations(drop_missing=True)` writes. A diff between two states read from databases or
+  migrations compares every clause.
+- **Migration files are Python code**, executed when loaded: point `MigrationExecutor` and
+  `makemigrations()` at the application's own directory only. Expressions, rules, view queries,
+  event and function bodies, `RawSQL` and `DataMigration` SQL are trusted application code,
+  embedded as written: never build an operation from user input.
+- **Deferred**: the CLI (`surreal-orm-lite makemigrations`, `migrate`, `rollback`…) to v0.39.0;
+  stored functions declared on models and their diff (the rest of #276); `DefineBearerAccess`,
+  `DefineApi` and the GraphQL config on SurrealDB 3.x; `CreateIndex(concurrently=True)`; squashing
+  migrations; a non-atomic mode; field `ASSERT`, `READONLY`, permissions and comment declared on
+  models; `define_table()` keeping a stored `DEFAULT ALWAYS`; a `schema_diff()` option listing the
+  clauses a model leaves to the database.
+- Same code on SurrealDB 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro), with no test skipped
+  on a supported line.
+
 ## [0.37.7] - 2026-10-28
 
 Follow-up to the review of v0.37.0 (#320): a write the ORM refuses before it reaches the database

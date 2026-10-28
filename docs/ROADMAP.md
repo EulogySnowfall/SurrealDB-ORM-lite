@@ -46,7 +46,8 @@
 | v0.35.0           | Tier 3 — Full-text search                           | Done    |
 | v0.36.0           | Tier 3 — Vector search                              | Done    |
 | v0.37.0           | Tier 3 — Hybrid search                              | Done    |
-| v0.38.0 – v0.40.0 | Tier 3 — Advanced (migrations, CLI), 3 minors       | Planned |
+| v0.38.0           | Tier 3 — Migration system                           | Done    |
+| v0.39.0 – v0.40.0 | Tier 3 — Advanced (CLI, test factories), 2 minors   | Planned |
 | v0.41.0           | Beta Phase (API freeze, hardening)                  | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
 | v2.1.0+           | Future (post-GA)                                    | Future  |
@@ -110,7 +111,7 @@ pieces stay out.
 | Full-Text Search (BM25)                | `DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*` | ✅ v0.35.0     |
 | Vector Search (KNN, HNSW)              | `DEFINE INDEX … HNSW` + KNN operator `<\|K,EF\|>`           | ✅ v0.36.0     |
 | Hybrid Search (RRF)                    | `search::rrf()` (3.x) or the same fusion in the ORM (2.x)   | ✅ v0.37.0     |
-| Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`            | v0.38.0        |
+| Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`            | ✅ v0.38.0     |
 | CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                                 | v0.39.0        |
 | Test fixtures & factories              | `ModelFactory`, pytest fixtures                             | v0.40.0        |
 | QueryLogger / profiling                | wraps `query()` calls                                       | v0.41.0 (Beta) |
@@ -134,51 +135,51 @@ moves it to the `surrealdb[embedded]` extra.
 
 ## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison
 
-| Feature                       | ORM (full) | ORM-lite                      |
-| ----------------------------- | ---------- | ----------------------------- |
-| Supported SurrealDB           | 3.x only   | **2.6/2.7 + 3.2/3.3**         |
-| CRUD & QuerySet               | yes        | v0.2.0                        |
-| Aggregations & GROUP BY       | yes        | v0.3.0                        |
-| Model Signals                 | yes        | v0.4.0                        |
-| Bulk Operations               | yes        | v0.5.0                        |
-| Q Objects (OR/AND/NOT)        | yes        | v0.5.0                        |
-| Parameterized filters         | yes        | v0.5.0                        |
-| Relations & Graph             | yes        | v0.6.0                        |
-| FETCH clause                  | yes        | v0.6.0                        |
-| Transactions (`tx=`)          | yes        | ✅ v0.8 core, v0.9 QuerySet   |
-| `upsert` / `update_or_create` | yes        | ✅ v0.10.0                    |
-| `call_function()` (`fn::`)    | yes        | ✅ v0.15.0                    |
-| Atomic field/array ops        | yes        | ✅ v0.11.0                    |
-| Retry on conflict             | yes        | ✅ v0.12.0                    |
-| SurrealFunc & server values   | yes        | ✅ v0.13.0                    |
-| Computed fields               | yes        | ✅ v0.14.0                    |
-| `call_function()`             | yes        | ✅ v0.15.0                    |
-| JWT Authentication            | yes        | ✅ v0.16.0 (connection)       |
-| Model-level auth mixin        | yes        | ✅ v0.17.0                    |
-| Field aliases & DX            | yes        | ✅ v0.18.0                    |
-| Live queries (raw notifs)     | yes        | ✅ v0.19.0                    |
-| Typed live queries            | yes        | ✅ v0.20.0                    |
-| Live auto-resubscribe / CDC   | yes        | ✅ v0.21.0                    |
-| Native typed relations        | yes        | ✅ v0.22.0                    |
-| Rich field types              | yes        | ✅ v0.23.0                    |
-| Geospatial fields             | yes        | ✅ v0.24.0                    |
-| Embedded / versioned engine   | no         | ✅ v0.25 – v0.26              |
-| Subqueries                    | yes        | ✅ v0.27.0                    |
-| Query cache (TTL)             | yes        | ✅ v0.28.0                    |
-| Multi-database                | yes        | ✅ v0.29.0                    |
-| Schema introspection          | yes        | ✅ v0.30.0                    |
-| DEFINE EVENT                  | yes        | ✅ v0.31.0                    |
-| Materialized views            | yes        | ✅ v0.32.0                    |
-| TYPE RELATION enforcement     | yes        | ✅ v0.33.0                    |
-| Model table DDL               | yes        | ✅ v0.34.0 (`define_table()`) |
-| Full-Text Search (BM25)       | yes        | ✅ v0.35.0                    |
-| Vector Search (KNN/HNSW)      | yes        | ✅ v0.36.0                    |
-| Hybrid Search (RRF)           | yes        | ✅ v0.37.0                    |
-| Migrations & CLI              | yes        | v0.38 – v0.39                 |
-| Test fixtures & factories     | yes        | v0.25.0 + v0.40.0             |
-| QueryLogger / profiling       | yes        | v0.41.0                       |
-| Custom SDK (`surreal_sdk`)    | yes        | never                         |
-| CBOR protocol internals       | yes        | never                         |
+| Feature                       | ORM (full) | ORM-lite                             |
+| ----------------------------- | ---------- | ------------------------------------ |
+| Supported SurrealDB           | 3.x only   | **2.6/2.7 + 3.2/3.3**                |
+| CRUD & QuerySet               | yes        | v0.2.0                               |
+| Aggregations & GROUP BY       | yes        | v0.3.0                               |
+| Model Signals                 | yes        | v0.4.0                               |
+| Bulk Operations               | yes        | v0.5.0                               |
+| Q Objects (OR/AND/NOT)        | yes        | v0.5.0                               |
+| Parameterized filters         | yes        | v0.5.0                               |
+| Relations & Graph             | yes        | v0.6.0                               |
+| FETCH clause                  | yes        | v0.6.0                               |
+| Transactions (`tx=`)          | yes        | ✅ v0.8 core, v0.9 QuerySet          |
+| `upsert` / `update_or_create` | yes        | ✅ v0.10.0                           |
+| `call_function()` (`fn::`)    | yes        | ✅ v0.15.0                           |
+| Atomic field/array ops        | yes        | ✅ v0.11.0                           |
+| Retry on conflict             | yes        | ✅ v0.12.0                           |
+| SurrealFunc & server values   | yes        | ✅ v0.13.0                           |
+| Computed fields               | yes        | ✅ v0.14.0                           |
+| `call_function()`             | yes        | ✅ v0.15.0                           |
+| JWT Authentication            | yes        | ✅ v0.16.0 (connection)              |
+| Model-level auth mixin        | yes        | ✅ v0.17.0                           |
+| Field aliases & DX            | yes        | ✅ v0.18.0                           |
+| Live queries (raw notifs)     | yes        | ✅ v0.19.0                           |
+| Typed live queries            | yes        | ✅ v0.20.0                           |
+| Live auto-resubscribe / CDC   | yes        | ✅ v0.21.0                           |
+| Native typed relations        | yes        | ✅ v0.22.0                           |
+| Rich field types              | yes        | ✅ v0.23.0                           |
+| Geospatial fields             | yes        | ✅ v0.24.0                           |
+| Embedded / versioned engine   | no         | ✅ v0.25 – v0.26                     |
+| Subqueries                    | yes        | ✅ v0.27.0                           |
+| Query cache (TTL)             | yes        | ✅ v0.28.0                           |
+| Multi-database                | yes        | ✅ v0.29.0                           |
+| Schema introspection          | yes        | ✅ v0.30.0                           |
+| DEFINE EVENT                  | yes        | ✅ v0.31.0                           |
+| Materialized views            | yes        | ✅ v0.32.0                           |
+| TYPE RELATION enforcement     | yes        | ✅ v0.33.0                           |
+| Model table DDL               | yes        | ✅ v0.34.0 (`define_table()`)        |
+| Full-Text Search (BM25)       | yes        | ✅ v0.35.0                           |
+| Vector Search (KNN/HNSW)      | yes        | ✅ v0.36.0                           |
+| Hybrid Search (RRF)           | yes        | ✅ v0.37.0                           |
+| Migrations & CLI              | yes        | ✅ v0.38.0 (migrations), CLI v0.39.0 |
+| Test fixtures & factories     | yes        | v0.25.0 + v0.40.0                    |
+| QueryLogger / profiling       | yes        | v0.41.0                              |
+| Custom SDK (`surreal_sdk`)    | yes        | never                                |
+| CBOR protocol internals       | yes        | never                                |
 
 ### Embedded URLs
 
@@ -893,6 +894,45 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   annotations next to `similar_to()` on SurrealDB 2.x and the embedded engine, which the ORM still
   refuses there
 
+### Version 0.38.0 — Migration system (`makemigrations()`, `MigrationExecutor`)
+
+- Django-style migration files with the full SurrealDB-ORM's API: `surreal_orm_lite.migrations`
+  holds `Migration`, the operations (`CreateTable`, `AlterTable`, `AddField`, `CreateIndex`,
+  `DefineAnalyzer`, `DefineEvent`, `DefineAccess`, `DefineFunction`, `DataMigration`, `RawSQL`
+  and the others), `MigrationGenerator`, `MigrationExecutor` and `makemigrations()`; the top level
+  adds `schema_diff()` and `get_registered_models()`, and `SchemaState` gains `diff()` and
+  `applied_migrations`
+- `MigrationExecutor.migrate()` reads the database's schema first, replays the pending migrations
+  over it and checks them, then applies each migration in one SurrealDB transaction together with
+  its record in the `_surreal_orm_migrations` tracking table; `rollback()` undoes them,
+  `upgrade()` runs the data operations, and a concurrent `migrate()` skips a migration the other
+  recorded.
+  Statements are rendered from the database's schema, so a table made by `define_table()` can be
+  altered by a migration
+- `makemigrations()` diffs the models against the connected database by default, with the
+  pending files replayed on top (`from_db=False`: against the files alone, offline);
+  `schema_diff()` lists the same operations without writing a file. The comparator normalises what
+  SurrealDB renders differently from the ORM, so the diff right after `migrate()` or
+  `define_table()` is empty on every line
+- An absent model key leaves its clause to the database, as `define_table()` does, so the diff
+  carries it; a clause is removed by an `AlterTable`/`AlterField` written by hand, and a field the
+  model no longer declares by the `DropField` that `makemigrations(drop_missing=True)` writes
+- The same migration applies on SurrealDB 3.x, 2.x and the embedded engine: a full-text
+  `CreateIndex` writes `FULLTEXT` on 3.x and `SEARCH` on 2.x; on 2.x and the embedded engine an
+  `any` column of a `SCHEMAFULL` table is written `FLEXIBLE` (also in the redefinitions of an
+  `AlterTable` that makes a table `SCHEMAFULL`), and `ASYNC` events, `WITH REFRESH` and `COMPUTED`
+  fields are refused before any change. Same code on 2.7.0, 3.3.4 and the embedded engine (3.1.5
+  retro)
+- Deviations from the full ORM: analyzers are committed before the rest of their migration and
+  restored to the database's definition when the rest fails; `MigrationStatementError` names the
+  migration, the operation and SurrealDB's reason, never the statement
+- Deferred: the CLI (`surreal-orm-lite makemigrations`, `migrate`, `rollback`…) → v0.39.0; stored
+  functions declared on models and their diff (the rest of #276); `DefineBearerAccess`,
+  `DefineApi` and the GraphQL config on 3.x; `CreateIndex(concurrently=True)`; squashing
+  migrations; a non-atomic mode; field `ASSERT`, `READONLY`, permissions and comment declared on
+  models; `define_table()` keeping a stored `DEFAULT ALWAYS`; a `schema_diff()` option listing the
+  clauses a model leaves to the database
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -1112,11 +1152,11 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 
 ### 🛠️ Phase H — Tooling
 
-| Version | Theme                                                  | SDK 2.0 realization                        |
-| ------- | ------------------------------------------------------ | ------------------------------------------ |
-| v0.38.0 | Migration system (makemigrations / migrate / rollback) | DDL orchestration + tracking via `query()` |
-| v0.39.0 | CLI `surreal-orm-lite` (shell, migrate, inspectdb)     | entry point over the ORM                   |
-| v0.40.0 | Test fixtures & factories (`ModelFactory`, pytest)     | tooling over the ORM                       |
+| Version    | Theme                                                  | SDK 2.0 realization                        |
+| ---------- | ------------------------------------------------------ | ------------------------------------------ |
+| ✅ v0.38.0 | Migration system (makemigrations / migrate / rollback) | DDL orchestration + tracking via `query()` |
+| v0.39.0    | CLI `surreal-orm-lite` (shell, migrate, inspectdb)     | entry point over the ORM                   |
+| v0.40.0    | Test fixtures & factories (`ModelFactory`, pytest)     | tooling over the ORM                       |
 
 ---
 

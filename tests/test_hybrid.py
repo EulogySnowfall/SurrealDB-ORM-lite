@@ -3692,6 +3692,10 @@ class TestRoadmap37:
     def test_overview(self) -> None:
         overview = _roadmap_rows("## Overview")
         start = [cells[0] for cells in overview].index("v0.36.0") + 1
+        if _roadmap_rows("### 🛠️ Phase H — Tooling")[0][0] == "✅ v0.38.0":
+            assert overview[start] == _OVERVIEW_37[0], overview
+            assert overview[start + 1][0] == "v0.38.0", overview
+            return
         expected = _OVERVIEW_37 if _released_37() else _PLANNED_OVERVIEW_37
         assert overview[start : start + len(expected)] == expected, overview
         assert overview[start + len(expected)][0] == "v0.41.0", overview
