@@ -44,7 +44,22 @@ from . import loader, render
 from . import state as _state
 from .constants import MIGRATIONS_TABLE
 from .migration import Migration, _statements
-from .operations import DataMigration, DefineAnalyzer, RemoveAnalyzer
+from .operations import (
+    AddField,
+    AlterField,
+    AlterTable,
+    CreateTable,
+    DataMigration,
+    DefineAccess,
+    DefineAnalyzer,
+    DefineEvent,
+    Operation,
+    RawSQL,
+    RemoveAccess,
+    RemoveAnalyzer,
+    RemoveEvent,
+    _makes_schemafull,
+)
 
 __all__ = ["MigrationExecutor", "MigrationStatementError"]
 
@@ -435,6 +450,114 @@ def _compensation_sentence(outcome: _Compensated, names: Sequence[str], way: _Wa
 
 # --- the pre-pass: every batch rendered before the first is sent (spec §5.6 step 3, rollback()) -----------------------
 
+#: E-D1, E-D2, E-D3 (spec §7): what SurrealDB 2.x and the embedded engine cannot parse.
+_ASYNC_EVENTS = "ASYNC events"
+_REFRESH_TOKENS = "refresh tokens (WITH REFRESH)"
+_COMPUTED_FIELDS = "COMPUTED fields"
+
+
+def _line_only(operation: Operation, *, backwards: bool) -> str | None:
+    """What *operation* — or its backwards, with *backwards* — would define that only SurrealDB 3.x parses (spec §4,
+    §7): an ``ASYNC`` event (a ``DefineEvent(async_mode=True)``, or the ``previous=`` a ``DefineEvent``/``RemoveEvent``
+    backwards restores), a ``WITH REFRESH`` access (likewise with ``DefineAccess``/``RemoveAccess``) or a ``COMPUTED``
+    field (an ``AddField``/``AlterField`` with ``computed``, an ``AlterField`` backwards with ``previous_computed``).
+    ``None`` otherwise: a ``RawSQL``'s ``state_operations`` are never sent."""
+    defined: object = None
+    if isinstance(operation, DefineEvent | RemoveEvent | DefineAccess | RemoveAccess):
+        if backwards:
+            defined = operation.previous
+        elif isinstance(operation, DefineEvent | DefineAccess):
+            defined = operation
+    if isinstance(defined, DefineEvent) and defined.async_mode:
+        return _ASYNC_EVENTS
+    if isinstance(defined, DefineAccess) and defined.with_refresh:
+        return _REFRESH_TOKENS
+    if isinstance(operation, AlterField) and (operation.previous_computed if backwards else operation.computed):
+        return _COMPUTED_FIELDS
+    if isinstance(operation, AddField) and not backwards and operation.computed:
+        return _COMPUTED_FIELDS
+    return None
+
+
+def _defined_tables(operation: Operation, *, backwards: bool) -> list[str]:
+    """The tables whose definition *operation* — or its backwards — places in the state: a ``CreateTable``'s and an
+    ``AlterTable``'s (undone, an ``AlterTable``'s only: a ``CreateTable``'s backwards removes it), a ``RawSQL``'s
+    ``state_operations`` included."""
+    if isinstance(operation, AlterTable) or (isinstance(operation, CreateTable) and not backwards):
+        return [operation.name]
+    if isinstance(operation, RawSQL):
+        return [name for inner in operation.state_operations for name in _defined_tables(inner, backwards=backwards)]
+    return []
+
+
+def _section_unread(issue: SchemaIssue, section: str) -> bool:
+    return issue.kind == "section" and issue.name == section
+
+
+def _blinded_table(operation: Operation, issues: Sequence[SchemaIssue], *, backwards: bool, defined: set[str]) -> str | None:
+    """The table whose ``FLEXIBLE`` choice on line 2 *operation* — or its backwards — would make from a read that could
+    not read it entirely (E-I1, spec §5.6 step 3 and ``rollback()``, C8, P2); ``None`` when it makes none.
+
+    (a) An ``AlterTable`` whose statement makes the table ``SCHEMAFULL`` (or whose backwards restores it) redefines the
+    columns of the read: refused under an issue whose ``table`` is that table, or the ``tables`` section issue. (b) An
+    ``AddField``/``AlterField`` (an ``AlterField``'s backwards) writing a kind ``render.flexible_candidate()`` accepts,
+    without ``flexible=True`` (then ``FLEXIBLE`` is written whatever the read says), reads the table's schema mode:
+    refused under the table's own ``table`` issue or the ``tables`` section issue, unless an operation before it in
+    the plan (*defined*) placed a definition of the table.
+    """
+    if isinstance(operation, AlterTable):
+        if backwards:
+            restores = _makes_schemafull(operation.previous_schema_mode, operation.schema_mode)
+        else:
+            restores = _makes_schemafull(operation.schema_mode, operation.previous_schema_mode)
+        unread = any(issue.table == operation.name or _section_unread(issue, "tables") for issue in issues)
+        return operation.name if restores and unread else None
+    if not isinstance(operation, AlterField | AddField) or (backwards and isinstance(operation, AddField)):
+        return None
+    written = render.field_state(operation, previous=backwards)
+    if written.flexible or not render.flexible_candidate(written.field_type) or operation.table in defined:
+        return None
+    unread = any(
+        (issue.kind == "table" and issue.name == operation.table) or _section_unread(issue, "tables") for issue in issues
+    )
+    return operation.table if unread else None
+
+
+class _Refusals:
+    """The refusals of the pre-pass that read one operation and the state before it (spec §5.6 step 3 and
+    ``rollback()``, §6.4): the line refusals (E-D1–E-D3), the state guards (``state.guard()``, E-G1, E-G2) and, on line
+    2, the read's issues under a ``FLEXIBLE`` choice (E-I1) — handed to ``state.advance()``/``state.rewind()`` as their
+    *check*, migration by migration, in the plan's order (the undo order for a rollback). It keeps the tables the
+    operations before placed (E-I1's (b))."""
+
+    def __init__(self, line: Literal[2, 3], *, backwards: bool) -> None:
+        self._line = line
+        self._backwards = backwards
+        self._defined: set[str] = set()
+
+    def of(self, migration: Migration) -> _state.Check:
+        """The check of *migration*'s operations."""
+
+        def check(position: int, operation: Operation, state: SchemaState) -> None:
+            subject = f"Migration '{migration.name}', operation {position} ({operation.describe()})"
+            needs = _line_only(operation, backwards=self._backwards) if self._line == 2 else None
+            if needs is not None:
+                raise SurrealDbError(
+                    f"{subject}: {needs} need SurrealDB 3.x; this connection runs SurrealDB 2.x or the embedded engine."
+                )
+            _state.guard(migration, position, operation, state, backwards=self._backwards)
+            if self._line == 2:
+                table = _blinded_table(operation, state.issues, backwards=self._backwards, defined=self._defined)
+                if table is not None:
+                    raise SurrealDbError(
+                        f"{subject}: table '{table}' could not be read entirely from the database, and on SurrealDB 2.x "
+                        "and the embedded engine the FLEXIBLE clauses of this operation are chosen from that reading; "
+                        "nothing was applied. DatabaseIntrospector().introspect().issues lists what could not be read."
+                    )
+            self._defined |= set(_defined_tables(operation, backwards=self._backwards))
+
+        return check
+
 
 @dataclass(frozen=True)
 class _Prepared:
@@ -493,16 +616,16 @@ def _compensation(
             defined[operation.name] = (index + 1, operation)
     statements: list[str] = []
     for name, (position, operation) in reversed(defined.items()):
-        found = held.analyzers.get(name)
-        if found is not None:
-            restoring = DefineAnalyzer.from_analyzer_state(found)
-            if restoring is None:
-                raise _unrestorable(migration, position, operation)
-            statements.append(restoring.forwards())
-        elif _unreadable(held.issues, name):
+        if _unreadable(held.issues, name):  # the read may miss it, or hold another definition of that name
             raise _unrestorable(migration, position, operation)
-        else:
+        found = held.analyzers.get(name)
+        if found is None:
             statements.append(render.removal("analyzer", name, if_exists=True))
+            continue
+        restoring = DefineAnalyzer.from_analyzer_state(found)
+        if restoring is None:
+            raise _unrestorable(migration, position, operation)
+        statements.append(restoring.forwards())
     rebuilds = tuple(
         render.rebuild(table.name, index.name, if_exists=True)
         for table in held.tables.values()
@@ -729,7 +852,11 @@ class MigrationExecutor:
         3. Otherwise the database's schema is read **once** (``DatabaseIntrospector``), before any DDL: definitions made
            by ``define_table()`` and the other appliers, or by hand, are part of it. The planned migrations are
            replayed over it strictly, and every statement is rendered from those states — on SurrealDB 2.x and the
-           embedded engine the ``FLEXIBLE`` choices are the database's —, all before the first batch is sent.
+           embedded engine the ``FLEXIBLE`` choices are the database's —, all before the first batch is sent. What
+           would fail or break the schema is refused there, before any DDL: a removal of a missing definition, a
+           3.x-only clause on SurrealDB 2.x or the embedded engine, an analyzer an index still uses, a table a view
+           reads, a ``FLEXIBLE`` choice from a table the read could not read entirely, an analyzer whose definition
+           could not be restored (see the exceptions below).
         4. Each migration: its ``DefineAnalyzer`` statements in a batch committed first (an index built in the same
            transaction would not use a redefined analyzer, M4, M26), then one batch holding its tracking record and
            every other schema statement, in order — applied whole or not at all. Its ``DataMigration`` operations run
@@ -745,9 +872,13 @@ class MigrationExecutor:
         :param fake: Record the migrations as applied without running them.
         :param schema_only: ``False`` also runs each applied migration's data operations, after its schema.
         :raises ValueError: *target* names no migration file; an applied migration depends on a pending one (E-H1); a
-            removal of a definition neither the database nor an earlier planned operation holds (E-R1); see
-            :meth:`get_pending_migrations`.
-        :raises SurrealDbError: an analyzer phase A redefines whose database definition cannot be restored (E-I2).
+            removal of a definition neither the database nor an earlier planned operation holds (E-R1); the removal of
+            an analyzer an index still uses (E-G1) or of a table a view reads (E-G2) — an index made by
+            ``define_indexes()`` or a view made by ``define_view()`` included; see :meth:`get_pending_migrations`.
+        :raises SurrealDbError: on SurrealDB 2.x or the embedded engine, an ``ASYNC`` event (E-D1), a ``WITH REFRESH``
+            access (E-D2) or a ``COMPUTED`` field (E-D3), which only SurrealDB 3.x parses; a ``FLEXIBLE`` choice made
+            from a table the read could not read entirely (E-I1); an analyzer phase A redefines whose database
+            definition cannot be restored (E-I2). Each of these refusals comes before any DDL.
         :raises SurrealDbConflictError: a retryable conflict (E-C1).
         :raises MigrationStatementError: SurrealDB refused a statement (E-X1), the tracking record (E-X2), the batch
             as a whole (E-X6) or a data operation's SQL (E-X5: the migration stays applied — run :meth:`upgrade` once
@@ -800,10 +931,13 @@ class MigrationExecutor:
         :param target: The last migration to keep applied, or ``""``.
         :raises TypeError: *target* is not a ``str``.
         :raises ValueError: *target* is not applied; an applied migration depends on a pending one (E-H1); a migration
-            to undo holds an irreversible operation; see :meth:`get_pending_migrations`.
+            to undo holds an irreversible operation; a backwards removing an analyzer an index still uses (E-G1) or a
+            table a view reads (E-G2); see :meth:`get_pending_migrations`.
         :raises FileNotFoundError: an applied migration has no file.
-        :raises SurrealDbError: an analyzer the backwards restore whose database definition could not be restored
-            (E-I2).
+        :raises SurrealDbError: on SurrealDB 2.x or the embedded engine, a backwards restoring an ``ASYNC`` event (E-D1),
+            a ``WITH REFRESH`` access (E-D2) or a ``COMPUTED`` field (E-D3), or making a ``FLEXIBLE`` choice from a table
+            the read could not read entirely (E-I1); an analyzer the backwards restore whose database definition could
+            not be restored (E-I2). Each of these refusals comes before any DDL.
         :raises SurrealDbConflictError: a retryable conflict (E-C1).
         :raises MigrationStatementError: SurrealDB refused a statement or the record's deletion (E-X3), or the batch as
             a whole (E-X6). An exception a data function raises propagates unchanged.
@@ -916,17 +1050,19 @@ class MigrationExecutor:
         after it, its compensation from the state before it. Backwards, *plan* (in undo order) rewinds the read: the
         state with each migration applied is the read rewound through the migrations undone before it, and its
         backwards render from that state rewound through it (``state.rewind()``), its compensation from the state with
-        it applied.
+        it applied. Each operation is checked on the state before it (``_Refusals``: E-D1–E-D3, E-G1, E-G2, E-I1), and
+        each compensation rendered (E-I2), all before the first batch is sent.
         """
         current = await DatabaseIntrospector(self._connection).introspect()
+        refusals = _Refusals(line, backwards=backwards)
         prepared: list[_Prepared] = []
         for migration in plan:
             if backwards:
-                before = _state.rewind(migration, current)
+                before = _state.rewind(migration, current, check=refusals.of(migration))
                 prepared.append(_prepared(migration, line=line, before=before, after=current, backwards=True))
                 current = before
             else:
-                after = _state.advance(migration, current, strict=True)
+                after = _state.advance(migration, current, strict=True, check=refusals.of(migration))
                 prepared.append(_prepared(migration, line=line, before=current, after=after))
                 current = after
         return prepared

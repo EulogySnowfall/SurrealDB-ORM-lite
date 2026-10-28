@@ -24,6 +24,13 @@ the embedded engine only: ``TestRollbackStatesE2E`` (AC-11), ``TestReversibleE2E
 ``TestRollbackCompensationE2E`` (AC-9's rollback part), ``TestEventsAndFunctionsE2E`` (AC-27), ``TestDataE2E`` (AC-15,
 AC-18), ``TestStatusE2E`` (AC-13, AC-18). Each E2E test chooses its expectation per line from ``cached_major()``; none
 skips.
+
+The pre-pass's refusals, before any DDL (spec §5.6 step 3, §7): unit ``TestLineRefusalsUnit`` (E-D1–E-D3),
+``TestGuardsUnit`` (E-G1, E-G2), ``TestReadIssuesUnit`` (E-I1); E2E over WebSocket and the embedded engine
+``TestLineDispatchE2E`` (AC-16), ``TestAlterTableFlexibleE2E`` (AC-16, M27), ``TestGuardsE2E`` (AC-17, AC-17 +),
+``TestReadIssuesE2E`` (AC-16 +, AC-9 +: E-I1, E-I2 on a fake read) and ``TestReferenceE2E`` (``REFERENCE``, whose
+expectation comes from the capability probe ``reference_supported()``, spec §9.2); over WebSocket only
+``TestUnwritableAnalyzerE2E`` (P3, M32).
 """
 
 import asyncio
@@ -2514,3 +2521,1056 @@ class TestStatusE2E:
                 f"Migration '{second}' is applied but its dependency '{first}' is not: the database's history does not "
                 f"match {tmp_path}."
             ]
+
+
+# === the pre-pass's refusals: line-only clauses, state guards, read issues (spec §5.6 step 3, §7) ======================
+
+#: E-D1, E-D2, E-D3: what SurrealDB 2.x and the embedded engine cannot parse (spec §7).
+_ASYNC_EVENTS = "ASYNC events"
+_REFRESH_TOKENS = "refresh tokens (WITH REFRESH)"
+_COMPUTED_FIELDS = "COMPUTED fields"
+_ASYNC_EVENT = DefineEvent("audit", "doc", None, "CREATE log SET a = 1", async_mode=True)
+_REFRESH_ACCESS = DefineAccess("acc", "users", {"email": "$email"}, "email = $email", with_refresh=True)
+
+
+def _e_d(name: str, position: int, operation: Operation, needs: str) -> str:
+    """E-D1/E-D2/E-D3 (spec §7)."""
+    return (
+        f"Migration '{name}', operation {position} ({operation.describe()}): {needs} need SurrealDB 3.x; this "
+        "connection runs SurrealDB 2.x or the embedded engine."
+    )
+
+
+def _e_g1(name: str, position: int, operation: Operation, index: str, table: str) -> str:
+    return (
+        f"Migration '{name}', operation {position} ({operation.describe()}): the analyzer is still used by index "
+        f"'{index}' on table '{table}'; drop the index first."
+    )
+
+
+def _e_g2(name: str, position: int, operation: Operation, view: str) -> str:
+    return (
+        f"Migration '{name}', operation {position} ({operation.describe()}): the view '{view}' reads this table; drop "
+        "the view first."
+    )
+
+
+def _e_i1(name: str, position: int, operation: Operation, table: str) -> str:
+    return (
+        f"Migration '{name}', operation {position} ({operation.describe()}): table '{table}' could not be read entirely "
+        "from the database, and on SurrealDB 2.x and the embedded engine the FLEXIBLE clauses of this operation are "
+        "chosen from that reading; nothing was applied. DatabaseIntrospector().introspect().issues lists what could not "
+        "be read."
+    )
+
+
+def _line_of(version: str) -> int:
+    return 3 if version.startswith("surrealdb-3") else 2
+
+
+_VERSIONS = ["surrealdb-2.7.0", "surrealdb-3.3.4"]
+
+
+class TestLineRefusalsUnit:
+    """Spec §5.6 step 3, §7 E-D1–E-D3, D27: below SurrealDB 3 a migration defining an ``ASYNC`` event, a ``WITH
+    REFRESH`` access or a ``COMPUTED`` field is refused before any DDL — and so is a rollback whose backwards would
+    define one —; SurrealDB 3.x applies it."""
+
+    @pytest.mark.parametrize(
+        ("operation", "needs"),
+        [
+            (_ASYNC_EVENT, _ASYNC_EVENTS),
+            (_REFRESH_ACCESS, _REFRESH_TOKENS),
+            (AddField("doc", "c", "int", computed="a + 1"), _COMPUTED_FIELDS),
+            (AlterField("doc", "c", "int", computed="a + 1", previous_type="int"), _COMPUTED_FIELDS),
+        ],
+        ids=["async", "refresh", "add-computed", "alter-computed"],
+    )
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_a_line_only_clause(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: Operation, needs: str, version: str
+    ) -> None:
+        name = _write(tmp_path, "a", [CreateTable("doc", "SCHEMALESS"), operation])
+        client = _FakeClient([_ok(3, line=_line_of(version))], version=version)
+        _offline(monkeypatch, client, SchemaState())
+        executor = MigrationExecutor(tmp_path)
+        if _line_of(version) == 3:
+            assert await executor.migrate() == [name]
+            assert len(client.sent) == 1
+            return
+        with pytest.raises(SurrealDbError) as raised:
+            await executor.migrate()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _e_d(name, 2, operation, needs)
+        assert client.sent == []
+
+    async def test_the_first_refusal_of_the_plan_is_raised(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        first = _write(tmp_path, "a", [CreateTable("doc", "SCHEMALESS")])
+        second = _write(tmp_path, "b", [AddField("doc", "a", "int"), _REFRESH_ACCESS, _ASYNC_EVENT], [first])
+        client = _FakeClient([], version="surrealdb-2.7.0")
+        _offline(monkeypatch, client, SchemaState())
+        with pytest.raises(SurrealDbError) as raised:
+            await MigrationExecutor(tmp_path).migrate()
+        assert str(raised.value) == _e_d(second, 2, _REFRESH_ACCESS, _REFRESH_TOKENS)
+        assert client.sent == []
+
+    @pytest.mark.parametrize(
+        ("operation", "needs"),
+        [
+            (DefineEvent("audit", "doc", None, "CREATE log SET a = 2", previous=_ASYNC_EVENT), _ASYNC_EVENTS),
+            (RemoveEvent("audit", "doc", previous=_ASYNC_EVENT), _ASYNC_EVENTS),
+            (DefineAccess("acc", "users", {"email": "$email"}, "email = $email", previous=_REFRESH_ACCESS), _REFRESH_TOKENS),
+            (RemoveAccess("acc", previous=_REFRESH_ACCESS), _REFRESH_TOKENS),
+            (AlterField("doc", "c", "int", previous_type="int", previous_computed="a + 1"), _COMPUTED_FIELDS),
+        ],
+        ids=["define-event", "remove-event", "define-access", "remove-access", "alter-field"],
+    )
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_a_backwards_line_only_clause(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: Operation, needs: str, version: str
+    ) -> None:
+        name = _write(tmp_path, "a", [CreateTable("doc", "SCHEMALESS"), operation])
+        client = _recording([_ok(3, line=_line_of(version))], name, version=version)
+        _offline(monkeypatch, client, SchemaState())
+        executor = MigrationExecutor(tmp_path)
+        if _line_of(version) == 3:
+            assert await executor.rollback("") == [name]
+            assert len(client.sent) == 1
+            return
+        with pytest.raises(SurrealDbError) as raised:
+            await executor.rollback("")
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _e_d(name, 2, operation, needs)
+        assert client.sent == []
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            DefineEvent("audit", "doc", None, "CREATE log SET a = 1"),
+            DefineEvent(
+                "audit", "doc", None, "CREATE log SET a = 2", previous=DefineEvent("audit", "doc", None, "CREATE log SET a = 0")
+            ),
+            AlterField("doc", "c", "int", previous_type="string"),
+        ],
+        ids=["event", "event-previous", "alter-field"],
+    )
+    async def test_a_backwards_without_a_line_only_clause(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: Operation
+    ) -> None:
+        name = _write(tmp_path, "a", [CreateTable("doc", "SCHEMALESS"), operation])
+        client = _recording([_ok(3, line=2)], name, version="surrealdb-2.7.0")
+        _offline(monkeypatch, client, SchemaState())
+        assert await MigrationExecutor(tmp_path).rollback("") == [name]
+
+    async def test_a_fake_run_refuses_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        name = _write(tmp_path, "a", [_ASYNC_EVENT])
+        client = _FakeClient([_ok(1, line=2)], version="surrealdb-2.7.0")
+        _offline(monkeypatch, client, SchemaState())
+        assert await MigrationExecutor(tmp_path).migrate(fake=True) == [name]
+        assert _sent(client.sent[0]) == [_TRACKING]
+
+
+def _read_view() -> SchemaState:
+    """A read holding ``src``, ``other`` and the view ``v`` reading ``src``."""
+    tables = {
+        "src": TableState("src", "SCHEMALESS", "normal"),
+        "other": TableState("other", "SCHEMALESS", "normal"),
+        "v": TableState("v", "SCHEMALESS", "any", view_query="SELECT count() AS n FROM `src` GROUP ALL"),
+    }
+    return SchemaState(tables)
+
+
+class TestGuardsUnit:
+    """Spec §5.6, §7 E-G1/E-G2, D13 (AC-17): on the state before each operation — the read with the plan replayed, or
+    for a rollback the read rewound through each backwards — the removal of an analyzer an index still uses and of a
+    table a view reads are refused before any DDL, on every line; dropped first, the index or the view no longer
+    counts."""
+
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_an_analyzer_in_use(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, version: str) -> None:
+        removal = RemoveAnalyzer("english")
+        name = _write(tmp_path, "a", [CreateTable("x", "SCHEMALESS"), removal])
+        client = _FakeClient([], version=version)
+        _offline(monkeypatch, client, _read_with_index())
+        with pytest.raises(ValueError) as raised:
+            await MigrationExecutor(tmp_path).migrate()
+        # The first index (by table, then name) that uses it.
+        assert str(raised.value) == _e_g1(name, 2, removal, "doc_title", "doc")
+        assert client.sent == []
+
+    async def test_an_analyzer_whose_indexes_were_dropped_first(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        operations: list[Operation] = [DropIndex("doc", "doc_title"), DropIndex("doc", "odd-name")]
+        first = _write(tmp_path, "a", operations)
+        second = _write(tmp_path, "b", [RemoveAnalyzer("english")], [first])
+        client = _FakeClient([_ok(3), _ok(2)])
+        _offline(monkeypatch, client, _read_with_index())
+        assert await MigrationExecutor(tmp_path).migrate() == [first, second]
+
+    async def test_an_analyzer_an_earlier_operation_puts_in_use(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        index = CreateIndex("doc", "doc_body", ["body"], search_analyzer="french", bm25=True)
+        removal = RemoveAnalyzer("french")
+        name = _write(tmp_path, "a", [DropIndex("doc", "doc_other"), index, removal])
+        client = _FakeClient([])
+        _offline(monkeypatch, client, _read_with_index())
+        with pytest.raises(ValueError) as raised:
+            await MigrationExecutor(tmp_path).migrate()
+        assert str(raised.value) == _e_g1(name, 3, removal, "doc_body", "doc")
+
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_a_views_source(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, version: str) -> None:
+        drop = DropTable("src")
+        name = _write(tmp_path, "a", [DropTable("other"), drop])
+        client = _FakeClient([], version=version)
+        _offline(monkeypatch, client, _read_view())
+        with pytest.raises(ValueError) as raised:
+            await MigrationExecutor(tmp_path).migrate()
+        assert str(raised.value) == _e_g2(name, 2, drop, "v")
+        assert client.sent == []
+
+    async def test_a_views_source_once_the_view_is_dropped(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        name = _write(tmp_path, "a", [DropTable("v"), DropTable("src")])
+        client = _FakeClient([_ok(3)])
+        _offline(monkeypatch, client, _read_view())
+        assert await MigrationExecutor(tmp_path).migrate() == [name]
+
+    async def test_a_rollback_removing_a_views_source(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        creation = CreateTable("src", "SCHEMALESS")
+        name = _write(tmp_path, "a", [creation])
+        client = _recording([], name)
+        _offline(monkeypatch, client, _read_view())
+        with pytest.raises(ValueError) as raised:
+            await MigrationExecutor(tmp_path).rollback("")
+        assert str(raised.value) == _e_g2(name, 1, creation, "v")
+        assert client.sent == []
+
+    async def test_a_rollback_removing_an_analyzer_in_use(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        definition = DefineAnalyzer("english", ["blank"])
+        name = _write(tmp_path, "a", [definition, CreateTable("x", "SCHEMALESS")])
+        client = _recording([], name)
+        _offline(monkeypatch, client, _read_with_index())
+        with pytest.raises(ValueError) as raised:
+            await MigrationExecutor(tmp_path).rollback("")
+        assert str(raised.value) == _e_g1(name, 1, definition, "doc_title", "doc")
+        assert client.sent == []
+
+    async def test_a_rollback_whose_backwards_drop_the_index_first(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Undone in reverse order: the index goes before its analyzer (M6), which is then no longer in use.
+        operations: list[Operation] = [
+            DefineAnalyzer("german", ["blank"]),
+            CreateIndex("doc", "doc_de", ["body"], search_analyzer="german", bm25=True),
+        ]
+        name = _write(tmp_path, "a", operations)
+        read = _read_with_index()
+        doc = read.tables["doc"]
+        index = IndexState("doc_de", ("body",), search_analyzer="german", bm25=True, table="doc")
+        read = dataclasses.replace(
+            read,
+            tables={"doc": dataclasses.replace(doc, indexes={**doc.indexes, "doc_de": index})},
+            analyzers={**read.analyzers, "german": AnalyzerState("german", ("blank",))},
+        )
+        client = _recording([_ok(3)], name)
+        _offline(monkeypatch, client, read)
+        assert await MigrationExecutor(tmp_path).rollback("") == [name]
+
+
+#: A read issue on ``t``'s column ``lost``, on ``t``'s own definition, and the ``tables`` section issue.
+_FIELD_ISSUE = SchemaIssue("field", "lost", "t", "could not parse its definition")
+_TABLE_ISSUE = SchemaIssue("table", "t", "t", "INFO FOR TABLE failed")
+_TABLES_ISSUE = SchemaIssue("section", "tables", None, "section 'tables' is not a mapping of names to definitions")
+
+
+def _read_t_with(*issues: SchemaIssue) -> SchemaState:
+    """``_read_t()``'s table ``t``, made ``SCHEMAFULL``, with *issues*."""
+    read = _read_t()
+    table = dataclasses.replace(read.tables["t"], schema_mode="SCHEMAFULL")
+    return dataclasses.replace(read, tables={"t": table}, issues=issues)
+
+
+class TestReadIssuesUnit:
+    """Spec §5.6 step 3 and ``rollback()``, §7 E-I1 (C8, P2): on SurrealDB 2.x and the embedded engine, a ``FLEXIBLE``
+    choice made from a table the read could not read entirely is refused before any DDL — (a) an ``AlterTable`` making
+    it ``SCHEMAFULL`` (or a backwards restoring it) under an issue of that table or the ``tables`` section issue; (b) an
+    ``AddField``/``AlterField`` of an ``any`` or object-array kind under the table's own issue or the ``tables`` section
+    issue, unless an operation before it in the plan defines the table —; SurrealDB 3.x applies them."""
+
+    @pytest.mark.parametrize("issue", [_FIELD_ISSUE, _TABLE_ISSUE, _TABLES_ISSUE], ids=["field", "table", "tables"])
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_a_table_made_schemafull(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, issue: SchemaIssue, version: str
+    ) -> None:
+        name = _write(tmp_path, "schemafull", [R33])
+        line = _line_of(version)
+        client = _FakeClient([_ok(1 + (len(_R33_LINES) if line == 2 else 1), line=line)], version=version)
+        _offline(monkeypatch, client, dataclasses.replace(_read_t(), issues=(issue,)))
+        executor = MigrationExecutor(tmp_path)
+        if line == 3:
+            assert await executor.migrate() == [name]
+            return
+        with pytest.raises(SurrealDbError) as raised:
+            await executor.migrate()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _e_i1(name, 1, R33, "t")
+        assert client.sent == []
+
+    @pytest.mark.parametrize(
+        "issue",
+        [SchemaIssue("field", "x", "other", "?"), SchemaIssue("table", "other", "other", "?")],
+        ids=["field", "table"],
+    )
+    async def test_an_issue_on_another_table(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, issue: SchemaIssue) -> None:
+        name = _write(tmp_path, "schemafull", [R33, AddField("t", "box", "any")])
+        client = _FakeClient([_ok(1 + len(_R33_LINES) + 1, line=2)], version="surrealdb-2.7.0")
+        _offline(monkeypatch, client, dataclasses.replace(_read_t(), issues=(issue,)))
+        assert await MigrationExecutor(tmp_path).migrate() == [name]
+        assert _sent(client.sent[0])[1:] == [*_R33_LINES, "DEFINE FIELD `box` ON `t` TYPE any FLEXIBLE;"]
+
+    @pytest.mark.parametrize(
+        "operation",
+        [AddField("t", "box", "any"), AlterField("t", "bag", "array<object>", previous_type="any"), AlterField("t", "bag")],
+        ids=["add-any", "alter-objects", "alter-untyped"],
+    )
+    @pytest.mark.parametrize("issue", [_TABLE_ISSUE, _TABLES_ISSUE], ids=["table", "tables"])
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_a_flexible_candidate_on_an_unread_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: Operation, issue: SchemaIssue, version: str
+    ) -> None:
+        name = _write(tmp_path, "add", [CreateTable("x", "SCHEMALESS"), operation])
+        client = _FakeClient([_ok(3, line=_line_of(version))], version=version)
+        _offline(monkeypatch, client, _read_t_with(issue))
+        executor = MigrationExecutor(tmp_path)
+        if _line_of(version) == 3:
+            assert await executor.migrate() == [name]
+            return
+        with pytest.raises(SurrealDbError) as raised:
+            await executor.migrate()
+        assert str(raised.value) == _e_i1(name, 2, operation, "t")
+        assert client.sent == []
+
+    @pytest.mark.parametrize(
+        ("operations", "issue"),
+        [
+            ([AddField("t", "label", "string")], _TABLE_ISSUE),
+            ([AddField("t", "box", "any", flexible=True)], _TABLE_ISSUE),
+            ([AddField("t", "box", "any")], _FIELD_ISSUE),
+            (
+                [AlterTable("t", "SCHEMAFULL", "normal", previous_schema_mode="SCHEMAFULL"), AddField("t", "box", "any")],
+                _TABLE_ISSUE,
+            ),
+            (
+                [
+                    RawSQL("DEFINE TABLE OVERWRITE t SCHEMAFULL;", state_operations=[CreateTable("t")]),
+                    AddField("t", "box", "any"),
+                ],
+                _TABLES_ISSUE,
+            ),
+        ],
+        ids=["string", "flexible", "field-issue", "defined-before", "raw-sql-defines"],
+    )
+    async def test_a_field_whose_flexible_is_not_chosen_from_an_unread_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operations: list[Operation], issue: SchemaIssue
+    ) -> None:
+        name = _write(tmp_path, "add", operations)
+        client = _FakeClient([lambda fake: _ok(_sent_count(fake), line=2)], version="surrealdb-2.7.0")
+        _offline(monkeypatch, client, _read_t_with(issue))
+        assert await MigrationExecutor(tmp_path).migrate() == [name]
+
+    async def test_a_table_an_earlier_migration_defines(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        first = _write(tmp_path, "a", [CreateTable("u")])
+        second = _write(tmp_path, "b", [AddField("u", "bag", "any")], [first])
+        client = _FakeClient([_ok(2, line=2), _ok(2, line=2)], version="surrealdb-2.7.0")
+        _offline(monkeypatch, client, SchemaState(issues=[SchemaIssue("table", "u", "u", "INFO FOR TABLE failed")]))
+        assert await MigrationExecutor(tmp_path).migrate() == [first, second]
+        assert _sent(client.sent[1])[1:] == ["DEFINE FIELD `bag` ON `u` TYPE any FLEXIBLE;"]
+
+    @pytest.mark.parametrize("issue", [_FIELD_ISSUE, _TABLES_ISSUE], ids=["field", "tables"])
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_a_rollback_restoring_schemafull(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, issue: SchemaIssue, version: str
+    ) -> None:
+        name = _write(tmp_path, "schemaless", [R33_REVERSE])
+        line = _line_of(version)
+        client = _recording([_ok(1 + (len(_R33_LINES) if line == 2 else 1), line=line)], name, version=version)
+        _offline(monkeypatch, client, dataclasses.replace(_read_t(), issues=(issue,)))
+        executor = MigrationExecutor(tmp_path)
+        if line == 3:
+            assert await executor.rollback("") == [name]
+            return
+        with pytest.raises(SurrealDbError) as raised:
+            await executor.rollback("")
+        assert str(raised.value) == _e_i1(name, 1, R33_REVERSE, "t")
+        assert client.sent == []
+
+    @pytest.mark.parametrize("version", _VERSIONS)
+    async def test_a_rollback_redefining_a_flexible_candidate(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, version: str
+    ) -> None:
+        alteration = AlterField("t", "bag", "string", previous_type="any")
+        name = _write(tmp_path, "bag_text", [alteration])
+        client = _recording([_ok(2, line=_line_of(version))], name, version=version)
+        _offline(monkeypatch, client, _read_t_with(_TABLE_ISSUE))
+        executor = MigrationExecutor(tmp_path)
+        if _line_of(version) == 3:
+            assert await executor.rollback("") == [name]
+            return
+        with pytest.raises(SurrealDbError) as raised:
+            await executor.rollback("")
+        assert str(raised.value) == _e_i1(name, 1, alteration, "t")
+        assert client.sent == []
+
+    async def test_a_rollback_whose_earlier_backwards_defines_the_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        first = _write(tmp_path, "bag_text", [AlterField("t", "bag", "string", previous_type="any")])
+        # Undone first, the later migration's backwards redefines t (SCHEMALESS): the earlier one's FLEXIBLE is chosen
+        # from that definition, not from the read.
+        loose = AlterTable("t", "SCHEMALESS", "normal", previous_schema_mode="SCHEMALESS", previous_table_type="normal")
+        second = _write(tmp_path, "schemaless", [loose], [first])
+        client = _recording([_ok(2, line=2), _ok(2, line=2)], first, second, version="surrealdb-2.7.0")
+        _offline(monkeypatch, client, _read_t_with(_TABLE_ISSUE))
+        assert await MigrationExecutor(tmp_path).rollback("") == [second, first]
+
+
+def _sent_count(client: _FakeClient) -> int:
+    """The number of statements of the batch *client* was sent last (without ``BEGIN``/``COMMIT``)."""
+    return len(_sent(client.sent[-1]))
+
+
+def _with_issue(monkeypatch: pytest.MonkeyPatch, issue: SchemaIssue, **replaced: Any) -> None:
+    """``DatabaseIntrospector.introspect()`` returns the real read plus *issue* — and the *replaced* sections."""
+    real = DatabaseIntrospector.introspect
+
+    async def read(self: DatabaseIntrospector) -> SchemaState:
+        state = await real(self)
+        return dataclasses.replace(state, issues=(*state.issues, issue), **replaced)
+
+    monkeypatch.setattr(DatabaseIntrospector, "introspect", read)
+
+
+async def _nothing_applied(
+    client: Any, executor: MigrationExecutor, before: dict[str, Any], applied: Sequence[str] = ()
+) -> None:
+    """Nothing was sent: the tracking table records *applied*, ``INFO FOR DB`` is *before*."""
+    assert await executor.get_applied_migrations() == list(applied)
+    assert await _info_db(client) == before
+
+
+async def _ready(client: Any, executor: MigrationExecutor) -> dict[str, Any]:
+    """``INFO FOR DB`` once the tracking table exists."""
+    await executor.ensure_migrations_table()
+    return await _info_db(client)
+
+
+class LdItem(BaseSurrealModel):
+    """A SCHEMAFULL model with an ``Any`` column and an untyped list (``FLEXIBLE`` below 3, v0.34.0)."""
+
+    model_config = SurrealConfigDict(table_name="ld_item", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    bag: Any = None
+    tags: list = []  # type: ignore[type-arg]
+
+
+class TestLineDispatchE2E:
+    """AC-16 (spec §4): what the line chooses — the full-text keyword, ``FLEXIBLE`` on the ``any`` columns of a
+    ``SCHEMAFULL`` table —, the 3.x-only clauses refused before any DDL below 3 (E-D1, E-D2, E-D3, a rollback's
+    included) and applied on 3.x, and a primary-key user model's access, whose SIGNUP sets the record id."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_the_full_text_keyword(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            operations: list[Operation] = [
+                DefineAnalyzer("ld_an", ["blank"], ["lowercase"]),
+                CreateTable("ld_doc", "SCHEMAFULL"),
+                AddField("ld_doc", "title", "string"),
+                CreateIndex("ld_doc", "ld_title", ["title"], search_analyzer="ld_an", bm25=True),
+            ]
+            name = _write(tmp_path, "docs", operations)
+            assert await MigrationExecutor(tmp_path).migrate() == [name]
+            info = await client.query("INFO FOR TABLE ld_doc;", {})
+            stored = info["indexes"]["ld_title"]
+            keyword, other = ("FULLTEXT", "SEARCH") if await _line(client) >= 3 else ("SEARCH", "FULLTEXT")
+            assert keyword in stored
+            assert other not in stored
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_flexible_on_the_any_columns_of_a_schemafull_table(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            path = await makemigrations("items", migrations_dir=tmp_path, models=[LdItem], from_db=False)
+            assert path is not None
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            fields = (await DatabaseIntrospector().introspect()).tables["ld_item"].fields
+            below_3 = await _line(client) < 3
+            assert (fields["bag"].flexible, fields["tags"].flexible) == (below_3, below_3)
+            item = LdItem(id="one", bag={"a": {"b": 1}}, tags=[{"c": 1}])
+            await item.save()
+            await item.refresh()
+            assert (item.bag, item.tags) == ({"a": {"b": 1}}, [{"c": 1}])
+
+    @pytest.mark.parametrize(
+        ("operation", "needs", "stored"),
+        [
+            (
+                DefineEvent("ld_e", "ld_t", None, "CREATE ld_log SET a = 1", async_mode=True),
+                _ASYNC_EVENTS,
+                ("events", "ld_e", "ASYNC"),
+            ),
+            (
+                DefineAccess(
+                    "ld_acc",
+                    "ld_t",
+                    {"email": "$email", "password": "crypto::argon2::generate($password)"},
+                    "email = $email AND crypto::argon2::compare(password, $password)",
+                    with_refresh=True,
+                ),
+                _REFRESH_TOKENS,
+                ("accesses", "ld_acc", "WITH REFRESH"),
+            ),
+            (AddField("ld_t", "c", "int", computed="a + 1"), _COMPUTED_FIELDS, ("fields", "c", "COMPUTED")),
+        ],
+        ids=["async", "refresh", "computed"],
+    )
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_line_only_clause(
+        self, kind: str, tmp_path: Path, operation: Operation, needs: str, stored: tuple[str, str, str]
+    ) -> None:
+        async with migration_database(kind) as client:
+            operations: list[Operation] = [CreateTable("ld_t", "SCHEMALESS"), AddField("ld_t", "a", "int"), operation]
+            name = _write(tmp_path, "line_only", operations)
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            if await _line(client) >= 3:
+                assert await executor.migrate() == [name]
+                section, key, clause = stored
+                info = await _info_db(client) if section == "accesses" else await client.query("INFO FOR TABLE ld_t;", {})
+                assert clause in info[section][key]
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.migrate()
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _e_d(name, 3, operation, needs)
+            await _nothing_applied(client, executor, before)
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_rollback_restoring_a_computed_field(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "a", [CreateTable("ld_r", "SCHEMALESS"), AddField("ld_r", "a", "int")])
+            alteration = AlterField("ld_r", "c", "int", previous_type="int", previous_computed="a + 1")
+            second = _write(tmp_path, "b", [alteration], [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second]
+            before = await _info_db(client)
+            fields = await _fields(client, "ld_r")
+            if await _line(client) >= 3:
+                assert await executor.rollback(first) == [second]
+                assert "COMPUTED a + 1" in (await _fields(client, "ld_r"))["c"]
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.rollback(first)
+            assert str(raised.value) == _e_d(second, 1, alteration, _COMPUTED_FIELDS)
+            await _nothing_applied(client, executor, before, [first, second])
+            assert await _fields(client, "ld_r") == fields
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_primary_key_user_models_access(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            path = await makemigrations("users", migrations_dir=tmp_path, models=[MigUser], from_db=False)
+            assert path is not None
+            assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
+            result = await MigUser.signup(email="pk@x.io", password="p", bind=kind == "mem")
+            assert result.user.email == "pk@x.io"
+            assert await client.query("SELECT VALUE id FROM mig_user;", {}) == [_sdk.RecordID("mig_user", "pk@x.io")]
+
+
+#: The columns ``table_ddl()`` writes for ``Any``, ``list`` and ``list[Sub]`` (spec M27), on a SCHEMALESS table.
+_AF_TABLE = CreateTable("af_t", "SCHEMALESS", "normal")
+_AF_COLUMNS: list[Operation] = [
+    AddField("af_t", "name", "string"),
+    AddField("af_t", "bag", "any"),
+    AddField("af_t", "tags", "array"),
+    AddField("af_t", "tags.*", "any"),
+    AddField("af_t", "subs", "array<object>"),
+    AddField("af_t", "subs.*.k", "any"),
+]
+_AF_FLEXIBLE = ("bag", "tags", "tags.*", "subs", "subs.*.k")
+_AF_SCHEMAFULL = AlterTable("af_t", "SCHEMAFULL", "normal", previous_schema_mode="SCHEMALESS", previous_table_type="normal")
+_AF_SCHEMALESS = AlterTable("af_t", "SCHEMALESS", "normal", previous_schema_mode="SCHEMAFULL", previous_table_type="normal")
+_AF_OBJECTS = "bag = { x: { y: 1 } }, tags = [{ a: 1 }], subs = [{ k: { z: 1 } }]"
+_AF_VALUES = {"bag": {"x": {"y": 1}}, "tags": [{"a": 1}], "subs": [{"k": {"z": 1}}]}
+
+
+async def _af_kept(client: Any, *records: str) -> None:
+    """After one more write, each of *records* still holds the objects of ``_AF_OBJECTS``."""
+    for record in records:
+        await _run(client, f"UPDATE af_t:{record} SET name = 'again';")
+        (row,) = await client.query(f"SELECT bag, tags, subs FROM af_t:{record};", {})
+        assert {key: row[key] for key in _AF_VALUES} == _AF_VALUES, record
+
+
+def _redefinitions(batch: str) -> list[str]:
+    return [statement for statement in _sent(batch) if statement.startswith("DEFINE FIELD")]
+
+
+class AfLoose(BaseSurrealModel):
+    """A SCHEMALESS model with an ``Any`` column: ``define_table()`` writes ``bag TYPE any``, no migration file."""
+
+    model_config = SurrealConfigDict(table_name="af_l", schema_mode=SchemaMode.SCHEMALESS)
+
+    id: str | None = None
+    name: str = ""
+    bag: Any = None
+
+
+class TestAlterTableFlexibleE2E:
+    """M27, D15 (AC-16, AC-16 +'s hand-written part): an ``AlterTable`` making a table holding objects ``SCHEMAFULL``
+    — or a backwards restoring it — redefines ``FLEXIBLE`` below 3 the columns the **database** holds that would lose
+    them, so the objects written before and after are kept; on 3.x the table statement comes alone and the objects are
+    kept too. ``show_sql()`` renders from the files: a column no file defines is not listed."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_table_a_migration_made(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind) as client:
+            line = await _line(client)
+            first = _write(tmp_path, "table", [_AF_TABLE, *_AF_COLUMNS])
+            second = _write(tmp_path, "schemafull", [_AF_SCHEMAFULL], [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first) == [first]
+            await _run(client, f"UPSERT af_t:one SET name = 'a', {_AF_OBJECTS};")
+            shown = await executor.show_sql(second, line=line)
+            expected = [statement for statement in shown.split("\n") if statement.startswith("DEFINE FIELD")]
+            assert len(expected) == (len(_AF_FLEXIBLE) if line == 2 else 0)
+            sent = _send_spy(monkeypatch)
+            for attempt in ("migrate", "again"):
+                assert await executor.migrate() == [second], attempt
+                (batch,) = [text for text in sent if _TRACKING in text]
+                assert _sent(batch)[1] == _AF_SCHEMAFULL.forwards()
+                redefined = _redefinitions(batch)
+                assert [statement.split(" ON ")[0] for statement in redefined] == [
+                    statement.split(" ON ")[0] for statement in expected
+                ], attempt
+                assert all(statement.endswith(" FLEXIBLE;") for statement in redefined)
+                fields = (await DatabaseIntrospector().introspect()).tables["af_t"].fields
+                assert all(fields[column].flexible is (line == 2) for column in _AF_FLEXIBLE), attempt
+                await _run(client, f"UPSERT af_t:two SET name = 'b', {_AF_OBJECTS};")
+                await _af_kept(client, "one", "two")
+                if attempt == "migrate":
+                    assert await executor.rollback(first) == [second]
+                    sent.clear()
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_backwards_restoring_schemafull(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind) as client:
+            line = await _line(client)
+            first = _write(tmp_path, "table", [_AF_TABLE, *_AF_COLUMNS])
+            second = _write(tmp_path, "schemafull", [_AF_SCHEMAFULL], [first])
+            third = _write(tmp_path, "schemaless", [_AF_SCHEMALESS], [second])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second, third]
+            await _run(client, f"UPSERT af_t:one SET name = 'a', {_AF_OBJECTS};")
+            sent = _send_spy(monkeypatch)
+            assert await executor.rollback(second) == [third]
+            (batch,) = [text for text in sent if _UNRECORD in text]
+            assert _sent(batch)[1] == _AF_SCHEMALESS.backwards()
+            assert len(_redefinitions(batch)) == (len(_AF_FLEXIBLE) if line == 2 else 0)
+            shown = await executor.show_sql(third, backwards=True, line=line)
+            assert len([statement for statement in shown.split("\n") if statement.startswith("DEFINE FIELD")]) == len(
+                _redefinitions(batch)
+            )
+            assert "SCHEMAFULL" in (await _info_db(client))["tables"]["af_t"]
+            await _run(client, f"UPSERT af_t:two SET name = 'b', {_AF_OBJECTS};")
+            await _af_kept(client, "one", "two")
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_table_define_table_made(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind) as client:
+            line = await _line(client)
+            await AfLoose.define_table()
+            await AfLoose(id="one", bag={"x": {"y": 1}}).save()
+            schemafull = AlterTable("af_l", "SCHEMAFULL", "normal", previous_schema_mode="SCHEMALESS")
+            name = _write(tmp_path, "schemafull", [schemafull])
+            executor = MigrationExecutor(tmp_path)
+            # The files hold no column of af_l: show_sql() gives the table statement alone on either line.
+            assert await executor.show_sql(name, line=2) == schemafull.forwards(line=2)
+            sent = _send_spy(monkeypatch)
+            assert await executor.migrate() == [name]
+            (batch,) = [text for text in sent if _TRACKING in text]
+            expected = ["DEFINE FIELD OVERWRITE `bag` ON `af_l` TYPE any FLEXIBLE;"] if line == 2 else []
+            assert _redefinitions(batch) == expected
+            assert ("FLEXIBLE" in (await _fields(client, "af_l"))["bag"]) is (line == 2)
+            await AfLoose(id="two", bag={"x": {"y": 2}}).save()
+            await _run(client, "UPDATE af_l:one SET name = 'again';")
+            assert await client.query("SELECT VALUE bag FROM af_l:one;", {}) == [{"x": {"y": 1}}]
+            assert await client.query("SELECT VALUE bag FROM af_l:two;", {}) == [{"x": {"y": 2}}]
+
+
+_GD_ANALYZER = Analyzer("gd_x", ["blank"], ["lowercase"])
+
+
+class GdDoc(BaseSurrealModel):
+    """A full-text index and its analyzer made by ``define_indexes()``, no migration defining them."""
+
+    model_config = SurrealConfigDict(
+        table_name="gd_doc",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        indexes=[Index("gd_title", "title", search_analyzer=_GD_ANALYZER, bm25=True)],
+    )
+
+    id: str | None = None
+    title: str = ""
+
+
+class GdView(BaseSurrealModel):
+    """A view made by ``define_view()``, no migration defining it, reading ``gd_src``."""
+
+    model_config = SurrealConfigDict(table_name="gd_view", view_query="SELECT count() AS n FROM gd_src GROUP ALL")
+
+    id: str | None = None
+    n: int = 0
+
+
+class TestGuardsE2E:
+    """AC-17, AC-17 + (D13, C8): E-G1 (an analyzer an index still uses) and E-G2 (a table a view reads) before any DDL
+    on every engine — the index or the view made by an earlier migration, by ``define_indexes()``/``define_view()``
+    outside migrations, or met by a rollback's backwards; nothing recorded, nothing removed."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_analyzer_an_earlier_migration_put_in_use(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(
+                tmp_path,
+                "docs",
+                [
+                    DefineAnalyzer("gd_an", ["blank"], ["lowercase"]),
+                    CreateTable("gd_m", "SCHEMAFULL"),
+                    AddField("gd_m", "title", "string"),
+                    CreateIndex("gd_m", "gd_m_title", ["title"], search_analyzer="gd_an", bm25=True),
+                ],
+            )
+            removal = RemoveAnalyzer("gd_an")
+            second = _write(tmp_path, "drop", [removal, DropIndex("gd_m", "gd_m_title")], [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first) == [first]
+            before = await _info_db(client)
+            with pytest.raises(ValueError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _e_g1(second, 1, removal, "gd_m_title", "gd_m")
+            await _nothing_applied(client, executor, before, [first])
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_analyzer_define_indexes_put_in_use(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await GdDoc.define_table()
+            await GdDoc.define_indexes()
+            removal = RemoveAnalyzer("gd_x")
+            name = _write(tmp_path, "drop", [removal])
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            with pytest.raises(ValueError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _e_g1(name, 1, removal, "gd_title", "gd_doc")
+            await _nothing_applied(client, executor, before)
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_rollback_removing_an_analyzer_in_use(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            definition = DefineAnalyzer("gd_x", ["blank"], ["lowercase"])
+            name = _write(tmp_path, "analyzer", [definition])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [name]
+            await GdDoc.define_table()
+            await GdDoc.define_indexes()
+            before = await _info_db(client)
+            with pytest.raises(ValueError) as raised:
+                await executor.rollback("")
+            assert str(raised.value) == _e_g1(name, 1, definition, "gd_title", "gd_doc")
+            await _nothing_applied(client, executor, before, [name])
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_view_an_earlier_migration_made(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            view = CreateTable("gd_mv", None, view_query="SELECT count() AS n FROM gd_src GROUP ALL")
+            first = _write(tmp_path, "tables", [CreateTable("gd_src", "SCHEMALESS"), view])
+            drop = DropTable("gd_src")
+            second = _write(tmp_path, "drop", [drop], [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate(target=first) == [first]
+            before = await _info_db(client)
+            with pytest.raises(ValueError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _e_g2(second, 1, drop, "gd_mv")
+            await _nothing_applied(client, executor, before, [first])
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_view_define_view_made(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, "DEFINE TABLE gd_src SCHEMALESS;")
+            await GdView.define_view()
+            drop = DropTable("gd_src")
+            name = _write(tmp_path, "drop", [drop])
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            with pytest.raises(ValueError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _e_g2(name, 1, drop, "gd_view")
+            await _nothing_applied(client, executor, before)
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_rollback_removing_a_views_source(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            creation = CreateTable("gd_src", "SCHEMALESS")
+            name = _write(tmp_path, "source", [creation])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [name]
+            await GdView.define_view()
+            before = await _info_db(client)
+            with pytest.raises(ValueError) as raised:
+                await executor.rollback("")
+            assert str(raised.value) == _e_g2(name, 1, creation, "gd_view")
+            await _nothing_applied(client, executor, before, [name])
+
+
+#: A table made by hand for ``TestReadIssuesE2E``: ``SCHEMAFULL``, with a ``label`` and an ``any`` column ``bag``.
+_RI_TABLE = "DEFINE TABLE t TYPE NORMAL SCHEMAFULL; DEFINE FIELD label ON t TYPE string; DEFINE FIELD bag ON t TYPE any;"
+
+
+def _issue(kind: str, name: str, table: str | None) -> SchemaIssue:
+    return SchemaIssue(kind, name, table, "could not parse its definition")
+
+
+class TestReadIssuesE2E:
+    """C8, D38, P1–P3 (AC-16 +, AC-9 +): the real read plus one ``SchemaIssue``. E-I1 below 3 — never on 3.x — when a
+    ``FLEXIBLE`` choice would be made from a table the read could not read entirely; E-I2 on every engine when the
+    database's definition of an analyzer phase A redefines cannot be read (an ``analyzer`` issue, the ``analyzers``
+    section issue) or written by the ORM. Each refusal comes before any DDL: no record, ``INFO FOR DB`` unchanged."""
+
+    @pytest.mark.parametrize(
+        "issue", [_issue("field", "lost", "t"), _issue("section", "tables", None)], ids=["field", "tables"]
+    )
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_table_made_schemafull(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, issue: SchemaIssue
+    ) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, _RI_TABLE)
+            name = _write(tmp_path, "schemafull", [R33])
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            _with_issue(monkeypatch, issue)
+            if await _line(client) >= 3:
+                assert await executor.migrate() == [name]
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _e_i1(name, 1, R33, "t")
+            await _nothing_applied(client, executor, before)
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_any_column_added_to_an_unread_table(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, _RI_TABLE)
+            addition = AddField("t", "box", "any")
+            name = _write(tmp_path, "box", [addition])
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            _with_issue(monkeypatch, _issue("table", "t", "t"))
+            if await _line(client) >= 3:
+                assert await executor.migrate() == [name]
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _e_i1(name, 1, addition, "t")
+            await _nothing_applied(client, executor, before)
+
+    @pytest.mark.parametrize(
+        ("addition", "issue", "defined_before"),
+        [
+            (AddField("t", "name", "string"), _issue("table", "t", "t"), False),
+            (AddField("t", "box", "any"), _issue("field", "label", "t"), False),
+            (AddField("t", "box", "any"), _issue("table", "other", "other"), False),
+            (AddField("u", "box", "any"), _issue("table", "u", "u"), True),
+        ],
+        ids=["string", "field-issue", "other-table", "defined-by-the-plan"],
+    )
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_field_applied_on_every_line(
+        self,
+        kind: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        addition: AddField,
+        issue: SchemaIssue,
+        defined_before: bool,
+    ) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, _RI_TABLE)
+            names: list[str] = []
+            if defined_before:  # a migration before the field's defines u, which the database does not hold
+                names.append(_write(tmp_path, "table", [CreateTable("u")]))
+            names.append(_write(tmp_path, "field", [addition], names))
+            _with_issue(monkeypatch, issue)
+            assert await MigrationExecutor(tmp_path).migrate() == names
+            column = (await _fields(client, addition.table))[addition.name]
+            if addition.field_type == "any":  # FLEXIBLE below 3, chosen from the read or from the plan
+                assert ("FLEXIBLE" in column) is (await _line(client) < 3)
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_rollback_redefining_an_any_column_of_an_unread_table(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, _RI_TABLE)
+            alteration = AlterField("t", "bag", "string", previous_type="any")
+            name = _write(tmp_path, "bag_text", [alteration])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [name]
+            before = await _info_db(client)
+            _with_issue(monkeypatch, _issue("table", "t", "t"))
+            if await _line(client) >= 3:
+                assert await executor.rollback("") == [name]
+                assert "TYPE any" in (await _fields(client, "t"))["bag"]
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.rollback("")
+            assert str(raised.value) == _e_i1(name, 1, alteration, "t")
+            await _nothing_applied(client, executor, before, [name])
+
+    @pytest.mark.parametrize(
+        "issue", [_issue("analyzer", "ri_an", None), _issue("section", "analyzers", None)], ids=["analyzer", "section"]
+    )
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_unreadable_analyzer_phase_a_redefines(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, issue: SchemaIssue
+    ) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, "DEFINE ANALYZER ri_an TOKENIZERS blank FILTERS ascii;")
+            name = _write(tmp_path, "analyzer", [DefineAnalyzer("ri_an", ["blank"], ["lowercase"])])
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            _with_issue(monkeypatch, issue)
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _ri_e_i2(name, "Define analyzer ri_an")
+            await _nothing_applied(client, executor, before)
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_unreadable_analyzer_a_rollback_restores(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with migration_database(kind) as client:
+            definition = DefineAnalyzer("ri_an", ["blank"], ["lowercase"])
+            first = _write(tmp_path, "a", [definition])
+            second = _write(tmp_path, "b", [DefineAnalyzer("ri_an", ["blank"], ["ascii"], previous=definition)], [first])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first, second]
+            before = await _info_db(client)
+            _with_issue(monkeypatch, _issue("section", "analyzers", None))
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.rollback(first)
+            assert str(raised.value) == _ri_e_i2(second, "Define analyzer ri_an")
+            await _nothing_applied(client, executor, before, [first, second])
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_an_analyzer_the_orm_cannot_write(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind) as client:
+            await _run(client, "DEFINE ANALYZER ri_an TOKENIZERS blank FILTERS ascii;")
+            name = _write(tmp_path, "analyzer", [DefineAnalyzer("ri_an", ["blank"], ["lowercase"])])
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            odd = AnalyzerState("ri_an", ("blank",), ("edgengram(10,2)",))
+            real = DatabaseIntrospector.introspect
+
+            async def read(self: DatabaseIntrospector) -> SchemaState:
+                state = await real(self)
+                return dataclasses.replace(state, analyzers={**state.analyzers, "ri_an": odd})
+
+            monkeypatch.setattr(DatabaseIntrospector, "introspect", read)
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _ri_e_i2(name, "Define analyzer ri_an")
+            await _nothing_applied(client, executor, before)
+
+
+def _ri_e_i2(name: str, describe: str, analyzer: str = "ri_an") -> str:
+    return (
+        f"Migration '{name}', operation 1 ({describe}): the database's definition of analyzer '{analyzer}' cannot be "
+        "read or written by the ORM, so it could not be restored if the migration failed; nothing was applied. "
+        "Redefine the analyzer in a form search.Analyzer accepts (by hand, or with define_indexes()), then run the call "
+        "again."
+    )
+
+
+class TestUnwritableAnalyzerE2E:
+    """P3, M32 (AC-9 +): an analyzer defined by hand with ``edgengram(10,2)`` — stored by SurrealDB 3.3.4 and 2.7.0,
+    refused by ``search.Analyzer`` — cannot be restored by phase A's compensation, so a migration redefining it is
+    refused before any DDL (E-I2, its remedy included); redefined by hand in a form ``search.Analyzer`` accepts, the
+    same ``migrate()`` applies."""
+
+    async def test_refused_then_applied_once_redefined(self, tmp_path: Path) -> None:
+        async with migration_database("ws") as client:
+            await _run(client, "DEFINE ANALYZER odd TOKENIZERS blank FILTERS edgengram(10,2);")
+            name = _write(tmp_path, "odd", [DefineAnalyzer("odd", tokenizers=["blank"], filters=["lowercase"])])
+            executor = MigrationExecutor(tmp_path)
+            before = await _ready(client, executor)
+            with pytest.raises(SurrealDbError) as raised:
+                await executor.migrate()
+            assert str(raised.value) == _ri_e_i2(name, "Define analyzer odd", "odd")
+            await _nothing_applied(client, executor, before)
+            await _run(client, "DEFINE ANALYZER OVERWRITE odd TOKENIZERS blank FILTERS edgengram(2,10);")
+            assert await executor.migrate() == [name]
+            read = await DatabaseIntrospector().introspect()
+            assert read.analyzers["odd"].filters == ("lowercase",)
+            assert await executor.get_applied_migrations() == [name]
+
+
+#: Spec §9.2: whether the server accepts a ``REFERENCE`` field, per port (the embedded engine: ``"mem"``).
+_REFERENCE_SUPPORT: dict[str, bool] = {}
+
+
+async def reference_supported(kind: str) -> bool:
+    """The capability probe for ``REFERENCE`` (spec §9.2, CLAUDE.md rule 1): a ``REFERENCE`` field defined in a
+    throwaway database (``mig_probe_<uuid8>``, removed after) of the engine *kind* — never the version, since a 2.x
+    server may enable the experimental ``record_references`` capability. Cached per port."""
+    key = "mem" if kind == "mem" else os.environ.get("SURREALDB_PORT", "8000")
+    if key not in _REFERENCE_SUPPORT:
+        async with migration_database(kind, f"mig_probe_{uuid.uuid4().hex[:8]}") as client:
+            statements = (
+                "DEFINE TABLE `probe_owner`; DEFINE FIELD `o` ON `probe_pet` TYPE option<record<probe_owner>> REFERENCE;"
+            )
+            try:
+                answer = await client.query_raw(statements, {})
+            except RuntimeError:  # the embedded engine raises its parse errors
+                supported = False
+            else:
+                supported = "error" not in answer and all(entry["status"] == "OK" for entry in answer["result"])
+        _REFERENCE_SUPPORT[key] = supported
+    return _REFERENCE_SUPPORT[key]
+
+
+class TestReferenceE2E:
+    """AC-16, spec §4: ``AddField(reference=True)`` is applied where the capability probe's ``REFERENCE`` field is
+    accepted, and refused by the server elsewhere — E-X1 naming the operation through the parse error's position, its
+    reason mentioning ``record_references``."""
+
+    @pytest.mark.parametrize("kind", _WS_KINDS)
+    async def test_a_reference_field(self, kind: str, tmp_path: Path) -> None:
+        supported = await reference_supported(kind)
+        async with migration_database(kind) as client:
+            operations: list[Operation] = [
+                CreateTable("rf_owner", "SCHEMALESS"),
+                AddField("rf_pet", "o", "option<record<rf_owner>>", reference=True),
+            ]
+            name = _write(tmp_path, "reference", operations)
+            executor = MigrationExecutor(tmp_path)
+            if supported:
+                assert await executor.migrate() == [name]
+                assert "REFERENCE" in (await _fields(client, "rf_pet"))["o"]
+                return
+            with pytest.raises(MigrationStatementError) as raised:
+                await executor.migrate()
+            assert (raised.value.operation, raised.value.description) == (2, "Add field o to rf_pet")
+            assert str(raised.value).startswith(f"Migration '{name}' failed at operation 2 of 2 (Add field o to rf_pet): ")
+            assert "record_references" in str(raised.value)
+            assert await executor.get_applied_migrations() == []

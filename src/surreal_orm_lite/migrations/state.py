@@ -18,7 +18,9 @@ migrations, :func:`rewind` undoes one. ``strict`` has no default — every calle
 ``strict=True`` for a replay anchored on a database read (``migrate()``, ``makemigrations(from_db=True)``), where the
 removal of a definition the state does not hold raises E-R1 (SurrealDB would refuse it), unless an issue of the read
 could hide that definition (D36); ``strict=False`` for a file replay, where such a removal is a no-op. A ``RawSQL``'s
-``state_operations`` are never checked (D37).
+``state_operations`` are never checked (D37). :func:`advance` and :func:`rewind` also hand the state before each
+operation (or each backwards) to a *check* — the executor's pre-pass, which runs :func:`guard` (E-G1, E-G2) and its own
+refusals there.
 
 The diff (spec §5.7): :func:`diff` gives the operations that turn a state into a target, comparing definitions with
 ``compare``'s keys and each one with its **effective** target (:func:`effective`), the target's definition with the
@@ -35,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from ..define_parser import DefineParseError, KName, normalise_kind, parse_kind, render_kind
 from ..model_ddl import holds_object
+from ..schema import view_reads_table
 from ..schema_state import (
     AccessState,
     AnalyzerState,
@@ -53,12 +56,15 @@ if TYPE_CHECKING:
     from .migration import Migration
     from .operations import Operation
 
-__all__ = ["advance", "diff", "effective", "place", "replay", "rewind", "take_out"]
+__all__ = ["Check", "advance", "diff", "effective", "guard", "place", "replay", "rewind", "take_out"]
 
 #: A definition :func:`place` puts into a state.
 Definition = TableState | FieldState | IndexState | AnalyzerState | EventState | AccessState | FunctionState
 #: The kinds of definition :func:`take_out` removes.
 Kind = Literal["table", "field", "index", "event", "analyzer", "access", "function"]
+#: What :func:`advance` and :func:`rewind` call before each operation (each backwards): its 1-based position in the
+#: migration, the operation, and the state before it.
+Check = Callable[[int, "Operation", SchemaState], None]
 
 _D = TypeVar("_D")
 
@@ -565,14 +571,82 @@ def _check_removal(migration: "Migration", position: int, operation: "Operation"
     )
 
 
-def advance(migration: "Migration", start: SchemaState, *, strict: bool) -> SchemaState:
+# --- the guards (spec §5.6, §7 E-G1/E-G2, D13) --------------------------------------------------------------------------
+
+
+def _guarded(operation: "Operation", *, backwards: bool) -> tuple[Literal["analyzer", "table"], str] | None:
+    """The analyzer or the table *operation* removes when it is sent — or, *backwards*, when its backwards is: a
+    ``RemoveAnalyzer`` and a ``DropTable``; undone, a ``DefineAnalyzer`` without ``previous=`` (``REMOVE ANALYZER IF
+    EXISTS``) and a ``CreateTable`` (``REMOVE TABLE IF EXISTS``). ``None`` for any other."""
+    from . import operations as ops
+
+    if backwards:
+        if isinstance(operation, ops.DefineAnalyzer) and operation.previous is None:
+            return "analyzer", operation.name
+        if isinstance(operation, ops.CreateTable):
+            return "table", operation.name
+        return None
+    if isinstance(operation, ops.RemoveAnalyzer):
+        return "analyzer", operation.name
+    if isinstance(operation, ops.DropTable):
+        return "table", operation.name
+    return None
+
+
+def _index_using(state: SchemaState, analyzer: str) -> tuple[str, str] | None:
+    """The first index of *state* — by table, then by name — whose full-text analyzer is *analyzer*: ``(index,
+    table)``."""
+    for table in sorted(state.tables.values(), key=lambda stored: stored.name):
+        for index in sorted(table.indexes.values(), key=lambda stored: stored.name):
+            if index.search_analyzer == analyzer:
+                return index.name, table.name
+    return None
+
+
+def _view_reading(state: SchemaState, table: str) -> str | None:
+    """The first view of *state*, by name, whose query reads *table* (``schema.view_reads_table()``)."""
+    for stored in sorted(state.tables.values(), key=lambda stored: stored.name):
+        if stored.name != table and stored.view_query and view_reads_table(stored.view_query, table):
+            return stored.name
+    return None
+
+
+def guard(migration: "Migration", position: int, operation: "Operation", state: SchemaState, *, backwards: bool) -> None:
+    """The state guards (spec §5.6, §7, D13), on *state* — the state before *operation*, or before its backwards with
+    *backwards*: the removal of an analyzer an index of *state* still uses (E-G1: SurrealDB 3.x refuses it, 2.x accepts
+    it and then refuses the index's writes) and of a table a view of *state* reads (E-G2: 2.x accepts it). An index
+    made by ``define_indexes()`` and a view made by ``define_view()`` count: *state* is the database's read with the
+    plan replayed, or rewound. Pure.
+
+    :raises ValueError: E-G1 or E-G2, naming the migration, the operation (1-based) and the index or the view.
+    """
+    guarded = _guarded(operation, backwards=backwards)
+    if guarded is None:
+        return
+    kind, name = guarded
+    subject = f"Migration {migration.name!r}, operation {position} ({operation.describe()})"
+    if kind == "analyzer":
+        using = _index_using(state, name)
+        if using is not None:
+            index, table = using
+            raise ValueError(
+                f"{subject}: the analyzer is still used by index {index!r} on table {table!r}; drop the index first."
+            )
+        return
+    view = _view_reading(state, name)
+    if view is not None:
+        raise ValueError(f"{subject}: the view {view!r} reads this table; drop the view first.")
+
+
+def advance(migration: "Migration", start: SchemaState, *, strict: bool, check: Check | None = None) -> SchemaState:
     """*start* after *migration*: each operation's ``state_forwards()`` in order, the migration's name appended to
     ``applied_migrations`` — pure (spec §6.3).
 
     *strict* (no default): ``True`` for a replay anchored on a database read — the removal of a definition the state
     does not hold raises E-R1, unless an issue of the read (*start*'s ``issues``, kept through the replay) could hide
     it (D36); ``False`` for a file replay, where it is a no-op. A ``RawSQL``'s ``state_operations`` are never checked
-    (D37).
+    (D37). *check*, when given, is called with each operation and the state before it (after E-R1's check), and may
+    raise.
 
     :raises ValueError: E-R1, naming the migration and the operation (1-based).
     """
@@ -580,6 +654,8 @@ def advance(migration: "Migration", start: SchemaState, *, strict: bool) -> Sche
     for position, operation in enumerate(migration.operations, 1):
         if strict:
             _check_removal(migration, position, operation, result)
+        if check is not None:
+            check(position, operation, result)
         result = operation.state_forwards(result)
     return replace(result, applied_migrations=(*result.applied_migrations, migration.name))
 
@@ -603,13 +679,17 @@ def replay(
     return result
 
 
-def rewind(migration: "Migration", start: SchemaState) -> SchemaState:
+def rewind(migration: "Migration", start: SchemaState, *, check: Check | None = None) -> SchemaState:
     """*start* — a state *migration* was applied to — with *migration* undone: each operation's
-    ``state_backwards()`` in reverse order, its name taken out of ``applied_migrations`` — pure (spec §6.3).
+    ``state_backwards()`` in reverse order, its name taken out of ``applied_migrations`` — pure (spec §6.3). *check*,
+    when given, is called with each operation and the state before its backwards, and may raise.
 
     :raises ValueError: an operation is not reversible (``"<describe()> is not reversible."``, D39).
     """
     result = start
-    for operation in reversed(migration.operations):
+    for position in range(len(migration.operations), 0, -1):
+        operation = migration.operations[position - 1]
+        if check is not None:
+            check(position, operation, result)
         result = operation.state_backwards(result)
     return replace(result, applied_migrations=tuple(name for name in result.applied_migrations if name != migration.name))
