@@ -75,7 +75,7 @@ from tests.test_time_travel import (
     _record_queries,
     connected,
 )
-from tests.test_transactions import _ARGUMENT_REFUSALS
+from tests.test_transactions import _ARGUMENT_REFUSALS, _BODY_REFUSALS, _BUFFERED_ONLY, TxBody
 from tests.test_views import _QUERYSET_TX_WRITES, _stats
 
 # --- models (spec §9) ---------------------------------------------------------------------------------
@@ -1416,12 +1416,97 @@ class TestWriting:
         assert QueryCache.stats()["entries"] == 0
 
     async def test_invalidated_after_an_exception(self) -> None:
+        """A block that raises once it reached the database (``cache.reaching()``: a client was asked for, a
+        statement handed to a transaction) is invalidated as one that returns: what the server applied is unknown."""
         QueryCache.set("k", 1, "t")
         with pytest.raises(RuntimeError, match="boom"):
             async with cache.writing(["t"]):
+                cache.reaching()
                 raise RuntimeError("boom")
         assert _in_flight() == ({}, 0)
         assert QueryCache.get("k") is None
+
+    @pytest.mark.parametrize("tables", [["t"], None])
+    async def test_a_block_that_raises_before_reaching_invalidates_nothing(self, tables: list[str] | None) -> None:
+        """#325: a block that raises before it reached the database changed nothing: its tables leave flight and no
+        cached read is dropped, every table included; while it ran, they were in flight as for any write."""
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("other", 2, "u")
+        writes = QueryCache._writes
+        with pytest.raises(RuntimeError, match="refused"):
+            async with cache.writing(tables):
+                assert QueryCache.get("k") is None
+                raise RuntimeError("refused")
+        assert _in_flight() == ({}, 0)
+        assert (QueryCache.get("k"), QueryCache.get("other")) == (1, 2)
+        assert QueryCache._writes == writes
+
+    async def test_a_read_begun_before_a_refused_write_is_stored(self, scope: int) -> None:
+        """A read that took its ticket before a write refused before reaching the database stores its result: the
+        refused write moved no generation."""
+        _hit, _data, ticket = QueryCache._begin_read("k", frozenset({"t"}), True, scope, 60.0)
+        assert ticket is not None
+        with pytest.raises(RuntimeError):
+            async with cache.writing({"t"}):
+                raise RuntimeError("refused")
+        QueryCache._finish_read(ticket, [1])
+        assert QueryCache._begin_read("k", frozenset({"t"}), True, scope, 60.0) == (True, [1], None)
+
+    async def test_reaching_marks_every_write_around_it(self) -> None:
+        """A write in the block of another — a handler's, a nested ORM write — reaches the database for both: the
+        outer block that raises afterwards is invalidated too, even when the inner write itself raised."""
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("j", 2, "u")
+        with pytest.raises(RuntimeError, match="outer"):
+            async with cache.writing({"t"}):
+                with pytest.raises(RuntimeError, match="inner"):
+                    async with cache.writing({"u"}):
+                        cache.reaching()
+                        raise RuntimeError("inner")
+                raise RuntimeError("outer")
+        assert (QueryCache.get("k"), QueryCache.get("j")) == (None, None)
+        assert _in_flight() == ({}, 0)
+
+    async def test_an_inner_refusal_leaves_the_outer_write_unreached(self) -> None:
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("j", 2, "u")
+        with pytest.raises(RuntimeError, match="outer"):
+            async with cache.writing({"t"}):
+                with pytest.raises(RuntimeError, match="inner"):
+                    async with cache.writing({"u"}):
+                        raise RuntimeError("inner")
+                raise RuntimeError("outer")
+        assert (QueryCache.get("k"), QueryCache.get("j")) == (1, 2)
+
+    async def test_reaching_outside_a_write_does_nothing(self) -> None:
+        QueryCache.set("k", 1, "t")
+        cache.reaching()
+        assert QueryCache.get("k") == 1
+        assert _in_flight() == ({}, 0)
+
+    async def test_a_task_reaches_only_its_own_writes(self) -> None:
+        """Each task has its own writes in progress: a concurrent write that reaches the database does not make
+        another task's refused write count as written."""
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("j", 2, "u")
+        refused_started, reached = asyncio.Event(), asyncio.Event()
+
+        async def refused() -> None:
+            async with cache.writing({"t"}):
+                refused_started.set()
+                await reached.wait()
+                raise RuntimeError("refused")
+
+        async def written() -> None:
+            await refused_started.wait()
+            async with cache.writing({"u"}):
+                cache.reaching()
+            reached.set()
+
+        results = await asyncio.gather(refused(), written(), return_exceptions=True)
+        assert [type(result) for result in results] == [RuntimeError, type(None)]
+        assert (QueryCache.get("k"), QueryCache.get("j")) == (1, None)
+        assert _in_flight() == ({}, 0)
 
     @pytest.mark.parametrize("tables", [(), [], set(), frozenset()])
     async def test_no_table_is_a_no_op(self, tables: Any) -> None:
@@ -1971,6 +2056,42 @@ class TestRefusedWritesKeepTheCache:
         assert _in_flight() == ({}, 0)
 
 
+#: #325: the writes of ``tests/test_transactions.py``'s :data:`_BODY_REFUSALS`, refused in their body, outside a
+#: transaction (``save()`` without an id is not refused there).
+_BODY_REFUSED_OUTSIDE = [
+    pytest.param(functools.partial(write, None), error, pattern, id=name)
+    for name, _tables, write, error, pattern in _BODY_REFUSALS
+    if name not in _BUFFERED_ONLY
+]
+
+#: The tables the writes of :data:`_BODY_REFUSED_OUTSIDE` would put in flight, and one none of them writes (a write
+#: refused for its edge name puts every table in flight).
+_BODY_TABLES = ("tx_body", "tx_body_edge", EDGES, "other")
+
+
+class TestBodyRefusedWritesKeepTheCache:
+    """#325: outside a transaction, a write the ORM refuses in its body — once its ``invalidates()`` hooks let it
+    through, before it asks for a client — takes its tables out of flight without dropping a cached read: it changed
+    nothing. A value the ORM cannot send is refused before the client is asked for."""
+
+    @pytest.mark.parametrize(("write", "error", "pattern"), _BODY_REFUSED_OUTSIDE)
+    async def test_a_refused_write_drops_no_cached_read(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        write: Callable[[], Awaitable[Any]],
+        error: type[Exception],
+        pattern: str,
+    ) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+        for table in _BODY_TABLES:
+            QueryCache.set(table, [table], table)
+        with pytest.raises(error, match=pattern) as raised:
+            await write()
+        assert type(raised.value) is error
+        assert {table: QueryCache.get(table) for table in _BODY_TABLES} == {table: [table] for table in _BODY_TABLES}
+        assert _in_flight() == ({}, 0)
+
+
 # --- spec §6.5: transactions note the tables written and invalidate them at commit ----------------------
 
 
@@ -1982,8 +2103,9 @@ class _TxClient:
         self.in_flight_during_commit: list[tuple[dict[str, int], int]] = []
         self.cancelled = 0
 
-    async def query_raw(self, query: str, variables: Any = None) -> Any:
-        """The buffered commit: one ``BEGIN … COMMIT`` request; ``fail`` answers an ``ERR`` statement."""
+    async def query_raw(self, query: str, variables: Any = None, txn_id: Any = None) -> Any:
+        """The buffered commit: one ``BEGIN … COMMIT`` request, or an interactive statement (*txn_id*); ``fail``
+        answers an ``ERR`` statement."""
         self.in_flight_during_commit.append(_in_flight())
         if self.fail:
             return {"result": [{"status": "ERR", "result": "Database record `t:1` already exists"}]}
@@ -2161,6 +2283,97 @@ class TestTransactionBookkeeping:
         await tx.commit()
         assert client.in_flight_during_commit == [({"t": 1}, 0), ({}, 0)]
         assert QueryCache.get("k") == 1
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    @pytest.mark.parametrize("tables", [{"t"}, None])
+    async def test_a_write_that_raises_before_reaching_notes_nothing(self, strategy: str, tables: set[str] | None) -> None:
+        """#325: a write that raises before it reached the database takes back what it noted — for the query cache
+        and, with ``records=True``, as written with records; one that raised after it reached keeps it."""
+        tx = await _transaction(strategy, _TxClient(), statement=False)
+        with pytest.raises(RuntimeError):
+            async with cache.writing(tables, tx=tx, records=True):
+                assert tx._cache_written() == (None if tables is None else frozenset(tables))
+                assert tx._records_written() == tx._cache_written()
+                raise RuntimeError("refused")
+        assert (tx._cache_written(), tx._records_written()) == (frozenset(), frozenset())
+        with pytest.raises(RuntimeError):
+            async with cache.writing(tables, tx=tx, records=True):
+                cache.reaching()
+                raise RuntimeError("after the request")
+        noted = None if tables is None else frozenset(tables)
+        assert (tx._cache_written(), tx._records_written()) == (noted, noted)
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_a_definition_takes_back_its_cache_note_only(self, strategy: str) -> None:
+        """A write that notes its tables for the query cache only (``records=False``, a definition) takes back that
+        note, and leaves the tables written with records by others as they are."""
+        tx = await _transaction(strategy, _TxClient(), statement=False)
+        tx._note_record_write({"t"})
+        with pytest.raises(RuntimeError):
+            async with cache.writing({"t"}, tx=tx):
+                raise RuntimeError("refused")
+        assert (tx._cache_written(), tx._records_written()) == (frozenset(), frozenset({"t"}))
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    @pytest.mark.parametrize("refused_first", [True, False])
+    async def test_concurrent_writes_take_back_only_their_own(self, strategy: str, refused_first: bool) -> None:
+        """Two tasks write the same table in one transaction: the one refused before reaching the database takes back
+        its own note only, whether it ends before or after the other one reaches the database."""
+        tx = await _transaction(strategy, _TxClient(), statement=False)
+        both_in, refused_out = asyncio.Event(), asyncio.Event()
+        entered = 0
+
+        async def enter() -> None:
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both_in.set()
+            await both_in.wait()
+
+        async def refused() -> None:
+            async with cache.writing({"t"}, tx=tx, records=True):
+                await enter()
+                if not refused_first:
+                    await asyncio.sleep(0.01)
+                refused_out.set()
+                raise RuntimeError("refused")
+
+        async def written() -> None:
+            async with cache.writing({"t"}, tx=tx, records=True):
+                await enter()
+                if refused_first:
+                    await refused_out.wait()
+                await tx.add("CREATE t:1;")
+
+        results = await asyncio.gather(refused(), written(), return_exceptions=True)
+        assert [type(result) for result in results] == [RuntimeError, type(None)]
+        assert (tx._cache_written(), tx._records_written()) == (frozenset({"t"}), frozenset({"t"}))
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_a_refused_write_inside_another_takes_back_its_note_only(self, strategy: str) -> None:
+        """A write refused inside another write of the same table (a handler's, ``relate(EdgeModel, …)``'s edge
+        ``save()``) takes back its own note; the outer one that then queues its statement keeps the table noted."""
+        tx = await _transaction(strategy, _TxClient(), statement=False)
+        async with cache.writing({"t"}, tx=tx, records=True):
+            with pytest.raises(RuntimeError):
+                async with cache.writing({"t", "u"}, tx=tx, records=True):
+                    raise RuntimeError("refused")
+            await tx.add("CREATE t:1;")
+        assert (tx._cache_written(), tx._records_written()) == (frozenset({"t"}), frozenset({"t"}))
+
+    async def test_a_commit_that_raises_before_its_request_invalidates_nothing(self) -> None:
+        """A buffered commit that cannot build its request sends nothing: the tables noted are forgotten without
+        being invalidated, as on a cancel."""
+        QueryCache.set("k", 1, "t")
+        tx = await _transaction("buffered", _TxClient(), statement=False)
+        await tx.add("CREATE t:1;")
+        tx._note_cache_write({"t"})
+        tx.variables["t9_unsendable"] = timedelta(seconds=-1)
+        with pytest.raises(ValueError, match="^Cannot send a negative duration"):
+            await tx.commit()
+        assert QueryCache.get("k") == 1
+        assert _in_flight() == ({}, 0)
+        assert tx._cache_written() == frozenset()
 
 
 # --- spec §5.1, §5.3, §6.3: QuerySet.cache(), its tags and its refusals ---------------------------------
@@ -2756,6 +2969,7 @@ _TABLES = (
     "qc_ghost",
     "qc_player",
     "qc_account",
+    "tx_body",
 )
 
 #: The engines every cached read runs on (spec §9).
@@ -2775,6 +2989,55 @@ async def cache_db(kind: str) -> AsyncIterator[Any]:
         return
     async with connected(_ws_url() if kind == "ws" else _http_url(), "db", *_TABLES) as client:
         yield client
+
+
+class TestAskingForAClientReachesTheDatabase:
+    """#325: a write that raises once it asked the connection for a client counts as written — its request may have
+    reached the server — on every engine: ``get_client()``, the embedded engine's held session and a short-lived
+    client of the model-level auth."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_get_client(self, kind: str) -> None:
+        async with cache_db(kind):
+            QueryCache.set("k", 1, "t")
+            with pytest.raises(RuntimeError, match="after the client"):
+                async with cache.writing({"t"}):
+                    await SurrealDBConnectionManager.get_client()
+                    raise RuntimeError("after the client")
+            assert QueryCache.get("k") is None
+            assert _in_flight() == ({}, 0)
+
+    async def test_the_embedded_session(self) -> None:
+        async with cache_db("mem"):
+            QueryCache.set("k", 1, "t")
+            with pytest.raises(RuntimeError, match="after the session"):
+                async with cache.writing({"t"}):
+                    async with SurrealDBConnectionManager._exclusive_embedded_client():
+                        pass
+                    raise RuntimeError("after the session")
+            assert QueryCache.get("k") is None
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_an_ephemeral_client(self, kind: str) -> None:
+        async with cache_db(kind):
+            QueryCache.set("k", 1, "t")
+            with pytest.raises(RuntimeError, match="after the client"):
+                async with cache.writing({"t"}):
+                    async with SurrealDBConnectionManager.ephemeral_client():
+                        pass
+                    raise RuntimeError("after the client")
+            assert QueryCache.get("k") is None
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_the_server_refuses_still_invalidates(self, kind: str) -> None:
+        """``save()`` of an id that exists raises after its request: the cached reads of its table are dropped."""
+        async with cache_db(kind):
+            await TxBody(id="a", n=1).save()
+            QueryCache.set("k", 1, "tx_body")
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await TxBody(id="a", n=2).save()
+            assert QueryCache.get("k") is None
+            assert _in_flight() == ({}, 0)
 
 
 #: Spec M1/M2's record-access fixture, in a database of its own.

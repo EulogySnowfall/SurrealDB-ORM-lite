@@ -21,6 +21,8 @@ What makes a cached result right:
   of them is stored), then bumps their generations and removes their entries; a read that follows links
   (``any_table``) is removed by every write. ``EDGES`` tags the reads of edge tables, which every
   delete invalidates (a deleted record's edges go with it).
+- **Refused writes** (issue #325): a write that raises before it reached the database (:func:`reaching`) changed
+  nothing: its tables leave flight without being invalidated, or its notes are taken back from its transaction.
 
 Internal failures never fail a read: keying, copying a hit and copying a result to store fall back to the database.
 Nothing is logged but the fixed warning of an SDK without a CBOR encoder: no row, variable or key.
@@ -48,6 +50,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, TypeVar, cast
@@ -532,6 +535,21 @@ class QueryCache:
                     cls._in_flight.pop(table, None)
             cls._invalidate_tables(token)
 
+    @classmethod
+    def _write_withdrawn(cls, token: frozenset[str] | None) -> None:
+        """End a write that changed nothing (issue #325): its tables leave flight, no generation moves and no entry
+        goes. A read that began before it and finishes after it may store its result."""
+        with cls._guard():
+            if token is None:
+                cls._in_flight_all = max(0, cls._in_flight_all - 1)
+                return
+            for table in token:
+                count = cls._in_flight.get(table, 0) - 1
+                if count > 0:
+                    cls._in_flight[table] = count
+                else:
+                    cls._in_flight.pop(table, None)
+
     # --- scopes -------------------------------------------------------------------------------------------
 
     @classmethod
@@ -718,13 +736,44 @@ def retire_client(client: Any) -> None:
 # --- writes (the ORM's write methods, transactions) -----------------------------------------------------------
 
 
+@dataclass(eq=False, slots=True)
+class _Attempt:
+    """One write in progress (:func:`writing`): whether it reached the database (:func:`reaching`)."""
+
+    reached: bool = False
+
+
+#: The writes in progress in this context, innermost last (issue #325). Each task has its own: a concurrent write
+#: that reaches the database never makes another task's write count as reached; a nested one reaches every write
+#: around it.
+_attempts: ContextVar[tuple[_Attempt, ...]] = ContextVar("surreal_orm_lite_cache_attempts", default=())
+
+
+def reaching() -> None:
+    """Mark every write in progress in this context as having reached the database (issue #325).
+
+    Called wherever a write may stop changing nothing: ``Transaction.add()`` once its variables are encoded, an
+    interactive transaction's ``run_read()`` and commit, a buffered commit once its request is built, and the
+    connection manager whenever it hands out a client. A write that raises after it is marked counts as written:
+    what the server applied is unknown. Outside a write: nothing.
+    """
+    for attempt in _attempts.get():
+        attempt.reached = True
+
+
 @asynccontextmanager
-async def writing(tables: Iterable[str] | None, tx: Any = None) -> AsyncIterator[None]:
+async def writing(tables: Iterable[str] | None, tx: Any = None, *, records: bool = False) -> AsyncIterator[None]:
     """Around one ORM write of ``tables`` (``None``: every table).
 
     Outside a transaction, the tables are in flight for the whole block (a cached read of them goes to the database
     and stores nothing), then invalidated when it ends, also on an exception. With a transaction (``tx`` whose class
-    has ``_note_cache_write``), the tables are noted on it and invalidated at its commit. No table: nothing.
+    has ``_note_cache_write``), the tables are noted on it and invalidated at its commit; with ``records``, they are
+    also noted as written with records (``_note_record_write``, issue #304). No table: nothing.
+
+    Issue #325: a block that raises before it reached the database (:func:`reaching`) changed nothing. Outside a
+    transaction its tables leave flight without being invalidated; with one, the notes it made are taken back
+    (``_withdraw_write``, which keeps those of every other write, a concurrent or an enclosing one included). A block
+    that reached the database, or that returns, counts as a write.
 
     The transaction is recognised by its class, never by asking the object (no instance ``__getattr__`` runs), so a
     write refused before it reaches its transaction leaves the object untouched.
@@ -733,15 +782,32 @@ async def writing(tables: Iterable[str] | None, tx: Any = None) -> AsyncIterator
     if resolved is not None and not resolved:
         yield
         return
-    if tx is not None and callable(getattr(type(tx), "_note_cache_write", None)):
-        tx._note_cache_write(resolved)
-        yield
-        return
-    token = QueryCache._write_started(resolved)
+    attempt = _Attempt()
+    reset = _attempts.set((*_attempts.get(), attempt))
     try:
-        yield
-    finally:
+        if tx is not None and callable(getattr(type(tx), "_note_cache_write", None)):
+            if records:
+                _note_records(resolved, tx)
+            tx._note_cache_write(resolved)
+            try:
+                yield
+            except BaseException:
+                if not attempt.reached and callable(getattr(type(tx), "_withdraw_write", None)):
+                    tx._withdraw_write(resolved, records=records)
+                raise
+            return
+        token = QueryCache._write_started(resolved)
+        try:
+            yield
+        except BaseException:
+            if attempt.reached:
+                QueryCache._write_finished(token)
+            else:
+                QueryCache._write_withdrawn(token)
+            raise
         QueryCache._write_finished(token)
+    finally:
+        _attempts.reset(reset)
 
 
 F = TypeVar("F", bound=Callable[..., Coroutine[Any, Any, Any]])
@@ -828,6 +894,11 @@ def invalidates(
     and never ask the transaction. Whatever they raise propagates: a write they refuse leaves the transaction as it was
     (no statement, no table noted) and invalidates nothing — no table in flight, no cached read dropped. Neither is
     called when the arguments do not bind (Python raises the function's own error).
+
+    A refusal of the method's body (issue #325) — an id it needs, a name the statement cannot take, a payload that
+    cannot be serialized, a value the ORM cannot send — raises before the write reached the database, so
+    :func:`writing` takes back what the call noted on the transaction, or puts its tables out of flight without
+    invalidating them. Once the call reached the database, it counts as written, whatever it raises.
     """
     if of not in _RESOLVERS:
         raise ValueError(f"invalidates() takes one of {sorted(_RESOLVERS)}, not {of!r}")
@@ -853,9 +924,7 @@ def invalidates(
                 refuse(bound.arguments[first])
             if refuse_args is not None:
                 refuse_args(bound.arguments)
-            if records and tx is not None:
-                _note_records(tables, tx)
-            async with writing(tables, tx):
+            async with writing(tables, tx, records=records and tx is not None):
                 return await func(*args, **kwargs)
 
         wrapper.__surreal_cache_writes__ = True  # type: ignore[attr-defined]

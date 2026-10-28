@@ -1787,9 +1787,10 @@ class QuerySet:
                     self._tx._note_failure(refusal)
                     raise refusal from exc
                 raise
+        encoded = _encoding.encode(vars_)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
         try:
-            return await client.query(query, _encoding.encode(vars_))  # type: ignore
+            return await client.query(query, encoded)  # type: ignore
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
@@ -2863,8 +2864,9 @@ class QuerySet:
                 return self.model.from_db(rows)  # type: ignore
             return models  # buffered: not executed until commit; return inputs
 
+        encoded = _encoding.encode(data_list)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
-        results = await client.insert(self._model_table, _encoding.encode(data_list))
+        results = await client.insert(self._model_table, encoded)
 
         if isinstance(results, list):
             return self.model.from_db(results)  # type: ignore

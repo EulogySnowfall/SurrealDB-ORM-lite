@@ -3765,6 +3765,11 @@ Every ORM write removes the cached reads it can change, **before** its `post_*` 
   cache.
 - While a write runs, cached reads of its tables go to the database and store nothing: a read
   answered before the write completed is returned to its caller, never stored.
+- A write the ORM refuses before it reaches the database — for its arguments, while it is built
+  (an `upsert()` without an id, a field name the statement cannot take…), or for a value it cannot
+  send — removes nothing, and in a transaction notes nothing for the commit to invalidate. Once its
+  statement is queued or sent, or it asked the connection for a client, it counts as a write,
+  whatever it raises.
 
 What the cache **cannot see** — the TTL bounds it, and `QueryCache.invalidate(Model)` removes a
 table's entries after such a change:
@@ -6070,23 +6075,18 @@ print(await NoteV2.objects().search(text="physics").count())
   missing them would not enforce uniqueness for them. The refusal does not fail the block. `define_table(tx=…)`,
   `define_relation(tx=…)` and a write to another table do not count, nor does a write the ORM refused before sending or
   queuing it: one refused for a materialized view, a snapshot read with `as_of()`, an auth model with a
-  `Field(exclude=True)` field SIGNUP writes, a `tx=` of another connection, or one of its arguments (a missing id,
-  invalid patch operations, an invalid `server_values`/`extra_vars` pair or either one on an edge's `save()`, a computed
-  field or an edge endpoint among the fields written, an atomic helper's field, amount or values, a subquery value in
-  `bulk_update()`, a snapshot in `bulk_create()`'s list); a raw `tx.add()` is not tracked. Until
-  [EulogySnowfall/SurrealDB-ORM-lite#325](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/325) is fixed,
-  some refusals made while the write is built or its values are encoded still count, although nothing was sent or
-  queued: `upsert()` without an id, `save(tx=…)` without an id in a buffered transaction, a field name or an
-  `extra_vars` key refused while the statement of `save(server_values=…)` or `merge(server_values=…)` is compiled (an
-  invalid name, a key that collides with an internal binding), the argument checks of `relate()`, `remove_relation()`
-  and `remove_all_relations()` (an invalid edge name, or an empty list of edges, counts as a write to every table, so
-  every later `define_indexes(tx=…)` in the block is refused), a field name `bulk_update()` refuses, a filter refused
-  while the statement of `objects(tx=…).bulk_update()`, `bulk_delete()` or `patch()` is compiled, an edge id of another
-  table in an edge's `save()` or `bulk_create()`, and a value the ORM cannot send, in any write (a field, a filter, a
-  patch operation, an atomic helper's value or amount, a relation's data, `extra_vars`): a `field_serializer` that
-  raises, or one of the [values refused before sending](#values-refused-before-sending), such as a negative duration,
-  an `int` outside the signed 64-bit range or a `Decimal` out of range. A write refused first for one of the arguments
-  listed above, such as an `update()` or a `merge()` without an id, does not count.
+  `Field(exclude=True)` field SIGNUP writes, a `tx=` of another connection, one of its arguments (a missing id, invalid
+  patch operations, an invalid `server_values`/`extra_vars` pair, a computed field or an edge endpoint among the fields
+  written, an atomic helper's field, amount or values, a subquery value in `bulk_update()`, a snapshot in
+  `bulk_create()`'s list), or while the write is built: `upsert()` without an id, `save(tx=…)` without an id in a
+  buffered transaction, a field name or an `extra_vars` key the statement cannot take, the checks of `relate()`,
+  `remove_relation()` and `remove_all_relations()` (an invalid edge name, an empty list of edges, an unsaved record, an
+  invalid direction or target), a field or a filter refused while a QuerySet write is compiled, an edge id of another
+  table, a `field_serializer` that raises, and a value the ORM cannot send in any write (a field, a filter, a patch
+  operation, an atomic helper's value, a relation's data, `extra_vars`), such as one of the
+  [values refused before sending](#values-refused-before-sending); a raw `tx.add()` is not tracked. A write counts once
+  it reached the database: when it raises after its statement was queued or sent, or after it, or one of its `pre_*`
+  handlers, asked the connection for a client, its table stays counted.
 - Prefer `define_indexes()` outside the block: on SurrealDB 2.x, a write to a table that held records, after its index
   in the same block, fails the commit with a retryable `SurrealDbConflictError` that a retry meets again; so does a
   block that removes an index of a table that held records and defines it again, where the index stands as before.

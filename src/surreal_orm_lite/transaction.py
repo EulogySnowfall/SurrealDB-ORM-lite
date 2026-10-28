@@ -30,6 +30,11 @@ Records written (issue #304): an ORM write of records that joins a transaction a
 for the cache only. ``define_indexes(tx=…)`` reads them (``_records_written``): SurrealDB servers do not index the
 records a transaction wrote before the index was defined. A raw ``tx.add()`` is not noted.
 
+Refused writes (issue #325): each note is counted per write, so that a write that raises before it reached the
+database takes back its own notes (``_withdraw_write``) and leaves those of every other write. ``add()``, an
+interactive ``run_read()`` and the commits mark the writes in progress as reached (``cache.reaching()``) before they
+queue or send anything.
+
 Indexes removed (issue #312): ``remove_index(tx=…)`` notes the index it removes, by table (``_note_index_removal``).
 ``define_indexes(tx=…)`` reads committed state, where that index still stands: it counts the indexes noted for its table
 (``_indexes_removed``) as missing, plans them again, and forgets those it defines (``_forget_index_removals``, through
@@ -96,6 +101,16 @@ _MISSING_INDEX_EXPRESSION = re.compile(r"no suitable index supporting the expres
 #: ``(number, count, line, column)``, the line and column in the text the caller queued; ``None`` outside every
 #: statement (:meth:`BufferedTransaction._locate`).
 _Locate = Callable[[int, int], tuple[int, int, int, int] | None]
+
+
+def _count(counts: dict[str, int], tables: Iterable[str], step: int) -> None:
+    """Add *step* to the count of each of *tables* (each once); a count that reaches 0 is removed (issue #325)."""
+    for table in set(tables):
+        count = counts.get(table, 0) + step
+        if count > 0:
+            counts[table] = count
+        else:
+            counts.pop(table, None)
 
 
 def _is_pure_filler(result: Any) -> bool:
@@ -248,13 +263,15 @@ class Transaction(ABC):
 
     def __init__(self) -> None:
         self._post_commit: list[Callable[[], Awaitable[None]]] = []
-        # Query cache: the tables written in this transaction, invalidated at commit.
-        self._cache_tables: set[str] = set()
-        self._cache_all = False
+        # Query cache: the tables written in this transaction, invalidated at commit — each with the number of writes
+        # that noted it, and the number of writes that noted every table (issue #325: a refused write takes back its
+        # own note only).
+        self._cache_tables: dict[str, int] = {}
+        self._cache_all = 0
         # Issue #304: the tables an ORM write of records changed in this transaction (definitions excluded), kept
-        # until the transaction ends.
-        self._record_tables: set[str] = set()
-        self._record_all = False
+        # until the transaction ends; counted as the query cache's.
+        self._record_tables: dict[str, int] = {}
+        self._record_all = 0
         # Issue #312: the indexes remove_index(tx=…) removed in this transaction, by table, until define_indexes(tx=…)
         # defines them again; kept until the transaction ends.
         self._removed_indexes: dict[str, set[str]] = {}
@@ -293,9 +310,9 @@ class Transaction(ABC):
         invalidates the edge reads at commit).
         """
         if tables is None:
-            self._cache_all = True
+            self._cache_all += 1
         else:
-            self._cache_tables |= set(tables)
+            _count(self._cache_tables, tables, 1)
 
     def _cache_written(self) -> frozenset[str] | None:
         """The tables noted so far: ``None`` when a write noted every table."""
@@ -304,7 +321,7 @@ class Transaction(ABC):
     def _forget_cache_writes(self) -> None:
         """Clear the tables noted (after a commit, or on cancel without invalidating)."""
         self._cache_tables.clear()
-        self._cache_all = False
+        self._cache_all = 0
 
     def _note_record_write(self, tables: Iterable[str] | None) -> None:
         """Note the tables an ORM write of records in this transaction changes (``None``: every table) — issue #304.
@@ -314,17 +331,35 @@ class Transaction(ABC):
         refuse_args=…)``: a write refused for a materialized view, a snapshot or SG1, #315, or for a snapshot in
         ``bulk_create()``'s list, a missing id or another argument it checks, #320, notes nothing) — never for a
         definition (``define_table()``, ``remove_index()``…), whose table is noted for the query cache only. Unlike
-        the query cache's tables, the commit and the cancel keep them.
+        the query cache's tables, the commit and the cancel keep them. A write that raises before it reached the
+        database takes them back (:meth:`_withdraw_write`, issue #325).
         """
         if tables is None:
-            self._record_all = True
+            self._record_all += 1
         else:
-            self._record_tables |= set(tables)
+            _count(self._record_tables, tables, 1)
 
     def _records_written(self) -> frozenset[str] | None:
         """The tables an ORM write of records changed so far in this transaction (issue #304): ``None`` when one noted
         every table. ``define_indexes(tx=…)`` reads it; a raw ``tx.add()`` is not counted."""
         return None if self._record_all else frozenset(self._record_tables)
+
+    def _withdraw_write(self, tables: Iterable[str] | None, *, records: bool) -> None:
+        """Take back the notes of one ORM write that raised before it reached the database (issue #325).
+
+        ``cache.writing()`` calls it with what that write noted: *tables* (``None``: every table) for the query cache
+        and, with *records*, as written with records. Each note is counted per write, so the notes of every other
+        write stay, a concurrent or an enclosing one on the same tables included. Never below nothing: a note the
+        commit or the cancel already forgot is not taken from a later write.
+        """
+        if tables is None:
+            self._cache_all = max(0, self._cache_all - 1)
+            if records:
+                self._record_all = max(0, self._record_all - 1)
+            return
+        _count(self._cache_tables, tables, -1)
+        if records:
+            _count(self._record_tables, tables, -1)
 
     def _note_index_removal(self, table: str, name: str) -> None:
         """Note that the index *name* of *table* was removed in this transaction — issue #312.
@@ -499,6 +534,7 @@ class BufferedTransaction(Transaction):
         position the server reports at commit is given in the caller's text (issue #278).
         """
         variables = _encoding.encode(variables)
+        _cache.reaching()  # issue #325: past every refusal, the statement joins the transaction
         prefix = f"t{self._counter}_"
         renamed = statement
         inserted: list[int] = []
@@ -578,8 +614,11 @@ class BufferedTransaction(Transaction):
                     return
                 # query_raw (NOT query): query() returns None on a failed tx; query_raw gives
                 # per-statement status for raise_for_status.
+                query = self.build_query()
+                variables = _encoding.encode(self.variables)
+                _cache.reaching()  # issue #325: from here, the commit's outcome is unknown
                 try:
-                    raw = await self._client.query_raw(self.build_query(), _encoding.encode(self.variables))
+                    raw = await self._client.query_raw(query, variables)
                 except RuntimeError as exc:
                     # The embedded engine raises a bare RuntimeError for a query it refuses as a whole (issue
                     # #278): the same error as a server's envelope, the engine's error kept as the suppressed
@@ -631,6 +670,7 @@ class InteractiveTransaction(Transaction):
         A failure is recorded before it raises: the transaction will not commit (issue #268).
         """
         payload = _encoding.encode(variables or {})
+        _cache.reaching()  # issue #325: the statement is sent
         try:
             try:
                 raw = await self._client.query_raw(statement, payload, txn_id=self._txn_id)
@@ -650,6 +690,7 @@ class InteractiveTransaction(Transaction):
         error as an answer (:meth:`_absorb_failure`).
         """
         payload = _encoding.encode(variables or {})
+        _cache.reaching()  # issue #325: the statement is sent
         try:
             try:
                 return await self._client.query(statement, payload, txn_id=self._txn_id)
@@ -680,6 +721,7 @@ class InteractiveTransaction(Transaction):
         # or raises (a failed commit's state is unknown).
         try:
             async with _cache.writing(self._cache_written()):
+                _cache.reaching()  # issue #325: from here, the commit's outcome is unknown
                 try:
                     await self._client.commit(self._txn_id)
                 except Exception as exc:
