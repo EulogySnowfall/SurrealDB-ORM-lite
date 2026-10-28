@@ -690,7 +690,10 @@ class QuerySet:
         ``limit``, so without other conditions every line returns ``limit`` records when the table holds them. With a
         condition that keeps few records the search can return fewer than ``limit``, more often on SurrealDB 2.x and the
         embedded engine; ``dist=`` is exact. Distances are computed in the index's storage type (``F32`` by default),
-        ``dist=`` in double precision.
+        ``dist=`` in double precision. Records at an equal distance at the ``limit``-th place are kept, and returned, by
+        id on SurrealDB 2.x and the embedded engine, whose own exact scan picks among them in no fixed order: the ORM
+        ranks the scan by distance then id there (SurrealDB 3.x's scan gives one answer), so identical calls, a page of
+        them and the bulk writes take the same records.
 
         The other conditions — ``filter()``, ``Q``, ``nearby()``, ``search()`` and a ``Subquery`` filter — select the
         records first, then the ``limit`` nearest among them are kept: SurrealDB 3.x applies them during the index
@@ -1098,7 +1101,11 @@ class QuerySet:
         indexed column, a function call, a negation, a group, a dotted path or a full-text match, while it answers
         right through ids selected first — and the ORM cannot know a column's indexes. The ``LET`` reads the
         statement's own table and follows the ``LET`` s of the parts' own subqueries; inside a ``Subquery``, it
-        precedes the subquery's own. Without a compiler the KNN is written inline. With
+        precedes the subquery's own. An exact scan (``dist=``) sets ``subqueries.knn_conditions`` too, with or without
+        other parts: below 3 its ``LET`` holds the ids of the ``K`` nearest records matching every part, the id
+        subqueries included, ranked by distance then id (``vector.exact_scan_select()``), and the ``WHERE`` keeps
+        ``id IN $_sq<N>`` and the KNN — SurrealDB 2.x's and the embedded engine's own exact scan picks among records at
+        an equal distance at the ``K``-th place in no fixed order. Without a compiler the KNN is written inline. With
         ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check ``time_travel.GUARD`` is the last
         condition, after the ``nearby()`` ones (``search()`` never reads at a moment): every other part is a single
         comparison or a parenthesised group, so the check applies to every row they keep.
@@ -1162,20 +1169,26 @@ class QuerySet:
             variables[variable] = list(self._similar.vector)
             counter += 1
             others = [part for part in parts if not _vector.id_subquery_part(part)]
-            if subqueries is None or not others:
+            exact = self._similar.dist is not None
+            if subqueries is None or not (others or exact):
                 parts.append(knn)
             elif not subqueries.knn_prefilter:
-                # The form for SurrealDB 3.x, which applies every condition during the index search.
+                # The form for SurrealDB 3.x, which applies every condition during the index search and gives its exact
+                # scan one answer.
                 subqueries.knn_conditions = True
                 parts.append(knn)
             else:
-                # Below SurrealDB 3: the records matching the other conditions selected first, by their ids.
                 subqueries.knn_conditions = True
                 name = f"{_subquery.LET_PREFIX}{len(subqueries.lets)}"
-                subqueries.lets.append(
-                    f"LET ${name} = (SELECT VALUE id FROM {self._model_table} WHERE {' AND '.join(others)});"
-                )
-                kept = [part for part in parts if _vector.id_subquery_part(part)]
+                if exact:
+                    # Below SurrealDB 3, an exact scan: its K nearest ranked by distance then id, every condition first.
+                    select = _vector.exact_scan_select(self._model_table, self._similar, variable, parts)
+                    kept = []
+                else:
+                    # Below SurrealDB 3: the records matching the other conditions selected first, by their ids.
+                    select = f"(SELECT VALUE id FROM {self._model_table} WHERE {' AND '.join(others)})"
+                    kept = [part for part in parts if _vector.id_subquery_part(part)]
+                subqueries.lets.append(f"LET ${name} = {select};")
                 parts = [*kept, f"${name} CONTAINS id" if view else f"id IN ${name}", knn]
 
         if as_of:
@@ -1363,7 +1376,9 @@ class QuerySet:
 
         With ``similar_to()`` (v0.36.0) the distance is projected as ``vector::distance::knn() AS _knn_distance``,
         after the ``GeoDistance`` and search annotations, and without ``order_by()`` the statement ends
-        ``ORDER BY _knn_distance`` (nearest first). Its search annotations are projected in the form for SurrealDB
+        ``ORDER BY _knn_distance`` (nearest first) — ``ORDER BY _knn_distance, id`` for an exact scan (``dist=``) in the
+        form below SurrealDB 3 when the projection reads ``id`` (``*``, or ``select()`` naming it), so its records at
+        one distance come in one order on every call. Its search annotations are projected in the form for SurrealDB
         3.x only: the form below 3 (``subqueries.knn_prefilter``) selects the full-text matches in a ``LET``, so its
         outer statement holds no match to score, highlight or locate, and SurrealDB 2.x would answer ``NONE`` for each.
 
@@ -1411,6 +1426,10 @@ class QuerySet:
             query += f" ORDER BY {self._order_by}"
         elif self._similar is not None:
             query += f" ORDER BY {_vector.DISTANCE_ALIAS}"
+            # Below SurrealDB 3 the exact scan's records at one distance come by id; SurrealDB 2.x refuses to order by a
+            # column the projection does not read.
+            if compiler.knn_prefilter and self._similar.dist is not None and self._reads_id():
+                query += ", id"
 
         if self._limit is not None:
             query += f" LIMIT {self._limit}"
@@ -1423,6 +1442,11 @@ class QuerySet:
 
         query, variables = self._terminate(query, {**compiler.variables, **where_vars, **distance_vars, **search_vars}, moment)
         return compiler.wrap(query), variables
+
+    def _reads_id(self) -> bool:
+        """Whether the projection of :meth:`_compile_query` reads ``id``: ``*`` (no ``select()``, or ``select("*")``) or a
+        ``select()`` naming it."""
+        return not self.select_item or "*" in self.select_item or RECORD_ID_COLUMN in self.select_item
 
     def _search_projection(self) -> tuple[list[str], dict[str, Any]]:
         """The projections of the search annotations, in ``annotate()`` order, and the highlight tags they bind
@@ -1512,7 +1536,8 @@ class QuerySet:
         is a ``LET``: inline, every 3.x line reports a vector of the wrong length and a missing table as errors the ORM
         reads. Below 3 (SurrealDB 2.x, the embedded engine: no ``search::rrf()``) each list is a ``LET`` of the block,
         named once its own conditions are compiled — the vector list's conditions selected first under
-        ``compiler.knn_prefilter``, as for ``similar_to()`` —, without ``OMIT``, and the block's value is both lists:
+        ``compiler.knn_prefilter``, and an exact scan's nearest ranked by distance then id, as for ``similar_to()`` —,
+        without ``OMIT``, and the block's value is both lists:
         ``hybrid.fuse()`` fuses them, which drops the same keys, and the ORM pages.
 
         The filter values' warnings are given once for the statement, as :meth:`_build_where` gives them. Every number
@@ -1762,9 +1787,10 @@ class QuerySet:
                     self._tx._note_failure(refusal)
                     raise refusal from exc
                 raise
+        encoded = _encoding.encode(vars_)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
         try:
-            return await client.query(query, _encoding.encode(vars_))  # type: ignore
+            return await client.query(query, encoded)  # type: ignore
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
@@ -1892,9 +1918,9 @@ class QuerySet:
         subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them, and so are the
         fields their ``similar_to()`` searches (v0.36.0, ``knn_fields=``), so a dimension error names them.
 
-        A KNN next to other conditions (v0.36.0, ``compiler.knn_conditions``) is compiled for the line: *knn_prefilter*
-        ``None`` decides it once, right after the first compilation — the line read once per client
-        (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is checked,
+        A KNN next to other conditions (v0.36.0), or an exact scan (``compiler.knn_conditions``), is compiled for the
+        line: *knn_prefilter* ``None`` decides it once, right after the first compilation — the line read once per
+        client (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is checked,
         queued or sent — and every later compilation of this read or write (a re-send for a missing subquery table
         included) uses that decision; :meth:`_run_cached` passes the one it took."""
         empty: frozenset[str] = frozenset()
@@ -1935,9 +1961,9 @@ class QuerySet:
         (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
         compilation gives the filter values' warnings, once per read.
 
-        A KNN next to other conditions (v0.36.0) is keyed in its line's form: the line is read after the first
-        compilation and, below SurrealDB 3, the statement compiled again for the key; the decision is passed on to
-        :meth:`_run_uncached`, so a read the compilation refuses stores nothing.
+        A KNN next to other conditions (v0.36.0), or an exact scan, is keyed in its line's form: the line is read after
+        the first compilation and, below SurrealDB 3, the statement compiled again for the key; the decision is passed
+        on to :meth:`_run_uncached`, so a read the compilation refuses stores nothing.
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
@@ -1967,9 +1993,10 @@ class QuerySet:
 
     async def _below_3(self, compiler: SubqueryCompiler) -> bool:
         """Whether the statement *compiler* compiled is for a line below SurrealDB 3 and needs the form with the
-        conditions next to its KNN selected first (v0.36.0): only when it has such conditions
-        (``compiler.knn_conditions``) is the line read, once per client (``time_travel.cached_major()``) — on the
-        connection's client, an interactive transaction's included. A version that cannot be read counts as 3."""
+        conditions next to its KNN selected first (v0.36.0), or an exact scan's nearest ranked by distance then id: only
+        when it has such conditions or such a scan (``compiler.knn_conditions``) is the line read, once per client
+        (``time_travel.cached_major()``) — on the connection's client, an interactive transaction's included. A version
+        that cannot be read counts as 3."""
         if not compiler.knn_conditions:
             return False
         return await _time_travel.cached_major(await self._manager().get_client()) < 3
@@ -2133,8 +2160,11 @@ class QuerySet:
         counted from 1, and the records come back best first; equal scores keep the vector list's order first, then
         the full-text list's for the records it alone found. SurrealDB 3.x fuses the lists with its ``search::rrf()``;
         SurrealDB 2.x and the embedded engine have no such function, so the ORM fuses them with the same formula: the
-        records, scores and order are the same on every line. The vector and the text are bound as query variables,
-        never written into the statement.
+        same two lists give the same records, scores and order on every line. Each list is SurrealDB's own, so the
+        lists themselves can differ between lines: the HNSW search is approximate, and the full-text list follows the
+        line's BM25 scores (a term found in more than half the documents scores ``0.0`` on SurrealDB 3.x and below
+        zero on 2.x and the embedded engine, README section 36). The vector and the text are bound as query
+        variables, never written into the statement.
 
         Each record is a dict — the full SurrealDB-ORM's result: its fields keyed by their Python names and
         ``_rrf_score``, plus ``_knn_distance`` (its distance, ``None`` when only the full-text search found it) and
@@ -2169,7 +2199,10 @@ class QuerySet:
             ef: The HNSW search's candidate list: ``None`` (100) or an ``int`` from 1 to 10000, raised to
                 ``vector_limit``.
             dist: An exact scan by this distance instead of the index's search: ``EUCLIDEAN``, ``COSINE``,
-                ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``.
+                ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING``, in any case; not with ``ef``. SurrealDB 2.x's and the
+                embedded engine's own scan picks among records at an equal distance at the ``vector_limit``-th place
+                in no fixed order, so there the ORM ranks it by distance, then id, as ``similar_to(dist=...)`` does:
+                the tied records are kept by id, and identical calls get one vector list on every line.
 
         Returns:
             list[dict[str, Any]]: The fused records, best first, each a dict of its fields and ``_rrf_score``,
@@ -2831,8 +2864,9 @@ class QuerySet:
                 return self.model.from_db(rows)  # type: ignore
             return models  # buffered: not executed until commit; return inputs
 
+        encoded = _encoding.encode(data_list)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
-        results = await client.insert(self._model_table, _encoding.encode(data_list))
+        results = await client.insert(self._model_table, encoded)
 
         if isinstance(results, list):
             return self.model.from_db(results)  # type: ignore

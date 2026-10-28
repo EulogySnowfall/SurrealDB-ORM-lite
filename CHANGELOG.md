@@ -5,6 +5,144 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.7] - 2026-10-28
+
+Follow-up to the review of v0.37.0 (#320): a write the ORM refuses before it reaches the database
+now leaves its transaction and the query cache as they were, wherever in the method the refusal
+comes from. No new public API.
+
+### Fixed
+
+- **A refused write no longer counts as a write** (#325). Since v0.37.0 the refusals that need no
+  request ran before the write's tables were noted; a few refusals still ran in the method's body
+  and left the table noted on the transaction (so a later `define_indexes(tx=tx)` on that table was
+  refused, and the commit dropped the table's cached reads although nothing was written) or, outside
+  a transaction, dropped its cached reads when the call ended. They are: `upsert()` without an id,
+  `save(tx=…)` without an id on a buffered transaction, a field name or an `extra_vars` key that
+  `save(server_values=…)` or `merge(server_values=…)` refuses, the checks of `relate()`,
+  `remove_relation()` and `remove_all_relations()` (an invalid edge name no longer counts as a write
+  to every table), a field or a filter refused while a QuerySet write is compiled, an edge id of
+  another table, and a value the ORM cannot send (a `field_serializer` that raises, a negative
+  duration, an `int` outside the signed 64-bit range…). A write now counts once its statement is
+  queued or sent, or once it asked the connection for a client; before that, its notes are taken
+  back, and the notes of every other write on the same tables, a concurrent or an enclosing one
+  included, stay. A write that raises after that point still counts, since what the server applied
+  is unknown. Error types, messages and their order are unchanged.
+
+### Changed
+
+- The values of a write are encoded before the connection is asked for a client, so a value the ORM
+  cannot send is refused without opening a connection.
+- The README (section 36, _Transactions_) lists the refusals that do not count as a write and drops
+  the note that they still did.
+
+### Notes
+
+- The bookkeeping is client-side: the behaviour is the same on SurrealDB 2.x and 3.x, on the
+  embedded engine and on both transaction strategies.
+
+## [0.37.6] - 2026-10-27
+
+Follow-up to the review of v0.37.0 (#340): `hybrid_search()`'s docstring words its cross-line guarantee as
+README section 38 does, and an empty `text_query` is tested against a server. No new public API.
+
+### Fixed
+
+- **`hybrid_search()`'s docstring states the cross-line guarantee with its condition** (#343).
+  `help(QuerySet.hybrid_search)` said the records, scores and order are the same on every line;
+  it now says that the same two lists give the same records, scores and order on every line, and
+  that the lists themselves can differ (the HNSW search is approximate, the full-text list follows
+  the line's BM25 scores). The `dist` argument names the exact scan's ties at the `vector_limit`-th
+  place on SurrealDB 2.x and the embedded engine, which the ORM keeps by id since v0.37.4.
+
+### Changed
+
+- A server test now covers an empty `text_query`: it matches nothing, so the vector list alone is
+  fused and every `_search_score` is `None`, with the HNSW index and with an exact scan, over
+  WebSocket and HTTP and on the embedded engine. Measured on SurrealDB 2.7.0 and 3.3.4; 3.1.5
+  behaves as 3.3.4.
+
+## [0.37.4] - 2026-10-27
+
+Follow-up to the review of v0.37.0 (#340): the exact scan (`dist=`) of `similar_to()` and
+`hybrid_search()` now keeps the same records on every identical call on SurrealDB 2.x and the
+embedded engine. No new public API.
+
+### Fixed
+
+- **The exact scan keeps records at an equal distance by id below SurrealDB 3** (#341). On
+  SurrealDB 2.x and the embedded engine, the engine's own exact scan picks among the records at an
+  equal distance at the `limit`-th place in no fixed order, so identical calls of
+  `similar_to(dist=...)` and `hybrid_search(dist=...)` could return other records, and a page
+  (`offset()`/`limit()`) or a bulk write (`bulk_update()`, `bulk_delete()`, `patch()`) could take
+  others than the read. Below 3 the ORM now selects the nearest records first, ranked by distance
+  then id, and the KNN operator searches exactly those ids: each `_knn_distance` is still
+  `vector::distance::knn()`'s, and without a tie at the last place the records and distances are
+  those the scan alone returned. The read ends `ORDER BY _knn_distance, id` when its projection
+  reads `id`. The statement sent to SurrealDB 3.x, whose exact scan gives one answer, is unchanged.
+  An exact scan now reads the server line (once per client) even without another condition.
+
+### Changed
+
+- The README documents the exact scan's ties in section 37 (*What SurrealDB decides*) and section 38,
+  and in the "ORM behaviour: SurrealDB 2.x vs 3.x" table; the embedded engine's hybrid row says the
+  tied records are kept by id. The `v0.37.0` hybrid notebook no longer describes an exact scan that
+  changes between two identical calls.
+
+### Notes
+
+- `TestExactScanTiesE2E` now expects one answer on every engine. Measured on SurrealDB 2.7.0 and
+  3.3.4 over WebSocket and HTTP, and on the embedded engine; 3.1.5 behaves as 3.3.4.
+
+## [0.37.5] - 2026-10-27
+
+Follow-up to the review of v0.36.4 (#328): analyzer DDL in a transaction now counts the indexes
+that `define_indexes(tx=…)` defined earlier in the same block. No new public API.
+
+### Fixed
+
+- **`remove_analyzer(tx=…)` refuses an analyzer that an index defined in the block uses**
+  (#329). On SurrealDB 2.x and the embedded engine, it found the indexes that use the analyzer by
+  reading committed state, where an index that `define_indexes(tx=…)` defined earlier in the
+  block does not stand yet. Such a block committed and left the index without its analyzer: every
+  later write to the table was then refused ("The analyzer '…' does not exist"). On SurrealDB 3.x
+  the server refused the removal itself, which failed the block. The removal is now refused before
+  any DDL, with the existing "in use by index …" message, on every engine and line, and the
+  refusal does not fail the block. The transaction's note costs no request.
+- **`define_analyzer(…, overwrite=True, tx=…)` refuses a redefinition when an index defined in
+  the block uses the analyzer** (#329). The block committed without `REBUILD INDEX` on every
+  engine, so the index kept the tokens of the old definition and a search could miss records.
+  The redefinition is now refused as one with indexes to rebuild, with the existing message,
+  before any DDL. The v0.36.4 note "an index queued earlier in a buffered block is still not seen"
+  no longer holds for `define_indexes(tx=…)`: both orders are guarded, in interactive and
+  buffered blocks, over WebSocket, HTTP and the embedded engine.
+- **The last change of an index name in the block wins** (#329). An index defined then removed in
+  the block (`remove_index(tx=…)`) no longer counts. One that the block defined again with
+  another analyzer counts for that analyzer only, so the analyzer it held in committed state can
+  be removed or redefined in the block. An index defined with `IF NOT EXISTS`
+  (`define_indexes(overwrite=False, tx=…)`) keeps the block's earlier definition (another model's
+  on the same table) and counts with the analyzer that one gave it. A refused
+  `define_indexes(tx=…)` notes nothing. A raw `tx.add("DEFINE INDEX …")` is not tracked.
+
+### Notes
+
+- **Behaviour table**: a new row for `define_indexes(tx=)` then `remove_index(tx=)` in one block,
+  the index not stored before the block. SurrealDB 3.x fails the commit with a retryable
+  `SurrealDbConflictError` whatever the table holds, and nothing is committed; 2.x and the
+  embedded engine commit it, the index absent afterwards. An index stored before the block,
+  redefined and then removed in it, fails the commit the same way on 2.x too when the table held
+  records, the index standing as before; the embedded engine commits it (README section 36,
+  Transactions). Measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded
+  engine, identical on 3.1.5.
+- **Docs**: README section 36 (Transactions) and the docstrings of `define_indexes()`,
+  `remove_index()`, `define_analyzer()` and `remove_analyzer()` describe the guarded orders.
+- **Tests**: 76 new tests in `tests/test_search.py`: 18 unit tests of the transaction's notes and
+  of the analyzer DDL against them, 57 end-to-end tests over WebSocket, HTTP and the embedded
+  engine, in interactive and buffered blocks, and one check of the new behaviour-table row and its
+  intro sentence.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.37.2] - 2026-10-27
 
 A model with a `primary_key` can have its access defined on SurrealDB 3.x. No new public API.

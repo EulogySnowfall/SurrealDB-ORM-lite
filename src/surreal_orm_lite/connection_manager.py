@@ -829,6 +829,9 @@ class SurrealDBConnectionManager:
         these clients get it: a client the application builds itself with ``AsyncSurreal`` keeps the
         SDK's behaviour.
 
+        Like every way the ORM gets a client, it marks the ORM writes in progress as having reached the database
+        (``cache.reaching()``, issue #325).
+
         On an **embedded** URL the SDK's constructor opens the in-process engine and ``connect()``
         takes no argument; nobody is signed in, whatever *signin_as_configured* says: the engine
         has no system user on a fresh database, and its anonymous session is the in-process owner.
@@ -838,6 +841,7 @@ class SurrealDBConnectionManager:
         :raises SurrealDbConnectionError: the client cannot be opened; on an embedded URL the error
             quotes the engine's own message and is never retryable (a bad path stays bad).
         """
+        _cache.reaching()
         assert cls.__url is not None
         assert cls.__namespace is not None
         assert cls.__database is not None
@@ -951,7 +955,11 @@ class SurrealDBConnectionManager:
         :param still_wanted: for a background reconnect — checked again just before a new client
             is published, so a connection the application closed meanwhile is not reopened behind
             its back. Not used on an embedded URL: an in-process client never drops.
+
+        Issue #325: an ORM write in progress that asks for a client counts as having reached the database
+        (``cache.reaching()``), whatever it raises afterwards.
         """
+        _cache.reaching()
         loop = asyncio.get_running_loop()
         cls.__prune_dead_loops()
         # Before the per-loop fast path: once the URL changed to one the SDK refuses (set_url()),
@@ -1253,7 +1261,10 @@ class SurrealDBConnectionManager:
         name again with other settings, or ``remove_connection()`` removes it, while the engine opens or its session
         is selected again, the call raises a retryable ``SurrealDbConnectionError`` instead of serving the old settings
         (:meth:`_refuse_retired_embedded`).
+
+        Issue #325: an ORM write in progress counts as having reached the database (``cache.reaching()``).
         """
+        _cache.reaching()
         if not is_embedded_url(cls.__url):
             return None
         cls.require_connection()
@@ -2750,9 +2761,13 @@ class SurrealDBConnectionManager:
         removed earlier with the same *tx* is not to rebuild, although committed state still holds it: once the block
         has removed every index that uses the analyzer, the redefinition joins the transaction, without
         ``REBUILD INDEX``. An index removed then defined again in the block (``define_indexes(tx=…)``), or removed with
-        a raw ``tx.add("REMOVE INDEX …")``, which the transaction does not track, still counts. The transaction notes
-        the analyzer it defines or redefines: ``Model.define_indexes(tx=…)`` then refuses, before any DDL, to define in
-        the block an index that uses it — SurrealDB would build it with the committed definition. An analyzer
+        a raw ``tx.add("REMOVE INDEX …")``, which the transaction does not track, still counts. An index
+        ``Model.define_indexes()`` defined earlier with the same *tx* counts with the analyzer the block gave it,
+        although committed state does not hold it yet, or holds it with another analyzer (issue #329): the redefinition
+        of that analyzer is refused before any DDL, and the refusal does not fail the block; an index defined then
+        removed in the block no longer counts. The transaction notes the analyzer it defines or redefines:
+        ``Model.define_indexes(tx=…)`` then refuses, before any DDL, to define in the block an index that uses it —
+        SurrealDB would build it with the committed definition. An analyzer
         :meth:`remove_analyzer` removed earlier with the same *tx* counts as missing, although committed state still
         holds it: it is defined again after its removal.
 
@@ -2802,8 +2817,12 @@ class SurrealDBConnectionManager:
         removed earlier with the same *tx* is left out, although committed state still holds it, so a block that
         removes the last index using the analyzer and then the analyzer commits, as on SurrealDB 3.x, which checks in
         the transaction; an index removed then defined again in the block, or removed with a raw
-        ``tx.add("REMOVE INDEX …")``, which the transaction does not track, still counts, and an index queued earlier in
-        a buffered block is not seen. The transaction notes the removal: ``Model.define_indexes(tx=…)`` then counts the
+        ``tx.add("REMOVE INDEX …")``, which the transaction does not track, still counts. On every line, SurrealDB 3.x
+        included, an index ``Model.define_indexes()`` defined earlier with the same *tx* counts with the analyzer the
+        block gave it, although committed state does not hold it yet, or holds it with another analyzer (issue #329):
+        the removal of that analyzer is refused before any DDL — the transaction's note costs no request — and the
+        refusal does not fail the block (on 3.x, the server's own refusal used to); an index defined then removed in the
+        block no longer counts. The transaction notes the removal: ``Model.define_indexes(tx=…)`` then counts the
         analyzer as missing, although committed state still holds it, and refuses, before any DDL, to define in the
         block an index that uses it — the commit would leave that index without its analyzer, and every write to its
         table refused; :meth:`define_analyzer` with the same *tx* defines it again. No cached read is dropped: a

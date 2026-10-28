@@ -1269,10 +1269,11 @@ class TestBoundary:
     def test_every_sdk_call_is_encoded(self) -> None:
         report = _package_report()
         assert report.offenders == [], "SDK calls outside the encoding boundary:\n" + "\n".join(report.offenders)
-        # The inventory of spec §6.2 at cc2cfa3: the scan is not vacuous.
+        # The inventory of spec §6.2 at cc2cfa3: the scan is not vacuous. Issue #325 encodes the payload of each write
+        # outside a transaction before the client is asked for, which turned 15 inline calls into named ones.
         counts = f"inline={report.inline} named={report.named} bare={report.bare}"
-        assert report.inline >= 22, counts
-        assert report.named >= 8, counts
+        assert report.inline >= 7, counts
+        assert report.named >= 23, counts
         assert report.inline + report.named >= 30, counts
         assert report.bare >= 6, counts
 

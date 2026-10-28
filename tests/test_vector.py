@@ -30,8 +30,10 @@ and ``ef`` of ``similar_to()``, 1 to 10000 — each refusal with its exact text 
 involved, no request is sent.
 
 The renderers (``TestRenderers``): ``hnsw_clause()`` writes every HNSW option of an index; ``knn_condition()`` writes
-the KNN operator with an ``EF`` of at least ``K`` (100 by default), or the distance of an exact search; both write the
-ORM's own constants and checked integers only.
+the KNN operator with an ``EF`` of at least ``K`` (100 by default), or the distance of an exact search; below
+SurrealDB 3, ``exact_distance()`` writes each distance as the function SurrealDB's exact scan computes,
+``scored_vector()`` the records that scan scores, and ``exact_scan_select()`` the ids of the ``K`` nearest ranked by
+distance then id; each writes the ORM's own constants, checked names and checked integers only.
 
 The vector index (``TestIndexVector``): ``Index(..., hnsw=True, dimension=, dist=, vector_type=, efc=, m=)`` — the full
 ORM's ``CreateIndex`` arguments — holds what was declared (``None`` for an option not given, the words upper case),
@@ -115,8 +117,9 @@ The other conditions next to the vector search (``TestPrefilter``): the statemen
 SurrealDB 3.x — every condition inline — and in the form below 3 — every condition but an id subquery selected first in
 a ``LET``, the KNN searching those ids (``$_sq<N> CONTAINS id`` on a view model), a ``Subquery``'s ``LET`` before its
 own —; the parts kept next to the KNN on every line are exactly the ORM's id subqueries; a statement without such a
-condition is the same on every line and needs no line. The line is read once per client and decided once per read, a
-re-send for a missing subquery table keeping it. ``TestPrefilterE2E`` reads, on every engine, a comparison, a function
+condition is the same on every line and needs no line, unless it is an exact scan, whose nearest are ranked by distance
+then id below 3. The line is read once per client and decided once per read, a re-send for a missing subquery table
+keeping it. ``TestPrefilterE2E`` reads, on every engine, a comparison, a function
 lookup, a ``Q`` group, a negation, ``nearby()``, ``search()``, a condition on an indexed column and one through a
 record link next to ``similar_to()`` (an index search and an exact scan): the same records everywhere, the form sent
 being the line's, the line read once and only for such a condition; ``exists()``, ``count()`` and a ``values()`` group
@@ -138,6 +141,12 @@ condition, and a transaction queues the block of its line. ``TestWriteByIdsE2E``
 records the same read returns — next to a range on an indexed column, with an exact search, next to a comparison,
 alone — and returns their number, a table that does not exist written as empty; ``TestWriteByIdsTxE2E`` writes them in
 an interactive transaction and in a buffered one.
+
+The exact scan (``TestExactScanRankingE2E``), on every engine: with records at an equal distance at the ``limit``-th
+place, identical calls return the same records under every distance, the tied ones kept by id below SurrealDB 3; a
+page, a condition, a ``Subquery``, ``count()``, ``bulk_update()``, ``patch()`` and ``bulk_delete()`` take the records the
+read returns; every ``_knn_distance`` is SurrealDB's own, bit for bit, and without a tie at the last place the records
+are the ones SurrealDB's scan alone returns.
 
 The dimension of the vector index (``TestDimensionRefusal``): SurrealDB's refusal of a query vector whose length is not
 the index's dimension becomes ``SurrealDbError`` naming the field — the statement's own, its subqueries', several as
@@ -170,7 +179,7 @@ embedded engine), and fails with a clear message when the compaction outlasts it
 
 The documentation (``TestReadmeSection37``): README section 37 — its place after section 36, its seven subsections,
 its examples (run on ``mem://`` as written, each printed line equal to its comment; the search annotations' block
-printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its nine sentences, the paragraph on the union spellings and thirteen "Coming from"
+printing the ORM's refusal; no ``limit`` nor ``ef`` outside 1 to 10000), its ten sentences, the paragraph on the union spellings and thirteen "Coming from"
 bullets word for word —, the eight rows of the 2.x/3.x table and the row of the embedded engine's, cell by cell within
 the tables' widths, the header sentence, and the features, roadmap and comparison rows. ``TestRoadmap36``:
 ``docs/ROADMAP.md`` records v0.36.0 as planned, or — once its Phase G row carries ✅ — as released.
@@ -985,6 +994,55 @@ class TestRenderers:
         with pytest.raises(ValueError) as caught:
             vector.knn_condition("embedding", 2, 40, "COSINE", "_f0")
         assert str(caught.value) == "knn_condition() takes ef or dist, not both."
+
+    @pytest.mark.parametrize(
+        ("dist", "call"),
+        [
+            ("euclidean", "vector::distance::euclidean(meta.vec, $_f3)"),
+            ("COSINE", "1 - vector::similarity::cosine(meta.vec, $_f3)"),
+            ("Manhattan", "vector::distance::manhattan(meta.vec, $_f3)"),
+            ("chebyshev", "vector::distance::chebyshev(meta.vec, $_f3)"),
+            ("HAMMING", "vector::distance::hamming(meta.vec, $_f3)"),
+        ],
+    )
+    def test_exact_distance(self, dist: str, call: str) -> None:
+        assert vector.exact_distance("meta.vec", dist, "_f3") == call
+
+    def test_exact_distance_writes_checked_values_only(self) -> None:
+        with pytest.raises(ValueError):
+            vector.exact_distance("embedding", "PEARSON", "_f0")
+        with pytest.raises(ValueError):
+            vector.exact_distance("embedding; DELETE x", "COSINE", "_f0")
+        for variable in ["q", "_f", "_fx", "_f0; DELETE x"]:
+            with pytest.raises(ValueError) as caught:
+                vector.exact_distance("embedding", "COSINE", variable)
+            assert str(caught.value) == f"exact_distance() binds the query vector as $_f<N>, not ${variable}."
+
+    def test_scored_vector(self) -> None:
+        assert vector.scored_vector("embedding", 3) == (
+            "type::is::array(embedding) AND array::len(embedding) = 3 AND type::is::number(array::min(embedding)) AND "
+            "type::is::number(array::max(embedding))"
+        )
+        with pytest.raises(ValueError):
+            vector.scored_vector("embedding", 0)
+        with pytest.raises(TypeError):
+            vector.scored_vector("embedding", True)
+        with pytest.raises(ValueError):
+            vector.scored_vector("1embedding", 3)
+
+    def test_exact_scan_select(self) -> None:
+        search = vector.KnnSearch("e", "embedding", (1.0, 0.0), 4, None, "EUCLIDEAN")
+        assert vector.exact_scan_select("vec_doc", search, "_f2", ["n > $_f0", "id IN $_sq0"]) == (
+            "(SELECT id, vector::distance::euclidean(embedding, $_f2) AS _knn_distance FROM vec_doc WHERE n > $_f0 AND "
+            "id IN $_sq0 AND type::is::array(embedding) AND array::len(embedding) = 2 AND "
+            "type::is::number(array::min(embedding)) AND type::is::number(array::max(embedding)) ORDER BY "
+            "_knn_distance, id LIMIT 4).id"
+        )
+        with pytest.raises(ValueError) as caught:
+            vector.exact_scan_select("vec_doc", vector.KnnSearch("e", "embedding", (1.0,), 4, None, None), "_f0", [])
+        assert str(caught.value) == "exact_scan_select() ranks an exact scan: the search has no distance."
+        with pytest.raises(ValueError):
+            vector.exact_scan_select("vec_doc", vector.KnnSearch("e", "embedding", (1.0,), 0, None, "COSINE"), "_f0", [])
 
     def test_defaults(self) -> None:
         assert vector.DEFAULTS == {"dist": "EUCLIDEAN", "vector_type": "F32", "efc": 150, "m": 12}
@@ -3766,7 +3824,8 @@ class TestCombinationsE2E:
     ``count()``, ``exists()``, ``sum()`` and the other aggregations, a ``values()`` group; a ``Subquery`` holding it
     gives their ids to another queryset's filter (one block, the KNN in its ``LET``); ``cache()`` answers a second
     identical read, not another vector, and ``define_indexes()`` drops it; a model of a named connection and a model
-    inside ``using()`` apply their indexes and search on that connection. None of these reads asks the line."""
+    inside ``using()`` apply their indexes and search on that connection. Only an exact scan asks the line, once per
+    client: below SurrealDB 3 its nearest are ranked by distance then id."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_the_aggregations(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3794,7 +3853,7 @@ class TestCombinationsE2E:
         assert sorted(groups, key=lambda row: row["category"]) == [{"category": "news", "c": 1}, {"category": "pets", "c": 2}]
         assert exact == 9
         assert every == 6
-        assert versions == []
+        assert versions == [("version", None)]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_subquery(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3820,7 +3879,7 @@ class TestCombinationsE2E:
         assert _ids(ordered) == ["d2", "d1"]
         assert sorted(_ids(summary)) == ["d1", "d2", "d6"]
         assert exact == 2
-        assert versions == []
+        assert versions == [("version", None)]
 
     @pytest.mark.usefixtures("empty_cache")
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3898,11 +3957,36 @@ _K11B = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, vector::distance::knn() AS "
     "_knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|3,40|> $_f1 ORDER BY _knn_distance) };"
 )
-#: K14: a Q OR group and an exact scan, in the form below SurrealDB 3.
+#: The records an exact scan below SurrealDB 3 ranks: the vectors of 3 numbers in ``embedding``.
+_SCORED = (
+    "type::is::array(embedding) AND array::len(embedding) = 3 AND type::is::number(array::min(embedding)) AND "
+    "type::is::number(array::max(embedding))"
+)
+#: K14: a Q OR group and an exact scan, in the form below SurrealDB 3: the two nearest matching records ranked by
+#: distance then id in the LET, the KNN on their ids, the records at one distance by id.
 _K14 = (
-    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE (category = $_f0 OR category = $_f1)); (SELECT *, "
+    "{ LET $_sq0 = (SELECT id, 1 - vector::similarity::cosine(embedding, $_f2) AS _knn_distance FROM vec_doc WHERE "
+    f"(category = $_f0 OR category = $_f1) AND {_SCORED} ORDER BY _knn_distance, id LIMIT 2).id; (SELECT *, "
     "vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,COSINE|> $_f2 ORDER BY "
-    "_knn_distance) };"
+    "_knn_distance, id) };"
+)
+#: K14b: an exact scan alone, in the form below SurrealDB 3; K14c: with select() leaving out id, which SurrealDB 2.x
+#: cannot order by.
+_K14B = (
+    "{ LET $_sq0 = (SELECT id, vector::distance::hamming(embedding, $_f0) AS _knn_distance FROM vec_doc WHERE "
+    f"{_SCORED} ORDER BY _knn_distance, id LIMIT 2).id; (SELECT *, vector::distance::knn() AS _knn_distance FROM "
+    "vec_doc WHERE id IN $_sq0 AND embedding <|2,HAMMING|> $_f0 ORDER BY _knn_distance, id) };"
+)
+_K14C = _K14B.replace("(SELECT *, vector::distance::knn()", "(SELECT title, vector::distance::knn()").replace(
+    "ORDER BY _knn_distance, id) };", "ORDER BY _knn_distance) };"
+)
+#: K14d: an exact scan next to a Subquery id list and on a view model, in the form below SurrealDB 3: every part in
+#: the ranked LET.
+_K14D = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); LET $_sq1 = (SELECT id, "
+    f"vector::distance::euclidean(embedding, $_f1) AS _knn_distance FROM vec_view WHERE $_sq0 CONTAINS id AND {_SCORED} "
+    "ORDER BY _knn_distance, id LIMIT 2).id; (SELECT *, vector::distance::knn() AS _knn_distance FROM vec_view WHERE "
+    "$_sq1 CONTAINS id AND embedding <|2,EUCLIDEAN|> $_f1 ORDER BY _knn_distance, id) };"
 )
 #: K17: search() next to the KNN (K16, ``_SEARCH_KNN``) in the form below SurrealDB 3.
 _K17 = (
@@ -4211,6 +4295,33 @@ class TestPrefilter:
             {"_f0": "tech", "_f1": "news", "_f2": [1.0, 0.0, 0.0]},
         )
 
+    def test_k14b_an_exact_scan_alone_needs_the_line(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 2, dist="hamming")
+        inline, compiler = _compiled(queryset)
+        assert inline == (_K1.replace("<|2,100|>", "<|2,HAMMING|>"), {"_f0": [1.0, 0.0, 0.0]})
+        assert compiler.knn_conditions is True
+        ranked, compiler = _compiled(queryset, knn_prefilter=True)
+        assert ranked == (_K14B, {"_f0": [1.0, 0.0, 0.0]})
+        assert compiler.knn_conditions is True
+
+    @pytest.mark.parametrize("items", [("id", "title"), ("*",), ("title", "id")])
+    def test_k14c_the_records_at_one_distance_by_id_when_the_projection_reads_it(self, items: tuple[str, ...]) -> None:
+        queryset = VecDoc.objects().select(*items).similar_to("embedding", _Q, 2, dist="hamming")
+        projection = "*" if items == ("*",) else ", ".join(items)
+        expected = _K14B.replace("(SELECT *, vector::distance::knn()", f"(SELECT {projection}, vector::distance::knn()")
+        assert _compiled(queryset, knn_prefilter=True)[0][0] == expected
+        alone = VecDoc.objects().select("title").similar_to("embedding", _Q, 2, dist="hamming")
+        assert _compiled(alone, knn_prefilter=True)[0][0] == _K14C
+        ordered = VecDoc.objects().order_by("-n").similar_to("embedding", _Q, 2, dist="hamming")
+        assert _compiled(ordered, knn_prefilter=True)[0][0] == _K14B.replace("_knn_distance, id) };", "n DESC) };")
+
+    def test_k14d_every_part_in_the_ranked_let(self) -> None:
+        by_ids = VecView.objects().filter(id__in=Subquery(VecDoc.objects().filter(category="tech")))
+        queryset = by_ids.similar_to("embedding", _Q, 2, dist="euclidean")
+        statement, compiler = _compiled(queryset, knn_prefilter=True)
+        assert statement == (_K14D, {"_f0": "tech", "_f1": [1.0, 0.0, 0.0]})
+        assert compiler.knn_conditions is True
+
     @pytest.mark.parametrize("knn_first", [False, True], ids=["search-then-similar_to", "similar_to-then-search"])
     def test_k16_and_k17_search(self, knn_first: bool) -> None:
         def k16() -> Any:
@@ -4507,8 +4618,9 @@ class TestSearchAnnotationsWithKnn:
 
 class TestPrefilterE2E:
     """``similar_to()`` next to every kind of condition, on every engine: the same records on every line — SurrealDB
-    3.x gets the conditions inline, SurrealDB 2.x and the embedded engine the ``LET`` form (the spy shows each) —, the
-    line read once per client and only for a statement with such a condition."""
+    3.x gets the conditions inline, SurrealDB 2.x and the embedded engine the ``LET`` form (the spy shows each), an exact
+    scan's ``LET`` ranking its nearest by distance then id —, the line read once per client and only for a statement
+    with such a condition or an exact scan."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize(
@@ -4599,7 +4711,8 @@ class TestPrefilterE2E:
             docs = await queryset.exec()
             sent = _calls(calls)
         assert sent == [("version", None), *_query(statement)]
-        assert statement.startswith("{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE ") == (major < 3)
+        let = "SELECT VALUE id FROM" if dist is None else "SELECT id, 1 - vector::similarity::cosine(embedding, $_f1) AS"
+        assert statement.startswith(f"{{ LET $_sq0 = ({let}") == (major < 3)
         assert _ids(docs) == expected
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -4629,7 +4742,12 @@ class TestPrefilterE2E:
             docs = await queryset.exec()
             sent = _calls(calls)
         assert sent == [("version", None), *_query(statement)]
-        assert statement.startswith("{ LET $_sq0 = (SELECT VALUE id FROM vec_owned WHERE owner.team = $_f0); ") == (major < 3)
+        if dist is None:
+            let = "{ LET $_sq0 = (SELECT VALUE id FROM vec_owned WHERE owner.team = $_f0); "
+        else:
+            let = "{ LET $_sq0 = (SELECT id, 1 - vector::similarity::cosine(embedding, $_f1) AS _knn_distance FROM vec_owned "
+            let += "WHERE owner.team = $_f0 AND type::is::array(embedding) AND "
+        assert statement.startswith(let) == (major < 3)
         assert _ids(docs) == ["d1", "d2"]
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -4719,7 +4837,8 @@ _K12B_3X = (
     "id IN $_sq0 RETURN BEFORE) };"
 )
 _K12B = (
-    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN "
+    "{ LET $_sq0 = (SELECT id, 1 - vector::similarity::cosine(embedding, $_f1) AS _knn_distance FROM vec_doc WHERE n > "
+    f"$_f0 AND {_SCORED} ORDER BY _knn_distance, id LIMIT 2).id; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN "
     "$_sq0 AND embedding <|2,COSINE|> $_f1); (DELETE vec_doc WHERE id IN $_sq1 RETURN BEFORE) };"
 )
 #: K12c: a comparison next to the index search and ``patch()``, in the form below SurrealDB 3.
@@ -4754,13 +4873,20 @@ _RANGE_EXACT_INLINE = (
     "vec_ranked SET hit = $_v0 WHERE id IN $_sq0) };"
 )
 _RANGE_EXACT_PREFILTERED = (
-    "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_ranked WHERE "
+    "{ LET $_sq0 = (SELECT id, 1 - vector::similarity::cosine(embedding, $_f1) AS _knn_distance FROM vec_ranked WHERE "
+    f"n > $_f0 AND {_SCORED} ORDER BY _knn_distance, id LIMIT 2).id; LET $_sq1 = (SELECT VALUE id FROM vec_ranked WHERE "
     "id IN $_sq0 AND embedding <|2,COSINE|> $_f1); (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq1) };"
 )
-#: ``similar_to("embedding", _Q, 2, dist="cosine").bulk_delete()``: the same on every line.
+#: ``similar_to("embedding", _Q, 2, dist="cosine").bulk_delete()``, in the form for SurrealDB 3.x, then below 3: the
+#: two nearest ranked by distance then id.
 _DELETE_NEAREST = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE embedding <|2,COSINE|> $_f0); (DELETE vec_ranked WHERE id IN "
     "$_sq0 RETURN BEFORE) };"
+)
+_DELETE_NEAREST_RANKED = (
+    "{ LET $_sq0 = (SELECT id, 1 - vector::similarity::cosine(embedding, $_f0) AS _knn_distance FROM vec_ranked WHERE "
+    f"{_SCORED} ORDER BY _knn_distance, id LIMIT 2).id; LET $_sq1 = (SELECT VALUE id FROM vec_ranked WHERE id IN $_sq0 "
+    "AND embedding <|2,COSINE|> $_f0); (DELETE vec_ranked WHERE id IN $_sq1 RETURN BEFORE) };"
 )
 #: ``filter(category="tech").similar_to("embedding", _Q, 1).patch(…)``, in the form for SurrealDB 3.x, then below 3.
 _PATCH_INLINE = (
@@ -4854,7 +4980,7 @@ class TestWriteByIds:
     the KNN ``SELECT`` returns, bound in a ``LET`` of the statement's block — the other conditions' ``LET`` s first,
     below SurrealDB 3 the pre-filter's too —, so the write itself never carries the KNN operator; the ``LET`` reads the
     model's table, so a table SurrealDB 3.x confirms missing binds it to ``[]``. The line is read once per write, and
-    only for a KNN next to another condition; a transaction queues the block of its line."""
+    only for a KNN next to another condition or an exact scan; a transaction queues the block of its line."""
 
     @pytest.mark.parametrize("knn_prefilter", [False, True])
     async def test_k12_similar_to_alone(self, knn_prefilter: bool, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4981,8 +5107,8 @@ class TestWriteByIdsE2E:
     """The bulk writes of a ``similar_to()`` queryset on every engine: they write exactly the records the same read
     returns — next to a range on an indexed column, with an exact search, with a comparison and alone — and return
     their number; the spy shows one block whose write goes by the ids of the nearest, the other conditions selected
-    first below SurrealDB 3 and inline on 3.x, the line read only for a write with a condition. A table that does not
-    exist is written as empty."""
+    first below SurrealDB 3 and inline on 3.x — an exact scan's nearest ranked by distance then id below 3 —, the line
+    read only for a write with a condition or an exact scan. A table that does not exist is written as empty."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize(
@@ -5008,13 +5134,14 @@ class TestWriteByIdsE2E:
     async def test_bulk_delete_of_the_exact_nearest(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
         async with _vec_models(kind) as client:
             await _seed_ranked(client)
+            major = await _major(client)
             calls = _spy(monkeypatch, client)
             deleted = await VecRanked.objects().similar_to("embedding", _Q, 2, dist="cosine").bulk_delete()
             sent = _calls(calls)
             left = await _ranked_left(client)
         assert deleted == 2
         assert left == ["d3", "d4", "d5", "d6"]
-        assert sent == _query(_DELETE_NEAREST)
+        assert sent == [("version", None), *_query(_DELETE_NEAREST_RANKED if major < 3 else _DELETE_NEAREST)]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_patch_next_to_an_indexed_column(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5086,6 +5213,158 @@ _DIMENSION_ERROR = "Incorrect vector dimension (2). Expected a vector of 3 dimen
 _VD1 = "similar_to(): the vector has 2 dimensions; the vector index on field 'embedding' expects 3."
 #: The query vector of two numbers.
 _SHORT = [1.0, 0.0]
+
+
+# === The exact scan below SurrealDB 3: ranked by distance, then id ==================================================
+
+
+class VecTied(BaseSurrealModel):
+    """The model of the exact scan's corpora: no vector index (``dist=`` needs none)."""
+
+    model_config = SurrealConfigDict(table_name="vec_tied")
+
+    id: str | None = None
+    n: int = 0
+    hit: bool = False
+    embedding: VectorField[3]
+
+
+#: The README row the ties pin back.
+_ROW_TIES = (
+    "README row 'An exact scan (`similar_to(dist=…)`, `hybrid_search(dist=…)`) with records at an equal distance at "
+    "the last place'"
+)
+#: The records ``d2`` to ``d8``: one and the same embedding, so one distance from ``_Q`` under every distance.
+_TIED = [f"d{number}" for number in range(2, 9)]
+#: The tie corpus, in ``vec_tied``: ``d0`` the farthest under every distance though first by id, ``d1`` alone nearest,
+#: then the seven tied records, so the three nearest are ``d1`` and two of the seven under every distance.
+_TIE_CORPUS = " ".join(
+    [
+        "CREATE vec_tied:d0 SET n = 0, embedding = [0.0, 0.5, 1.0];",
+        "CREATE vec_tied:d1 SET n = 1, embedding = [1.0, 0.0, 0.0];",
+        *(f"CREATE vec_tied:{key} SET n = {number}, embedding = [0.6, 0.8, 0.0];" for number, key in enumerate(_TIED, 2)),
+    ]
+)
+#: Six records at distinct distances from ``_Q`` under every distance at the second place: ``s1`` then ``s4``
+#: (``HAMMING``: ``s4`` then ``s1``), the next one farther; ``s4`` holds decimals, the others floats.
+_SPREAD_CORPUS = " ".join(
+    f"CREATE vec_tied:{key} SET n = {number}, embedding = {embedding};"
+    for number, (key, embedding) in enumerate(
+        [
+            ("s1", "[0.9, 0.1, 0.0]"),
+            ("s2", "[0.7, 0.2, 0.4]"),
+            ("s3", "[0.2, 0.9, 0.1]"),
+            ("s4", "[1dec, 0.3dec, 0dec]"),
+            ("s5", "[0.5, 0.5, 0.5]"),
+            ("s6", "[-0.3, 0.1, 0.8]"),
+        ],
+        start=1,
+    )
+)
+#: Three records under ``COSINE``: ``z0`` a zero vector, whose distance is ``NaN`` — SurrealDB's scan ranks it first —,
+#: then ``z1`` (0.0) and ``z2`` (0.4).
+_ZERO_CORPUS = (
+    "CREATE vec_tied:z0 SET embedding = [0.0, 0.0, 0.0]; CREATE vec_tied:z1 SET embedding = [1.0, 0.0, 0.0]; "
+    "CREATE vec_tied:z2 SET embedding = [0.6, 0.8, 0.0];"
+)
+#: Every record of ``vec_tied`` with SurrealDB's own distance from ``$q``: K covers the table, so no tie is cut.
+_PIN_EVERY_DISTANCE = "SELECT id, vector::distance::knn() AS d FROM vec_tied WHERE embedding <|9,{dist}|> $q;"
+#: The two nearest records of ``vec_tied`` by SurrealDB's exact scan alone, nearest first.
+_PIN_TWO_NEAREST = "SELECT id, vector::distance::knn() AS d FROM vec_tied WHERE embedding <|2,{dist}|> $q ORDER BY d;"
+#: Identical calls of each read: SurrealDB 2.x's and the embedded engine's own exact scan picks two of the seven tied
+#: records in no fixed order (20 of the 21 pairs in 60 calls), so twelve calls giving one answer without the ORM's
+#: ranking would happen far less than once in 10^9 runs.
+_TIE_CALLS = 12
+
+
+def _tied_nearest(dist: str = "cosine", limit: int = 3) -> Any:
+    """``VecTied.objects().similar_to("embedding", _Q, limit, dist=dist)``."""
+    return VecTied.objects().similar_to("embedding", _Q, limit, dist=dist)
+
+
+async def _tied_keys(client: Any, condition: str = "true") -> list[str]:
+    """The keys of the ``vec_tied`` records matching *condition* (a constant of these tests), sorted."""
+    rows = await client.query(f"SELECT VALUE id FROM vec_tied WHERE {condition};", {})
+    return sorted(str(row.id) for row in rows)
+
+
+class TestExactScanRankingE2E:
+    """The exact scan (``dist=``) on every engine, each test naming the README row it backs. Below SurrealDB 3, whose own
+    exact scan picks among records at an equal distance at the ``limit``-th place in no fixed order, the ORM ranks the
+    scan by distance then id: identical calls return the same records in the same order, the tied ones kept by id, under
+    every distance the ORM writes; a page, a condition, a ``Subquery``, ``count()`` and the bulk writes take the same
+    records. Every ``_knn_distance`` is SurrealDB's own (``vector::distance::knn()``), bit for bit, and without a tie at
+    the last place the records are the ones SurrealDB's exact scan alone returns, on every engine."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("dist", vector.DISTANCES)
+    async def test_the_tied_records_under_each_distance(self, kind: str, dist: str) -> None:
+        async with _vec_models(kind) as client:
+            await _apply_ddl(client, _TIE_CORPUS)
+            major = await _major(client)
+            every = await client.query(_PIN_EVERY_DISTANCE.format(dist=dist), {"q": _Q})
+            answers = [await _tied_nearest(dist).exec() for _ in range(_TIE_CALLS)]
+        own = {str(row["id"].id): row["d"] for row in every}
+        orders = {tuple(_ids(records)) for records in answers}
+        if major < 3:
+            assert orders == {("d1", "d2", "d3")}, f"{_ROW_TIES}: below 3 the tied records are kept by id: {orders}"
+        else:
+            assert len({frozenset(order) for order in orders}) == 1, f"{_ROW_TIES}: one answer on SurrealDB 3.x: {orders}"
+        for records in answers:
+            assert _ids(records)[0] == "d1" and set(_ids(records)[1:]) <= set(_TIED), _ids(records)
+            for record in records:
+                expected = own[str(record.id)]
+                assert record._knn_distance == expected and type(record._knn_distance) is type(expected), (
+                    f"{dist}: SurrealDB's own distance of {record.id}, bit for bit"
+                )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("dist", vector.DISTANCES)
+    async def test_without_a_tie_the_answer_is_the_exact_scan_s(self, kind: str, dist: str) -> None:
+        async with _vec_models(kind) as client:
+            await _apply_ddl(client, _SPREAD_CORPUS)
+            raw = await client.query(_PIN_TWO_NEAREST.format(dist=dist), {"q": _Q})
+            records = await _tied_nearest(dist, 2).exec()
+        assert [str(row["id"].id) for row in raw] == (["s4", "s1"] if dist == "HAMMING" else ["s1", "s4"])
+        assert list(zip(_ids(records), _distances(records), strict=True)) == [(str(row["id"].id), row["d"]) for row in raw]
+        assert [type(distance) for distance in _distances(records)] == [type(row["d"]) for row in raw]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_zero_vector_under_cosine(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _apply_ddl(client, _ZERO_CORPUS)
+            raw = await client.query(_PIN_TWO_NEAREST.format(dist="COSINE"), {"q": _Q})
+            records = await _tied_nearest("cosine", 2).exec()
+        assert [str(row["id"].id) for row in raw] == _ids(records) == ["z0", "z1"]
+        assert math.isnan(records[0]._knn_distance) and math.isnan(raw[0]["d"])
+        assert records[1]._knn_distance == raw[1]["d"] == 0.0
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_page_a_condition_a_subquery_and_the_writes(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _apply_ddl(client, _TIE_CORPUS)
+            major = await _major(client)
+            read = _ids(await _tied_nearest().exec())
+            pages = {tuple(_ids(await _tied_nearest(limit=4).offset(1).limit(2).exec())) for _ in range(_TIE_CALLS)}
+            kept = VecTied.objects().filter(n__gte=2).similar_to("embedding", _Q, 2, dist="cosine")
+            filtered = {tuple(_ids(await kept.exec())) for _ in range(_TIE_CALLS)}
+            selected = VecTied.objects().filter(id__in=Subquery(_tied_nearest()))
+            by_ids = {tuple(sorted(_ids(await selected.exec()))) for _ in range(_TIE_CALLS)}
+            counted = await _tied_nearest().count()
+            updated = await _tied_nearest().bulk_update(hit=True)
+            hits = await _tied_keys(client, "hit = true")
+            patched = await _tied_nearest().patch([{"op": "replace", "path": "/n", "value": 99}])
+            renumbered = await _tied_keys(client, "n = 99")
+            deleted = await _tied_nearest().bulk_delete()
+            left = await _tied_keys(client)
+        assert (counted, updated, patched, deleted) == (3, 3, 3, 3)
+        assert by_ids == {tuple(sorted(read))}, f"{_ROW_TIES}: a Subquery gives the records the read returns"
+        assert hits == renumbered == sorted(read), f"{_ROW_TIES}: the writes take the records the read returns"
+        assert left == sorted({"d0", "d1", *_TIED} - set(read)), f"{_ROW_TIES}: bulk_delete() too"
+        if major < 3:
+            assert read == ["d1", "d2", "d3"], f"{_ROW_TIES}: below 3 the tied records are kept by id"
+            assert pages == {("d2", "d3")}, f"{_ROW_TIES}: below 3 a page of the nearest is the same on every call"
+            assert filtered == {("d2", "d3")}, f"{_ROW_TIES}: below 3 the condition's records are ranked by id too"
 
 
 class VecLoose(BaseSurrealModel):
@@ -5944,6 +6223,13 @@ _S37_PRECISION = (
     "Distances are computed in the index's `vector_type` (`F32` by default: single precision), so they can differ "
     "from Python's in the last digits; `dist=` computes in double precision."
 )
+#: What *What SurrealDB decides* says of the exact scan's records at an equal distance at the last place (v0.37.4).
+_S37_TIES = (
+    "SurrealDB 2.x's and the embedded engine's exact scan (`dist=`) picks among records at an equal distance at the "
+    "`limit`-th place in no fixed order, so there the ORM ranks it by distance, then id: identical calls return the "
+    "same records in the same order, the tied ones by id, and a page, a `Subquery` and the bulk writes take the same "
+    "records. SurrealDB 3.x's own scan gives one answer."
+)
 #: What *Type checkers* says of the union spellings of a vector field (issue #318).
 _S37_UNION = (
     "`VectorField[d]` is already optional, so it needs no `| None`. Written `VectorField[d] | None` or "
@@ -5955,7 +6241,7 @@ _S37_UNION = (
     "`None`, or two different `Vector` markers, has no single dimension: the class statement refuses it, naming the "
     "field, and `get_vector_info()` and `is_vector_field()` raise `ValueError` for such a field or annotation."
 )
-#: The nine sentences section 37 says word for word (whitespace normalised), with their subsection.
+#: The ten sentences section 37 says word for word (whitespace normalised), with their subsection.
 _SENTENCES_37 = [
     ("Declare and apply", _S37_TYPE),
     ("Type checkers", _S37_TYPED),
@@ -5966,6 +6252,7 @@ _SENTENCES_37 = [
     ("With other conditions", _S37_SCORES),
     ("What SurrealDB decides", _S37_APPROX),
     ("What SurrealDB decides", _S37_PRECISION),
+    ("What SurrealDB decides", _S37_TIES),
 ]
 #: What each part of section 37 says (key phrases, whitespace normalised); the intro under ``""``.
 _PART_NEEDLES_37 = {
@@ -6276,10 +6563,10 @@ class TestReadmeSection37:
         missing = [needle for needle in _PART_NEEDLES_37[heading] if needle not in text]
         assert not missing, missing
 
-    @pytest.mark.parametrize(("heading", "sentence"), _SENTENCES_37, ids=[f"s{index}" for index in range(1, 10)])
+    @pytest.mark.parametrize(("heading", "sentence"), _SENTENCES_37, ids=[f"s{index}" for index in range(1, 11)])
     def test_sentences_word_for_word(self, heading: str, sentence: str) -> None:
-        """Each of the nine sentences exactly once in its subsection, and nowhere else in the section."""
-        assert len(_SENTENCES_37) == 9
+        """Each of the ten sentences exactly once in its subsection, and nowhere else in the section."""
+        assert len(_SENTENCES_37) == 10
         assert _normalised(_part_37(heading)).count(sentence) == 1, sentence
         assert _normalised(_section_37()).count(sentence) == 1, sentence
 

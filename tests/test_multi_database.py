@@ -2893,9 +2893,9 @@ def _record_cache_writes(patched: pytest.MonkeyPatch) -> list[Any]:
     real = cache.writing
 
     @contextlib.asynccontextmanager
-    async def recording(tables: Any, tx: Any = None) -> AsyncIterator[None]:
+    async def recording(tables: Any, tx: Any = None, **options: Any) -> AsyncIterator[None]:
         entered.append(tables)
-        async with real(tables, tx):
+        async with real(tables, tx, **options):
             yield
 
     patched.setattr(cache, "writing", recording)

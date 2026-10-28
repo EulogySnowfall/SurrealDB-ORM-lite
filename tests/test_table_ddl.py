@@ -234,6 +234,7 @@ from tests._readme_tables import (
     assert_server_table,
 )
 from tests._readme_tables import cells as _cells
+from tests._readme_tables import embedded_rows as _embedded_rows
 from tests._readme_tables import normalised as _normalised
 from tests._readme_tables import readme as _readme
 from tests._readme_tables import readme_part as _readme_part
@@ -5625,9 +5626,11 @@ _LISTS_ROW = (
     "A `list` of sub-models (`list[M]`, at any depth) holding a `dict`, an `Any` or an untyped `list`, in a `SCHEMAFULL` model"
 )
 _UNDECLARED_ROW = "A write naming a field a `SCHEMAFULL` table does not define"
-#: The other README rows stating the same rule: the 2.x/3.x table's v0.7.0 row and the embedded engine's v0.34.0 row.
+#: The other README places stating the same rule: the 2.x/3.x table's v0.7.0 row, the embedded engine's v0.34.0 row
+#: and the subsection of README section 35 whose bullets state it.
 _SCHEMAFULL_WRITE_FIRST_07 = "Writing a field a `SCHEMAFULL` table does not define (`CREATE`, `INSERT`, `INSERT RELATION`)"
 _EMBEDDED_TABLE_DDL_FIRST = "Model table DDL (v0.34.0)"
+_UNDECLARED_PART_35 = "SurrealDB 2.x and 3.x"
 
 #: The failures of the line-fact pins once a SurrealDB line changes.
 _UNTYPED_CHANGED = (
@@ -5636,8 +5639,11 @@ _UNTYPED_CHANGED = (
 )
 _UNDECLARED_CHANGED = (
     "SurrealDB changed how this line treats a write naming a field a SCHEMAFULL table does not define: re-measure it, "
-    f"then update this test's expectation and the README 2.x/3.x row '{_UNDECLARED_ROW}', with the 2.x/3.x row "
-    f"'{_SCHEMAFULL_WRITE_FIRST_07}' and the embedded engine's row '{_EMBEDDED_TABLE_DDL_FIRST}' that state the same rule"
+    "then update this test's expectation and rewrite together the four README places that state the rule: the "
+    f"2.x/3.x rows '{_UNDECLARED_ROW}' and '{_SCHEMAFULL_WRITE_FIRST_07}', the embedded engine's row "
+    f"'{_EMBEDDED_TABLE_DDL_FIRST}' and the bullets of README section 35's '{_UNDECLARED_PART_35}'. Each calls the 3.x "
+    "exception in list items a gap fixed in 3.4, a SurrealDB release still nightly when they were written: when the 3.x "
+    "pin moves to 3.4, rewrite that note in all four"
 )
 
 _NO_SUCH_FIELD = _Refused("no such field exists")
@@ -7581,7 +7587,7 @@ _PART_NEEDLES_35 = {
         "refused on 3.x and dropped on 2.x and the embedded engine",
         "except in the items of a list of objects: on 3.x of a list whose items define a field (every list of "
         "sub-models `define_table()` writes), on 2.x and the embedded engine of a list `define_table()` writes "
-        "`FLEXIBLE`.",
+        "`FLEXIBLE`. The 3.x exception is a gap fixed in SurrealDB 3.4 (nightly at the time of writing).",
         "`COMPUTED` fields are SurrealDB 3.x's",
         "(#orm-behaviour-surrealdb-2x-vs-3x)",
         "(#orm-behaviour-the-embedded-engine)",
@@ -7733,25 +7739,27 @@ _HEADER_SENTENCE_34 = (
     "refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`."
 )
 #: The row v0.34.0 adds to the embedded engine's table, cell by cell: the list-item exception in the words of the
-#: 2.x/3.x row ``_UNDECLARED_ROW``.
+#: 2.x/3.x row ``_UNDECLARED_ROW``, with its 3.4 note (#321).
 _EMBEDDED_TABLE_DDL_ROW = [
     _EMBEDDED_TABLE_DDL_FIRST,
     "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and "
     "to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops "
     "that field, except in the items of a list `define_table()` writes `FLEXIBLE`, which keep it",
-    "3.x keeps those values without `FLEXIBLE` and refuses that write, except in list items that define a field",
+    "3.x keeps them without `FLEXIBLE`, refuses that write except in list items defining a field, a gap fixed in 3.4",
     "v0.34.0",
 ]
 #: The v0.7.0 row of the 2.x/3.x table on the same writes, cell by cell: the list-item exception in the words of the
-#: row ``_UNDECLARED_ROW``.
+#: row ``_UNDECLARED_ROW``, with its 3.4 note (#321).
 _SCHEMAFULL_WRITE_ROW_07 = [
     _SCHEMAFULL_WRITE_FIRST_07,
     "silently dropped: the record is stored without it; kept in the items of a list `define_table()` writes `FLEXIBLE` "
     "(a 2.x limitation)",
     'rejected ("Found field …, but no such field exists"): nothing is stored, except in the items of a list whose '
-    "items define a field (every list of sub-models), which keep it",
+    "items define a field (every list of sub-models), a gap fixed in 3.4",
     "v0.7.0",
 ]
+#: The 3.4 note each of the four places in ``_UNDECLARED_CHANGED`` gives the 3.x list-item exception (#321).
+_GAP_FIXED_IN_34 = re.compile(r"\ba gap fixed in (?:SurrealDB )?3\.4\b")
 _FEATURES_ROW_35 = ["Model table DDL (`define_table()`, `schema_mode`, `permissions`)", "✅"]
 _ROADMAP_ROWS_35 = [
     ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
@@ -8027,6 +8035,29 @@ class TestReadmeSection35:
         index = rows.index(_SCHEMAFULL_WRITE_ROW_07)
         neighbours = firsts[index - 1 : index + 2 : 2]
         assert neighbours[0].startswith("Namespace/db selection") and neighbours[1].startswith("`upsert()`"), neighbours
+
+    def test_the_four_places_of_the_undeclared_rule_agree_on_3_4(self) -> None:
+        """The four README places stating the rule on a write naming an undeclared field — the 2.x/3.x rows of v0.34.0
+        and v0.7.0, the embedded engine's v0.34.0 row and the bullet of section 35's "SurrealDB 2.x and 3.x" on it —
+        each give the 3.x list-item exception the same 3.4 note, and ``_UNDECLARED_CHANGED``, which a 3.x pin moving
+        to 3.4 raises, names all four and asks to rewrite that note in each (#321)."""
+        server = {row[0]: row[2] for row in _server_rows()}
+        embedded = {row[0]: row[2] for row in _embedded_rows()}
+        [undeclared] = [cell for first, cell in server.items() if first.startswith(_UNDECLARED_ROW)]
+        bullets = _readme_bullets(_part_35(_UNDECLARED_PART_35))
+        [bullet] = [bullet for bullet in bullets if bullet.startswith(f"- {_UNDECLARED_ROW} ")]
+        places = {
+            _UNDECLARED_ROW: undeclared,
+            _SCHEMAFULL_WRITE_FIRST_07: server[_SCHEMAFULL_WRITE_FIRST_07],
+            _EMBEDDED_TABLE_DDL_FIRST: embedded[_EMBEDDED_TABLE_DDL_FIRST],
+            _UNDECLARED_PART_35: bullet,
+        }
+        missing = {name: text for name, text in places.items() if len(_GAP_FIXED_IN_34.findall(text)) != 1}
+        assert not missing, missing
+        for name in places:
+            assert f"'{name}'" in _UNDECLARED_CHANGED, name
+        assert "README section 35's" in _UNDECLARED_CHANGED, _UNDECLARED_CHANGED
+        assert "when the 3.x pin moves to 3.4, rewrite that note in all four" in _UNDECLARED_CHANGED, _UNDECLARED_CHANGED
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]

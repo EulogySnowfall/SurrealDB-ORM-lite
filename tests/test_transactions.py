@@ -4,6 +4,7 @@ import os
 import traceback
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     Computed,
+    Index,
     Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
@@ -31,6 +33,7 @@ from surreal_orm_lite.transaction import (
     Transaction,
 )
 from tests._readme_tables import assert_server_header_sentence
+from tests.conftest import orm_client
 
 
 def test_transaction_is_exported() -> None:
@@ -2259,3 +2262,441 @@ class TestArgumentRefusalLeavesTheTransaction:
             await unsaved.patch([{"op": "replace", "path": "/double", "value": 1}])
         with pytest.raises(SurrealDbError, match=r"^patch\(\) requires an explicit id"):
             await unsaved.patch([{"op": "replace", "path": "/n", "value": 1}])
+
+
+# --- #325: a write refused in its body leaves the transaction as it was --------------------------------------------
+
+
+class TxBody(BaseSurrealModel):
+    """A model whose writes the ORM refuses in their body, once the ``invalidates()`` hooks let them through (#325):
+    ``wait`` takes a duration and ``tags`` any value, so that a value the ORM cannot send reaches the write."""
+
+    model_config = SurrealConfigDict(table_name="tx_body")
+
+    id: str | None = None
+    n: int = 0
+    tags: list[Any] = []
+    wait: timedelta | None = None
+
+
+class TxBodyUnwritable(TxBody):
+    """``TxBody`` whose ``n`` cannot be serialized: its ``field_serializer`` raises (#325)."""
+
+    model_config = SurrealConfigDict(table_name="tx_body")
+
+    @field_serializer("n")
+    def _refuse(self, value: int) -> int:
+        raise ValueError("n cannot be written")
+
+
+class TxBodyEdge(BaseSurrealEdge):
+    """An edge between two ``TxBody`` records, with a field of any value (#325)."""
+
+    model_config = SurrealConfigDict(table_name="tx_body_edge")
+
+    w: Any = None
+
+
+def _tx_body_edge(**fields: Any) -> TxBodyEdge:
+    return TxBodyEdge(in_=RecordID("tx_body", "a"), out=RecordID("tx_body", "b"), **fields)
+
+
+_A, _B = TxBody(id="a"), TxBody(id="b")
+_NEGATIVE = timedelta(seconds=-1)
+_TOO_BIG = 2**70
+_UNSENDABLE_DURATION = (ValueError, r"^Cannot send a negative duration")
+_UNSENDABLE_INT = (ValueError, r"^Cannot send 1180591620717411303424: SurrealDB integers are signed 64-bit")
+_UNSAVED = (SurrealDbError, r"^Cannot use relations on an unsaved model \(no id\)\.$")
+_EDGE_NAME = (ValueError, "^Invalid edge name 'bad edge!'")
+_FILTER_NAME = (ValueError, "^Invalid filter field name 'bad field'")
+_FOREIGN_EDGE_ID = (ValueError, "^TxBodyEdge: id other:x belongs to table 'other', not to the edge table 'tx_body_edge'$")
+_UNSERIALIZABLE = (PydanticSerializationError, "n cannot be written")
+_BODY = frozenset({"tx_body"})
+_BODY_EDGE = frozenset({"tx_body_edge"})
+
+#: #325: each write the ORM refuses in its body — after its ``invalidates()`` hooks, before any statement is queued or
+#: sent: (test id, the tables the write notes, ``None`` for every table, the call made with the transaction *tx*, the
+#: error, its message as a pattern). v0.37.5 and before left those tables noted on the transaction (outside one: put
+#: them in flight and dropped their cached reads at the end), although nothing was queued or sent.
+_BODY_REFUSALS: list[tuple[str, frozenset[str] | None, Callable[[Any], Awaitable[Any]], type[Exception], str]] = [
+    # The id checks that run after pre_save.
+    (
+        "upsert-no-id",
+        _BODY,
+        lambda tx: TxBody(n=1).upsert(tx=tx),
+        SurrealDbError,
+        r"^upsert\(\) requires an explicit id \(there is nothing to match without one\)",
+    ),
+    (
+        "save-no-id-buffered",
+        _BODY,
+        lambda tx: TxBody(n=1).save(tx=tx),
+        SurrealDbError,
+        r"^save\(tx=\.\.\.\) requires an explicit id on a buffered transaction",
+    ),
+    # A field name or an extra_vars key refused while the SET statement is compiled.
+    (
+        "save-server_values-name",
+        _BODY,
+        lambda tx: TxBody(id="a").save(tx=tx, server_values={"bad field": _ONE}),
+        ValueError,
+        "^Invalid alias name 'bad field'",
+    ),
+    (
+        "save-extra_vars-binding",
+        _BODY,
+        lambda tx: TxBody(id="a").save(tx=tx, server_values={"n": _ONE}, extra_vars={"rid": 1}),
+        ValueError,
+        r"^extra_vars keys collide with internal query bindings: \['rid'\]",
+    ),
+    (
+        "merge-server_values-name",
+        _BODY,
+        lambda tx: TxBody(id="a").merge(tx=tx, server_values={"bad field": _ONE}),
+        ValueError,
+        "^Invalid alias name 'bad field'",
+    ),
+    (
+        "merge-extra_vars-binding",
+        _BODY,
+        lambda tx: TxBody(id="a").merge(tx=tx, server_values={"n": _ONE}, extra_vars={"rid": 1}),
+        ValueError,
+        r"^extra_vars keys collide with internal query bindings: \['rid'\]",
+    ),
+    # The relation helpers' own checks; an invalid edge name, or no edge, resolves to every table.
+    ("relate-edge-name", None, lambda tx: _A.relate("bad edge!", _B, tx=tx), *_EDGE_NAME),
+    ("relate-unsaved-source", _BODY_EDGE, lambda tx: TxBody(n=1).relate("tx_body_edge", _B, tx=tx), *_UNSAVED),
+    ("relate-unsaved-target", _BODY_EDGE, lambda tx: _A.relate("tx_body_edge", TxBody(n=1), tx=tx), *_UNSAVED),
+    (
+        "relate-field-twice",
+        _BODY_EDGE,
+        lambda tx: _A.relate("tx_body_edge", _B, tx=tx, data={"w": 1}, w=2),
+        TypeError,
+        r"^relate\(\) got edge field\(s\) \['w'\] both in data= and as keyword arguments",
+    ),
+    (
+        "relate-field-name",
+        _BODY_EDGE,
+        lambda tx: _A.relate("tx_body_edge", _B, tx=tx, data={"bad field": 1}),
+        ValueError,
+        "^Invalid relation data field name 'bad field'",
+    ),
+    (
+        "relate-typed-endpoint",
+        _BODY_EDGE,
+        lambda tx: _A.relate(TxBodyEdge, _B, tx=tx, data={"in": RecordID("tx_body", "x")}),
+        ValueError,
+        r"^relate\(\): `in`/`out` are the endpoints of edge `TxBodyEdge`",
+    ),
+    ("remove_relation-edge-name", None, lambda tx: _A.remove_relation("bad edge!", _B, tx=tx), *_EDGE_NAME),
+    (
+        "remove_relation-blank-target",
+        _BODY_EDGE,
+        lambda tx: _A.remove_relation("tx_body_edge", " ", tx=tx),
+        ValueError,
+        r"^remove_relation\(\) target must not be empty or blank",
+    ),
+    (
+        "remove_relation-unsaved",
+        _BODY_EDGE,
+        lambda tx: TxBody(n=1).remove_relation("tx_body_edge", _B, tx=tx),
+        *_UNSAVED,
+    ),
+    (
+        "remove_all_relations-direction",
+        _BODY_EDGE,
+        lambda tx: _A.remove_all_relations("tx_body_edge", "sideways", tx=tx),
+        ValueError,
+        "^direction must be 'out', 'in', or 'both', got 'sideways'$",
+    ),
+    (
+        "remove_all_relations-no-edge",
+        None,
+        lambda tx: _A.remove_all_relations([], tx=tx),
+        ValueError,
+        r"^remove_all_relations\(\) needs at least one edge$",
+    ),
+    (
+        "remove_all_relations-unsaved",
+        _BODY_EDGE,
+        lambda tx: TxBody(n=1).remove_all_relations("tx_body_edge", tx=tx),
+        *_UNSAVED,
+    ),
+    # A field or a filter refused while a QuerySet write is compiled.
+    (
+        "bulk_update-field-name",
+        _BODY,
+        lambda tx: TxBody.objects(tx=tx).bulk_update(**{"bad field": 1}),
+        ValueError,
+        "^Invalid bulk_update field name 'bad field'",
+    ),
+    (
+        "bulk_update-filter",
+        _BODY,
+        lambda tx: TxBody.objects(tx=tx).filter(**{"bad field": 1}).bulk_update(n=1),
+        *_FILTER_NAME,
+    ),
+    (
+        "bulk_delete-filter",
+        frozenset({"tx_body", "<edges>"}),
+        lambda tx: TxBody.objects(tx=tx).filter(**{"bad field": 1}).bulk_delete(),
+        *_FILTER_NAME,
+    ),
+    (
+        "queryset-patch-filter",
+        _BODY,
+        lambda tx: TxBody.objects(tx=tx).filter(**{"bad field": 1}).patch([{"op": "replace", "path": "/n", "value": 1}]),
+        *_FILTER_NAME,
+    ),
+    # An edge id of another table.
+    ("edge-save-id", _BODY_EDGE, lambda tx: _tx_body_edge(id=RecordID("other", "x")).save(tx=tx), *_FOREIGN_EDGE_ID),
+    (
+        "edge-bulk_create-id",
+        _BODY_EDGE,
+        lambda tx: TxBodyEdge.objects(tx=tx).bulk_create([_tx_body_edge(id=RecordID("other", "x"))]),
+        *_FOREIGN_EDGE_ID,
+    ),
+    # A payload that cannot be serialized.
+    ("serializer-save", _BODY, lambda tx: TxBodyUnwritable(id="a", n=1).save(tx=tx), *_UNSERIALIZABLE),
+    ("serializer-update", _BODY, lambda tx: TxBodyUnwritable(id="a", n=1).update(tx=tx), *_UNSERIALIZABLE),
+    ("serializer-upsert", _BODY, lambda tx: TxBodyUnwritable(id="a", n=1).upsert(tx=tx), *_UNSERIALIZABLE),
+    # A value the ORM cannot send, in any write.
+    ("value-save", _BODY, lambda tx: TxBody(id="a", wait=_NEGATIVE).save(tx=tx), *_UNSENDABLE_DURATION),
+    ("value-save-int", _BODY, lambda tx: TxBody(id="a", n=_TOO_BIG).save(tx=tx), *_UNSENDABLE_INT),
+    ("value-update", _BODY, lambda tx: TxBody(id="a", wait=_NEGATIVE).update(tx=tx), *_UNSENDABLE_DURATION),
+    ("value-upsert", _BODY, lambda tx: TxBody(id="a", n=_TOO_BIG).upsert(tx=tx), *_UNSENDABLE_INT),
+    (
+        "value-bulk_create",
+        _BODY,
+        lambda tx: TxBody.objects(tx=tx).bulk_create([TxBody(id="a", wait=_NEGATIVE)]),
+        *_UNSENDABLE_DURATION,
+    ),
+    ("value-edge-save", _BODY_EDGE, lambda tx: _tx_body_edge(w=_TOO_BIG).save(tx=tx), *_UNSENDABLE_INT),
+    (
+        "value-edge-bulk_create",
+        _BODY_EDGE,
+        lambda tx: TxBodyEdge.objects(tx=tx).bulk_create([_tx_body_edge(w=_NEGATIVE)]),
+        *_UNSENDABLE_DURATION,
+    ),
+    ("value-merge", _BODY, lambda tx: TxBody(id="a").merge(tx=tx, wait=_NEGATIVE), *_UNSENDABLE_DURATION),
+    (
+        "value-merge-extra_vars",
+        _BODY,
+        lambda tx: TxBody(id="a").merge(tx=tx, server_values={"n": SurrealFunc("$step")}, extra_vars={"step": _TOO_BIG}),
+        *_UNSENDABLE_INT,
+    ),
+    (
+        "value-save-extra_vars",
+        _BODY,
+        lambda tx: TxBody(id="a").save(tx=tx, server_values={"n": SurrealFunc("$step")}, extra_vars={"step": _NEGATIVE}),
+        *_UNSENDABLE_DURATION,
+    ),
+    (
+        "value-patch",
+        _BODY,
+        lambda tx: TxBody(id="a").patch([{"op": "replace", "path": "/wait", "value": _NEGATIVE}], tx=tx),
+        *_UNSENDABLE_DURATION,
+    ),
+    (
+        "value-queryset-patch",
+        _BODY,
+        lambda tx: TxBody.objects(tx=tx).patch([{"op": "replace", "path": "/n", "value": _TOO_BIG}]),
+        *_UNSENDABLE_INT,
+    ),
+    ("value-atomic_append", _BODY, lambda tx: _A.atomic_append("tags", _NEGATIVE, tx=tx), *_UNSENDABLE_DURATION),
+    ("value-atomic_remove", _BODY, lambda tx: _A.atomic_remove("tags", _TOO_BIG, tx=tx), *_UNSENDABLE_INT),
+    ("value-atomic_set_add", _BODY, lambda tx: _A.atomic_set_add("tags", _NEGATIVE, tx=tx), *_UNSENDABLE_DURATION),
+    ("value-atomic_append_many", _BODY, lambda tx: _A.atomic_append_many("tags", [_TOO_BIG], tx=tx), *_UNSENDABLE_INT),
+    (
+        "value-atomic_increment",
+        _BODY,
+        lambda tx: _A.atomic_increment("n", Decimal("1e400"), tx=tx),
+        ValueError,
+        r"^Cannot send Decimal\('1E\+400'\)",
+    ),
+    ("value-bulk_update", _BODY, lambda tx: TxBody.objects(tx=tx).bulk_update(wait=_NEGATIVE), *_UNSENDABLE_DURATION),
+    (
+        "value-bulk_update-filter",
+        _BODY,
+        lambda tx: TxBody.objects(tx=tx).filter(wait=_NEGATIVE).bulk_update(n=1),
+        *_UNSENDABLE_DURATION,
+    ),
+    (
+        "value-bulk_delete-filter",
+        frozenset({"tx_body", "<edges>"}),
+        lambda tx: TxBody.objects(tx=tx).filter(wait=_NEGATIVE).bulk_delete(),
+        *_UNSENDABLE_DURATION,
+    ),
+    (
+        "value-relate-data",
+        _BODY_EDGE,
+        lambda tx: _A.relate("tx_body_edge", _B, tx=tx, data={"w": _NEGATIVE}),
+        *_UNSENDABLE_DURATION,
+    ),
+    ("value-relate-keyword", _BODY_EDGE, lambda tx: _A.relate("tx_body_edge", _B, tx=tx, w=_TOO_BIG), *_UNSENDABLE_INT),
+    # relate(EdgeModel, …) creates the edge through its save(), a write in the write: both are taken back.
+    ("value-relate-typed", _BODY_EDGE, lambda tx: _A.relate(TxBodyEdge, _B, tx=tx, w=_TOO_BIG), *_UNSENDABLE_INT),
+]
+
+#: The rows of :data:`_BODY_REFUSALS` an interactive transaction does not refuse: it creates a record without an id.
+_BUFFERED_ONLY = frozenset({"save-no-id-buffered"})
+
+_BODY_STRATEGIES = ("buffered", "interactive")
+_BODY_CASES = [
+    pytest.param(strategy, *row, id=f"{strategy}-{row[0]}")
+    for strategy in _BODY_STRATEGIES
+    for row in _BODY_REFUSALS
+    if strategy == "buffered" or row[0] not in _BUFFERED_ONLY
+]
+
+
+class _TxBodyClient:
+    """The client of an interactive transaction (#325): records every request; answers each with no row, or with a
+    failed statement when told to (``fail``)."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.requests: list[str] = []
+
+    async def query_raw(self, query: str, variables: Any = None, txn_id: Any = None) -> Any:
+        self.requests.append(query)
+        if self.fail:
+            return {"result": [{"status": "ERR", "result": "refused by the server"}]}
+        return {"result": [{"status": "OK", "result": []}]}
+
+    async def query(self, query: str, variables: Any = None, txn_id: Any = None) -> Any:
+        self.requests.append(query)
+        return []
+
+
+def _body_tx(strategy: str, client: _TxBodyClient | None = None) -> tuple[Transaction, list[str]]:
+    """A transaction of *strategy* — buffered without a client, or interactive on a fake *client* — and the list of
+    what it queued (buffered) or sent (interactive)."""
+    if strategy == "interactive":
+        client = client or _TxBodyClient()
+        return InteractiveTransaction(client, "txn"), client.requests
+    tx = BufferedTransaction(client=None)
+    return tx, tx.statements
+
+
+class TestBodyRefusalLeavesTheTransaction:
+    """#325: a write the ORM refuses in its body — an id it needs, a name or a key the statement cannot take, an edge
+    id of another table, a payload that cannot be serialized, a value the ORM cannot send — raises the same error as
+    before and leaves its transaction as it was: nothing queued or sent, no table written with records
+    (``define_indexes(tx=…)``'s #304 check reads them) and none for the query cache to drop at the commit. The same on
+    both transaction strategies and server lines: this bookkeeping is the client's."""
+
+    @pytest.mark.parametrize(("strategy", "name", "tables", "write", "error", "pattern"), _BODY_CASES)
+    async def test_the_transaction_is_left_as_it_was(
+        self,
+        no_client: list[str],
+        strategy: str,
+        name: str,
+        tables: frozenset[str] | None,
+        write: Callable[[Any], Awaitable[Any]],
+        error: type[Exception],
+        pattern: str,
+    ) -> None:
+        tx, sent = _body_tx(strategy)
+        with pytest.raises(error, match=pattern) as raised:
+            await write(tx)
+        assert type(raised.value) is error
+        assert no_client == []
+        assert sent == []
+        assert tx._records_written() == frozenset()
+        assert tx._cache_written() == frozenset()
+        assert tx._first_failure() is None
+
+    @pytest.mark.parametrize("strategy", _BODY_STRATEGIES)
+    async def test_the_tables_noted_before_stay_noted(self, no_client: list[str], strategy: str) -> None:
+        """A refusal takes back only what its own call noted: the tables of the writes before it stay noted, every
+        table included (a refused edge name noted every table for the time of its call)."""
+        tx, sent = _body_tx(strategy)
+        await TxBody(id="a", n=1).update(tx=tx)
+        await _A.relate("tx_body_edge", _B, tx=tx)
+        for write, error in (
+            (lambda: TxBody(n=1).upsert(tx=tx), SurrealDbError),
+            (lambda: _A.relate("bad edge!", _B, tx=tx), ValueError),
+            (lambda: TxBody(id="a", wait=_NEGATIVE).update(tx=tx), ValueError),
+            (lambda: _A.remove_all_relations([], tx=tx), ValueError),
+        ):
+            with pytest.raises(error):
+                await write()
+        assert len(sent) == 2
+        assert tx._records_written() == frozenset({"tx_body", "tx_body_edge"})
+        assert tx._cache_written() == frozenset({"tx_body", "tx_body_edge"})
+
+    @pytest.mark.parametrize("strategy", _BODY_STRATEGIES)
+    async def test_the_transaction_still_takes_a_write(self, no_client: list[str], strategy: str) -> None:
+        tx, sent = _body_tx(strategy)
+        with pytest.raises(ValueError):
+            await _A.relate("bad edge!", _B, tx=tx)
+        await TxBody(id="a", n=1).update(tx=tx)
+        assert len(sent) == 1
+        assert tx._records_written() == frozenset({"tx_body"})
+        assert tx._cache_written() == frozenset({"tx_body"})
+
+    async def test_a_buffered_write_that_raises_after_its_statement_keeps_its_table(
+        self, no_client: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write that raises once its statement is queued counts as written: the statement runs at the commit."""
+
+        def applying(self: Any, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("raised after the statement")
+
+        monkeypatch.setattr(TxBody, "_apply_record", applying)
+        tx = BufferedTransaction(client=None)
+        with pytest.raises(RuntimeError, match="raised after the statement"):
+            await TxBody(id="a", n=1).save(tx=tx)
+        assert len(tx.statements) == 1
+        assert tx._records_written() == frozenset({"tx_body"})
+        assert tx._cache_written() == frozenset({"tx_body"})
+
+    async def test_an_interactive_write_that_raises_after_its_request_keeps_its_table(self, no_client: list[str]) -> None:
+        """A write whose request was sent counts as written, also when the server refuses it: what the server applied
+        is unknown to the client."""
+        client = _TxBodyClient(fail=True)
+        tx, sent = _body_tx("interactive", client)
+        with pytest.raises(SurrealDbError, match="refused by the server"):
+            await TxBody(id="a", n=1).save(tx=tx)
+        assert len(sent) == 1
+        assert tx._records_written() == frozenset({"tx_body"})
+        assert tx._cache_written() == frozenset({"tx_body"})
+        assert tx._first_failure() is not None
+
+
+class TxBodyIndexed(BaseSurrealModel):
+    """A model with an index for ``define_indexes(tx=…)`` to define after refused writes (#325)."""
+
+    model_config = SurrealConfigDict(table_name="tx_body_indexed", indexes=[Index("tx_body_indexed_name", "name")])
+
+    id: str | None = None
+    name: str = ""
+    wait: timedelta | None = None
+
+
+class TestBodyRefusalInTransactionE2E:
+    """#325 on both server lines: writes refused in their body leave the transaction as it was, so
+    ``define_indexes(tx=…)`` on the same table defines the index instead of refusing it as if a record had been
+    written there (#304), and the commit applies it (at once on SurrealDB 3.x over WebSocket, interactive; at the
+    commit on 2.x, buffered)."""
+
+    async def test_define_indexes_follows_refused_writes(self) -> None:
+        async with orm_client("tx_body_indexed") as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                with pytest.raises(SurrealDbError, match=r"^upsert\(\) requires an explicit id"):
+                    await TxBodyIndexed(name="Ada").upsert(tx=tx)
+                with pytest.raises(ValueError, match="^Cannot send a negative duration"):
+                    await TxBodyIndexed(id="a", wait=_NEGATIVE).save(tx=tx)
+                with pytest.raises(ValueError, match="^Invalid bulk_update field name"):
+                    await TxBodyIndexed.objects(tx=tx).bulk_update(**{"bad field": 1})
+                with pytest.raises(ValueError, match="^Invalid edge name"):
+                    await TxBodyIndexed(id="a").relate("bad edge!", TxBodyIndexed(id="b"), tx=tx)
+                written = (tx._records_written(), tx._cache_written())
+                applied = await TxBodyIndexed.define_indexes(tx=tx)
+            info = await client.query("INFO FOR TABLE tx_body_indexed;", {})
+            rows = await client.query("SELECT * FROM tx_body_indexed;", {})
+        assert written == (frozenset(), frozenset())
+        assert applied == TxBodyIndexed.index_ddl()
+        assert list(info["indexes"]) == ["tx_body_indexed_name"]
+        assert rows == []
