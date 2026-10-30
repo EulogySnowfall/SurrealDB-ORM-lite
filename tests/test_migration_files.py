@@ -1811,7 +1811,7 @@ class TestMakemigrationsOffline:
         caplog.clear()
         assert await makemigrations("change", migrations_dir=tmp_path, models=changed, from_db=False) is None
         assert _messages(caplog) == [
-            f"Skipped 1 removal(s) with no model to justify them: {skipped}; pass drop_missing=True to write them.",
+            f"Skipped 1 removal(s) with no model to justify them: {skipped}; pass drop_missing=True (--drop-missing) to write them.",
             "No changes detected.",
         ]
         assert not (tmp_path / "0002_change.py").exists()
@@ -1829,7 +1829,7 @@ class TestMakemigrationsOffline:
         assert [operation.describe() for operation in operations] == ["Alter table mk_t", "Add field nick to mk_t"]
         assert _messages(caplog) == [
             "Skipped 3 removal(s) with no model to justify them: Drop field age from mk_t, Drop index mk_t_age from mk_t, "
-            "Remove event mk_audit from mk_t; pass drop_missing=True to write them."
+            "Remove event mk_audit from mk_t; pass drop_missing=True (--drop-missing) to write them."
         ]
 
     async def test_a_removal_with_drop_missing_carries_its_previous(self, tmp_path: Path, define_models: Any) -> None:

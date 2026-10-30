@@ -116,7 +116,7 @@ async def makemigrations(
         operations, skipped = split_destructive(operations)
         if skipped:
             logger.warning(
-                "Skipped %d removal(s) with no model to justify them: %s; pass drop_missing=True to write them.",
+                "Skipped %d removal(s) with no model to justify them: %s; pass drop_missing=True (--drop-missing) to write them.",
                 len(skipped),
                 ", ".join(operation.describe() for operation in skipped),
             )

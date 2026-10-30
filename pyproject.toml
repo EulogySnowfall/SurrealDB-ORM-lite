@@ -1,6 +1,6 @@
 [project]
 name = "surreal-orm-lite"
-version = "0.38.3"
+version = "0.39.0"
 description = "Lightweight Django-style ORM for SurrealDB using the official Python SDK. Async support with Pydantic validation."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,9 @@ Documentation = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite"
 Repository = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite.git"
 Issues = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues"
 Changelog = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/CHANGELOG.md"
+
+[project.scripts]
+surreal-orm-lite = "surreal_orm_lite.cli.commands:main"
 
 [tool.setuptools]
 packages = ["src/surreal_orm_lite"]

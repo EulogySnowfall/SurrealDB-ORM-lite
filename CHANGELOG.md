@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-10-30
+
+The `surreal-orm-lite` command line: the migration system, a SurrealQL shell and `inspectdb` from a
+terminal, with the full SurrealDB-ORM's options, environment variables and texts.
+
+### Added
+
+- **The `surreal-orm-lite` console script** and `python -m surreal_orm_lite.cli`, built on
+  `argparse` (no new dependency). Nine commands: `shell`, `makemigrations`, `migrate`, `upgrade`,
+  `rollback`, `status`, `sqlmigrate`, `schemadiff` and `inspectdb`. The connection comes from
+  `--url`, `--namespace`, `--database`, `--user` and `--password` or from `SURREAL_URL`,
+  `SURREAL_NAMESPACE`, `SURREAL_DATABASE`, `SURREAL_USER` and `SURREAL_PASSWORD`; `--connection`
+  picks a named connection; `--version` prints the version. `--help` never shows the password and
+  error output never carries the credentials of the URL.
+- `makemigrations` (`--name`, `--models`, `--empty`, `--drop-missing`, `--no-from-db`),
+  `migrate`, `upgrade` and `rollback` run the `MigrationExecutor` of v0.38.0 against the models
+  imported from `--models`; `sqlmigrate` takes `--backwards` and `--line`; `schemadiff` lists the
+  operations `schema_diff()` returns and exits 1 when no model is found; `inspectdb` takes
+  `--table` and `--no-overwrite`.
+- `shell` is a SurrealQL prompt that also reads piped input and runs each statement on its own,
+  printing its result. Ctrl+C during a query exits with 130 after closing the connection.
+- README section 40 and an executed example, `examples/v0.39.0_cli_entry_point.ipynb`.
+
+### Changed
+
+- The warning `makemigrations()` logs when it skips removals now names `--drop-missing` (and the
+  `drop_missing=True` argument).
+
+### Notes
+
+- **SurrealDB 2.x vs 3.x**: every command runs on both lines and on the embedded engine. The one
+  difference is the shell's layout for a transaction: on 3.x `BEGIN … COMMIT` shows one block
+  per statement (`[1/3]` to `[3/3]`), on 2.x only the statements inside the transaction answer.
+  README section 40 and the 2.x/3.x behaviour table cover it.
+- Not included: a Python shell with the ORM preloaded; multi-line statements, history and a
+  failing exit status for piped input in the SurrealQL shell; `schemadiff --check` as a CI gate.
+- The 0.38.0 note about the CLI "arriving with v0.39.0" is now this release.
+
 ## [0.38.3] - 2026-10-30
 
 Test pins move to SurrealDB 3.3.5, which fixes the inline ordered and limited sub-SELECT bug
@@ -195,7 +233,7 @@ embedded engine. No new public API.
 
 ### Changed
 
-- The README documents the exact scan's ties in section 37 (*What SurrealDB decides*) and section 38,
+- The README documents the exact scan's ties in section 37 (_What SurrealDB decides_) and section 38,
   and in the "ORM behaviour: SurrealDB 2.x vs 3.x" table; the embedded engine's hybrid row says the
   tied records are kept by id. The `v0.37.0` hybrid notebook no longer describes an exact scan that
   changes between two identical calls.
