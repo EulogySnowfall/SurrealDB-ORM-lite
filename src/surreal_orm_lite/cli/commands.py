@@ -18,14 +18,18 @@ import dataclasses
 import importlib
 import logging
 import os
+import socket
 import sys
 import urllib.parse
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
 from .. import __version__
 from ..connection_manager import SurrealDBConnectionManager
-from ..migrations import MigrationExecutor, ModelIntrospector, makemigrations
+from ..exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
+from ..introspection import schema_diff
+from ..migrations import MigrationExecutor, ModelIntrospector, makemigrations, split_destructive
 
 __all__ = ["cli", "main"]
 
@@ -41,6 +45,16 @@ _NO_MODELS = "No models found. Register models by importing them (--models)."
 _LEGEND = "Legend: [X]=applied, R=reversible, D=has data migrations"
 _RULE = "-" * 60
 _LOOP_ERROR = "Error: surreal-orm-lite cannot run inside a running event loop (Jupyter, an async test); run it in a subprocess."
+_FROM_DB_HINT = "Pass --no-from-db to diff against the migration files instead (offline)."
+#: The failures of ``makemigrations --from-db`` that come from reaching the database, and only those, get
+#: :data:`_FROM_DB_HINT` (spec §5.3 step 7): not a ``PermissionError`` or ``FileNotFoundError`` writing the file.
+_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+    SurrealDbConnectionError,
+    SurrealDbAuthenticationError,
+    ConnectionError,
+    TimeoutError,
+    socket.gaierror,
+)
 
 
 class _UsageError(Exception):
@@ -248,25 +262,34 @@ def _in_running_loop() -> bool:
     return True
 
 
-def _configure(settings: _Settings, command: str) -> type[SurrealDBConnectionManager]:
-    """Register the settings under ``settings.connection`` and return its connection class.
+def _require_database(settings: _Settings, command: str) -> tuple[str, str]:
+    """The settings' namespace and database (a command that reaches the database needs both).
 
     :raises _UsageError: no namespace or no database.
-    :raises _ConfigureError: ``add_connection()`` refused the settings.
     """
     if not (settings.namespace and settings.database):
         raise _UsageError(
             f"{command} needs a namespace and a database: pass --namespace/-n and --database/-d "
             "(or set SURREAL_NAMESPACE and SURREAL_DATABASE)."
         )
+    return settings.namespace, settings.database
+
+
+def _configure(settings: _Settings, command: str) -> type[SurrealDBConnectionManager]:
+    """Register the settings under ``settings.connection`` and return its connection class.
+
+    :raises _UsageError: no namespace or no database.
+    :raises _ConfigureError: ``add_connection()`` refused the settings.
+    """
+    namespace, database = _require_database(settings, command)
     try:
         SurrealDBConnectionManager.add_connection(
             settings.connection,
             url=settings.url,
             user=settings.user,
             password=settings.password,
-            namespace=settings.namespace,
-            database=settings.database,
+            namespace=namespace,
+            database=database,
         )
         return SurrealDBConnectionManager._manager_for(settings.connection)
     except Exception as exc:
@@ -319,16 +342,32 @@ def _import_models(modules: Sequence[str]) -> None:
             raise _ImportFailure(module, exc) from exc
 
 
+def _load_models(modules: Sequence[str], settings: _Settings) -> bool:
+    """Import the ``--models`` *modules* and check that the connection has a registered model; report a failure on
+    stderr and return ``False`` (spec §5.3 steps 2–3)."""
+    try:
+        _import_models(modules)
+    except _ImportFailure as exc:
+        _err(str(exc), settings)
+        return False
+    if not ModelIntrospector(None, connection=settings.connection).models:
+        _err(_NO_MODELS, settings)
+        return False
+    return True
+
+
 def _cmd_makemigrations(args: argparse.Namespace, settings: _Settings) -> int:
     """``makemigrations``: the next migration file of the migrations directory (spec §5.3).
 
     ``--empty`` writes a file without operations, to fill in by hand. Otherwise the ``--models`` modules are imported
-    and every registered model of the connection is diffed — with ``--no-from-db`` against the migration files'
-    state, offline; by default against the database's schema. The removals left out without ``--drop-missing`` are
-    named by ``makemigrations()``'s warning, shown on stderr.
+    and every registered model of the connection is diffed — by default against the database's schema (the
+    connection is configured once the models are found), with ``--no-from-db`` against the migration files' state,
+    offline. The removals left out without ``--drop-missing`` are named by ``makemigrations()``'s warning, shown on
+    stderr. A failure to reach the database adds a hint towards ``--no-from-db``.
     """
-    if not args.empty and args.from_db:
-        _configure(settings, args.command)
+    from_db = not args.empty and args.from_db
+    if from_db:
+        _require_database(settings, args.command)
     directory = settings.migrations_dir
     if args.empty:
         try:
@@ -337,32 +376,29 @@ def _cmd_makemigrations(args: argparse.Namespace, settings: _Settings) -> int:
             return _fail("makemigrations", exc, settings)
         _echo(f"Created empty migration: {path}")
         return 0
-    try:
-        _import_models(args.models or [])
-    except _ImportFailure as exc:
-        _err(str(exc), settings)
+    if not _load_models(args.models or [], settings):
         return 1
-    if not ModelIntrospector(None, connection=settings.connection).models:
-        _err(_NO_MODELS, settings)
-        return 1
-    if args.from_db:
-        return 0  # the database's schema: v0.39.0 Task 4
-    try:
-        path = asyncio.run(
-            makemigrations(
-                args.name,
-                migrations_dir=directory,
-                connection=settings.connection,
-                from_db=False,
-                drop_missing=args.drop_missing,
-            )
+
+    async def generate() -> Path | None:
+        return await makemigrations(
+            args.name,
+            migrations_dir=directory,
+            connection=settings.connection,
+            from_db=from_db,
+            drop_missing=args.drop_missing,
         )
+
+    try:
+        path = _run(generate, _configure(settings, args.command)) if from_db else asyncio.run(generate())
         if path is None:
             _echo("No changes detected.")
             return 0
         operations = MigrationExecutor(directory).load_migration(path.stem).operations
     except Exception as exc:
-        return _fail("makemigrations", exc, settings)
+        status = _fail("makemigrations", exc, settings)
+        if from_db and isinstance(exc, _CONNECTION_ERRORS):
+            _err(_FROM_DB_HINT, settings)
+        return status
     _echo(f"Created migration: {path}")
     _echo(f"Operations: {len(operations)}")
     for operation in operations:
@@ -445,8 +481,35 @@ def _cmd_status(args: argparse.Namespace, settings: _Settings) -> int:
     return 0
 
 
+def _cmd_schemadiff(args: argparse.Namespace, settings: _Settings) -> int:
+    """``schemadiff``: what separates the models of the connection from the database's schema, read-only (spec
+    §5.10) — the reversible differences, then the removals ``makemigrations`` writes only with ``--drop-missing``.
+    Exit 0 whatever the differences. With no registered model it refuses before configuring the connection: every
+    table of the database would otherwise be listed as a removal."""
+    _require_database(settings, args.command)
+    if not _load_models(args.models or [], settings):
+        return 1
+    manager = _configure(settings, args.command)
+    try:
+        operations = _run(lambda: schema_diff(connection=settings.connection), manager)
+    except Exception as exc:
+        return _fail("Schema diff", exc, settings)
+    reversible, destructive = split_destructive(operations)
+    if reversible:
+        _echo_names(f"Found {len(reversible)} difference(s):", [operation.describe() for operation in reversible])
+    elif not destructive:
+        _echo("Models and database are in sync.")
+    if destructive:
+        _echo_names(
+            f"{len(destructive)} irreversible operation(s) with no model to justify them:",
+            [operation.describe() for operation in destructive],
+        )
+        _echo("makemigrations writes these only with --drop-missing.")
+    return 0
+
+
 def _cmd_database(args: argparse.Namespace, settings: _Settings) -> int:
-    """A command that reaches the database and is not written yet: ``inspectdb``, ``schemadiff``, ``shell``."""
+    """A command that reaches the database and is not written yet: ``inspectdb``, ``shell``."""
     _configure(settings, args.command)
     return 0
 
@@ -475,7 +538,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace, _Settings], int]] = {
     "status": _cmd_status,
     "sqlmigrate": _cmd_sqlmigrate,
     "inspectdb": _cmd_database,
-    "schemadiff": _cmd_database,
+    "schemadiff": _cmd_schemadiff,
     "shell": _cmd_database,
 }
 

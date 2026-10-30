@@ -12,6 +12,10 @@ that send no request — ``makemigrations --empty``, ``makemigrations --no-from-
 and ``status`` on the line under test, over WebSocket and HTTP, each test in a database of its own; the connection
 class closed once per command, also on failure; failures reported as ``<Prefix> failed: <message>`` without a traceback.
 
+``TestCliFromDbE2E`` (spec §5.3 steps 4 and 7, §5.10; AC-11, AC-12, AC-12b, AC-19's makemigrations part, AC-30):
+``makemigrations`` against the database's schema and ``schemadiff``, over WebSocket and HTTP; the ``--no-from-db``
+hint on connection errors only; ``--connection``; no connection configured when no model is registered.
+
 CLI tests are sync ``def`` tests: ``main()`` runs its own ``asyncio.run()`` (spec §9.2).
 """
 
@@ -36,6 +40,7 @@ import pytest
 import surreal_orm_lite
 from surreal_orm_lite import SurrealDBConnectionManager
 from surreal_orm_lite.cli import commands
+from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
 from surreal_orm_lite.migrations import MigrationExecutor, introspector
 from tests.conftest import _migration_url, new_database_name
 
@@ -482,9 +487,10 @@ class Book(BaseSurrealModel):
 
 
 @pytest.fixture
-def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[bool], str]]:
-    """Spec §9.2: ``app(with_book)`` writes a model module ``cli_app_<uuid8>`` to ``tmp_path`` (the working
-    directory) — ``Author``, and ``Book`` when *with_book* — and returns its name. The registry is patched to the models
+def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., str]]:
+    """Spec §9.2: ``app(with_book, extra)`` writes a model module ``cli_app_<uuid8>`` to ``tmp_path`` (the working
+    directory) — ``Author``, and ``Book`` when *with_book*, then the source *extra* (formatted with the module's
+    ``{suffix}``) — and returns its name. The registry is patched to the models
     of the last module written (the suite's own models are alive in-process); the modules leave ``sys.modules``
     afterwards."""
     monkeypatch.chdir(tmp_path)
@@ -497,9 +503,9 @@ def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[b
         lambda: [model for model in registered() if names and model.__module__ == names[-1]],
     )
 
-    def write(with_book: bool = True) -> str:
+    def write(with_book: bool = True, extra: str = "") -> str:
         name = f"cli_app_{uuid.uuid4().hex[:8]}"
-        source = _APP_SOURCE + (_BOOK_SOURCE if with_book else "")
+        source = _APP_SOURCE + (_BOOK_SOURCE if with_book else "") + extra
         (tmp_path / f"{name}.py").write_text(textwrap.dedent(source.format(suffix=suffix)))
         importlib.invalidate_caches()
         names.append(name)
@@ -1006,3 +1012,283 @@ class TestCliE2E:
         captured = capsys.readouterr()
         assert (captured.out, captured.err) == ("", f"{prefix}: RuntimeError\n")
         assert closes == ["closed"] * 2
+
+
+# === E2E: makemigrations from the database, schemadiff, --connection =================================================
+
+_HINT = "Pass --no-from-db to diff against the migration files instead (offline)."
+
+#: A model of the ``analytics`` connection (AC-19), appended to the ``app`` module.
+_METRIC_SOURCE = """
+
+class Metric(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="cli_metric_{suffix}", schema_mode=SchemaMode.SCHEMAFULL, connection="analytics"
+    )
+    id: str | None = None
+    value: int = 0
+"""
+
+#: One more field on ``Book`` (the last class of the ``app`` module): one difference.
+_PAGES_SOURCE = """    pages: int = 0
+"""
+
+
+def _created(out: str) -> list[str]:
+    """The ``  - <describe>`` lines of a ``Created migration:`` output."""
+    return [line.removeprefix("  - ") for line in _lines(out) if line.startswith("  - ")]
+
+
+@pytest.fixture
+def analytics() -> Iterator[None]:
+    """The ``analytics`` connection's settings restored (or the name removed) after the test."""
+    config = SurrealDBConnectionManager.get_config("analytics")
+    yield
+    if config is None:
+        asyncio.run(SurrealDBConnectionManager.remove_connection("analytics"))
+    else:
+        SurrealDBConnectionManager.add_connection("analytics", **dataclasses.asdict(config))
+
+
+@pytest.mark.parametrize("kind", ["ws", "http"])
+class TestCliFromDbE2E:
+    """AC-11 (WebSocket and HTTP), AC-12, AC-12b, AC-19 (makemigrations), AC-30 (spec §5.3 steps 4 and 7, §5.10):
+    ``makemigrations`` against the database's schema and ``schemadiff``, each test in a database of its own."""
+
+    @staticmethod
+    def _argv(kind: str, database: str, *rest: str) -> list[str]:
+        return ["-u", _migration_url(kind), "-n", "ns", "-d", database, *rest]
+
+    def test_from_db_chain(
+        self,
+        kind: str,
+        database: str,
+        app: Callable[..., str],
+        tmp_path: Path,
+        closes: list[str],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-11: makemigrations → migrate → status → makemigrations → schemadiff → rollback "" → status."""
+        module = app(True)
+        argv = functools.partial(self._argv, kind, database)
+        assert commands.main(argv("makemigrations", "-n", "init", "-m", module)) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        path = Path("migrations") / "0001_init.py"
+        operations = MigrationExecutor("migrations").load_migration("0001_init").operations
+        assert _lines(captured.out) == [
+            f"Created migration: {path}",
+            f"Operations: {len(operations)}",
+            *(f"  - {operation.describe()}" for operation in operations),
+        ]
+        assert (tmp_path / path).is_file()
+        assert commands.main(argv("migrate")) == 0
+        assert capsys.readouterr().out == "Applied 1 migration(s):\n  - 0001_init\n"
+        assert commands.main(argv("status")) == 0
+        assert f"[X] 0001_init ({len(operations)} ops) [R-]" in capsys.readouterr().out
+        assert commands.main(argv("makemigrations", "-n", "again", "-m", module)) == 0
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("No changes detected.\n", "")
+        assert not (tmp_path / "migrations" / "0002_again.py").exists()
+        assert commands.main(argv("schemadiff", "-m", module)) == 0
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("Models and database are in sync.\n", "")
+        assert commands.main(argv("rollback", "")) == 0
+        assert capsys.readouterr().out == "Rolled back 1 migration(s):\n  - 0001_init\n"
+        assert commands.main(argv("status")) == 0
+        assert f"[ ] 0001_init ({len(operations)} ops) [R-]" in capsys.readouterr().out
+        assert closes == ["closed"] * 7
+
+    def test_table_defined_by_hand(
+        self,
+        kind: str,
+        database: str,
+        app: Callable[..., str],
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-12: a table no model declares is a removal makemigrations writes only with --drop-missing, and
+        schemadiff lists apart (exit 0); a model change is one difference."""
+        legacy = f"cli_legacy_{uuid.uuid4().hex[:8]}"
+        _admin(kind, database, f"DEFINE TABLE {legacy} SCHEMALESS;")
+        module = app(True)
+        argv = functools.partial(self._argv, kind, database)
+        assert commands.main(argv("schemadiff", "-m", module)) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        out = _lines(captured.out)
+        assert out[0].startswith("Found ")
+        assert out[-3:] == [
+            "1 irreversible operation(s) with no model to justify them:",
+            f"  - Drop table {legacy}",
+            "makemigrations writes these only with --drop-missing.",
+        ]
+        assert commands.main(argv("makemigrations", "-n", "init", "-m", module)) == 0
+        captured = capsys.readouterr()
+        assert captured.err == (
+            f"Warning: Skipped 1 removal(s) with no model to justify them: Drop table {legacy}; "
+            "pass drop_missing=True (--drop-missing) to write them.\n"
+        )
+        assert not any(legacy in line for line in _created(captured.out))
+        assert commands.main(argv("migrate")) == 0
+        capsys.readouterr()
+        assert commands.main(argv("schemadiff", "-m", module)) == 0
+        assert _lines(capsys.readouterr().out) == [
+            "1 irreversible operation(s) with no model to justify them:",
+            f"  - Drop table {legacy}",
+            "makemigrations writes these only with --drop-missing.",
+        ]
+        assert commands.main(argv("makemigrations", "-n", "drop", "-m", module, "--drop-missing")) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert _created(captured.out) == [f"Drop table {legacy}"]
+        assert (tmp_path / "migrations" / "0002_drop.py").is_file()
+        changed = app(True, _PAGES_SOURCE)  # the registry now holds this module's models
+        assert commands.main(argv("schemadiff", "-m", changed)) == 0
+        out = _lines(capsys.readouterr().out)
+        assert len(out) == 5
+        assert out[0] == "Found 1 difference(s):"
+        assert out[1].startswith("  - Add field pages to cli_book_")
+        assert out[2:] == [
+            "1 irreversible operation(s) with no model to justify them:",
+            f"  - Drop table {legacy}",
+            "makemigrations writes these only with --drop-missing.",
+        ]
+
+    def test_refused_connection(
+        self, kind: str, tmp_path: Path, app: Callable[..., str], closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-12b: a connection error gets the --no-from-db hint; schemadiff reports its own prefix."""
+        port = _closed_port()
+        url = f"ws://127.0.0.1:{port}/rpc" if kind == "ws" else f"http://127.0.0.1:{port}"
+        module = app(True)
+        base = ["-u", url, "-n", "ns", "-d", "db"]
+        assert commands.main([*base, "makemigrations", "-n", "init", "-m", module]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines()[-2:] == ["makemigrations failed: Can't connect to the database.", _HINT]
+        assert "Traceback" not in captured.err
+        assert not (tmp_path / "migrations").exists()
+        assert commands.main([*base, "schemadiff", "-m", module]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines()[-1] == "Schema diff failed: Can't connect to the database."
+        assert _HINT not in captured.err
+        assert closes == ["closed"] * 2
+
+    @pytest.mark.parametrize(
+        "error",
+        [PermissionError("x"), FileNotFoundError("x"), ValueError("x")],
+        ids=["permission", "file-not-found", "value"],
+    )
+    def test_no_hint_on_other_errors(
+        self,
+        kind: str,
+        error: Exception,
+        app: Callable[..., str],
+        monkeypatch: pytest.MonkeyPatch,
+        closes: list[str],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-12b: an error that is not a connection problem gets no hint. No request: makemigrations is replaced."""
+
+        async def boom(*args: Any, **kwargs: Any) -> Any:
+            raise error
+
+        monkeypatch.setattr(commands, "makemigrations", boom)
+        assert commands.main(self._argv(kind, "db", "makemigrations", "-n", "init", "-m", app(True))) == 1
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", "makemigrations failed: x\n")
+        assert closes == ["closed"]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            SurrealDbConnectionError("down"),
+            SurrealDbAuthenticationError("down"),
+            ConnectionResetError("down"),
+            TimeoutError("down"),
+            socket.gaierror("down"),
+        ],
+        ids=["surreal-connection", "surreal-authentication", "connection", "timeout", "gaierror"],
+    )
+    def test_hint_on_connection_errors(
+        self,
+        kind: str,
+        error: Exception,
+        app: Callable[..., str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Spec §5.3 step 7: the five connection error types, and only with --from-db."""
+
+        async def boom(*args: Any, **kwargs: Any) -> Any:
+            raise error
+
+        monkeypatch.setattr(commands, "makemigrations", boom)
+        module = app(True)
+        assert commands.main(self._argv(kind, "db", "makemigrations", "-n", "init", "-m", module)) == 1
+        assert capsys.readouterr().err == f"makemigrations failed: down\n{_HINT}\n"
+        assert commands.main(self._argv(kind, "db", "makemigrations", "-n", "init", "-m", module, "--no-from-db")) == 1
+        assert capsys.readouterr().err == "makemigrations failed: down\n"
+
+    def test_schemadiff_without_models(
+        self,
+        kind: str,
+        app: Callable[..., str],
+        recorder: list[dict[str, Any]],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-30: no registered model → exit 1 before any connection is configured."""
+        assert commands.main(self._argv(kind, "db", "schemadiff")) == 1
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", "No models found. Register models by importing them (--models).\n")
+        assert recorder == []
+
+    def test_makemigrations_without_models_configures_nothing(
+        self,
+        kind: str,
+        app: Callable[..., str],
+        recorder: list[dict[str, Any]],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Spec §5.3: the connection is configured after the models are found (step 4)."""
+        assert commands.main(self._argv(kind, "db", "makemigrations", "-n", "init")) == 1
+        assert capsys.readouterr().err == "No models found. Register models by importing them (--models).\n"
+        assert recorder == []
+
+    def test_schemadiff_import_failure(
+        self, kind: str, app: Callable[..., str], recorder: list[dict[str, Any]], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert commands.main(self._argv(kind, "db", "schemadiff", "-m", "cli_no_such_module")) == 1
+        assert capsys.readouterr().err.startswith("Error importing cli_no_such_module: ")
+        assert recorder == []
+
+    def test_connection_option(
+        self,
+        kind: str,
+        database: str,
+        app: Callable[..., str],
+        analytics: None,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-19 (makemigrations): the settings registered under ``analytics``, the file holds that connection's
+        model only, ``default``'s settings untouched."""
+        default = SurrealDBConnectionManager.get_config("default")
+        module = app(False, _METRIC_SOURCE)
+        argv = ["--connection", "analytics", *self._argv(kind, database, "makemigrations", "-n", "init", "-m", module)]
+        assert commands.main(argv) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        created = _created(captured.out)
+        assert any(line.startswith("Create table cli_metric_") for line in created)
+        assert not any("cli_author_" in line for line in created)
+        config = SurrealDBConnectionManager.get_config("analytics")
+        assert config is not None
+        assert (config.url, config.namespace, config.database) == (_migration_url(kind), "ns", database)
+        assert SurrealDBConnectionManager.get_config("default") == default
+        assert commands.main(["--connection", "analytics", *self._argv(kind, database, "schemadiff", "-m", module)]) == 0
+        out = _lines(capsys.readouterr().out)
+        assert out[0] == f"Found {len(created)} difference(s):"
+        assert not any("cli_author_" in line for line in out)
