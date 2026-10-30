@@ -37,6 +37,9 @@ Repository = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite.git"
 Issues = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues"
 Changelog = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/CHANGELOG.md"
 
+[project.scripts]
+surreal-orm-lite = "surreal_orm_lite.cli.commands:main"
+
 [tool.setuptools]
 packages = ["src/surreal_orm_lite"]
 
