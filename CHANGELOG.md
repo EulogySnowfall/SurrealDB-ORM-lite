@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.1] - 2026-10-29
+
+### Fixed
+
+- **`define_table()` keeps a stored `DEFAULT ALWAYS`** when the model declares the default: over a
+  field stored with `DEFAULT ALWAYS`, it now writes `DEFAULT ALWAYS <model default>`, as the
+  migration diff does, instead of dropping `ALWAYS` (#368). A plain stored `DEFAULT`, or none, still
+  gives a plain `DEFAULT`. Same on SurrealDB 2.x and 3.x.
+
 ## [0.38.0] - 2026-10-28
 
 Migration system: the ORM writes Django-style migration files from the models and applies them,
