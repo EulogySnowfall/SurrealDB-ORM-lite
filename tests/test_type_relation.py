@@ -3698,6 +3698,13 @@ def _released_38() -> bool:
     return rows[0][0] == "✅ v0.38.0"
 
 
+def _released_39() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.39.0 (the command line) as released: its Phase H row carries the ✅ the
+    release adds."""
+    rows = [cells for _, cells in _table_rows(_subsection("### 🛠️ Phase H — Tooling", _roadmap()))]
+    return rows[1][0] == "✅ v0.39.0"
+
+
 class TestRoadmapTableDdl:
     """Issue #292: ``docs/ROADMAP.md`` inserts the model table DDL (``define_table()``) as v0.34.0, before search, and
     moves the later versions up one (search v0.35.0–v0.37.0, tooling v0.38.0–v0.40.0, Beta v0.41.0). Issue #291: the
@@ -3706,16 +3713,18 @@ class TestRoadmapTableDdl:
     Each check accepts the planned form and the released one — v0.34.0 marked ✅ or ``Done`` everywhere, its entry
     moved to "Completed versions" — and the Phase F row decides which one the whole file must be in. The checks that
     reach the search rows accept v0.35.0, v0.36.0 and v0.37.0 released too, which their Phase G rows decide, and
-    v0.38.0 (migrations), which its Phase H row decides."""
+    v0.38.0 (migrations) and v0.39.0 (the command line), which their Phase H rows decide."""
 
     def test_next_planned_version_is_the_model_table_ddl(self) -> None:
         """Planned: v0.34.0 first, then search, tooling and fixtures. Released: the same without v0.34.0, without
-        v0.35.0 once full-text search is released, without v0.36.0 once vector search is, and without v0.37.0 once
-        hybrid search is."""
+        v0.35.0 once full-text search is released, without v0.36.0 once vector search is, without v0.37.0 once
+        hybrid search is, without v0.38.0 once the migrations are and without v0.39.0 once the command line is."""
         planned = "\n".join(part for part in _roadmap().split("\n## ") if part.startswith("Planned"))
         rows = re.findall(r"^\|\s*(v\d+\.\d+\.\d+)\s*\|\s*([^|]+?)\s*\|", planned, re.MULTILINE)
         released = (
-            5
+            6
+            if _released_39()
+            else 5
             if _released_38()
             else 4
             if _released_37()
@@ -3774,19 +3783,26 @@ class TestRoadmapTableDdl:
             if _released_38():
                 assert overview[planned] == ["v0.38.0", "Tier 3 — Migration system", "Done"], overview
                 planned += 1
-            first = (
-                "v0.39.0"
-                if _released_38()
-                else "v0.38.0"
-                if _released_37()
-                else "v0.37.0"
-                if _released_36()
-                else "v0.36.0"
-                if _released_35()
-                else "v0.35.0"
-            )
-            assert (overview[planned][0], overview[planned][2]) == (f"{first} – v0.40.0", "Planned"), overview
-            assert overview[planned + 1] == ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"], overview
+            if _released_39():
+                assert overview[planned : planned + 3] == [
+                    ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "Done"],
+                    ["v0.40.0", "Tier 3 — Test fixtures & factories", "Planned"],
+                    ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"],
+                ], overview
+            else:
+                first = (
+                    "v0.39.0"
+                    if _released_38()
+                    else "v0.38.0"
+                    if _released_37()
+                    else "v0.37.0"
+                    if _released_36()
+                    else "v0.36.0"
+                    if _released_35()
+                    else "v0.35.0"
+                )
+                assert (overview[planned][0], overview[planned][2]) == (f"{first} – v0.40.0", "Planned"), overview
+                assert overview[planned + 1] == ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"], overview
         else:
             assert overview[start + 1 : start + 3] == [
                 ["v0.34.0 – v0.40.0", "Tier 3 — Advanced (DDL/search/migrations/CLI), 7 minors", "Planned"],
@@ -3800,8 +3816,8 @@ class TestRoadmapTableDdl:
     def test_sdk_and_comparison_tables(self) -> None:
         """The two tables that date every feature: the model table DDL gets its row (marked ✅ once released), the
         later rows their new number; full-text search is marked ✅ once v0.35.0 is released, vector search once
-        v0.36.0 is (the SDK table then names HNSW alone), hybrid search once v0.37.0 is, and the migrations once
-        v0.38.0 is."""
+        v0.36.0 is (the SDK table then names HNSW alone), hybrid search once v0.37.0 is, the migrations once
+        v0.38.0 is, and the command line once v0.39.0 is."""
         roadmap = _roadmap()
         mark = "✅ " if _released_34() else ""
         mark_35 = "✅ " if _released_35() else ""
@@ -3812,7 +3828,14 @@ class TestRoadmapTableDdl:
         hybrid_37 = ("Hybrid Search (RRF)", "✅ v0.37.0") if _released_37() else ("Hybrid Search (RRF)", "v0.37.0")
         mark_37 = "✅ " if _released_37() else ""
         mark_38 = "✅ " if _released_38() else ""
-        migrations_38 = "✅ v0.38.0 (migrations), CLI v0.39.0" if _released_38() else "v0.38 – v0.39"
+        cli_39 = "✅ v0.39.0" if _released_39() else "v0.39.0"
+        migrations_38 = (
+            "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)"
+            if _released_39()
+            else "✅ v0.38.0 (migrations), CLI v0.39.0"
+            if _released_38()
+            else "v0.38 – v0.39"
+        )
         unlocked = [
             cells for _, cells in _table_rows(_subsection("## 🆕 Everything unlocked by the official SDK 2.0", roadmap))
         ]
@@ -3823,7 +3846,7 @@ class TestRoadmapTableDdl:
             vector_36,
             hybrid_37,
             ("Migrations (makemigrations/migrate)", f"{mark_38}v0.38.0"),
-            ("CLI `surreal-orm-lite`", "v0.39.0"),
+            ("CLI `surreal-orm-lite`", cli_39),
             ("Test fixtures & factories", "v0.40.0"),
             ("QueryLogger / profiling", "v0.41.0 (Beta)"),
         ], unlocked
