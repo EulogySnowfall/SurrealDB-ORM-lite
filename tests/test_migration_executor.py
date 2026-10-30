@@ -1298,6 +1298,12 @@ class TestMigrateE2E:
             read = await DatabaseIntrospector().introspect()
             assert list(read.issues) == []
             assert read.diff(introspect_models(models)) == []
+            if line < 3:
+                # The CHANGEFEED clause is checked above. On 2.x the server's own change-feed upkeep can refuse a single
+                # writer's write to a CHANGEFEED table with a retryable conflict (README section 22; #372, measured on
+                # 2.7.0: 6 refusals in about 130,000 writes to new CHANGEFEED tables, none in about 190,000 without one
+                # or after this ALTER, none on 3.3.4), so the data below goes to mig_person without it.
+                await _run(client, "ALTER TABLE mig_person CHANGEFEED NONE;")
             ann = MigPerson(name="Ann", email="ann@x.io", emb=[0.1, 0.2, 0.3])
             bob = MigPerson(name="Bob", email="bob@x.io", emb=[0.3, 0.2, 0.1])
             await ann.save()

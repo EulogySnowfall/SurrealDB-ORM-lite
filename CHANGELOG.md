@@ -113,8 +113,8 @@ on SurrealDB 3.x, 2.x and the embedded engine. The first minor of Tier 3's tooli
   migrations; a non-atomic mode; field `ASSERT`, `READONLY`, permissions and comment declared on
   models; `define_table()` keeping a stored `DEFAULT ALWAYS`; a `schema_diff()` option listing the
   clauses a model leaves to the database.
-- Same code on SurrealDB 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro), with no test skipped
-  on a supported line.
+- Same code on SurrealDB 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro), with no migration
+  test skipped on a supported line.
 
 ## [0.37.7] - 2026-10-28
 
