@@ -753,7 +753,8 @@ def field_statement_keeping(
     - ``REFERENCE[ ON DELETE …]``: the stored one;
     - ``DEFAULT[ ALWAYS] <expr>``: the column's constant default — for a ``server_fields`` column only when the stored
       field has no ``DEFAULT``, ``VALUE`` or ``COMPUTED``, so the database's own rule is never replaced —, else the
-      stored one;
+      stored one; ``ALWAYS`` when the stored ``DEFAULT`` is ``ALWAYS``, whichever expression is written (#368), as the
+      migration diff keeps it;
     - ``READONLY``: the stored one;
     - ``VALUE <expr>``: a computed field's expression, else the stored one;
     - ``ASSERT <expr>``, ``PERMISSIONS <rules>`` (as :func:`field_permissions_text` renders them), ``COMMENT
@@ -785,11 +786,12 @@ def field_statement_keeping(
             if on_delete is not None and on_delete.startswith("THEN"):
                 carried.append(on_delete.removeprefix("THEN"))
             parts.append("REFERENCE" if on_delete is None else f"REFERENCE ON DELETE {on_delete}")
+        always = stored.default is not None and stored.default_always
         if column.default is not None and not (column.server and _has_value_rule(stored)):
-            parts.append(f"DEFAULT {column.default}")
+            parts.append(f"DEFAULT ALWAYS {column.default}" if always else f"DEFAULT {column.default}")
         elif stored.default is not None:
             carried.append(stored.default)
-            parts.append(f"DEFAULT ALWAYS {stored.default}" if stored.default_always else f"DEFAULT {stored.default}")
+            parts.append(f"DEFAULT ALWAYS {stored.default}" if always else f"DEFAULT {stored.default}")
         if stored.readonly:
             parts.append("READONLY")
         if column.value is not None:

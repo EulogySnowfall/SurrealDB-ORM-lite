@@ -22,6 +22,15 @@ Test pins move to SurrealDB 3.3.5, which fixes the inline ordered and limited su
   binds each subquery once in a `LET`, which the affected releases need; README and docstrings
   name the affected range.
 
+## [0.38.2] - 2026-10-30
+
+### Fixed
+
+- **`define_table()` keeps a stored `DEFAULT ALWAYS`** when the model declares the default: over a
+  field stored with `DEFAULT ALWAYS`, it now writes `DEFAULT ALWAYS <model default>`, as the
+  migration diff does, instead of dropping `ALWAYS` (#368). A plain stored `DEFAULT`, or none, still
+  gives a plain `DEFAULT`. Same on SurrealDB 2.x and 3.x.
+
 ## [0.38.0] - 2026-10-28
 
 Migration system: the ORM writes Django-style migration files from the models and applies them,
