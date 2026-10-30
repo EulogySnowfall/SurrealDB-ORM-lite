@@ -1217,6 +1217,12 @@ async def _line_version(client: Any) -> tuple[int, int]:
     return (int(match.group(1)), int(match.group(2))) if match else (3, 99)
 
 
+async def _server_version(client: Any) -> tuple[int, int, int]:
+    """The server's ``(major, minor, patch)``; ``(3, 99, 0)`` when its version cannot be read (as ``_line_version``)."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", str(await client.version()))
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3))) if match else (3, 99, 0)
+
+
 async def _interactive_transactions(client: Any) -> bool:
     """Whether the server has interactive transactions (``begin()``: SurrealDB 3.x), as ``tests/test_transactions.py``
     probes it: ``begin()``, then ``cancel()``."""
@@ -1418,9 +1424,11 @@ class TestSubqueryReadsE2E:
 _Q_AUTHORS = ("ada", "bob", "cy")
 _RUNS = 12
 _PIN = "SELECT VALUE id FROM sq_post WHERE author IN (SELECT id AS _sqv, age FROM sq_person ORDER BY age DESC LIMIT 1)._sqv;"
+#: The 3.x releases with surrealdb/surrealdb#7470: from 3.2.0 up to 3.3.4; 3.3.5 fixed it.
+_7470_FIRST, _7470_FIXED = (3, 2, 0), (3, 3, 5)
 _PIN_FIXED = (
-    "SurrealDB fixed surrealdb/surrealdb#7470: narrow this test's version range to the affected 3.x minors and rewrite "
-    "the README 2.x/3.x row 'A subquery with order_by() and limit()'"
+    "SurrealDB fixed surrealdb/surrealdb#7470 on this release: narrow this test's version range to the affected 3.x "
+    "releases and rewrite the README 2.x/3.x row 'A subquery with order_by() and limit()'"
 )
 
 
@@ -1438,8 +1446,8 @@ def _posts_of(author: str) -> set[str]:
 
 
 class TestOrderedLimitedE2E:
-    """AC-6: an ordered and limited subquery gives the right rows in 12 of 12 runs on every line, 3.2+ included,
-    and the pin on the server's own inline form (surrealdb/surrealdb#7470)."""
+    """AC-6: an ordered and limited subquery gives the right rows in 12 of 12 runs on every line, 3.2.0 to 3.3.4
+    included, and the pin on the server's own inline form (surrealdb/surrealdb#7470, fixed in 3.3.5)."""
 
     @pytest.mark.parametrize("kind", ["mem", "ws"])
     async def test_ordered_and_limited(self, kind: str) -> None:
@@ -1462,14 +1470,15 @@ class TestOrderedLimitedE2E:
                 assert _ids(await SqPost.objects().filter(score=Subquery(best)).exec()) == {"q29"}
 
     async def test_7470_pin(self) -> None:
-        """The raw inline form the ORM avoids: wrong rows on 3.2 and later, right on 2.x and 3.1.
+        """The raw inline form the ORM avoids: wrong rows from 3.2.0 to 3.3.4, right on 2.x, 3.1 and 3.3.5+.
 
-        Fails on purpose when an upstream 3.x release fixes surrealdb/surrealdb#7470 (spec D16).
+        Fails on purpose when an affected 3.x release no longer shows surrealdb/surrealdb#7470 (spec D16), and when a
+        release from 3.3.5 on, which fixed it, shows it again.
         """
         async with subquery_db("ws") as client:
             await _seed_ordered()
             counts = [len(await client.query(_PIN)) for _ in range(_RUNS)]
-            if await _line_version(client) >= (3, 2):
+            if _7470_FIRST <= await _server_version(client) < _7470_FIXED:
                 if min(counts) >= 10:
                     pytest.fail(_PIN_FIXED)
             else:
@@ -2405,8 +2414,8 @@ def _keys(events: list[Any]) -> list[str]:
 class TestSubqueryLiveE2E:
     """AC-9: a live query with a subquery, on the server of ``SURREALDB_PORT`` over WebSocket (both lines). The
     sub-SELECT is inline, so the server evaluates it on every change: a change of the inner table changes what
-    notifies, and the ordered and first-value forms notify exactly the expected records (SurrealDB 3.2+'s #7470
-    does not reach a live query). Writes that must not notify come before one that must, so the first event read
+    notifies, and the ordered and first-value forms notify exactly the expected records (#7470 of SurrealDB
+    3.2.0 to 3.3.4 does not reach a live query). Writes that must not notify come before one that must, so the first event read
     proves they did not."""
 
     async def test_a_change_of_the_inner_table_changes_what_notifies(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2756,8 +2765,8 @@ _SUBQUERY_ROWS = [
         "A subquery with `order_by()` and `limit()`",
         "right; the ORM also selects the order fields, without which 2.x refuses to order by a field other than the "
         "one compared",
-        "right: the ORM binds each subquery once, in a `LET`; 3.2 and later can return wrong rows for such an inline "
-        "sub-SELECT (surrealdb#7470)",
+        "right: the ORM binds each subquery once, in a `LET`; 3.2.0 to 3.3.4 can return wrong rows for such an inline "
+        "sub-SELECT (surrealdb#7470, fixed in 3.3.5)",
         "v0.27.0",
     ],
     [
