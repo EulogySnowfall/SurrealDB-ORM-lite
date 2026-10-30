@@ -20,9 +20,12 @@ hint on connection errors only; ``--connection``; no connection configured when 
 source, writes it with ``-o`` (``--no-overwrite`` refuses an existing file), ``--table`` limits it, a named
 ``--connection`` shows in the generated models.
 
-``TestShellRendering``, ``TestCliShellE2E``, ``TestCliEmbedded`` (spec §5.11; AC-20, AC-21, AC-22's ``mem://`` part):
-the SurrealQL shell — one block per statement as the line answers it, the session's end and exit codes, the connection
-closed once, the URL's credentials never printed.
+``TestShellRendering``, ``TestCliShellE2E``, ``TestCliEmbedded`` (spec §5.11, M6; AC-20, AC-21, AC-22): the SurrealQL
+shell — one block per statement as the line answers it, the session's end and exit codes, the connection closed once,
+the URL's credentials never printed — and a ``surrealkv://`` path keeping its data from one command to the next.
+
+``TestCliE2E.test_async_event_by_line`` (AC-24, M8): a 3.x-only migration applied on 3.x, refused on 2.x with only the
+empty tracking table left. ``TestEntryPoint`` (AC-26): the chain through the real interpreter, in a subprocess.
 
 CLI tests are sync ``def`` tests: ``main()`` runs its own ``asyncio.run()`` (spec §9.2).
 """
@@ -53,6 +56,7 @@ from surreal_orm_lite.cli import commands
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
 from surreal_orm_lite.introspection import generate_models_from_db
 from surreal_orm_lite.migrations import MigrationExecutor, introspector
+from surreal_orm_lite.migrations.operations import DefineEvent
 from surreal_orm_lite.time_travel import cached_major
 from tests.conftest import _migration_url, new_database_name
 
@@ -757,6 +761,20 @@ _DATA_OPERATIONS = (
     'DataMigration(forwards_sql="UPDATE cli_item SET n = n + 1;", backwards_sql="UPDATE cli_item SET n = n - 1;")'
 )
 
+#: AC-24: a migration whose second operation is an ``ASYNC`` event (3.x-only, v0.38.0 E-D1).
+_ASYNC_MIGRATION = """from surreal_orm_lite.migrations import Migration
+from surreal_orm_lite.migrations.operations import CreateTable, DefineEvent
+
+migration = Migration(
+    name="0001_audit",
+    operations=[
+        CreateTable("cli_doc", "SCHEMALESS"),
+        DefineEvent("cli_audit", "cli_doc", None, "CREATE cli_log SET a = 1", async_mode=True),
+    ],
+)
+"""
+_ASYNC_EVENT = DefineEvent("cli_audit", "cli_doc", None, "CREATE cli_log SET a = 1", async_mode=True)
+
 _RULE = "-" * 60
 _LEGEND = "Legend: [X]=applied, R=reversible, D=has data migrations"
 
@@ -1024,6 +1042,32 @@ class TestCliE2E:
         captured = capsys.readouterr()
         assert (captured.out, captured.err) == ("", f"{prefix}: RuntimeError\n")
         assert closes == ["closed"] * 2
+
+    def test_async_event_by_line(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-24 (M8): an ``ASYNC`` event, 3.x-only — applied on 3.x; on 2.x refused before any DDL (v0.38.0 E-D1),
+        the tracking table, which ``migrate()`` defines first, the only table and empty. Branch by line, no skip."""
+        directory = tmp_path / "migrations"
+        directory.mkdir()
+        (directory / "0001_audit.py").write_text(_ASYNC_MIGRATION, encoding="utf-8")
+        status = commands.main(self._argv(kind, database, directory, "migrate"))
+        captured = capsys.readouterr()
+        assert closes == ["closed"]
+        if _major(kind, database) >= 3:
+            assert (status, captured.out, captured.err) == (0, "Applied 1 migration(s):\n  - 0001_audit\n", "")
+            info = _admin(kind, database, "INFO FOR TABLE cli_doc;")
+            assert set(info["events"]) == {"cli_audit"}
+            assert "ASYNC" in info["events"]["cli_audit"]
+            assert _applied(kind, database) == ["0001_audit"]
+        else:
+            needs = (
+                f"Migration '0001_audit', operation 2 ({_ASYNC_EVENT.describe()}): ASYNC events need SurrealDB 3.x; "
+                "this connection runs SurrealDB 2.x or the embedded engine."
+            )
+            assert (status, captured.out, captured.err) == (1, "", f"Migration failed: {needs}\n")
+            assert _tables(kind, database) == {"_surreal_orm_migrations"}
+            assert _applied(kind, database) == []
 
 
 # === E2E: makemigrations from the database, schemadiff, --connection =================================================
@@ -1803,3 +1847,52 @@ class TestCliEmbedded:
         assert "Parse error" in chunks[2]
         assert (captured.out, captured.err) == ("Goodbye!\n", "")
         assert closes == ["closed"]
+
+    def test_surrealkv_chain(self, app: Callable[..., str], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-22 (M6): ``makemigrations`` → ``migrate`` → ``status`` on one ``surrealkv://`` path in three ``main()``
+        calls — the embedded engine keeps its data from one command to the next."""
+        module = app(False)
+        argv = ["-u", f"surrealkv://{tmp_path / 'db'}", "-n", "ns", "-d", "db"]
+        assert commands.main([*argv, "makemigrations", "-n", "init", "-m", module]) == 0
+        captured = capsys.readouterr()
+        assert captured.out.startswith(f"Created migration: {Path('migrations') / '0001_init.py'}\n")
+        operations = MigrationExecutor("migrations").load_migration("0001_init").operations
+        assert commands.main([*argv, "migrate"]) == 0
+        assert capsys.readouterr().out == "Applied 1 migration(s):\n  - 0001_init\n"
+        assert commands.main([*argv, "status"]) == 0
+        captured = capsys.readouterr()
+        assert captured.out == _status(f"[X] 0001_init ({len(operations)} ops) [R-]")
+        assert captured.err == ""
+
+
+class TestEntryPoint:
+    """AC-26 (spec §9.2): the real interpreter — ``python -m surreal_orm_lite.cli`` in a subprocess, its settings from
+    the ``SURREAL_*`` environment, the working directory a temporary one holding the model module."""
+
+    @pytest.mark.parametrize("kind", ["ws"])
+    def test_subprocess_chain(self, kind: str, database: str, app: Callable[..., str], tmp_path: Path) -> None:
+        module = app(False)
+        env = {name: value for name, value in os.environ.items() if name not in _ENV_VARS}
+        env.update(
+            SURREAL_URL=_migration_url(kind),
+            SURREAL_NAMESPACE="ns",
+            SURREAL_DATABASE=database,
+            SURREAL_USER="root",
+            SURREAL_PASSWORD="root",
+        )
+        outputs = []
+        for command in (["makemigrations", "-n", "init", "-m", module], ["migrate"], ["status"]):
+            done = subprocess.run(
+                [sys.executable, "-m", "surreal_orm_lite.cli", *command],
+                cwd=tmp_path,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            assert done.returncode == 0, done.stderr
+            outputs.append(done.stdout)
+        assert outputs[1] == "Applied 1 migration(s):\n  - 0001_init\n"
+        assert "[X] 0001_init " in outputs[2]
+        assert _applied(kind, database) == ["0001_init"]
