@@ -3027,10 +3027,28 @@ class TestCarriedFields:
             "DEFINE FIELD OVERWRITE `owner_ref` ON `tdl_note` TYPE string;"
         )
 
-    def test_an_ordinary_column_writes_its_default(self) -> None:
-        """The model's ``DEFAULT`` wins over a stored ``DEFAULT ALWAYS``, written without ``ALWAYS``."""
-        stored = "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT ALWAYS true PERMISSIONS FULL"
-        assert _kept_field(TdlNoteTuned, stored) == "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT false;"
+    @pytest.mark.parametrize(
+        ("stored", "statement"),
+        [
+            (
+                "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT ALWAYS true PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT ALWAYS false;",
+            ),
+            (
+                "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT true PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT false;",
+            ),
+            (
+                "DEFINE FIELD done ON tdl_note TYPE bool PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT false;",
+            ),
+        ],
+        ids=["default-always", "default", "no-default"],
+    )
+    def test_an_ordinary_column_writes_its_default(self, stored: str, statement: str) -> None:
+        """The model's ``DEFAULT`` wins over the stored one and keeps a stored ``ALWAYS`` (#368), as the migration diff
+        does; a plain stored ``DEFAULT``, or none, gives a plain ``DEFAULT``."""
+        assert _kept_field(TdlNoteTuned, stored) == statement
 
     # --- the COMPUTED rule ---------------------------------------------------------------------------------------
 
@@ -4848,6 +4866,20 @@ class TestExistingTableE2E:
             assert status.default == "'new'"
             await TdlNoteStatus(id="s1", body="b").save()
             assert await client.query("SELECT VALUE status FROM tdl_note:s1;", {}) == ["new"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("always", [True, False], ids=["default-always", "default"])
+    async def test_an_ordinary_column_keeps_a_stored_default_always(self, kind: str, always: bool) -> None:
+        """#368: the model's ``DEFAULT`` replaces the stored expression and keeps a stored ``ALWAYS``; a plain stored
+        ``DEFAULT`` stays plain."""
+        clause = "DEFAULT ALWAYS true" if always else "DEFAULT true"
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, f"DEFINE TABLE tdl_note; DEFINE FIELD done ON tdl_note TYPE bool {clause};")
+            statements = (await TdlNoteTuned.define_table()).splitlines()
+            keyword = "DEFAULT ALWAYS" if always else "DEFAULT"
+            assert f"DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool {keyword} false;" in statements
+            done = _field_states(await _table_info(client, "tdl_note"))[("done",)]
+            assert (done.default, done.default_always) == ("false", always)
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_k1d_a_drop_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
