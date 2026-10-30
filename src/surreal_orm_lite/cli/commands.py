@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
 import importlib
 import logging
 import os
+import pprint
 import socket
 import sys
 import urllib.parse
@@ -531,10 +533,90 @@ def _cmd_inspectdb(args: argparse.Namespace, settings: _Settings) -> int:
     return 0
 
 
-def _cmd_database(args: argparse.Namespace, settings: _Settings) -> int:
-    """A command that reaches the database and is not written yet: ``shell``."""
-    _configure(settings, args.command)
-    return 0
+def _error_line(text: object) -> str:
+    """``Error: <text>`` without trailing blanks (a server's parse error ends with a newline)."""
+    return f"Error: {text}".rstrip()
+
+
+def _render_answer(answer: object) -> list[str]:
+    """The lines the shell prints for one ``query_raw()`` envelope (spec §5.11): an ``error`` envelope (a parse
+    error) as one ``Error:`` line; otherwise one block per statement, with ``-- [<i>/<N>] --`` headers when the line
+    holds several — an ``OK`` list one ``pprint`` line per item, ``(empty result)`` when empty or ``None``, any other
+    value ``pprint``-ed; an ``ERR`` entry ``Error: <result>``. Anything else is ``Error: unexpected answer (<type>)``."""
+    if not isinstance(answer, dict):
+        return [f"Error: unexpected answer ({type(answer).__name__})"]
+    if "error" in answer:
+        error = answer["error"]
+        message = error.get("message") if isinstance(error, dict) else None
+        return [_error_line(error if message is None else message)]
+    entries = answer.get("result")
+    if not isinstance(entries, list):
+        return [f"Error: unexpected answer ({type(answer).__name__})"]
+    lines: list[str] = []
+    for index, entry in enumerate(entries, start=1):
+        if len(entries) > 1:
+            lines.append(f"-- [{index}/{len(entries)}] --")
+        if not isinstance(entry, dict):
+            lines.append(f"Error: unexpected answer ({type(entry).__name__})")
+            continue
+        result = entry.get("result")
+        if entry.get("status") != "OK":
+            lines.append(_error_line(result))
+        elif result is None or result == []:
+            lines.append("(empty result)")
+        elif isinstance(result, list):
+            lines.extend(pprint.pformat(item) for item in result)
+        else:
+            lines.append(pprint.pformat(result))
+    return lines
+
+
+async def _query(manager: type[SurrealDBConnectionManager], line: str) -> Any:
+    """Send *line* unchanged with ``query_raw()`` on the connection's client, taken again for each line (a dropped
+    WebSocket is replaced by the manager), and return the raw envelope."""
+    client = await manager.get_client()
+    return await client.query_raw(line)
+
+
+def _cmd_shell(args: argparse.Namespace, settings: _Settings) -> int:
+    """``shell``: the full ORM's SurrealQL console (spec §5.11), one request per line through ``query_raw()``, each
+    statement's outcome on stdout (:func:`_render_answer`). ``exit``/``quit``, EOF or Ctrl+C at the prompt end the
+    session with ``Goodbye!`` (exit 0); a failed first connection is ``Shell failed: <message>`` (exit 1); Ctrl+C
+    during a query ends it as in any command (``Interrupted.``, exit 130). One ``asyncio.Runner`` for the session;
+    the connection is closed in its ``finally`` in every case."""
+    manager = _configure(settings, args.command)
+    with contextlib.suppress(ImportError):
+        import readline  # noqa: F401  (line editing for input(); no history file)
+    with asyncio.Runner() as runner:
+        try:
+            try:
+                runner.run(manager.get_client())
+            except Exception as exc:
+                return _fail("Shell", exc, settings)
+            _echo(f"Connected to {_redact(settings.url)}")
+            _echo(f"Namespace: {settings.namespace}, Database: {settings.database}")
+            _echo("Type 'exit' or 'quit' to exit. Enter SurrealQL queries:")
+            _echo(_RULE)
+            while True:
+                try:
+                    line = input("surreal> ")
+                except (EOFError, KeyboardInterrupt):
+                    break
+                command = line.strip()
+                if not command:
+                    continue
+                if command.lower() in ("exit", "quit"):
+                    break
+                try:
+                    lines = _render_answer(runner.run(_query(manager, line)))
+                except Exception as exc:
+                    lines = [_error_line(_scrub(_message(exc), settings))]
+                for text in lines:
+                    _echo(text)
+            _echo("Goodbye!")
+            return 0
+        finally:
+            runner.run(manager.close_connection())
 
 
 def _cmd_sqlmigrate(args: argparse.Namespace, settings: _Settings) -> int:
@@ -562,7 +644,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace, _Settings], int]] = {
     "sqlmigrate": _cmd_sqlmigrate,
     "inspectdb": _cmd_inspectdb,
     "schemadiff": _cmd_schemadiff,
-    "shell": _cmd_database,
+    "shell": _cmd_shell,
 }
 
 

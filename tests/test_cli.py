@@ -20,6 +20,10 @@ hint on connection errors only; ``--connection``; no connection configured when 
 source, writes it with ``-o`` (``--no-overwrite`` refuses an existing file), ``--table`` limits it, a named
 ``--connection`` shows in the generated models.
 
+``TestShellRendering``, ``TestCliShellE2E``, ``TestCliEmbedded`` (spec §5.11; AC-20, AC-21, AC-22's ``mem://`` part):
+the SurrealQL shell — one block per statement as the line answers it, the session's end and exit codes, the connection
+closed once, the URL's credentials never printed.
+
 CLI tests are sync ``def`` tests: ``main()`` runs its own ``asyncio.run()`` (spec §9.2).
 """
 
@@ -29,6 +33,7 @@ import functools
 import importlib
 import logging
 import os
+import pprint
 import socket
 import subprocess
 import sys
@@ -43,10 +48,12 @@ import pytest
 
 import surreal_orm_lite
 from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite._sdk import RecordID
 from surreal_orm_lite.cli import commands
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
 from surreal_orm_lite.introspection import generate_models_from_db
 from surreal_orm_lite.migrations import MigrationExecutor, introspector
+from surreal_orm_lite.time_travel import cached_major
 from tests.conftest import _migration_url, new_database_name
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -1413,4 +1420,386 @@ class TestCliInspectdbE2E:
         assert captured.err.splitlines()[-1].startswith("Introspection failed: ")
         assert "Traceback" not in captured.err
         assert not output.exists()
+        assert closes == ["closed"]
+
+
+# === shell: rendering (no database) ==================================================================================
+
+
+class TestShellRendering:
+    """Spec §5.11: ``_render_answer()`` on the envelopes ``query_raw()`` returns (M1–M4), recorded on 3.3.4, 2.7.0 and
+    the embedded engine; one block per statement, with ``-- [i/N] --`` headers when a line holds several."""
+
+    def test_one_value(self) -> None:
+        assert commands._render_answer({"result": [{"result": 2, "status": "OK", "time": "1µs"}]}) == ["2"]
+
+    def test_one_list(self) -> None:
+        answer = {"result": [{"result": [{"a": 1}, {"a": 2}], "status": "OK", "time": "1µs"}]}
+        assert commands._render_answer(answer) == ["{'a': 1}", "{'a': 2}"]
+
+    @pytest.mark.parametrize("value", [[], None])
+    def test_empty_result(self, value: Any) -> None:
+        answer = {"id": "x", "result": [{"result": value, "status": "OK", "time": "1µs", "type": None}]}
+        assert commands._render_answer(answer) == ["(empty result)"]
+
+    def test_scalar_is_pretty_printed(self) -> None:
+        answer = {"result": [{"result": "text", "status": "OK", "time": "1µs"}]}
+        assert commands._render_answer(answer) == ["'text'"]
+
+    def test_several_entries_get_headers(self) -> None:
+        answer = {
+            "result": [
+                {"result": [{"a": 1}], "status": "OK", "time": "1µs"},
+                {"result": 5, "status": "OK", "time": "1µs"},
+            ]
+        }
+        assert commands._render_answer(answer) == ["-- [1/2] --", "{'a': 1}", "-- [2/2] --", "5"]
+
+    def test_err_entry(self) -> None:
+        answer = {
+            "result": [
+                {
+                    "details": {"details": {"name": "t"}, "kind": "Table"},
+                    "kind": "NotFound",
+                    "result": "The table 't' does not exist",
+                    "status": "ERR",
+                    "time": "1µs",
+                    "type": None,
+                }
+            ]
+        }
+        assert commands._render_answer(answer) == ["Error: The table 't' does not exist"]
+
+    def test_top_level_error(self) -> None:
+        message = "Parse error: Unexpected token\n --> [1:8]\n  |        ^ \n"
+        answer = {"error": {"code": -32000, "message": message}, "id": "x"}
+        assert commands._render_answer(answer) == ["Error: Parse error: Unexpected token\n --> [1:8]\n  |        ^"]
+
+    def test_top_level_error_without_message(self) -> None:
+        assert commands._render_answer({"error": {"code": -32000}}) == ["Error: {'code': -32000}"]
+        assert commands._render_answer({"error": "boom"}) == ["Error: boom"]
+
+    @pytest.mark.parametrize(
+        ("answer", "name"), [(None, "NoneType"), ([1], "list"), ({"id": "x"}, "dict"), ({"result": 1}, "dict")]
+    )
+    def test_unexpected_answer(self, answer: Any, name: str) -> None:
+        assert commands._render_answer(answer) == [f"Error: unexpected answer ({name})"]
+
+    def test_unexpected_entry(self) -> None:
+        answer = {"result": [{"result": 1, "status": "OK"}, "oops"]}
+        assert commands._render_answer(answer) == ["-- [1/2] --", "1", "-- [2/2] --", "Error: unexpected answer (str)"]
+
+    def test_transaction_3x(self) -> None:
+        """M3: 3.x answers one entry for ``BEGIN`` and one for ``COMMIT``."""
+        answer = {
+            "result": [
+                {"result": None, "status": "OK", "time": "0ns", "type": None},
+                {"result": [{"a": 2}], "status": "OK", "time": "1µs", "type": None},
+                {"result": None, "status": "OK", "time": "1µs", "type": None},
+            ]
+        }
+        assert commands._render_answer(answer) == [
+            "-- [1/3] --",
+            "(empty result)",
+            "-- [2/3] --",
+            "{'a': 2}",
+            "-- [3/3] --",
+            "(empty result)",
+        ]
+
+    def test_failed_transaction_2x(self) -> None:
+        """M3: 2.x answers one entry per statement inside the transaction, none for ``BEGIN``/``COMMIT``."""
+        answer = {
+            "result": [
+                {"result": "Database record `t:2` already exists", "status": "ERR", "time": "1µs"},
+                {"result": "The query was not executed due to a failed transaction", "status": "ERR", "time": "0ns"},
+            ]
+        }
+        assert commands._render_answer(answer) == [
+            "-- [1/2] --",
+            "Error: Database record `t:2` already exists",
+            "-- [2/2] --",
+            "Error: The query was not executed due to a failed transaction",
+        ]
+
+
+# === E2E: shell ======================================================================================================
+
+_BANNER_TAIL = ["Type 'exit' or 'quit' to exit. Enter SurrealQL queries:", _RULE]
+
+
+class _Prefix(str):
+    """An expected output line that only has to start with this text."""
+
+
+def _check(chunk: str, expected: Sequence[str]) -> None:
+    """*chunk*'s lines against *expected* (a :class:`_Prefix` matches by prefix)."""
+    lines = chunk.splitlines()
+    assert len(lines) == len(expected), lines
+    for line, want in zip(lines, expected, strict=True):
+        if isinstance(want, _Prefix):
+            assert line.startswith(want), (line, want)
+        else:
+            assert line == want
+
+
+def _feed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    lines: Sequence[str],
+    end: type[BaseException] = EOFError,
+) -> list[str]:
+    """``input()`` replaced by *lines*, then *end* raised. The returned list gets, at each prompt, the stdout written
+    since the previous one: the banner first, then the answer of each line in turn."""
+    feed = iter(lines)
+    chunks: list[str] = []
+
+    def fake_input(prompt: str = "") -> str:
+        assert prompt == "surreal> "
+        chunks.append(capsys.readouterr().out)
+        try:
+            return next(feed)
+        except StopIteration:
+            raise end() from None
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    return chunks
+
+
+def _major(kind: str, database: str) -> int:
+    """The line under test (``cached_major()`` on a private connection)."""
+
+    async def run() -> int:
+        SurrealDBConnectionManager.add_connection(
+            "cli_admin", url=_migration_url(kind), user="root", password="root", namespace="ns", database=database
+        )
+        try:
+            return await cached_major(await SurrealDBConnectionManager.get_client("cli_admin"))
+        finally:
+            await SurrealDBConnectionManager.remove_connection("cli_admin")
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["ws", "http"])
+class TestCliShellE2E:
+    """AC-20, AC-21 (spec §5.11): the SurrealQL shell on the line under test, over WebSocket and HTTP, in a database of
+    its own — one block per statement, each line's layout as the server answers it (branch by ``cached_major()``, no
+    skip); the session's end on ``exit``, EOF, Ctrl+C at the prompt (exit 0) or during a query (exit 130); the resolved
+    connection class's ``close_connection`` awaited once in every case."""
+
+    @staticmethod
+    def _argv(kind: str, database: str) -> list[str]:
+        return ["-u", _migration_url(kind), "-n", "ns", "-d", database, "shell"]
+
+    @staticmethod
+    def _banner(url: str, database: str) -> list[str]:
+        return [f"Connected to {url}", f"Namespace: ns, Database: {database}", *_BANNER_TAIL]
+
+    def test_session(
+        self,
+        kind: str,
+        database: str,
+        closes: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-20."""
+        script = [
+            "RETURN 1+1",
+            "CREATE cli_shell:1 SET a=1; RETURN 5",
+            "SELEKT 1",
+            "SELECT * FROM cli_shell_missing",
+            "BEGIN; CREATE cli_shell:2 SET a=2; COMMIT;",
+            "BEGIN; CREATE cli_shell:2 SET a=3; RETURN 5; COMMIT;",
+            "   ",
+            "  EXIT ",
+        ]
+        chunks = _feed(monkeypatch, capsys, script)
+        assert commands.main(self._argv(kind, database)) == 0
+        captured = capsys.readouterr()
+        chunks.append(captured.out)
+        assert closes == ["closed"]
+        record_1 = pprint.pformat({"a": 1, "id": RecordID("cli_shell", 1)})
+        record_2 = pprint.pformat({"a": 2, "id": RecordID("cli_shell", 2)})
+        major = _major(kind, database)
+        _check(chunks[0], self._banner(_migration_url(kind), database))
+        _check(chunks[1], ["2"])
+        _check(chunks[2], ["-- [1/2] --", record_1, "-- [2/2] --", "5"])
+        assert chunks[3].startswith("Error: ")
+        assert "Parse error" in chunks[3]
+        if major >= 3:
+            _check(chunks[4], ["Error: The table 'cli_shell_missing' does not exist"])
+            _check(chunks[5], ["-- [1/3] --", "(empty result)", "-- [2/3] --", record_2, "-- [3/3] --", "(empty result)"])
+            _check(
+                chunks[6],
+                [
+                    "-- [1/4] --",
+                    "(empty result)",
+                    "-- [2/4] --",
+                    _Prefix("Error: "),
+                    "-- [3/4] --",
+                    "Error: The query was not executed due to a cancelled transaction",
+                    "-- [4/4] --",
+                    _Prefix("Error: Cannot COMMIT"),
+                ],
+            )
+            assert chunks[6].splitlines()[3].endswith("already exists")
+        else:
+            _check(chunks[4], ["(empty result)"])
+            _check(chunks[5], [record_2])
+            _check(
+                chunks[6],
+                [
+                    "-- [1/2] --",
+                    _Prefix("Error: "),
+                    "-- [2/2] --",
+                    "Error: The query was not executed due to a failed transaction",
+                ],
+            )
+            assert chunks[6].splitlines()[1].endswith("already exists")
+        assert chunks[7] == ""  # the blank line is skipped
+        assert chunks[8] == "Goodbye!\n"
+        assert len(chunks) == 9
+        assert captured.err == ""
+
+    @pytest.mark.parametrize("end", [EOFError, KeyboardInterrupt])
+    def test_eof_and_ctrl_c_at_the_prompt(
+        self,
+        kind: str,
+        database: str,
+        end: type[BaseException],
+        closes: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-21: EOF and Ctrl+C at the prompt end the session with ``Goodbye!``, exit 0."""
+        chunks = _feed(monkeypatch, capsys, ["RETURN 1"], end)
+        assert commands.main(self._argv(kind, database)) == 0
+        captured = capsys.readouterr()
+        _check(chunks[0], self._banner(_migration_url(kind), database))
+        assert chunks[1:] == ["1\n"]
+        assert (captured.out, captured.err) == ("Goodbye!\n", "")
+        assert closes == ["closed"]
+
+    def test_quit(
+        self,
+        kind: str,
+        database: str,
+        closes: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        chunks = _feed(monkeypatch, capsys, ["Quit", "RETURN 1"])
+        assert commands.main(self._argv(kind, database)) == 0
+        assert len(chunks) == 1
+        assert capsys.readouterr().out == "Goodbye!\n"
+        assert closes == ["closed"]
+
+    def test_refused_connection(
+        self,
+        kind: str,
+        database: str,
+        closes: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-21: a connection refused at start → ``Shell failed: …``, exit 1, no prompt."""
+        chunks = _feed(monkeypatch, capsys, ["RETURN 1"])
+        port = _closed_port()
+        url = f"ws://127.0.0.1:{port}/rpc" if kind == "ws" else f"http://127.0.0.1:{port}"
+        assert commands.main(["-u", url, "-n", "ns", "-d", database, "shell"]) == 1
+        captured = capsys.readouterr()
+        assert chunks == []
+        assert captured.out == ""
+        assert captured.err.splitlines()[-1] == "Shell failed: Can't connect to the database."
+        assert "Traceback" not in captured.err
+        assert closes == ["closed"]
+
+    def test_ctrl_c_during_a_query(
+        self,
+        kind: str,
+        database: str,
+        closes: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-21, D11: Ctrl+C during a query ends the session — ``Interrupted.`` on stderr, no ``Goodbye!``, 130."""
+
+        async def interrupted(manager: Any, line: str) -> Any:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(commands, "_query", interrupted)
+        chunks = _feed(monkeypatch, capsys, ["RETURN 1", "RETURN 2"])
+        assert commands.main(self._argv(kind, database)) == 130
+        captured = capsys.readouterr()
+        assert len(chunks) == 1  # the banner, then no second prompt
+        assert (captured.out, captured.err) == ("", "Interrupted.\n")
+        assert closes == ["closed"]
+
+    def test_query_exception_keeps_the_session(
+        self,
+        kind: str,
+        database: str,
+        closes: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """An exception from a query (a lost connection) is one ``Error:`` line; the next line still runs."""
+        original = commands._query
+        raised: list[BaseException] = [ConnectionError("connection lost"), RuntimeError("")]
+
+        async def flaky(manager: Any, line: str) -> Any:
+            if raised:
+                raise raised.pop(0)
+            return await original(manager, line)
+
+        monkeypatch.setattr(commands, "_query", flaky)
+        chunks = _feed(monkeypatch, capsys, ["RETURN 1", "RETURN 1", "RETURN 3"])
+        assert commands.main(self._argv(kind, database)) == 0
+        assert chunks[1:] == ["Error: connection lost\n", "Error: RuntimeError\n", "3\n"]
+        assert capsys.readouterr().out == "Goodbye!\n"
+        assert closes == ["closed"]
+
+    def test_url_credentials_not_printed(
+        self,
+        kind: str,
+        database: str,
+        closes: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-21: a URL with ``user:password@`` is shown without it. The SDK's WebSocket accepts it; its HTTP client
+        refuses credentials in the URL besides the sign-in (``Shell failed``) — the URL's userinfo never shows. The
+        WebSocket sends them at the handshake, so they are the line's real ones."""
+        clean = _migration_url(kind)
+        scheme, rest = clean.split("://", 1)
+        url = f"{scheme}://root:root@{rest}"
+        chunks = _feed(monkeypatch, capsys, [])
+        status = commands.main(["-u", url, "-n", "ns", "-d", database, "shell"])
+        captured = capsys.readouterr()
+        everything = "".join(chunks) + captured.out + captured.err
+        assert "root:root@" not in everything
+        if kind == "ws":
+            assert status == 0
+            _check(chunks[0], self._banner(clean, database))
+        else:
+            assert status == 1
+            assert captured.err.splitlines()[-1].startswith("Shell failed: ")
+        assert closes == ["closed"]
+
+
+class TestCliEmbedded:
+    """AC-22 (spec §5.11, M2): the embedded engine — ``--url mem:// shell`` answers like a 2.x server; a parse error,
+    raised by the SDK as an exception there, is one ``Error:`` line."""
+
+    def test_mem_shell(self, closes: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        chunks = _feed(monkeypatch, capsys, ["RETURN 1", "RETURN 1; SELEKT 1"])
+        assert commands.main(["-u", "mem://", "-n", "ns", "-d", "db", "shell"]) == 0
+        captured = capsys.readouterr()
+        _check(chunks[0], ["Connected to mem://", "Namespace: ns, Database: db", *_BANNER_TAIL])
+        assert chunks[1] == "1\n"
+        assert chunks[2].startswith("Error: ")
+        assert "Parse error" in chunks[2]
+        assert (captured.out, captured.err) == ("Goodbye!\n", "")
         assert closes == ["closed"]
