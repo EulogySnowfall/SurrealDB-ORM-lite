@@ -5,17 +5,23 @@
 option > environment > default, the password kept out of ``--help`` and of ``repr``, the logging handler removed after
 ``main()``, and ``main()`` refusing to run inside a running event loop before touching the connection registry.
 
+``TestOffline`` (spec §5.3 steps 1–3, 5–6, §5.8, §6.3; AC-8, AC-9, AC-10, AC-14, AC-27's warning text): the commands
+that send no request — ``makemigrations --empty``, ``makemigrations --no-from-db`` with ``--models``, ``sqlmigrate``.
+
 CLI tests are sync ``def`` tests: ``main()`` runs its own ``asyncio.run()`` (spec §9.2).
 """
 
+import asyncio
 import dataclasses
 import importlib
 import logging
 import os
 import subprocess
 import sys
+import textwrap
 import tomllib
-from collections.abc import Iterator
+import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +30,7 @@ import pytest
 import surreal_orm_lite
 from surreal_orm_lite import SurrealDBConnectionManager
 from surreal_orm_lite.cli import commands
+from surreal_orm_lite.migrations import MigrationExecutor, introspector
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -442,3 +449,268 @@ class TestParser:
         assert capsys.readouterr().err.strip() == _LOOP_ERROR
         assert SurrealDBConnectionManager.get_config("default") == before
         assert SurrealDBConnectionManager.list_connections() == names
+
+
+_APP_SOURCE = """
+from typing import Any
+
+from surreal_orm_lite import BaseSurrealModel, SchemaMode, SurrealConfigDict
+
+
+class Author(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cli_author_{suffix}", schema_mode=SchemaMode.SCHEMAFULL)
+    id: str | None = None
+    name: str = ""
+    meta: dict[str, Any] = {{}}
+    bag: Any = None
+"""
+
+_BOOK_SOURCE = """
+
+class Book(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cli_book_{suffix}", schema_mode=SchemaMode.SCHEMAFULL)
+    id: str | None = None
+    title: str = ""
+"""
+
+
+@pytest.fixture
+def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[bool], str]]:
+    """Spec §9.2: ``app(with_book)`` writes a model module ``cli_app_<uuid8>`` to ``tmp_path`` (the working
+    directory) — ``Author``, and ``Book`` when *with_book* — and returns its name. The registry is patched to the models
+    of the last module written (the suite's own models are alive in-process); the modules leave ``sys.modules``
+    afterwards."""
+    monkeypatch.chdir(tmp_path)
+    suffix = uuid.uuid4().hex[:8]
+    names: list[str] = []
+    registered = introspector.get_registered_models
+    monkeypatch.setattr(
+        introspector,
+        "get_registered_models",
+        lambda: [model for model in registered() if names and model.__module__ == names[-1]],
+    )
+
+    def write(with_book: bool = True) -> str:
+        name = f"cli_app_{uuid.uuid4().hex[:8]}"
+        source = _APP_SOURCE + (_BOOK_SOURCE if with_book else "")
+        (tmp_path / f"{name}.py").write_text(textwrap.dedent(source.format(suffix=suffix)))
+        importlib.invalidate_caches()
+        names.append(name)
+        return name
+
+    yield write
+    for name in names:
+        sys.modules.pop(name, None)
+
+
+def _lines(text: str) -> list[str]:
+    return text.splitlines()
+
+
+class TestOffline:
+    """The commands that send no request: no namespace, no database, no connection registered."""
+
+    # -- AC-8: makemigrations --empty ---------------------------------------------------------------------------------
+
+    def test_empty_twice(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        directory = tmp_path / "migrations"
+        names = SurrealDBConnectionManager.list_connections()
+        assert commands.main(["-m", str(directory), "makemigrations", "-n", "init", "--empty"]) == 0
+        assert capsys.readouterr().out == f"Created empty migration: {directory / '0001_init.py'}\n"
+        assert commands.main(["-m", str(directory), "makemigrations", "-n", "more", "--empty"]) == 0
+        assert capsys.readouterr().out == f"Created empty migration: {directory / '0002_more.py'}\n"
+        executor = MigrationExecutor(directory)
+        assert len(executor.load_migration("0001_init").operations) == 0
+        assert list(executor.load_migration("0002_more").dependencies) == ["0001_init"]
+        assert SurrealDBConnectionManager.list_connections() == names
+
+    def test_empty_failure(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        directory = tmp_path / "migrations"
+        directory.mkdir()
+        (directory / "0001_broken.py").write_text("raise RuntimeError('broken file')\n")
+        assert commands.main(["-m", str(directory), "makemigrations", "-n", "init", "--empty"]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "makemigrations failed: broken file\n"
+
+    # -- AC-9: makemigrations --no-from-db with --models --------------------------------------------------------------
+
+    def test_no_from_db(self, app: Callable[[bool], str], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        module = app(True)
+        names = SurrealDBConnectionManager.list_connections()
+        assert commands.main(["makemigrations", "-n", "init", "-m", module, "--no-from-db"]) == 0
+        out = _lines(capsys.readouterr().out)
+        path = Path("migrations") / "0001_init.py"
+        assert (tmp_path / path).is_file()
+        operations = MigrationExecutor("migrations").load_migration("0001_init").operations
+        assert len(operations) > 2
+        assert out == [
+            f"Created migration: {path}",
+            f"Operations: {len(operations)}",
+            *(f"  - {operation.describe()}" for operation in operations),
+        ]
+        assert SurrealDBConnectionManager.list_connections() == names
+        # Run again: the file is part of the current state.
+        assert commands.main(["makemigrations", "-n", "again", "-m", module, "--no-from-db"]) == 0
+        captured = capsys.readouterr()
+        assert captured.out == "No changes detected.\n"
+        assert captured.err == ""
+        assert not (tmp_path / "migrations" / "0002_again.py").exists()
+
+    def test_several_models_options(
+        self, app: Callable[[bool], str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        first = app(True)
+        second = app(True)
+        assert commands.main(["makemigrations", "-n", "init", "-m", first, "-m", second, "--no-from-db"]) == 0
+        assert first in sys.modules
+        assert second in sys.modules
+        assert capsys.readouterr().out.startswith("Created migration: ")
+
+    # -- AC-10: imports and the registry ------------------------------------------------------------------------------
+
+    def test_missing_module(self, app: Callable[[bool], str], capsys: pytest.CaptureFixture[str]) -> None:
+        name = f"cli_missing_{uuid.uuid4().hex[:8]}"
+        assert commands.main(["makemigrations", "-n", "init", "-m", name, "--no-from-db"]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == f"Error importing {name}: No module named '{name}'\n"
+
+    def test_module_raising(self, app: Callable[[bool], str], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        name = f"cli_raising_{uuid.uuid4().hex[:8]}"
+        (tmp_path / f"{name}.py").write_text("raise RuntimeError('boom at import')\n")
+        importlib.invalidate_caches()
+        try:
+            assert commands.main(["makemigrations", "-n", "init", "-m", name, "--no-from-db"]) == 1
+        finally:
+            sys.modules.pop(name, None)
+        assert capsys.readouterr().err == f"Error importing {name}: boom at import\n"
+        assert not (tmp_path / "migrations").exists()
+
+    def test_module_raising_without_message(
+        self, app: Callable[[bool], str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        name = f"cli_raising_{uuid.uuid4().hex[:8]}"
+        (tmp_path / f"{name}.py").write_text("raise RuntimeError\n")
+        importlib.invalidate_caches()
+        try:
+            assert commands.main(["makemigrations", "-n", "init", "-m", name, "--no-from-db"]) == 1
+        finally:
+            sys.modules.pop(name, None)
+        assert capsys.readouterr().err == f"Error importing {name}: RuntimeError\n"
+
+    def test_no_models(self, app: Callable[[bool], str], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        assert commands.main(["makemigrations", "-n", "init", "--no-from-db"]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "No models found. Register models by importing them (--models).\n"
+        assert not (tmp_path / "migrations").exists()
+
+    def test_working_directory_inserted_when_absent(
+        self, app: Callable[[bool], str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cwd = os.getcwd()
+        monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry not in ("", cwd)])
+        rest = list(sys.path)
+        assert commands.main(["makemigrations", "-n", "init", "-m", app(True), "--no-from-db"]) == 0
+        assert sys.path == [cwd, *rest]
+        capsys.readouterr()
+
+    @pytest.mark.parametrize("present", ["", "cwd"])
+    def test_working_directory_not_inserted_when_present(
+        self, present: str, app: Callable[[bool], str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cwd = os.getcwd()
+        entry = cwd if present == "cwd" else ""
+        monkeypatch.setattr(sys, "path", [*(item for item in sys.path if item not in ("", cwd)), entry])
+        before = list(sys.path)
+        assert commands.main(["makemigrations", "-n", "init", "-m", app(True), "--no-from-db"]) == 0
+        assert sys.path == before
+        capsys.readouterr()
+
+    def test_working_directory_untouched_without_models(
+        self, app: Callable[[bool], str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cwd = os.getcwd()
+        monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry not in ("", cwd)])
+        before = list(sys.path)
+        commands.main(["makemigrations", "-n", "init", "--no-from-db"])
+        assert sys.path == before
+        capsys.readouterr()
+
+    # -- §5.3 step 6, §6.3: the removals left out offline -----------------------------------------------------------
+
+    def test_removal_skipped_then_written(
+        self, app: Callable[[bool], str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert commands.main(["makemigrations", "-n", "init", "-m", app(True), "--no-from-db"]) == 0
+        book = next(
+            operation.describe().removeprefix("Create table ")
+            for operation in MigrationExecutor("migrations").load_migration("0001_init").operations
+            if operation.describe().startswith("Create table cli_book_")
+        )
+        capsys.readouterr()
+        without_book = app(False)
+        assert commands.main(["makemigrations", "-n", "drop", "-m", without_book, "--no-from-db"]) == 0
+        captured = capsys.readouterr()
+        assert captured.err == (
+            f"Warning: Skipped 1 removal(s) with no model to justify them: Drop table {book}; "
+            "pass drop_missing=True (--drop-missing) to write them.\n"
+        )
+        assert captured.out == "No changes detected.\n"
+        assert not (tmp_path / "migrations" / "0002_drop.py").exists()
+        assert commands.main(["makemigrations", "-n", "drop", "-m", without_book, "--no-from-db", "--drop-missing"]) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert _lines(captured.out) == [
+            f"Created migration: {Path('migrations') / '0002_drop.py'}",
+            "Operations: 1",
+            f"  - Drop table {book}",
+        ]
+
+    # -- AC-14: sqlmigrate ------------------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("extra", [[], ["--line", "3"], ["--line", "2"], ["--backwards"], ["--backwards", "--line", "2"]])
+    def test_sqlmigrate(self, extra: list[str], app: Callable[[bool], str], capsys: pytest.CaptureFixture[str]) -> None:
+        assert commands.main(["makemigrations", "-n", "init", "-m", app(True), "--no-from-db"]) == 0
+        capsys.readouterr()
+        names = SurrealDBConnectionManager.list_connections()
+        assert commands.main(["sqlmigrate", "0001_init", *extra]) == 0
+        line = 2 if "2" in extra else 3
+        expected = asyncio.run(
+            MigrationExecutor("migrations").show_sql("0001_init", backwards="--backwards" in extra, line=line)
+        )
+        assert expected
+        captured = capsys.readouterr()
+        assert captured.out == expected + "\n"
+        assert captured.err == ""
+        assert SurrealDBConnectionManager.list_connections() == names
+
+    def test_sqlmigrate_lines_differ(self, app: Callable[[bool], str], capsys: pytest.CaptureFixture[str]) -> None:
+        assert commands.main(["makemigrations", "-n", "init", "-m", app(True), "--no-from-db"]) == 0
+        capsys.readouterr()
+        outputs = []
+        for line in ("2", "3"):
+            assert commands.main(["sqlmigrate", "0001_init", "--line", line]) == 0
+            outputs.append(capsys.readouterr().out)
+        assert "FLEXIBLE" in outputs[0]  # line 2: an `any` column of a SCHEMAFULL table
+        assert outputs[0] != outputs[1]
+
+    def test_sqlmigrate_not_found(self, app: Callable[[bool], str], capsys: pytest.CaptureFixture[str]) -> None:
+        assert commands.main(["makemigrations", "-n", "init", "-m", app(True), "--no-from-db"]) == 0
+        capsys.readouterr()
+        assert commands.main(["sqlmigrate", "0009_nope"]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "Migration not found: 0009_nope\n"
+
+    def test_sqlmigrate_without_directory(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        assert commands.main(["-m", str(tmp_path / "none"), "sqlmigrate", "0001_init"]) == 1
+        assert capsys.readouterr().err == "Migration not found: 0001_init\n"
+
+    def test_sqlmigrate_invalid_name(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        assert commands.main(["-m", str(tmp_path), "sqlmigrate", "nope"]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("Error: ")
+        assert "nope" in captured.err

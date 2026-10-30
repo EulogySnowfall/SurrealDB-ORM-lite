@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import importlib
 import logging
 import os
 import sys
@@ -24,6 +25,7 @@ from typing import Any, NoReturn
 
 from .. import __version__
 from ..connection_manager import SurrealDBConnectionManager
+from ..migrations import MigrationExecutor, ModelIntrospector, makemigrations
 
 __all__ = ["cli", "main"]
 
@@ -33,6 +35,7 @@ _DEFAULT_URL = "http://localhost:8000"
 _DEFAULT_USER = "root"
 _DEFAULT_PASSWORD = "root"
 _LOGGER_NAME = "surreal_orm_lite"
+_NO_MODELS = "No models found. Register models by importing them (--models)."
 _LOOP_ERROR = "Error: surreal-orm-lite cannot run inside a running event loop (Jupyter, an async test); run it in a subprocess."
 
 
@@ -195,9 +198,25 @@ def _scrub(text: str, settings: _Settings) -> str:
     return text
 
 
+def _echo(text: str) -> None:
+    """Write *text* to stdout."""
+    print(text)
+
+
 def _err(text: str, settings: _Settings) -> None:
     """Write *text* to stderr, scrubbed (:func:`_scrub`)."""
     print(_scrub(text, settings), file=sys.stderr)
+
+
+def _message(exc: BaseException) -> str:
+    """``str(exc)``, or the exception's class name when that is empty."""
+    return str(exc) or type(exc).__name__
+
+
+def _fail(prefix: str, exc: BaseException, settings: _Settings) -> int:
+    """Report a failed command as ``<prefix> failed: <message>`` on stderr (scrubbed) and return the exit status 1."""
+    _err(f"{prefix} failed: {_message(exc)}", settings)
+    return 1
 
 
 class _LogHandler(logging.Handler):
@@ -247,13 +266,83 @@ def _configure(settings: _Settings, command: str) -> type[SurrealDBConnectionMan
         )
         return SurrealDBConnectionManager._manager_for(settings.connection)
     except Exception as exc:
-        raise _ConfigureError(str(exc) or type(exc).__name__) from exc
+        raise _ConfigureError(_message(exc)) from exc
+
+
+class _ImportFailure(Exception):
+    """A ``--models`` module raised at import: reported as ``Error importing <module>: <message>``, exit 1."""
+
+    def __init__(self, module: str, cause: Exception) -> None:
+        super().__init__(f"Error importing {module}: {_message(cause)}")
+
+
+def _import_models(modules: Sequence[str]) -> None:
+    """Import each of *modules*, in order (their models then register themselves). Before the first import, the
+    working directory is inserted at ``sys.path[0]`` when neither it nor ``""`` is already there: a console script's
+    ``sys.path[0]`` is its ``bin/`` directory, where ``python -m`` puts the working directory itself.
+
+    :raises _ImportFailure: an import raised an ``Exception``.
+    """
+    if not modules:
+        return
+    cwd = os.getcwd()
+    if cwd not in sys.path and "" not in sys.path:
+        sys.path.insert(0, cwd)
+    for module in modules:
+        try:
+            importlib.import_module(module)
+        except Exception as exc:
+            raise _ImportFailure(module, exc) from exc
 
 
 def _cmd_makemigrations(args: argparse.Namespace, settings: _Settings) -> int:
-    """``makemigrations``: the database is reached unless ``--empty`` or ``--no-from-db``."""
+    """``makemigrations``: the next migration file of the migrations directory (spec §5.3).
+
+    ``--empty`` writes a file without operations, to fill in by hand. Otherwise the ``--models`` modules are imported
+    and every registered model of the connection is diffed — with ``--no-from-db`` against the migration files'
+    state, offline; by default against the database's schema. The removals left out without ``--drop-missing`` are
+    named by ``makemigrations()``'s warning, shown on stderr.
+    """
     if not args.empty and args.from_db:
         _configure(settings, args.command)
+    directory = settings.migrations_dir
+    if args.empty:
+        try:
+            path = asyncio.run(makemigrations(args.name, migrations_dir=directory, empty=True))
+        except Exception as exc:
+            return _fail("makemigrations", exc, settings)
+        _echo(f"Created empty migration: {path}")
+        return 0
+    try:
+        _import_models(args.models or [])
+    except _ImportFailure as exc:
+        _err(str(exc), settings)
+        return 1
+    if not ModelIntrospector(None, connection=settings.connection).models:
+        _err(_NO_MODELS, settings)
+        return 1
+    if args.from_db:
+        return 0  # the database's schema: v0.39.0 Task 4
+    try:
+        path = asyncio.run(
+            makemigrations(
+                args.name,
+                migrations_dir=directory,
+                connection=settings.connection,
+                from_db=False,
+                drop_missing=args.drop_missing,
+            )
+        )
+        if path is None:
+            _echo("No changes detected.")
+            return 0
+        operations = MigrationExecutor(directory).load_migration(path.stem).operations
+    except Exception as exc:
+        return _fail("makemigrations", exc, settings)
+    _echo(f"Created migration: {path}")
+    _echo(f"Operations: {len(operations)}")
+    for operation in operations:
+        _echo(f"  - {operation.describe()}")
     return 0
 
 
@@ -265,7 +354,18 @@ def _cmd_database(args: argparse.Namespace, settings: _Settings) -> int:
 
 
 def _cmd_sqlmigrate(args: argparse.Namespace, settings: _Settings) -> int:
-    """``sqlmigrate``: offline, no connection."""
+    """``sqlmigrate``: the statements of a migration, rendered for ``--line`` (``--backwards``: those that undo it) —
+    ``MigrationExecutor.show_sql()``, offline, no connection."""
+    executor = MigrationExecutor(settings.migrations_dir)
+    try:
+        sql = asyncio.run(executor.show_sql(args.migration, backwards=args.backwards, line=args.line))
+    except FileNotFoundError:
+        _err(f"Migration not found: {args.migration}", settings)
+        return 1
+    except Exception as exc:
+        _err(f"Error: {_message(exc)}", settings)
+        return 1
+    _echo(sql)
     return 0
 
 
