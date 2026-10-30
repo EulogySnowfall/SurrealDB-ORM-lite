@@ -20,14 +20,16 @@ import logging
 import os
 import sys
 import urllib.parse
-from collections.abc import Callable, Sequence
-from typing import Any, NoReturn
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, NoReturn, TypeVar
 
 from .. import __version__
 from ..connection_manager import SurrealDBConnectionManager
 from ..migrations import MigrationExecutor, ModelIntrospector, makemigrations
 
 __all__ = ["cli", "main"]
+
+_T = TypeVar("_T")
 
 _PROG = "surreal-orm-lite"
 _DESCRIPTION = "SurrealDB-ORM-lite command line: migrations, schema introspection and a SurrealQL shell."
@@ -36,6 +38,8 @@ _DEFAULT_USER = "root"
 _DEFAULT_PASSWORD = "root"
 _LOGGER_NAME = "surreal_orm_lite"
 _NO_MODELS = "No models found. Register models by importing them (--models)."
+_LEGEND = "Legend: [X]=applied, R=reversible, D=has data migrations"
+_RULE = "-" * 60
 _LOOP_ERROR = "Error: surreal-orm-lite cannot run inside a running event loop (Jupyter, an async test); run it in a subprocess."
 
 
@@ -269,6 +273,26 @@ def _configure(settings: _Settings, command: str) -> type[SurrealDBConnectionMan
         raise _ConfigureError(_message(exc)) from exc
 
 
+def _run(coro_factory: Callable[[], Awaitable[_T]], manager: type[SurrealDBConnectionManager]) -> _T:
+    """Run ``coro_factory()`` in one ``asyncio.run()`` whose last step, in a ``finally``, closes the connection
+    *manager* — once per command, also when the command fails or is interrupted."""
+
+    async def run() -> _T:
+        try:
+            return await coro_factory()
+        finally:
+            await manager.close_connection()
+
+    return asyncio.run(run())
+
+
+def _echo_names(header: str, names: Sequence[str]) -> None:
+    """Print *header* then one ``  - <name>`` line per name."""
+    _echo(header)
+    for name in names:
+        _echo(f"  - {name}")
+
+
 class _ImportFailure(Exception):
     """A ``--models`` module raised at import: reported as ``Error importing <module>: <message>``, exit 1."""
 
@@ -346,9 +370,83 @@ def _cmd_makemigrations(args: argparse.Namespace, settings: _Settings) -> int:
     return 0
 
 
+def _executor(settings: _Settings) -> MigrationExecutor:
+    """The migrations directory's executor, on the command's connection."""
+    return MigrationExecutor(settings.migrations_dir, connection=settings.connection)
+
+
+def _cmd_migrate(args: argparse.Namespace, settings: _Settings) -> int:
+    """``migrate``: apply the pending migrations, up to ``--target`` — schema only (data operations: ``upgrade``);
+    ``--fake`` records them without running them (spec §5.4)."""
+    manager = _configure(settings, args.command)
+    executor = _executor(settings)
+    try:
+        applied = _run(lambda: executor.migrate(target=args.target, fake=args.fake, schema_only=True), manager)
+    except Exception as exc:
+        return _fail("Migration", exc, settings)
+    if applied:
+        _echo_names(f"Applied {len(applied)} migration(s):", applied)
+    else:
+        _echo("No migrations to apply.")
+    return 0
+
+
+def _cmd_upgrade(args: argparse.Namespace, settings: _Settings) -> int:
+    """``upgrade``: run the data operations of the applied migrations, up to ``--target`` (spec §5.5)."""
+    manager = _configure(settings, args.command)
+    executor = _executor(settings)
+    try:
+        upgraded = _run(lambda: executor.upgrade(target=args.target), manager)
+    except Exception as exc:
+        return _fail("Upgrade", exc, settings)
+    if upgraded:
+        _echo_names(f"Applied data migrations for {len(upgraded)} migration(s):", upgraded)
+    else:
+        _echo("No data migrations to apply.")
+    return 0
+
+
+def _cmd_rollback(args: argparse.Namespace, settings: _Settings) -> int:
+    """``rollback``: undo the applied migrations after ``TARGET`` (``""``: every one), newest first (spec §5.6)."""
+    manager = _configure(settings, args.command)
+    executor = _executor(settings)
+    try:
+        undone = _run(lambda: executor.rollback(args.target), manager)
+    except Exception as exc:
+        return _fail("Rollback", exc, settings)
+    if undone:
+        _echo_names(f"Rolled back {len(undone)} migration(s):", undone)
+    else:
+        _echo("No migrations to rollback.")
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace, settings: _Settings) -> int:
+    """``status``: every migration file, applied or not, in the full ORM's layout (spec §5.7). Defines the tracking
+    table when it is missing."""
+    manager = _configure(settings, args.command)
+    executor = _executor(settings)
+    try:
+        status = _run(executor.get_migration_status, manager)
+    except Exception as exc:
+        return _fail("Status", exc, settings)
+    if not status:
+        _echo("No migrations found.")
+        return 0
+    _echo("Migration status:")
+    _echo(_RULE)
+    for name, info in status.items():
+        applied = "[X]" if info["applied"] else "[ ]"
+        reversible = "R" if info["reversible"] else "-"
+        has_data = "D" if info["has_data"] else "-"
+        _echo(f"{applied} {name} ({info['operations']} ops) [{reversible}{has_data}]")
+    _echo(_RULE)
+    _echo(_LEGEND)
+    return 0
+
+
 def _cmd_database(args: argparse.Namespace, settings: _Settings) -> int:
-    """A command that reaches the database: ``migrate``, ``upgrade``, ``rollback``, ``status``, ``inspectdb``,
-    ``schemadiff``, ``shell``."""
+    """A command that reaches the database and is not written yet: ``inspectdb``, ``schemadiff``, ``shell``."""
     _configure(settings, args.command)
     return 0
 
@@ -371,10 +469,10 @@ def _cmd_sqlmigrate(args: argparse.Namespace, settings: _Settings) -> int:
 
 _COMMANDS: dict[str, Callable[[argparse.Namespace, _Settings], int]] = {
     "makemigrations": _cmd_makemigrations,
-    "migrate": _cmd_database,
-    "upgrade": _cmd_database,
-    "rollback": _cmd_database,
-    "status": _cmd_database,
+    "migrate": _cmd_migrate,
+    "upgrade": _cmd_upgrade,
+    "rollback": _cmd_rollback,
+    "status": _cmd_status,
     "sqlmigrate": _cmd_sqlmigrate,
     "inspectdb": _cmd_database,
     "schemadiff": _cmd_database,

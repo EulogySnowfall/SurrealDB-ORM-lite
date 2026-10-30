@@ -8,20 +8,26 @@ option > environment > default, the password kept out of ``--help`` and of ``rep
 ``TestOffline`` (spec §5.3 steps 1–3, 5–6, §5.8, §6.3; AC-8, AC-9, AC-10, AC-14, AC-27's warning text): the commands
 that send no request — ``makemigrations --empty``, ``makemigrations --no-from-db`` with ``--models``, ``sqlmigrate``.
 
+``TestCliE2E`` (spec §5.2, §5.4–§5.7; AC-6, AC-13, AC-15, AC-16, AC-17, AC-23): ``migrate``, ``upgrade``, ``rollback``
+and ``status`` on the line under test, over WebSocket and HTTP, each test in a database of its own; the connection
+class closed once per command, also on failure; failures reported as ``<Prefix> failed: <message>`` without a traceback.
+
 CLI tests are sync ``def`` tests: ``main()`` runs its own ``asyncio.run()`` (spec §9.2).
 """
 
 import asyncio
 import dataclasses
+import functools
 import importlib
 import logging
 import os
+import socket
 import subprocess
 import sys
 import textwrap
 import tomllib
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +37,7 @@ import surreal_orm_lite
 from surreal_orm_lite import SurrealDBConnectionManager
 from surreal_orm_lite.cli import commands
 from surreal_orm_lite.migrations import MigrationExecutor, introspector
+from tests.conftest import _migration_url, new_database_name
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -714,3 +721,288 @@ class TestOffline:
         assert captured.out == ""
         assert captured.err.startswith("Error: ")
         assert "nope" in captured.err
+
+
+# === E2E: the migration commands on the line under test, over WebSocket and HTTP =====================================
+
+#: A hand-written migration file (spec §9.2): *name*, *dependencies* and the operations' source.
+_MIGRATION_FILE = """from surreal_orm_lite.migrations import Migration
+from surreal_orm_lite.migrations.operations import AddField, CreateTable, DataMigration
+
+migration = Migration(name={name!r}, dependencies={dependencies!r}, operations=[{operations}])
+"""
+
+_ITEM_OPERATIONS = 'CreateTable("cli_item", "SCHEMALESS"), AddField("cli_item", "n", "int")'
+_MORE_OPERATIONS = 'CreateTable("cli_more", "SCHEMALESS")'
+_DATA_OPERATIONS = (
+    'CreateTable("cli_item", "SCHEMALESS"), '
+    'DataMigration(forwards_sql="UPDATE cli_item SET n = n + 1;", backwards_sql="UPDATE cli_item SET n = n - 1;")'
+)
+
+_RULE = "-" * 60
+_LEGEND = "Legend: [X]=applied, R=reversible, D=has data migrations"
+
+
+def _write_migration(directory: Path, name: str, operations: str, dependencies: Sequence[str] = ()) -> None:
+    """Write the migration file ``<directory>/<name>.py``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    source = _MIGRATION_FILE.format(name=name, dependencies=list(dependencies), operations=operations)
+    (directory / f"{name}.py").write_text(source, encoding="utf-8")
+
+
+def _admin(kind: str, database: str, sql: str) -> Any:
+    """Run *sql* on ``ns``/*database* of the line under test through a private connection (opened, closed and
+    unregistered here, in an ``asyncio.run()`` of its own) and return the answer of its last statement."""
+
+    async def run() -> Any:
+        SurrealDBConnectionManager.add_connection(
+            "cli_admin", url=_migration_url(kind), user="root", password="root", namespace="ns", database=database
+        )
+        try:
+            client = await SurrealDBConnectionManager.get_client("cli_admin")
+            return await client.query(sql, {})
+        finally:
+            await SurrealDBConnectionManager.remove_connection("cli_admin")
+
+    return asyncio.run(run())
+
+
+@pytest.fixture
+def database(request: pytest.FixtureRequest) -> Iterator[str]:
+    """Spec §9.2: a database of its own on the line under test (``REMOVE DATABASE IF EXISTS x; DEFINE DATABASE
+    x;``), removed afterwards. The protocol is the test's ``kind`` parameter."""
+    kind: str = request.node.callspec.params["kind"]
+    name = new_database_name()
+    _admin(kind, name, f"REMOVE DATABASE IF EXISTS {name}; DEFINE DATABASE {name};")
+    try:
+        yield name
+    finally:
+        _admin(kind, name, f"REMOVE DATABASE IF EXISTS {name};")
+
+
+@pytest.fixture
+def closes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """A spy on the default connection class's ``close_connection``: one entry per await (spec §5.2: once per command,
+    also on failure)."""
+    connection = SurrealDBConnectionManager._manager_for("default")
+    original = connection.close_connection
+    calls: list[str] = []
+
+    async def spy(*args: Any, **kwargs: Any) -> None:
+        calls.append("closed")
+        await original(*args, **kwargs)
+
+    monkeypatch.setattr(connection, "close_connection", spy)
+    return calls
+
+
+def _tables(kind: str, database: str) -> set[str]:
+    """The tables ``INFO FOR DB`` lists."""
+    info = _admin(kind, database, "INFO FOR DB;")
+    return set(info["tables"])
+
+
+def _applied(kind: str, database: str) -> list[str]:
+    """The names the tracking table records."""
+    rows = _admin(kind, database, "SELECT name FROM _surreal_orm_migrations ORDER BY name;")
+    return [row["name"] for row in rows]
+
+
+def _status(*rows: str) -> str:
+    """``status``'s exact output for *rows* (spec §5.7)."""
+    return "\n".join(["Migration status:", _RULE, *rows, _RULE, _LEGEND]) + "\n"
+
+
+def _closed_port() -> int:
+    """A freshly closed ephemeral port: a connection to it is refused at once (spec §9.3)."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+    return port
+
+
+@pytest.mark.parametrize("kind", ["ws", "http"])
+class TestCliE2E:
+    """AC-13, AC-15, AC-16, AC-17, AC-23 (spec §5.4–§5.7): ``migrate``, ``upgrade``, ``rollback`` and ``status`` on
+    the line under test, over WebSocket and HTTP, each in a database of its own; the resolved connection class's
+    ``close_connection`` awaited once per command, also on failure."""
+
+    @staticmethod
+    def _argv(kind: str, database: str, directory: Path, *rest: str) -> list[str]:
+        return ["-u", _migration_url(kind), "-n", "ns", "-d", database, "-m", str(directory), *rest]
+
+    def test_migrate_and_status(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        directory = tmp_path / "migrations"
+        _write_migration(directory, "0001_init", _ITEM_OPERATIONS)
+        argv = functools.partial(self._argv, kind, database, directory)
+        assert commands.main(argv("status")) == 0
+        assert capsys.readouterr().out == _status("[ ] 0001_init (2 ops) [R-]")
+        assert commands.main(argv("migrate")) == 0
+        captured = capsys.readouterr()
+        assert captured.out == "Applied 1 migration(s):\n  - 0001_init\n"
+        assert captured.err == ""
+        assert {"_surreal_orm_migrations", "cli_item"} <= _tables(kind, database)
+        assert commands.main(argv("status")) == 0
+        assert capsys.readouterr().out == _status("[X] 0001_init (2 ops) [R-]")
+        assert commands.main(argv("migrate")) == 0
+        assert capsys.readouterr().out == "No migrations to apply.\n"
+        assert closes == ["closed"] * 4
+        assert _applied(kind, database) == ["0001_init"]
+
+    def test_status_of_an_empty_directory(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert commands.main(self._argv(kind, database, tmp_path / "none", "status")) == 0
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("No migrations found.\n", "")
+        assert closes == ["closed"]
+
+    def test_migrate_fake(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        directory = tmp_path / "migrations"
+        _write_migration(directory, "0001_init", _ITEM_OPERATIONS)
+        assert commands.main(self._argv(kind, database, directory, "migrate", "--fake")) == 0
+        assert capsys.readouterr().out == "Applied 1 migration(s):\n  - 0001_init\n"
+        tables = _tables(kind, database)
+        assert "_surreal_orm_migrations" in tables
+        assert "cli_item" not in tables
+        assert _applied(kind, database) == ["0001_init"]
+        assert closes == ["closed"]
+
+    def test_migrate_target(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        directory = tmp_path / "migrations"
+        _write_migration(directory, "0001_init", _ITEM_OPERATIONS)
+        _write_migration(directory, "0002_more", _MORE_OPERATIONS, ["0001_init"])
+        argv = functools.partial(self._argv, kind, database, directory)
+        assert commands.main(argv("migrate", "-t", "0001_init")) == 0
+        assert capsys.readouterr().out == "Applied 1 migration(s):\n  - 0001_init\n"
+        assert commands.main(argv("status")) == 0
+        assert capsys.readouterr().out == _status("[X] 0001_init (2 ops) [R-]", "[ ] 0002_more (1 ops) [R-]")
+        assert commands.main(argv("migrate", "--target", "0009_x")) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == f"Migration failed: Unknown migration target '0009_x': no such migration file in {directory}.\n"
+        assert "Traceback" not in captured.err
+        assert _applied(kind, database) == ["0001_init"]
+        assert closes == ["closed"] * 3
+
+    def test_upgrade(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        directory = tmp_path / "migrations"
+        _write_migration(directory, "0001_data", _DATA_OPERATIONS)
+        argv = functools.partial(self._argv, kind, database, directory)
+        assert commands.main(argv("upgrade")) == 0  # nothing applied yet
+        assert capsys.readouterr().out == "No data migrations to apply.\n"
+        assert commands.main(argv("migrate")) == 0  # schema only: the data operation does not run
+        capsys.readouterr()
+        _admin(kind, database, "CREATE cli_item:one SET n = 1;")
+        assert commands.main(argv("status")) == 0
+        assert capsys.readouterr().out == _status("[X] 0001_data (2 ops) [RD]")
+        assert commands.main(argv("upgrade")) == 0
+        captured = capsys.readouterr()
+        assert captured.out == "Applied data migrations for 1 migration(s):\n  - 0001_data\n"
+        assert captured.err == ""
+        assert _admin(kind, database, "SELECT VALUE n FROM cli_item:one;") == [2]
+        assert commands.main(argv("upgrade", "-t", "0009_x")) == 1
+        captured = capsys.readouterr()
+        assert captured.err == f"Upgrade failed: Unknown migration target '0009_x': no such migration file in {directory}.\n"
+        assert closes == ["closed"] * 5
+
+    def test_rollback(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        directory = tmp_path / "migrations"
+        _write_migration(directory, "0001_init", _ITEM_OPERATIONS)
+        _write_migration(directory, "0002_more", _MORE_OPERATIONS, ["0001_init"])
+        argv = functools.partial(self._argv, kind, database, directory)
+        assert commands.main(argv("migrate")) == 0
+        assert capsys.readouterr().out == "Applied 2 migration(s):\n  - 0001_init\n  - 0002_more\n"
+        assert commands.main(argv("rollback", "0001_init")) == 0
+        assert capsys.readouterr().out == "Rolled back 1 migration(s):\n  - 0002_more\n"
+        assert _applied(kind, database) == ["0001_init"]
+        assert "cli_more" not in _tables(kind, database)
+        assert commands.main(argv("rollback", "0009_nope")) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "Rollback failed: Cannot roll back to '0009_nope': it is not applied.\n"
+        assert commands.main(argv("rollback", "")) == 0
+        assert capsys.readouterr().out == "Rolled back 1 migration(s):\n  - 0001_init\n"
+        assert _applied(kind, database) == []
+        assert commands.main(argv("rollback", "")) == 0
+        assert capsys.readouterr().out == "No migrations to rollback.\n"
+        assert commands.main(argv("status")) == 0
+        assert capsys.readouterr().out == _status("[ ] 0001_init (2 ops) [R-]", "[ ] 0002_more (1 ops) [R-]")
+        assert closes == ["closed"] * 6
+
+    def test_wrong_password(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-6: a refused password is reported without its value (``Status failed: Can't connect …``)."""
+        argv = ["--password", _SECRET, *self._argv(kind, database, tmp_path, "status")]
+        assert commands.main(argv) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines()[-1] == "Status failed: Can't connect to the database."
+        assert _SECRET not in captured.err
+        assert "Traceback" not in captured.err
+        assert closes == ["closed"]
+
+    def test_refused_connection(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        port = _closed_port()
+        url = f"ws://127.0.0.1:{port}/rpc" if kind == "ws" else f"http://127.0.0.1:{port}"
+        argv = ["-u", url, "-n", "ns", "-d", database, "-m", str(tmp_path), "migrate"]
+        assert commands.main(argv) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        lines = captured.err.splitlines()
+        # The lite logs the cause (a WARNING record), shown by the CLI's handler before the command's own line.
+        assert lines[0].startswith("Warning: Can't get connection: ")
+        assert lines[-1] == "Migration failed: Can't connect to the database."
+        assert "Traceback" not in captured.err
+        assert closes == ["closed"]
+
+    # -- AC-23: an interrupt and an empty message -----------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("command", "method", "prefix"),
+        [
+            (["migrate"], "migrate", "Migration failed"),
+            (["upgrade"], "upgrade", "Upgrade failed"),
+            (["rollback", ""], "rollback", "Rollback failed"),
+            (["status"], "get_migration_status", "Status failed"),
+        ],
+    )
+    def test_interrupt_and_empty_message(
+        self,
+        kind: str,
+        command: list[str],
+        method: str,
+        prefix: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        closes: list[str],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """No request: the executor's method is replaced; the database is never reached."""
+        raised: list[BaseException] = [KeyboardInterrupt(), RuntimeError("")]
+
+        async def boom(*args: Any, **kwargs: Any) -> Any:
+            raise raised.pop(0)
+
+        monkeypatch.setattr(MigrationExecutor, method, boom)
+        argv = self._argv(kind, "db", tmp_path, *command)
+        assert commands.main(argv) == 130
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", "Interrupted.\n")
+        assert commands.main(argv) == 1
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", f"{prefix}: RuntimeError\n")
+        assert closes == ["closed"] * 2
