@@ -1,7 +1,7 @@
 # Surreal ORM Lite
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![SurrealDB](https://img.shields.io/badge/SurrealDB-2.7.0%20%7C%203.3.4-purple)
+![SurrealDB](https://img.shields.io/badge/SurrealDB-2.7.0%20%7C%203.3.5-purple)
 ![SDK](https://img.shields.io/badge/SDK-Official%202.0-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![codecov](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite/graph/badge.svg)](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite)
@@ -28,7 +28,7 @@ This ORM is designed to:
 | Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0                            |
 | Pydantic     | >=2.13.4                                                     |
 
-> **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.7.0** and **v3.3.4**; up to v0.19.0 the pins were v2.6.5 and v3.2.4. The 2.x line behaves identically on 2.7.0, and 3.3.0 differs from 3.2.4 in one server behaviour, listed in the behaviour table. SurrealDB 3.1.x is no longer a supported line as of v0.14.0 — the suite is still run against 3.1.5 as a backward-compatibility check, but a regression there does not block a release.
+> **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.7.0** and **v3.3.5**; up to v0.19.0 the pins were v2.6.5 and v3.2.4. The 2.x line behaves identically on 2.7.0, and 3.3.0 differs from 3.2.4 in one server behaviour, listed in the behaviour table. SurrealDB 3.1.x is no longer a supported line as of v0.14.0 — the suite is still run against 3.1.5 as a backward-compatibility check, but a regression there does not block a release.
 
 ---
 
@@ -913,7 +913,7 @@ await user.merge(plan="pro", server_values={"updated_at": SurrealFunc.call(Surre
 
 `SurrealFunc.call(fn, *args)` builds `fn(arg, …)` from a function name — a plain string or a
 member of the shipped enums, which give you autocompletion over a **curated catalog whose every
-member is tested against SurrealDB 2.7.0 and 3.3.4**:
+member is tested against SurrealDB 2.7.0 and 3.3.5**:
 
 | Enum                    | Covers                                                           |
 | ----------------------- | ---------------------------------------------------------------- |
@@ -3562,10 +3562,11 @@ A statement with subqueries is one block, whose `LET`s bind each subquery once, 
 { LET $_sq0 = (SELECT id AS _sqv, age FROM Person WHERE active = $_f0 ORDER BY age DESC LIMIT 1)._sqv; (SELECT * FROM Post WHERE author IN $_sq0) };
 ```
 
-- **Why a `LET`**: SurrealDB 3.2 and later can return wrong rows for an inline sub-SELECT with
+- **Why a `LET`**: SurrealDB 3.2.0 to 3.3.4 can return wrong rows for an inline sub-SELECT with
   `ORDER BY` and `LIMIT`, which gives its value to the first outer record only
-  ([surrealdb/surrealdb#7470](https://github.com/surrealdb/surrealdb/issues/7470)). Bound once,
-  the subquery is right on every line, and the server runs it once instead of once per record.
+  ([surrealdb/surrealdb#7470](https://github.com/surrealdb/surrealdb/issues/7470), fixed in 3.3.5).
+  Bound once, the subquery is right on every release, and the server runs it once instead of once
+  per record.
 - **Why `_sqv`**: an ordered subquery selects its column as `_sqv`, with its order fields, and
   reads `._sqv` back: SurrealDB 2.x refuses to order a sub-SELECT of one column by another field.
 - **Reserved names**: `$_sq0`, `$_sq1`, … (`_sq<N>`) are the block's `LET`s and hide a
@@ -5572,13 +5573,13 @@ What the model declares wins; the rest is kept from the database:
 | `PERMISSIONS`           | `permissions`, written whole                                                                     | the stored ones kept         |
 | `DROP`                  | —                                                                                                | the stored one kept          |
 
-| Field clause                                                | Written from the model                                                                                                                          | Kept from the database                       |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| `TYPE`                                                      | always                                                                                                                                          | —                                            |
-| `FLEXIBLE`                                                  | as in "Field types"                                                                                                                             | a stored one, on a kind that holds an object |
-| `DEFAULT`                                                   | a constant default of a column that is not optional (a `server_fields` column: only where the database has no `DEFAULT`, `VALUE` or `COMPUTED`) | when the model writes none                   |
-| `VALUE`, `COMPUTED`                                         | a computed field's expression: `COMPUTED` over a stored `COMPUTED`, else `VALUE`                                                                | when the model writes none                   |
-| `REFERENCE`, `READONLY`, `ASSERT`, `PERMISSIONS`, `COMMENT` | —                                                                                                                                               | always                                       |
+| Field clause                                                | Written from the model                                                                                                                          | Kept from the database                                                |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `TYPE`                                                      | always                                                                                                                                          | —                                                                     |
+| `FLEXIBLE`                                                  | as in "Field types"                                                                                                                             | a stored one, on a kind that holds an object                          |
+| `DEFAULT`                                                   | a constant default of a column that is not optional (a `server_fields` column: only where the database has no `DEFAULT`, `VALUE` or `COMPUTED`) | when the model writes none; a stored `ALWAYS` even when it writes one |
+| `VALUE`, `COMPUTED`                                         | a computed field's expression: `COMPUTED` over a stored `COMPUTED`, else `VALUE`                                                                | when the model writes none                                            |
+| `REFERENCE`, `READONLY`, `ASSERT`, `PERMISSIONS`, `COMMENT` | —                                                                                                                                               | always                                                                |
 
 - Nothing is removed: the table keeps its records, the fields, clauses, indexes and events the model does not declare,
   the views that read it ([section 33](#33-materialized-views-view_query-define_view)), its live queries and its
@@ -7099,7 +7100,7 @@ As of v0.7.0, Surreal ORM Lite uses `surrealdb[pydantic]>=2.0.0,<3.0.0` (Surreal
 
 | SurrealDB Version                                  | SDK Version | Status                               |
 | -------------------------------------------------- | ----------- | ------------------------------------ |
-| 3.3.4                                              | 2.0         | ✅ Tested                            |
+| 3.3.5                                              | 2.0         | ✅ Tested                            |
 | 2.7.0                                              | 2.0         | ✅ Tested                            |
 | Embedded engine (SDK 2.0.0: SurrealDB 2.3.10 core) | 2.0         | ✅ Tested (in-process)               |
 | 3.2.4                                              | 2.0         | ✅ Compatible (tested up to v0.19.0) |
@@ -7134,7 +7135,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment`                                                  | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`)                                                                                                  | same on both lines                                                                                                                                                                  | v0.11.0                              |
 | `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                                                                    | same type + decorator; conflicts rarer (engine serialises more), except on `CHANGEFEED` tables (section 22)                                                                   | same type + decorator; conflicts are the normal optimistic-MVCC failure                                                                                                             | v0.12.0                              |
 | `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                                                                     | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)                                                                                                             | same on both lines                                                                                                                                                                  | v0.13.0                              |
-| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)                                                        | every catalogued member verified on 2.7.0                                                                                                                                     | every catalogued member verified on 3.3.4                                                                                                                                           | v0.13.0                              |
+| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)                                                        | every catalogued member verified on 2.7.0                                                                                                                                     | every catalogued member verified on 3.3.5                                                                                                                                           | v0.13.0                              |
 | `server_values` inside a transaction — when the instance sees the computed value                                                       | only after commit (buffered; `refresh()` to read it)                                                                                                                          | immediately (interactive returns the row)                                                                                                                                           | v0.13.0                              |
 | `merge(server_values=)` on a missing record / never-created table                                                                      | server returns no rows → ORM raises `SurrealDbError`                                                                                                                          | server raises `NotFound` for a missing table → ORM raises the same error                                                                                                            | v0.13.0                              |
 | Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                                                                             | same on both lines (DDL, recompute triggers, precedence over client data)                                                                                                     | same on both lines                                                                                                                                                                  | v0.14.0                              |
@@ -7219,7 +7220,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Writing history with a raw `CREATE … VERSION`                                                                                          | stored at that moment, readable with `as_of()`                                                                                                                                | accepted, not readable at that moment (the table did not exist then)                                                                                                                | v0.26.0                              |
 | `as_of()` moment before 1970-01-01 or after 2262-04-11T23:47:16.854775Z                                                                | refused by the ORM before any read (`ValueError`; `SurrealDbError` for a duration or expression resolving there): the server reads an earlier moment as the current state     | refused by the ORM before any read, same errors: the server would fail with an internal error                                                                                       | v0.26.0                              |
 | Subqueries (`Subquery`, or a QuerySet as a filter value)                                                                               | one statement for every read, count, aggregation, write by filter and live query; reads inside a transaction raise (buffered)                                                 | the same, and reads inside an interactive transaction (`objects(tx=)`) see its uncommitted writes                                                                                   | v0.27.0                              |
-| A subquery with `order_by()` and `limit()`                                                                                             | right; the ORM also selects the order fields, without which 2.x refuses to order by a field other than the one compared                                                       | right: the ORM binds each subquery once, in a `LET`; 3.2 and later can return wrong rows for such an inline sub-SELECT (surrealdb#7470)                                             | v0.27.0                              |
+| A subquery with `order_by()` and `limit()`                                                                                             | right; the ORM also selects the order fields, without which 2.x refuses to order by a field other than the one compared                                                       | right: the ORM binds each subquery once, in a `LET`; 3.2.0 to 3.3.4 can return wrong rows for such an inline sub-SELECT (surrealdb#7470, fixed in 3.3.5)                            | v0.27.0                              |
 | A subquery reading a table that does not exist                                                                                         | read as empty, like any missing table                                                                                                                                         | read as empty in three requests (statement, table probe, re-send); other errors, even ones quoting "does not exist", are relayed; transaction writes fail; `live()` raises on start | v0.27.0                              |
 | Subqueries under `as_of()`                                                                                                             | each subquery reads at the same moment: the ORM adds `VERSION` to it (the server would read the current state)                                                                | the same (the server applies the outer `VERSION` to an inline sub-SELECT only); without versioned storage `SurrealDbError`, but 3.1.5 raises the server's own `ThrownError`         | v0.27.0                              |
 | Query cache (`cache()`, `QueryCache`)                                                                                                  | same on both lines: client-side, per connection and identity; writes in a transaction invalidate at commit; reads in one are never cached (on 2.x they raise: buffered)       | the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)                                                                                | v0.28.0                              |

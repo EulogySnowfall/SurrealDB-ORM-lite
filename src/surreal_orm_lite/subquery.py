@@ -12,9 +12,9 @@ value is read as ``Subquery(qs)`` — sends **one** statement, inside which the 
   is its last one, on 2.x, 3.x and the embedded engine, over WebSocket and HTTP, in a buffered batch and in an
   interactive transaction. Its ``LET`` s are scoped to the block (a bound ``$_sq0`` is shadowed), each evaluated
   once, innermost first; the trailing statement is parenthesised, without which 2.x answers ``None``.
-- **Once, in a ``LET``.** SurrealDB 3.2 and later give an inline uncorrelated sub-SELECT with ``ORDER BY`` and
-  ``LIMIT`` its value for the first outer row only (surrealdb/surrealdb#7470). Bound once in a ``LET`` it is right
-  on every line, and evaluated once instead of once per outer row.
+- **Once, in a ``LET``.** SurrealDB 3.2.0 to 3.3.4 give an inline uncorrelated sub-SELECT with ``ORDER BY`` and
+  ``LIMIT`` its value for the first outer row only (surrealdb/surrealdb#7470, fixed in 3.3.5). Bound once in a
+  ``LET`` it is right on every release, and evaluated once instead of once per outer row.
 - **``_sqv``.** A subquery ordered by a field compiles to ``(SELECT <column> AS _sqv, <order columns> FROM … ORDER
   BY …)._sqv``: 2.x refuses ``SELECT VALUE x … ORDER BY y`` and orders wrongly by a column it selects only under
   an alias, while this form is right on every line. ``_sqv`` (:data:`VALUE_ALIAS`) and ``_sq<N>``
