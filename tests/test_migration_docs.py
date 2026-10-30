@@ -307,7 +307,7 @@ _NEEDLES_39 = {
         "`from_db=True` they are read and kept)",
         "`migrate()` and `rollback()` read the schema once, before their first change",
         "Functions are not compared",
-        "the CLI comes with v0.39.0",
+        "the command line is in [section 40](#40-command-line-surreal-orm-lite)",
     ),
 }
 #: What "Limits" no longer says (revision 4's analyzer and ``AlterTable`` wording).
@@ -354,10 +354,10 @@ _REGISTRY_BULLET = (
 
 
 def _section_39() -> str:
-    """Section 39, as written, without the ``---`` that ends it."""
-    body, separator, rest = _readme_part(_SECTION_39).rpartition("\n---\n")
-    assert separator and not rest.strip(), "section 39 ends with the --- of the next part"
-    return f"{body}\n"
+    """Section 39, as written: section 40 (v0.39.0) follows it, so it no longer ends with a ``---``."""
+    section = _readme_part(_SECTION_39)
+    assert "\n---\n" not in section, "section 39 is followed by section 40, not by the --- of the next part"
+    return section
 
 
 def _part_39(heading: str) -> str:
@@ -394,15 +394,19 @@ class TestReadmeSection39:
     """README section 39: its place, its parts, its blocks, its operations table and what each part states."""
 
     def test_section_39_follows_section_38(self) -> None:
-        """Right after section 38 (after its "Coming from" bullets), the last section before the ``---`` of
-        "Configuration Options"."""
+        """Right after section 38 (after its "Coming from" bullets), then section 40 (v0.39.0), the last section
+        before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_38 = text.index(f"\n{_SECTION_38}\n")
         start_39 = text.index(f"\n{_SECTION_39}\n")
         configuration = text.index("\n## Configuration Options\n")
         assert start_38 < start_39 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_38 + 1 : configuration], re.MULTILINE) == [_SECTION_38, _SECTION_39]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 39 ends before the --- of the next part"
+        assert re.findall(r"^#{2,3} .*$", text[start_38 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_38,
+            _SECTION_39,
+            "### 40. Command line (`surreal-orm-lite`)",
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_parts_in_order(self) -> None:
         """The intro, then the ten titled parts of the design, in order, as ``####`` headings."""
@@ -512,6 +516,7 @@ class TestReadmeSection39:
             "35-model-table-ddl-define_table-schema_mode-permissions",
             "orm-behaviour-the-embedded-engine",
             "orm-behaviour-surrealdb-2x-vs-3x",
+            "40-command-line-surreal-orm-lite",
         ], links
         assert [link for link in links if link not in anchors] == []
         assert _ANCHOR_39.lstrip("#") in anchors
@@ -564,10 +569,11 @@ _FEATURES_ROW_39 = ["Migrations (makemigrations / migrate / rollback)", "✅"]
 _ROADMAP_ROWS_39 = [
     ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
     ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
-    ["v0.39.0 – v0.40.0", "Tier 3 — Advanced (CLI, test factories)", "📋 Planned"],
+    ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "✅ Released"],
+    ["v0.40.0", "Tier 3 — Test fixtures & factories", "📋 Planned"],
     ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
 ]
-_COMPARISON_ROW_39 = ["Migrations & CLI", "✅ v0.38.0 (migrations), CLI v0.39.0", "✅"]
+_COMPARISON_ROW_39 = ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"]
 
 
 class TestReadmeRows38:
@@ -596,8 +602,9 @@ class TestReadmeRows38:
     def test_roadmap_rows(self) -> None:
         roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.37.0")
-        assert roadmap[start : start + 4] == _ROADMAP_ROWS_39, roadmap
+        assert roadmap[start : start + 5] == _ROADMAP_ROWS_39, roadmap
         assert "v0.38.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
+        assert "v0.39.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
 
     def test_comparison_row(self) -> None:
         """Right after hybrid search, before the fixtures."""
@@ -619,7 +626,8 @@ _FORWARD_REFERENCES = [
         "the `inspectdb` command comes with v0.39.0.",
         f"- **`SchemaState.diff()`, `schema_diff()` and `applied_migrations`** come with the migrations ({_LINK_39}): "
         "`applied_migrations` is filled from the tracking table when the database has one (full ORM: declared, never "
-        "filled; it is the 2nd attribute, positional as in the full ORM); the `inspectdb` command comes with v0.39.0.",
+        "filled; it is the 2nd attribute, positional as in the full ORM); the `inspectdb` command is in "
+        "[section 40](#40-command-line-surreal-orm-lite).",
     ),
     (
         "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",

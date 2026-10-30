@@ -6527,8 +6527,8 @@ class TestReadmeSection37:
     features, roadmap, comparison and both behaviour tables."""
 
     def test_section_37_follows_section_36(self) -> None:
-        """Right after section 36 (after its "Coming from" bullets), then section 38 (v0.37.0), section 39 (v0.38.0),
-        and before the ``---`` of "Configuration Options"."""
+        """Right after section 36 (after its "Coming from" bullets), then section 38 (v0.37.0), section 39 (v0.38.0) and
+        section 40 (v0.39.0), and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_36 = text.index(f"\n{_SECTION_36}\n")
         start_37 = text.index(f"\n{_SECTION_37}\n")
@@ -6539,6 +6539,7 @@ class TestReadmeSection37:
             _SECTION_37,
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
+            "### 40. Command line (`surreal-orm-lite`)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

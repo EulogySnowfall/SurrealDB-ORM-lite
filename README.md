@@ -222,6 +222,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Vector search (`similar_to()`, KNN, HNSW indexes)                             | ✅     |
 | Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)                     | ✅     |
 | Migrations (makemigrations / migrate / rollback)                              | ✅     |
+| Command line (`surreal-orm-lite`: migrations, inspectdb, shell)               | ✅     |
 
 ### Supported Filter Lookups
 
@@ -4474,7 +4475,8 @@ reads, stores, logs or writes them.
   `SchemaState.other["configs"]`, as SurrealDB returns them (full ORM: `ApiState`, `GraphQLConfigState`).
 - **`SchemaState.diff()`, `schema_diff()` and `applied_migrations`** come with the migrations ([section 39](#39-migrations-makemigrations-migrationexecutor-operations)):
   `applied_migrations` is filled from the tracking table when the database has one (full ORM: declared, never
-  filled; it is the 2nd attribute, positional as in the full ORM); the `inspectdb` command comes with v0.39.0.
+  filled; it is the 2nd attribute, positional as in the full ORM); the `inspectdb` command is in
+  [section 40](#40-command-line-surreal-orm-lite).
 - **A refused or failed `INFO FOR DB` raises** `SurrealDbAuthenticationError` or `SurrealDbError`, and a
   definition that cannot be read or parsed becomes a `SchemaIssue` in `schema.issues` and a logged warning (full
   ORM: an empty state, and definitions dropped with a debug log).
@@ -6938,7 +6940,7 @@ the differences.
   changes meanwhile is not seen.
 - On SurrealDB 2.x and the embedded engine, `show_sql()` shows the statements rendered from the migration files, and
   `migrate()`'s batch may hold more `FLEXIBLE` redefinitions (see "Server lines").
-- Functions are not compared; there is no squashing and no command line yet (the CLI comes with v0.39.0).
+- Functions are not compared and there is no squashing; the command line is in [section 40](#40-command-line-surreal-orm-lite).
 
 #### Coming from the full SurrealDB-ORM
 
@@ -6993,6 +6995,190 @@ the differences.
   anything is applied, and on SurrealDB 2.x the `FLEXIBLE` statements cover the columns the database holds; the full
   ORM sends each migration's statements as written. The session needs the right to read the schema, which every
   system user has.
+
+### 40. Command line (`surreal-orm-lite`)
+
+Since v0.39.0 the package installs a `surreal-orm-lite` console script, also run as `python -m surreal_orm_lite.cli`,
+with no extra to install: it is the full SurrealDB-ORM's command line — its nine commands, global options,
+`SURREAL_*` environment variables, defaults and output texts — built on the standard library's `argparse`. Each
+command is a thin front end over the migrations of [section 39](#39-migrations-makemigrations-migrationexecutor-operations)
+and the `generate_models_from_db()` of
+[section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db): the command line decides nothing
+about the schema.
+
+#### Install and run
+
+```bash
+pip install surreal-orm-lite
+surreal-orm-lite --version
+surreal-orm-lite --help
+surreal-orm-lite migrate --help
+python -m surreal_orm_lite.cli status --help
+```
+
+Global options go **before** the command (`surreal-orm-lite -n app -d app migrate`); after `makemigrations`, `-n` and
+`-m` mean `--name` and `--models`, as in the full ORM. Run the command line from the project directory: the migrations
+directory (`--migrations-dir`/`-m`, `migrations` by default) is relative to it, and it is put on the import path
+before the `--models` modules are imported, so `--models app.models` finds `app/models.py`.
+
+#### Connection options
+
+| Option                   | Environment variable | Default                 |
+| ------------------------ | -------------------- | ----------------------- |
+| `--url`, `-u`            | `SURREAL_URL`        | `http://localhost:8000` |
+| `--namespace`, `-n`      | `SURREAL_NAMESPACE`  | none                    |
+| `--database`, `-d`       | `SURREAL_DATABASE`   | none                    |
+| `--user`                 | `SURREAL_USER`       | `root`                  |
+| `--password`             | `SURREAL_PASSWORD`   | `root`                  |
+| `--migrations-dir`, `-m` | none                 | `migrations`            |
+| `--connection`           | none                 | `default`               |
+
+An option wins over its environment variable, a variable over the default, and an empty variable counts as unset. The
+URL is any URL `set_connection()` accepts: `ws://host:8000/rpc`, `http://host:8000`, `mem://` or `surrealkv://<path>`
+(the user and password are never sent to the embedded engine). Every command that reaches the database needs a
+namespace and a database; without them it stops with a usage error before connecting. `sqlmigrate`,
+`makemigrations --empty` and `makemigrations --no-from-db` work offline and need neither.
+
+#### Commands
+
+A model module (`app/models.py` declaring the models of [section 39](#39-migrations-makemigrations-migrationexecutor-operations)),
+from its first migration to its rollback:
+
+```bash
+export SURREAL_URL=ws://localhost:8000/rpc SURREAL_NAMESPACE=app SURREAL_DATABASE=app
+export SURREAL_PASSWORD='…'
+surreal-orm-lite makemigrations -n initial -m app.models
+surreal-orm-lite migrate
+surreal-orm-lite status
+surreal-orm-lite makemigrations -n again -m app.models   # No changes detected.
+surreal-orm-lite schemadiff -m app.models                # Models and database are in sync.
+surreal-orm-lite rollback ""
+surreal-orm-lite status
+```
+
+`makemigrations` prints the file it wrote and its operations, `migrate` the migrations it applied, and `status` each
+migration file, applied (`[X]`) or not:
+
+```
+Created migration: migrations/0001_initial.py
+Operations: 3
+  - Create table person
+  - Add field age to person
+  - Add field name to person
+Applied 1 migration(s):
+  - 0001_initial
+Migration status:
+------------------------------------------------------------
+[X] 0001_initial (3 ops) [R-]
+------------------------------------------------------------
+Legend: [X]=applied, R=reversible, D=has data migrations
+```
+
+The other commands, one line each:
+
+- `makemigrations -n NAME --empty` writes a migration with no operation, to fill in by hand.
+- `makemigrations -n NAME -m MODULE --no-from-db` diffs the models against the migration files, with no request
+  (offline); `--drop-missing` also writes the removals of what no model declares any more.
+- `migrate -t TARGET` applies the migrations up to _TARGET_; `migrate --fake` records them without running them.
+- `upgrade [-t TARGET]` runs the data migrations (`DataMigration`) of the applied migrations.
+- `rollback TARGET` undoes the migrations applied after _TARGET_; `rollback ""` undoes them all.
+- `sqlmigrate MIGRATION` prints the statements of a migration file without a connection; `--backwards` prints those
+  that undo it, `--line 2` those of SurrealDB 2.x and the embedded engine.
+- `inspectdb` prints the models of the database's tables; `-o FILE` writes them to a file, `--table NAME` (repeatable)
+  reads only those tables, `--no-overwrite` refuses to replace an existing file.
+- `schemadiff -m MODULE` lists what separates the models from the database, read-only, the irreversible removals
+  apart.
+
+#### The SurrealQL shell
+
+`surreal-orm-lite shell` sends each line you type to the database, unchanged, and shows SurrealDB's answer per
+statement: a line that holds several statements gets a `-- [i/N] --` header before each one, an error is an `Error:`
+line, and the session goes on until `exit`, `quit` or end of input.
+
+```bash
+surreal-orm-lite -u mem:// -n app -d app shell
+```
+
+```
+Connected to mem://
+Namespace: app, Database: app
+Type 'exit' or 'quit' to exit. Enter SurrealQL queries:
+------------------------------------------------------------
+surreal> CREATE person:ada SET name = 'Ada'; RETURN 1 + 1
+-- [1/2] --
+{'id': RecordID(table_name=person, record_id='ada'), 'name': 'Ada'}
+-- [2/2] --
+2
+surreal> SELECT name FROM person
+{'name': 'Ada'}
+surreal> exit
+Goodbye!
+```
+
+Each input line is one request: a transaction must fit on one line (`BEGIN; …; COMMIT;`). Over HTTP no session state
+(`LET`, `USE`) survives to the next line; use a `ws://` URL to keep it.
+
+#### Several databases
+
+`--connection NAME` registers the settings under that connection name, and every command uses it: `makemigrations`
+writes the models declared with `connection="NAME"`, and `inspectdb` writes `connection="NAME"` in the models it
+generates ([section 30](#30-multiple-databases-add_connection-using)). Without it the connection is `default`.
+
+#### Exit codes
+
+- `0`: success, including `No changes detected.`, `No migrations to apply.` and the differences `schemadiff` finds.
+- `1`: the command failed, with one `<Command> failed: <reason>` line on stderr and no traceback.
+- `2`: a usage error, including a missing namespace or database.
+- `130`: interrupted with Ctrl+C (`Interrupted.` on stderr).
+
+#### Security
+
+- Pass the password in `SURREAL_PASSWORD` rather than `--password`: an option is visible in the process list. The
+  command line never prints it — not in `--help`, not in an error, not in the shell's banner, which drops the URL's
+  `user:password@`.
+- The `root`/`root` defaults are SurrealDB's and the full ORM's development defaults: set a real user in production.
+- `--models` imports the modules it names and the migration commands load the migration files: both run their Python
+  code. Run the command line from your project directory, on modules and migration files you trust.
+- The shell runs any SurrealQL with the configured identity, as `surreal sql` does: give it a user with the rights
+  you mean to use.
+
+#### Server lines
+
+The commands behave the same on SurrealDB 3.x, 2.x and the embedded engine; what differs is what the API they call
+does on each line. `migrate` and `rollback` refuse `ASYNC` events, `WITH REFRESH` accesses and `COMPUTED` fields on 2.x
+and the embedded engine before any change (exit 1). The shell shows each line's answers as they come: on 3.x a
+transaction answers one entry for `BEGIN` and one for `COMMIT`, on 2.x and the embedded engine only the statements
+inside it; a `SELECT` on a missing table is an `Error:` line on 3.x and `(empty result)` on 2.x. On the embedded
+engine each command opens and closes the database: `mem://` starts empty at every command (use it for the shell and
+the offline commands), while `surrealkv://<path>` keeps its data from one command to the next. The
+[2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) and the [embedded table](#orm-behaviour-the-embedded-engine) list
+the differences.
+
+#### Coming from the full SurrealDB-ORM
+
+- **No `click`, no extra**: the command line is built on `argparse`, so the script works after a plain
+  `pip install surreal-orm-lite` (the full ORM needs `pip install surreal-orm[cli]`). Commands, options, environment
+  variables, defaults and texts are the same; the script is `surreal-orm-lite` instead of `surreal-orm`.
+- **The shell answers per statement**: one block per statement, with `-- [i/N] --` headers when a line holds several
+  statements, where the full ORM flattens every record of the line into one list.
+- **Options of this library**: `--connection`, `--version`, `sqlmigrate --backwards` and `--line`, and
+  `inspectdb --table` and `--no-overwrite`, each a parameter of the function the command calls.
+- **`makemigrations` keeps this library's meaning**: `--empty` writes a migration that depends on the latest ones;
+  `--no-from-db` diffs against the migration files (offline), where the full ORM diffs against an empty schema, and
+  `--drop-missing` keeps its meaning there.
+- **Skipped removals are one warning**: the removals left out without `--drop-missing` are reported as one `Warning:`
+  line on stderr, not as a list on stdout.
+- **Exit codes**: exit 2 when the namespace or the database is missing, before any connection; 130 on Ctrl+C; 0 for
+  `schemadiff` even when it finds differences, as in the full ORM.
+- **`schemadiff` with no registered model exits 1**, where the full ORM lists every table of the database as a removal.
+- **Ctrl+C during a shell query ends the session** with exit 130; Ctrl+C at the prompt still says `Goodbye!`.
+- **Not inside an event loop**: the command line refuses to run inside a running event loop (Jupyter, an async test)
+  and exits 1; run it in a subprocess.
+- **No models is an error on stderr**: `No models found. Register models by importing them (--models).` goes to stderr,
+  with the `(--models)` hint.
+- **Any import failure is reported**: any exception raised by a `--models` import is reported as
+  `Error importing <module>: <reason>`, not only an `ImportError`.
+- **The banner hides credentials**: the shell banner never prints the URL's credentials (`user:password@` is dropped).
 
 ---
 
@@ -7116,7 +7302,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.36.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where they differ from 3.3.4. The row added in v0.37.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.37.4 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.37.5 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.38.0 were measured on 2.7.0, 3.3.4 and the embedded engine.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4. Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`. Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.35.2 was measured on 2.7.0 and 3.3.4, identical on 3.1.5. The row added in v0.35.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.36.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.36.2 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.37.0 were measured on 2.7.0, 3.3.4, 3.2.6 and the embedded engine, with 3.1.5 and 3.2.6 where they differ from 3.3.4. The row added in v0.37.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.37.4 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.37.5 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. Rows added in v0.38.0 were measured on 2.7.0, 3.3.4 and the embedded engine. The row added in v0.39.0 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -7290,6 +7476,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Migrations: `COMPUTED` fields in `AddField`/`AlterField`                                                                               | refused before any DDL (`SurrealDbError`)                                                                                                                                     | applied                                                                                                                                                                             | v0.38.0                              |
 | Migrations: a live query on a table a migration removes                                                                                | no further notification                                                                                                                                                       | the subscription ends                                                                                                                                                               | v0.38.0                              |
 | Migrations: a migration's atomicity, concurrent `migrate()`                                                                            | same on both lines: each migration and its record in one transaction; a concurrent run skips a migration the other recorded                                                   | same on both lines                                                                                                                                                                  | v0.38.0                              |
+| CLI `surreal-orm-lite` `shell`: a transaction, a `SELECT` on a missing table                                                           | no entry for `BEGIN` and `COMMIT`, one per statement inside the transaction; a missing table answers `(empty result)`                                                         | one entry each for `BEGIN` and `COMMIT` (a failed transaction's `COMMIT` is an `Error:` line); a missing table is an `Error:` line                                                  | v0.39.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -7332,6 +7519,7 @@ Capabilities not listed behave as on a 2.x server.
 | `remove_index(tx=)` then `define_indexes(tx=)` in one block         | the index is defined again after its removal and committed, on a table holding records too                                                                                                                                                                                                                                                            | the same on 3.x; on 2.x, on a table holding records, the commit fails with a retryable conflict                 | v0.36.2 |
 | Hybrid search (v0.37.0)                                             | as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) keeps the records at an equal distance at the `vector_limit`-th place by id (since v0.37.4), as `similar_to(dist=…)` does                   | 3.x fuses with `search::rrf()`, each list applying the conditions; its exact scan returns the same list         | v0.37.0 |
 | Migrations (v0.38.0)                                                | as on a 2.x server: `SEARCH` for a full-text `CreateIndex`, `FLEXIBLE` on `any` columns (also in the redefinitions of an `AlterTable` that makes a table `SCHEMAFULL`), `ASYNC` events, `WITH REFRESH` and `COMPUTED` fields refused before any DDL; each migration atomic, its analyzers committed first and compensated as on the servers           | 3.x writes `FULLTEXT`, no `FLEXIBLE` on `any`, and applies `ASYNC`, `WITH REFRESH` and `COMPUTED`               | v0.38.0 |
+| CLI `surreal-orm-lite` (v0.39.0)                                    | each command opens and closes the engine: `mem://` starts empty at every command (use it for `shell` and the offline commands), `surrealkv://<path>` keeps its data from one command to the next; a parse error in a shell line is raised by the SDK and shown as one `Error:` line; the shell answers as a 2.x server                                | a server keeps its data between commands; a parse error comes back as an error answer, shown the same way       | v0.39.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -7385,7 +7573,8 @@ Contributions are welcome! Please:
 | v0.36.0           | Tier 3 — Vector search                               | ✅ Released |
 | v0.37.0           | Tier 3 — Hybrid search                               | ✅ Released |
 | v0.38.0           | Tier 3 — Migration system                            | ✅ Released |
-| v0.39.0 – v0.40.0 | Tier 3 — Advanced (CLI, test factories)              | 📋 Planned  |
+| v0.39.0           | Tier 3 — Command line (`surreal-orm-lite`)           | ✅ Released |
+| v0.40.0           | Tier 3 — Test fixtures & factories                   | 📋 Planned  |
 | v0.41.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
@@ -7447,7 +7636,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Full-Text Search              | ✅ v0.35.0 (`search()`)                                               | ✅                                        |
 | Vector Search (KNN/HNSW)      | ✅ v0.36.0 (`similar_to()`)                                           | ✅                                        |
 | Hybrid Search (RRF)           | ✅ v0.37.0 (`hybrid_search()`)                                        | ✅                                        |
-| Migrations & CLI              | ✅ v0.38.0 (migrations), CLI v0.39.0                                  | ✅                                        |
+| Migrations & CLI              | ✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)                             | ✅                                        |
 | Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.40.0                          | ✅                                        |
 | Retry, Logging, Metrics       | v0.41.0                                                               | ✅                                        |
 | Connection Pool               | post-GA (tentative)                                                   | ✅                                        |

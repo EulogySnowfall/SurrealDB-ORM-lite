@@ -3335,7 +3335,7 @@ _COMPARISON_ROWS_34 = [
     ["Full-Text Search", "✅ v0.35.0 (`search()`)", "✅"],
     ["Vector Search (KNN/HNSW)", "✅ v0.36.0 (`similar_to()`)", "✅"],
     ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"],
-    ["Migrations & CLI", "✅ v0.38.0 (migrations), CLI v0.39.0", "✅"],
+    ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"],
     ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.40.0", "✅"],
     ["Retry, Logging, Metrics", "v0.41.0", "✅"],
     ["Connection Pool", "post-GA (tentative)", "✅"],
@@ -3416,8 +3416,8 @@ class TestReadmeSection34:
 
     def test_section_34_follows_section_33(self) -> None:
         """Right after section 33 (after its "Coming from" bullets), then section 35 (v0.34.0), section 36 (v0.35.0),
-        section 37 (v0.36.0), section 38 (v0.37.0) and section 39 (v0.38.0), and before the ``---`` of "Configuration
-        Options"."""
+        section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0) and section 40 (v0.39.0), and before the
+        ``---`` of "Configuration Options"."""
         text = _readme()
         start_33 = text.index(f"\n{_SECTION_33}\n")
         start_34 = text.index(f"\n{_SECTION_34}\n")
@@ -3431,6 +3431,7 @@ class TestReadmeSection34:
             "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
+            "### 40. Command line (`surreal-orm-lite`)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -3539,7 +3540,7 @@ class TestReadmeSection34:
         start = [row[0] for row in roadmap].index("v0.32.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_34, roadmap
         firsts = [row[0] for row in roadmap]
-        assert "v0.33.0 – v0.39.0" not in firsts and "v0.34.0 – v0.40.0" not in firsts and "v0.40.0" not in firsts
+        assert "v0.33.0 – v0.39.0" not in firsts and "v0.34.0 – v0.40.0" not in firsts and "v0.39.0 – v0.40.0" not in firsts
 
     def test_comparison_rows(self) -> None:
         """The "Native typed relations" row no longer announces v0.33.0; the ``TYPE RELATION`` row comes right after

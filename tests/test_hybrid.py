@@ -3352,13 +3352,12 @@ _EMBEDDED_HYBRID_ROW = [
     "v0.37.0",
 ]
 _FEATURES_ROW_38 = ["Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)", "✅"]
-#: The roadmap from v0.36.0: v0.37.0 ships hybrid search, then v0.38.0 the migrations, so the planned range starts at
-#: v0.39.0.
+#: The roadmap from v0.36.0: v0.37.0 ships hybrid search, v0.38.0 the migrations, then v0.39.0 the command line.
 _ROADMAP_ROWS_38 = [
     ["v0.36.0", "Tier 3 — Vector search", "✅ Released"],
     ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
     ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
-    ["v0.39.0 – v0.40.0", "Tier 3 — Advanced (CLI, test factories)", "📋 Planned"],
+    ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "✅ Released"],
 ]
 _COMPARISON_ROW_38 = ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"]
 #: The arguments of ``hybrid_search()`` a README example may give as numbers, with the range each accepts.
@@ -3468,8 +3467,8 @@ class TestReadmeSection38:
     the bullets of sections 36 and 37 that point to it; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_38_follows_section_37(self) -> None:
-        """Right after section 37 (after its "Coming from" bullets), then section 39 (v0.38.0), and before the ``---``
-        of "Configuration Options"."""
+        """Right after section 37 (after its "Coming from" bullets), then section 39 (v0.38.0) and section 40 (v0.39.0),
+        and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_37 = text.index(f"\n{_SECTION_37}\n")
         start_38 = text.index(f"\n{_SECTION_38}\n")
@@ -3479,6 +3478,7 @@ class TestReadmeSection38:
             _SECTION_37,
             _SECTION_38,
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
+            "### 40. Command line (`surreal-orm-lite`)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
