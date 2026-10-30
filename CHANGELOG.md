@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.3] - 2026-10-30
+
+Test pins move to SurrealDB 3.3.5, which fixes the inline ordered and limited sub-SELECT bug
+(surrealdb/surrealdb#7470).
+
+### Changed
+
+- The primary test pin is now SurrealDB **3.3.5** (CI, `.surrealdb-version`, README, ROADMAP).
+  The 2.x line stays on 2.7.0.
+
+### Fixed
+
+- The #7470 pin test now expects the wrong rows only on SurrealDB 3.2.0 to 3.3.4 and the right
+  rows on 2.x, 3.1 and 3.3.5+ (it failed on purpose when the server fixed the bug). The ORM still
+  binds each subquery once in a `LET`, which the affected releases need; README and docstrings
+  name the affected range.
+
 ## [0.38.0] - 2026-10-28
 
 Migration system: the ORM writes Django-style migration files from the models and applies them,
