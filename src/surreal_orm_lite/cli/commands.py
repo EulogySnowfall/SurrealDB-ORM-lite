@@ -28,7 +28,7 @@ from typing import Any, NoReturn, TypeVar
 from .. import __version__
 from ..connection_manager import SurrealDBConnectionManager
 from ..exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
-from ..introspection import schema_diff
+from ..introspection import generate_models_from_db, schema_diff
 from ..migrations import MigrationExecutor, ModelIntrospector, makemigrations, split_destructive
 
 __all__ = ["cli", "main"]
@@ -508,8 +508,31 @@ def _cmd_schemadiff(args: argparse.Namespace, settings: _Settings) -> int:
     return 0
 
 
+def _cmd_inspectdb(args: argparse.Namespace, settings: _Settings) -> int:
+    """``inspectdb``: the models of the database's tables — ``generate_models_from_db()`` on the command's connection
+    (spec §5.9). With ``-o`` the module is written (``--no-overwrite``: an existing file is refused, left as it was);
+    without, the source goes to stdout with one trailing newline. ``--table`` (repeatable) reads those tables only;
+    a named ``--connection`` puts ``connection="<name>"`` in the generated models."""
+    manager = _configure(settings, args.command)
+    try:
+        source = _run(
+            lambda: generate_models_from_db(
+                args.output, settings.connection, tables=args.tables, overwrite=not args.no_overwrite
+            ),
+            manager,
+        )
+    except Exception as exc:
+        _err(f"Introspection failed: {_message(exc)}", settings)
+        return 1
+    if args.output is not None:
+        _echo(f"Generated models written to: {args.output}")
+    else:
+        print(source, end="" if source.endswith("\n") else "\n")
+    return 0
+
+
 def _cmd_database(args: argparse.Namespace, settings: _Settings) -> int:
-    """A command that reaches the database and is not written yet: ``inspectdb``, ``shell``."""
+    """A command that reaches the database and is not written yet: ``shell``."""
     _configure(settings, args.command)
     return 0
 
@@ -537,7 +560,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace, _Settings], int]] = {
     "rollback": _cmd_rollback,
     "status": _cmd_status,
     "sqlmigrate": _cmd_sqlmigrate,
-    "inspectdb": _cmd_database,
+    "inspectdb": _cmd_inspectdb,
     "schemadiff": _cmd_schemadiff,
     "shell": _cmd_database,
 }

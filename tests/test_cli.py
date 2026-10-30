@@ -16,6 +16,10 @@ class closed once per command, also on failure; failures reported as ``<Prefix> 
 ``makemigrations`` against the database's schema and ``schemadiff``, over WebSocket and HTTP; the ``--no-from-db``
 hint on connection errors only; ``--connection``; no connection configured when no model is registered.
 
+``TestCliInspectdbE2E`` (spec §5.9; AC-18, AC-19's inspectdb part): ``inspectdb`` prints ``generate_models_from_db()``'s
+source, writes it with ``-o`` (``--no-overwrite`` refuses an existing file), ``--table`` limits it, a named
+``--connection`` shows in the generated models.
+
 CLI tests are sync ``def`` tests: ``main()`` runs its own ``asyncio.run()`` (spec §9.2).
 """
 
@@ -41,6 +45,7 @@ import surreal_orm_lite
 from surreal_orm_lite import SurrealDBConnectionManager
 from surreal_orm_lite.cli import commands
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
+from surreal_orm_lite.introspection import generate_models_from_db
 from surreal_orm_lite.migrations import MigrationExecutor, introspector
 from tests.conftest import _migration_url, new_database_name
 
@@ -1292,3 +1297,120 @@ class TestCliFromDbE2E:
         out = _lines(capsys.readouterr().out)
         assert out[0] == f"Found {len(created)} difference(s):"
         assert not any("cli_author_" in line for line in out)
+
+
+# === E2E: inspectdb ==================================================================================================
+
+#: Two tables to read back (spec §5.9; AC-18).
+_INSPECT_SCHEMA = (
+    "DEFINE TABLE cli_t1 SCHEMAFULL; DEFINE FIELD a ON cli_t1 TYPE int; "
+    "DEFINE TABLE cli_t2 SCHEMAFULL; DEFINE FIELD b ON cli_t2 TYPE string;"
+)
+
+
+def _generated(connection: str | None = None, **kwargs: Any) -> str:
+    """``generate_models_from_db()``'s source on *connection* (already configured), in an ``asyncio.run()`` that
+    closes that connection afterwards."""
+
+    async def run() -> str:
+        try:
+            return await generate_models_from_db(None, connection, **kwargs)
+        finally:
+            await SurrealDBConnectionManager._manager_for(connection or "default").close_connection()
+
+    return asyncio.run(run())
+
+
+def _stdout_of(source: str) -> str:
+    """What ``inspectdb`` prints for *source*: one trailing newline, none added when present."""
+    return source if source.endswith("\n") else source + "\n"
+
+
+@pytest.mark.parametrize("kind", ["ws", "http"])
+class TestCliInspectdbE2E:
+    """AC-18, AC-19 (inspectdb) (spec §5.9): ``inspectdb`` on the line under test, over WebSocket and HTTP, each in a
+    database of its own; the resolved connection class's ``close_connection`` awaited once per command."""
+
+    @staticmethod
+    def _argv(kind: str, database: str, *rest: str) -> list[str]:
+        return ["-u", _migration_url(kind), "-n", "ns", "-d", database, *rest]
+
+    def test_stdout_is_the_generated_source(
+        self, kind: str, database: str, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _admin(kind, database, _INSPECT_SCHEMA)
+        assert commands.main(self._argv(kind, database, "inspectdb")) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert closes == ["closed"]
+        source = _generated()
+        assert "cli_t1" in source and "cli_t2" in source
+        assert captured.out == _stdout_of(source)
+
+    def test_output_file_and_no_overwrite(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _admin(kind, database, _INSPECT_SCHEMA)
+        output = tmp_path / "models.py"
+        assert commands.main(self._argv(kind, database, "inspectdb", "-o", str(output))) == 0
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == (f"Generated models written to: {output}\n", "")
+        content = output.read_text(encoding="utf-8")
+        assert content == _generated()
+        assert commands.main(self._argv(kind, database, "inspectdb", "--output", str(output), "--no-overwrite")) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("Introspection failed: ")
+        assert "already exists" in captured.err
+        assert "Traceback" not in captured.err
+        assert output.read_text(encoding="utf-8") == content
+        assert closes == ["closed"] * 3  # two commands, then the direct call's close
+
+    def test_table_option(self, kind: str, database: str, closes: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+        _admin(kind, database, _INSPECT_SCHEMA)
+        assert commands.main(self._argv(kind, database, "inspectdb", "--table", "cli_t1")) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert "cli_t1" in captured.out
+        assert "cli_t2" not in captured.out
+        assert captured.out == _stdout_of(_generated(tables=["cli_t1"]))
+        assert commands.main(self._argv(kind, database, "inspectdb", "--table", "cli_t1", "--table", "cli_t2")) == 0
+        out = capsys.readouterr().out
+        assert "cli_t1" in out and "cli_t2" in out
+
+    def test_unknown_table(self, kind: str, database: str, closes: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+        _admin(kind, database, _INSPECT_SCHEMA)
+        assert commands.main(self._argv(kind, database, "inspectdb", "--table", "cli_nope")) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines()[-1].startswith("Introspection failed: ")
+        assert "Traceback" not in captured.err
+        assert closes == ["closed"]
+
+    def test_connection_option(self, kind: str, database: str, analytics: None, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-19 (inspectdb): the generated models carry ``connection="analytics"``; ``default`` untouched."""
+        _admin(kind, database, _INSPECT_SCHEMA)
+        default = SurrealDBConnectionManager.get_config("default")
+        assert commands.main(["--connection", "analytics", *self._argv(kind, database, "inspectdb")]) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert 'connection="analytics"' in captured.out
+        assert captured.out == _stdout_of(_generated("analytics"))
+        config = SurrealDBConnectionManager.get_config("analytics")
+        assert config is not None
+        assert (config.url, config.namespace, config.database) == (_migration_url(kind), "ns", database)
+        assert SurrealDBConnectionManager.get_config("default") == default
+
+    def test_refused_connection(
+        self, kind: str, database: str, tmp_path: Path, closes: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        port = _closed_port()
+        url = f"ws://127.0.0.1:{port}/rpc" if kind == "ws" else f"http://127.0.0.1:{port}"
+        output = tmp_path / "models.py"
+        assert commands.main(["-u", url, "-n", "ns", "-d", database, "inspectdb", "-o", str(output)]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.splitlines()[-1].startswith("Introspection failed: ")
+        assert "Traceback" not in captured.err
+        assert not output.exists()
+        assert closes == ["closed"]
