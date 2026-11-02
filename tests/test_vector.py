@@ -3707,6 +3707,7 @@ class TestSimilarToE2E:
             await doc.update()
             updated = await client.query("SELECT * FROM vec_doc:d2;", {})
             await doc.delete()
+            await _compaction.wait_for_model_indexes(client, VecDoc)
             await doc.save()
             saved = await client.query("SELECT * FROM vec_doc:d2;", {})
         for stored in (updated, saved):
@@ -3731,6 +3732,7 @@ class TestSimilarToE2E:
             await first.update()
             updated = await client.query("SELECT * FROM vec_extra:d1;", {})
             await first.delete()
+            await _compaction.wait_for_model_indexes(client, VecExtra)
             await first.save()
             saved = await client.query("SELECT * FROM vec_extra:d1;", {})
         for stored in (updated, saved):
