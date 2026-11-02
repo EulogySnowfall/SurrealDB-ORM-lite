@@ -7,11 +7,13 @@ open a server or the embedded engine are suffixed ``E2E``.
 """
 
 import ast
+import contextlib
 import enum
 import functools
 import random
 import re
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,8 +33,10 @@ from surreal_orm_lite import (
     post_save,
     pre_save,
 )
+from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from surreal_orm_lite.testing.factories import Faker, ModelFactory
-from tests.conftest import orm_client
+from tests.conftest import _ws_url, orm_client
+from tests.test_embedded import _embedded_engine_available
 
 
 class FxUser(BaseSurrealModel):
@@ -1293,3 +1297,162 @@ class TestServerValuesE2E:
             record = await StampedFactory.create(**{key: "fixed"})
             assert record.token == "fixed"
             assert (await FxStamped.objects().get(record.get_id())).token == "fixed"
+
+
+# --- edges, named connections, views and the embedded engine (AC-12, AC-13, AC-14) ----------------------------------
+
+
+class FxKnowsFactory(ModelFactory[FxKnows]):
+    """An edge factory: a plain ``since``, endpoints given at the call."""
+
+    class Meta:
+        model = FxKnows
+
+    since = Faker("random_int")
+
+
+class FxUserView(BaseSurrealModel):
+    """A materialized view over ``fx_user``: its writes raise ``TypeError`` before any request."""
+
+    model_config = SurrealConfigDict(table_name="fx_user_view", view_query="SELECT name FROM fx_user")
+
+    id: RecordID | None = None
+    name: str = ""
+
+
+class FxUserViewFactory(ModelFactory[FxUserView]):
+    """A factory of a materialized view model: ``build()`` works, ``create()`` is refused by ``save()``."""
+
+    class Meta:
+        model = FxUserView
+
+    name = Faker("name")
+
+
+def _rid(user: FxUser) -> RecordID:
+    """The record id of a created ``FxUser`` (``save()`` keeps a ``str`` id field's key)."""
+    return RecordID("fx_user", _key(user.get_id()))
+
+
+async def _edge_count(client: Any) -> int:
+    """The rows of ``fx_knows``, counted by the server (``0`` for an absent table)."""
+    rows = await client.query("SELECT count() FROM fx_knows GROUP ALL;", {})
+    return int(rows[0]["count"]) if rows else 0
+
+
+async def _tables(client: Any) -> set[str]:
+    """The tables of the current database (``INFO FOR DB``)."""
+    info = await client.query("INFO FOR DB;", {})
+    return set(info.get("tables", {}))
+
+
+class TestEdgeFactoryE2E:
+    """An edge factory relates factory-created nodes, on 3.x and 2.x (AC-12)."""
+
+    async def test_edges_between_factory_nodes_are_traversed(self) -> None:
+        async with orm_client("fx_user", "fx_knows") as client:
+            a = await UserFactory.create(id="a", name="A")
+            b = await UserFactory.create(id="b", name="B")
+            c = await UserFactory.create(id="c", name="C")
+            first = await FxKnowsFactory.create(in_=_rid(a), out=_rid(b))
+            second = await FxKnowsFactory.create(**{"in": _rid(a)}, out=_rid(c))
+            for edge in (first, second):
+                assert isinstance(edge.since, int)
+                assert edge.in_ == _rid(a)
+            assert (first.out, second.out) == (_rid(b), _rid(c))
+            rows = await client.query("SELECT ->fx_knows->fx_user AS friends FROM fx_user:a;", {})
+            assert {_key(friend) for friend in rows[0]["friends"]} == {"b", "c"}
+            assert await _edge_count(client) == 2
+
+    async def test_surreal_func_override_refused_before_any_request(self) -> None:
+        async with orm_client("fx_user", "fx_knows") as client:
+            a = await UserFactory.create(id="a")
+            b = await UserFactory.create(id="b")
+            await FxKnowsFactory.create(in_=_rid(a), out=_rid(b), since=7)
+            with pytest.raises(TypeError) as info:
+                await FxKnowsFactory.create(in_=_rid(a), out=_rid(b), since=SurrealFunc("time::now()"))
+            assert str(info.value) == f"create() got SurrealFunc 'since', but FxKnows is an edge: {_EDGE_SUFFIX}"
+            with pytest.raises(TypeError, match=r"^create_batch\(\) got SurrealFunc 'since'"):
+                await FxKnowsFactory.create_batch(2, in_=_rid(a), out=_rid(b), since=SurrealFunc("time::now()"))
+            assert await _edge_count(client) == 1
+
+
+#: The database of ``TestFactoryRoutingE2E``'s named connection: a constant of this module, never input.
+_OTHER_DATABASE = "fx_factory_other"
+
+
+@contextlib.asynccontextmanager
+async def _other_connection(client: Any) -> AsyncIterator[str]:
+    """Register ``"fx_other"`` on ``ns``/``fx_factory_other`` of the line under test, removed before and after.
+
+    *client* is the default connection's: it runs ``REMOVE DATABASE IF EXISTS`` (and ``DEFINE DATABASE``) on entry
+    and ``REMOVE DATABASE IF EXISTS`` on exit — the pattern of ``tests.conftest.change_feed_database()`` — so nothing
+    of a run survives into the next one.
+    """
+    await client.query(f"REMOVE DATABASE IF EXISTS {_OTHER_DATABASE}; DEFINE DATABASE {_OTHER_DATABASE};", {})
+    SurrealDBConnectionManager.add_connection(
+        "fx_other", url=_ws_url(), user="root", password="root", namespace="ns", database=_OTHER_DATABASE
+    )
+    try:
+        yield "fx_other"
+    finally:
+        await SurrealDBConnectionManager.remove_connection("fx_other")
+        with contextlib.suppress(Exception):
+            await client.query(f"REMOVE DATABASE IF EXISTS {_OTHER_DATABASE};", {})
+
+
+class TestFactoryRoutingE2E:
+    """``create()`` follows ``using()``; a materialized view's ``create()`` is refused (AC-13)."""
+
+    async def test_create_inside_using_writes_to_that_database_only(self) -> None:
+        async with orm_client("fx_user") as client:
+            for run in (1, 2):  # the second run finds an empty database: nothing survives the helper
+                async with _other_connection(client) as name:
+                    async with SurrealDBConnectionManager.using(name):
+                        assert await FxUser.objects().count() == 0, f"run {run}"
+                        user = await UserFactory.create(name=f"routed-{run}")
+                    async with SurrealDBConnectionManager.using(name):
+                        fetched = await FxUser.objects().get(user.get_id())
+                        assert fetched.name == f"routed-{run}"
+                        assert await FxUser.objects().count() == 1
+                    assert await FxUser.objects().count() == 0
+            remaining = await client.query("INFO FOR NS;", {})
+            assert _OTHER_DATABASE not in remaining.get("databases", {})
+
+    async def test_view_factory_builds_but_create_is_refused(self) -> None:
+        view = FxUserViewFactory.build()
+        assert isinstance(view, FxUserView) and view.name
+        async with orm_client("fx_user", "fx_user_view") as client:
+            with pytest.raises(TypeError, match="FxUserView"):
+                await FxUserViewFactory.create()
+            with pytest.raises(TypeError, match="FxUserView"):
+                await FxUserViewFactory.create_batch(2)
+            assert "fx_user_view" not in await _tables(client)
+
+
+@fixture
+class FxFixtures(SurrealFixture):
+    """A ``SurrealFixture`` whose templates come from ``build()`` (§5.3)."""
+
+    a = UserFactory.build(id="a")
+    b = UserFactory.build(id="b")
+
+
+@pytest.mark.skipif(not _embedded_engine_available(), reason="the installed surrealdb SDK has no embedded engine")
+class TestFactoriesEmbeddedE2E:
+    """Factories inside ``embedded_database()``, and as ``SurrealFixture`` templates (AC-14)."""
+
+    async def test_create_batch_on_the_embedded_engine(self) -> None:
+        async with embedded_database():
+            users = await UserFactory.create_batch(4)
+            assert len(users) == 4
+            assert await FxUser.objects().count() == 4
+            assert all(user.role == "admin" for user in await FxUser.objects().all())
+
+    async def test_fixture_from_built_templates_loads_and_cleans_up(self) -> None:
+        async with embedded_database():
+            async with FxFixtures.load() as data:
+                assert await FxUser.objects().count() == 2
+                assert {_key(data.a.get_id()), _key(data.b.get_id())} == {"a", "b"}
+                assert (await FxUser.objects().get("a")).role == "admin"
+            assert await FxUser.objects().count() == 0
