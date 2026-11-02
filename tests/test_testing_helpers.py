@@ -103,16 +103,30 @@ class TestTestingPackage:
         assert not hasattr(surreal_orm_lite, "embedded_database")
 
     def test_the_fixture_helpers_are_exported_from_the_subpackage_only(self) -> None:
-        assert sorted(testing.__all__) == ["SurrealFixture", "embedded_database", "fixture"]
+        assert "SurrealFixture" in testing.__all__
+        assert "fixture" in testing.__all__
         assert testing.SurrealFixture is SurrealFixture
         assert testing.fixture is fixture
         assert not hasattr(surreal_orm_lite, "SurrealFixture")
         assert not hasattr(surreal_orm_lite, "fixture")
 
+    def test_all_lists_the_five_names(self) -> None:
+        """AC-1: the v0.40.0 factories join the v0.25.0 helpers, in sorted order."""
+        assert testing.__all__ == ["Faker", "ModelFactory", "SurrealFixture", "embedded_database", "fixture"]
+
+    def test_the_factories_are_exported_from_the_subpackage_only(self) -> None:
+        from surreal_orm_lite.testing import factories
+
+        assert testing.ModelFactory is factories.ModelFactory
+        assert testing.Faker is factories.Faker
+        assert not hasattr(surreal_orm_lite, "ModelFactory")
+        assert not hasattr(surreal_orm_lite, "Faker")
+
     def test_importing_it_does_not_import_pytest(self) -> None:
         code = (
             "import sys\n"
             "import surreal_orm_lite.testing\n"
+            "import surreal_orm_lite.testing.factories\n"
             "print(sorted(m for m in sys.modules if m.split('.')[0] in {'pytest', '_pytest'}))\n"
         )
         result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120, check=False)

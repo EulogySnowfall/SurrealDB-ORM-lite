@@ -6,8 +6,8 @@ The following versions of Surreal-ORM-Lite are currently supported with security
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.39.x  | :white_check_mark: |
-| < 0.39  | :x:                |
+| 0.40.x  | :white_check_mark: |
+| < 0.40  | :x:                |
 
 ## Embedded Engine
 

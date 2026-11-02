@@ -1202,8 +1202,9 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
     """The encoding-boundary guard of ``conftest.py`` is lifted for this new module only (v0.25.0), beside the
     modules of v0.23.0, v0.24.0 and v0.24.3 (#235), and for ``tests/test_time_travel.py`` (v0.26.0),
     ``tests/test_subqueries.py`` (v0.27.0), ``tests/test_query_cache.py`` (v0.28.0),
-    ``tests/test_introspection.py`` (v0.30.0), ``tests/test_table_ddl.py`` (v0.34.0) and ``tests/test_vector.py``
-    (v0.36.0), new too."""
+    ``tests/test_introspection.py`` (v0.30.0), ``tests/test_table_ddl.py`` (v0.34.0), ``tests/test_vector.py``
+    (v0.36.0), ``tests/test_factories.py``, ``tests/test_pytest_plugin.py`` and ``tests/test_factories_docs.py``
+    (v0.40.0), new too."""
     assert (
         frozenset(
             {
@@ -1220,6 +1221,9 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
                 "tests.test_introspection",
                 "tests.test_table_ddl",
                 "tests.test_vector",
+                "tests.test_factories",
+                "tests.test_pytest_plugin",
+                "tests.test_factories_docs",
             }
         )
         == _REWRITE_MODULES
@@ -2511,6 +2515,23 @@ class TestConcurrentBindEmbeddedE2E:
 
 _ROADMAP = Path(__file__).resolve().parents[1] / "docs" / "ROADMAP.md"
 _SECTION_26 = "### 26. Embedded engine and test fixtures"
+#: The last sentence of the ROADMAP's "Embedded URLs" note, whitespace normalised: planned, and once v0.40.0 is
+#: released (the factories and the pytest plugin shipped).
+_PLANNED_FIXTURES_NOTE_40 = (
+    "Base test fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; "
+    "factories (`ModelFactory`, `Faker`) in v0.40.0."
+)
+_RELEASED_FIXTURES_NOTE_40 = (
+    "Base test fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; "
+    "factories (`ModelFactory`, `Faker`) and the pytest plugin shipped in v0.40.0 (README section 41)."
+)
+
+
+def _released_40(roadmap: str) -> bool:
+    """Whether *roadmap* records v0.40.0 (model factories) as released: its Phase H row carries the ✅ the release
+    adds (the same rule as ``tests/test_type_relation.py``)."""
+    rows = [cells for _, cells in _table_rows(_subsection("### 🛠️ Phase H — Tooling", roadmap))]
+    return rows[2][0] == "✅ v0.40.0"
 
 
 def _section_26() -> str:
@@ -2576,7 +2597,7 @@ class TestReadmeEmbeddedWording:
         """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0), section 29
         (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34
         (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39
-        (v0.38.0) and section 40 (v0.39.0), up to "Configuration Options"."""
+        (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), up to "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
@@ -2598,6 +2619,7 @@ class TestReadmeEmbeddedWording:
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
             "### 40. Command line (`surreal-orm-lite`)",
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
 
     def test_subsections_in_order(self) -> None:
@@ -2671,7 +2693,8 @@ class TestReadmeEmbeddedWording:
         text = _normalised(_subsection("#### Coming from the full SurrealDB-ORM", _section_26()))
         for word in ("resets", "id", "TypeError", "is_embedded()", "embedded_database()"):
             assert word in text, word
-        assert "**`ModelFactory` and `Faker`** come in v0.40.0." in text, text
+        assert "**`ModelFactory` and `Faker`**, and a pytest plugin with the `surreal_db` fixture, are in" in text, text
+        assert "come in v0.40.0" not in text, text
 
     def test_embedded_behaviour_table(self) -> None:
         """Four cells a row, each "Since" a release; v0.25.0's rows first and together, in a table in version order
@@ -2728,7 +2751,7 @@ class TestReadmeEmbeddedWording:
         assert embedded == ["Embedded engine", "✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)", "❌ (HTTP/WebSocket only)"]
         [fixtures] = [cells for cells in rows if cells[0] == "Test Fixtures & Factories"]
         assert "v0.25.0" in fixtures[1] and "v0.40.0" in fixtures[1], fixtures
-        assert fixtures == ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.40.0", "✅"]
+        assert fixtures == ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; ✅ v0.40.0 factories", "✅"]
         assert [cells[0] for cells in rows].index("Embedded engine") == [cells[0] for cells in rows].index(
             "Geospatial Fields"
         ) + 1
@@ -2736,8 +2759,10 @@ class TestReadmeEmbeddedWording:
 
     def test_roadmap_parity_notes(self) -> None:
         """P2: the full SurrealDB-ORM has no embedded engine; fixtures ship in v0.25.0, factories in v0.40.0 (moved up
-        one by the model table DDL of v0.34.0, issue #292)."""
+        one by the model table DDL of v0.34.0, issue #292). The planned form or the released one, as the Phase H row
+        of v0.40.0 decides (``_released_40()``)."""
         roadmap = _ROADMAP.read_text(encoding="utf-8")
+        released_40 = _released_40(roadmap)
         comparison = roadmap.split("\n## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison\n", 1)[1].split("\n#", 1)[0]
         [lines] = _tables(comparison)
         assert _cells(lines[0]) == ["Feature", "ORM (full)", "ORM-lite"]
@@ -2749,7 +2774,8 @@ class TestReadmeEmbeddedWording:
             ["Embedded / versioned engine", "no", "✅ v0.25 – v0.26"],
         ), row
         [fixtures] = [line for line in lines if line.startswith("| Test fixtures & factories")]
-        assert _cells(fixtures) == ["Test fixtures & factories", "yes", "v0.25.0 + v0.40.0"], fixtures
+        fixtures_40 = "✅ v0.25.0 + ✅ v0.40.0" if released_40 else "v0.25.0 + v0.40.0"
+        assert _cells(fixtures) == ["Test fixtures & factories", "yes", fixtures_40], fixtures
         for name in ("rocksdb://", "#233", "2.3.10", "surrealdb[embedded]"):
             assert name in roadmap, name
         assert "To confirm" not in roadmap, "footnotes ¹/² are resolved"
@@ -2758,10 +2784,7 @@ class TestReadmeEmbeddedWording:
         note = _normalised(raw_note)
         assert "The full SurrealDB-ORM has no embedded engine (HTTP/WebSocket only)" in note
         assert "SurrealDB core 2.3.10 with SDK 2.0.0" in note
-        assert (
-            "Base test fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; "
-            "factories (`ModelFactory`, `Faker`) in v0.40.0." in note
-        )
+        assert (_RELEASED_FIXTURES_NOTE_40 if released_40 else _PLANNED_FIXTURES_NOTE_40) in note, note
         rows = _table_rows(raw_note, "Embedded URL")
         firsts = [cells[0] for _, cells in rows]
         for scheme in ("mem://", "surrealkv://", "surrealkv+versioned://", "file://", "rocksdb://"):

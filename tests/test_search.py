@@ -6655,7 +6655,7 @@ class TestReadmeSection36:
 
     def test_section_36_follows_section_35(self) -> None:
         """Right after section 35 (after its "Coming from" bullets), then section 37 (v0.36.0), section 38 (v0.37.0),
-        section 39 (v0.38.0) and section 40 (v0.39.0), and before the ``---`` of "Configuration Options"."""
+        section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_35 = text.index(f"\n{_SECTION_35}\n")
         start_36 = text.index(f"\n{_SECTION_36}\n")
@@ -6668,6 +6668,7 @@ class TestReadmeSection36:
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
             "### 40. Command line (`surreal-orm-lite`)",
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
