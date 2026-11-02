@@ -509,18 +509,20 @@ class FloatKeyUser(AuthenticatedUserMixin, BaseSurrealModel):
     password: str
 
 
-_BAD_FLOAT_KEYS = [1.5, -0.25, float("nan"), float("inf"), float("-inf")]
+_BAD_FLOAT_KEYS = [1.5, -0.25, float("nan"), float("inf"), float("-inf"), 1e19, 9223372036854775808.0, -1e300]
 
 
 class TestFloatPrimaryKey:
     """#352: the guard of ``_auth_variables()``, before any request."""
 
-    @pytest.mark.parametrize("key", _BAD_FLOAT_KEYS, ids=["1.5", "-0.25", "nan", "inf", "-inf"])
+    @pytest.mark.parametrize("key", _BAD_FLOAT_KEYS, ids=["1.5", "-0.25", "nan", "inf", "-inf", "1e19", "2**63", "-1e300"])
     def test_a_fractional_or_non_finite_float_key_is_refused(self, key: float) -> None:
         with pytest.raises(ValueError, match=r"FloatKeyUser\.signup\(\) got code=.*primary key"):
             FloatKeyUser._auth_variables("signup", {"code": key, "email": "a@b.c", "password": "pw"}, require_all=True)
 
-    @pytest.mark.parametrize("key", [2.0, 0.0, -3.0, 7, 0, True, "ada", "ada:lovelace"])
+    @pytest.mark.parametrize(
+        "key", [2.0, 0.0, -3.0, -9223372036854775808.0, 9223372036854774784.0, 7, 2**70, True, "ada", "ada:lovelace"]
+    )
     def test_integral_floats_integers_and_strings_are_bound_unchanged(self, key: Any) -> None:
         bound = FloatKeyUser._auth_variables("signup", {"code": key, "email": "a@b.c", "password": "pw"}, require_all=True)
         assert bound["code"] is key
