@@ -2207,6 +2207,224 @@ class TestForwardReferenceOrm:
         assert user_namespace() == {}
 
 
+def _count_rebuilds(monkeypatch: pytest.MonkeyPatch, model: type[BaseModel]) -> list[dict[str, Any]]:
+    """The keyword arguments of each ``model.model_rebuild()`` call from now on, the call still made."""
+    calls: list[dict[str, Any]] = []
+    rebuild = model.model_rebuild
+
+    def spy(**kwargs: Any) -> bool | None:
+        calls.append(kwargs)
+        return rebuild(**kwargs)
+
+    monkeypatch.setattr(model, "model_rebuild", spy)
+    return calls
+
+
+class TestPydanticInternals:
+    """The two private Pydantic names the forward-reference completion relies on (issues #327, #345): a Pydantic
+    release that moves either fails here, at the cause. Without ``set_model_mocks``, the refusal is still the error
+    raised."""
+
+    def test_set_model_mocks_is_importable(self) -> None:
+        from pydantic._internal._mock_val_ser import set_model_mocks
+
+        assert callable(set_model_mocks)
+
+    def test_model_rebuild_takes_a_types_namespace(self) -> None:
+        parameter = inspect.signature(BaseModel.model_rebuild).parameters["_types_namespace"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+
+    def test_the_refusal_without_set_model_mocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``set_model_mocks`` not importable: the refusal is raised, not an ``ImportError``, and again at the next
+        call — the model stays incomplete."""
+
+        class VecFwdNoMocks(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_no_mocks", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        Later = VectorField[3]  # noqa: F841 - read by the completion, from this frame's local names
+        monkeypatch.setitem(sys.modules, "pydantic._internal._mock_val_ser", None)
+        text = _IC8.format("VecFwdNoMocks", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        with pytest.raises(ValueError) as raised:
+            VecFwdNoMocks.table_ddl()  # from this frame, whose locals hold the name
+        assert type(raised.value) is ValueError
+        assert str(raised.value) == text
+        assert VecFwdNoMocks.__pydantic_complete__ is False
+        with pytest.raises(ValueError) as raised:
+            VecFwdNoMocks.get_indexes()
+        assert str(raised.value) == text
+
+
+class TestFailedRebuildRemembered:
+    """A name that does not resolve yet (issue #345): the ORM's completion (``_complete_pending_checks()``) remembers
+    its failed ``model_rebuild()`` until the names it could use — the caller's local names, the model's module — change,
+    so a call on unchanged names does not rebuild again. Once the name is defined, the next call completes the model:
+    the memory is never stale. A subclass keeps its own."""
+
+    def test_repeated_calls_do_not_rebuild_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class VecFwdOnce(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_once")
+
+            id: str | None = None
+            e: "Later" = None  # noqa: F821 - never defined: the model stays incomplete
+
+        calls = _count_rebuilds(monkeypatch, VecFwdOnce)
+        # One expression: no local name of this frame changes between the calls (an ``assert`` binds some).
+        first, second, _, _ = VecFwdOnce.table_ddl(), VecFwdOnce.table_ddl(), VecFwdOnce.get_indexes(), VecFwdOnce.objects()
+        assert first[1:] == second[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_once` TYPE any;"]
+        assert len(calls) == 1
+        assert calls[0]["raise_errors"] is False
+        another = 1  # noqa: F841 - a new local name: the names the completion could use have changed
+        VecFwdOnce.table_ddl()
+        assert len(calls) == 2
+        assert VecFwdOnce.__pydantic_complete__ is False
+
+    def test_the_model_completes_once_the_name_is_defined(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class VecFwdLater(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_later")
+
+            id: str | None = None
+            e: "Later" = None
+
+        calls = _count_rebuilds(monkeypatch, VecFwdLater)
+        first, second = VecFwdLater.table_ddl(), VecFwdLater.table_ddl()
+        assert first[1:] == second[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_later` TYPE any;"]
+        assert len(calls) == 1
+        Later = VectorField[3]  # noqa: F841 - read by the completion, from this frame's local names
+        assert VecFwdLater.table_ddl()[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_later` TYPE option<array<float, 3>>;"]
+        assert len(calls) == 2
+        assert VecFwdLater.__pydantic_complete__ is True
+        assert VecFwdLater.__dict__.get("__surreal_failed_rebuild__") is None
+
+    def test_a_refusal_once_the_name_is_defined(self) -> None:
+        """The remembered failure does not hide the refusal: defining the name raises it, at every call."""
+
+        class VecFwdLaterRefused(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_later_refused", indexes=[_hnsw("vec_fwd_e", "e", dimension=4)])
+
+            id: str | None = None
+            e: "Later" = None
+
+        VecFwdLaterRefused.table_ddl()
+        Later = VectorField[3]  # noqa: F841 - read by the completion, from this frame's local names
+        text = _IC8.format("VecFwdLaterRefused", "vec_fwd_e", 4, "F32", "e", 3, "F32")
+        for _ in range(2):
+            with pytest.raises(ValueError) as raised:
+                VecFwdLaterRefused.table_ddl()  # from this frame, whose locals hold the name
+            assert str(raised.value) == text
+
+    def test_a_name_defined_later_in_the_module(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An application's model, whose name the module binds to another forward reference, then rebinds after a
+        first call: the next call completes it."""
+        module = types.ModuleType("vec_fwd_module_later")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, VectorField\n"
+            "class VecFwdModuleLater(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_module_later')\n"
+            "    id: str | None = None\n"
+            "    e: 'Later' = None\n"
+            "Later = 'Missing'\n",
+            module.__dict__,
+        )
+        model = module.VecFwdModuleLater
+        calls = _count_rebuilds(monkeypatch, model)
+        first, second = model.table_ddl(), model.table_ddl()
+        assert first[1:] == second[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_module_later` TYPE any;"]
+        assert len(calls) == 1
+        module.Later = VectorField[2]
+        assert model.table_ddl()[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_module_later` TYPE option<array<float, 2>>;"]
+        assert len(calls) == 2
+        assert model.__pydantic_complete__ is True
+
+    @staticmethod
+    def _two_modules(monkeypatch: pytest.MonkeyPatch, base: str) -> tuple[types.ModuleType, types.ModuleType]:
+        """Module ``vec_fwd_dep_m2`` holds ``B``, a *base* model whose ``x: "C"`` waits for ``C``; module
+        ``vec_fwd_dep_m1`` holds ``A3``, which links ``B`` and whose vector index contradicts its vector field, a forward
+        reference the module defines after the class: ``A3`` stays incomplete while ``B`` is, its refusal waiting."""
+        m2 = types.ModuleType("vec_fwd_dep_m2")
+        m1 = types.ModuleType("vec_fwd_dep_m1")
+        monkeypatch.setitem(sys.modules, m2.__name__, m2)
+        monkeypatch.setitem(sys.modules, m1.__name__, m1)
+        exec(  # noqa: S102 - the test's own text
+            "from pydantic import BaseModel\n"
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            f"class B({base}):\n"
+            + ("    model_config = SurrealConfigDict(table_name='vec_fwd_dep_b')\n" if base == "BaseSurrealModel" else "")
+            + "    x: 'C' = None\n",
+            m2.__dict__,
+        )
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, Index, SurrealConfigDict, VectorField\n"
+            "from vec_fwd_dep_m2 import B\n"
+            "class A3(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_dep_a3',\n"
+            "        indexes=[Index('vec_fwd_e', 'e', hnsw=True, dimension=4)])\n"
+            "    id: str | None = None\n"
+            "    b: B | None = None\n"
+            "    e: 'Vec' = None\n"
+            "Vec = VectorField[3]\n",
+            m1.__dict__,
+        )
+        assert m1.A3.__pydantic_complete__ is False
+        return m1, m2
+
+    @pytest.mark.parametrize("base", ["BaseModel", "BaseSurrealModel"])
+    def test_a_dependency_completed_later(self, monkeypatch: pytest.MonkeyPatch, base: str) -> None:
+        """A model left incomplete by a model of another module, itself incomplete: once that model completes, the
+        next call completes the dependent model and raises its refusal — the memory is not stale."""
+        m1, m2 = self._two_modules(monkeypatch, base)
+        model = m1.A3
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A3", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        # No local name of this frame changes from the first call on (an ``assert`` binds some): only the dependency.
+        model.table_ddl(), model.table_ddl()
+        m2.C = int
+        m2.B.model_rebuild()
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        assert len(calls) == 3  # the second call remembered the failure; each refusal rebuilds again
+
+    @pytest.mark.parametrize("base", ["BaseModel", "BaseSurrealModel"])
+    def test_a_name_defined_later_in_a_dependency_module(self, monkeypatch: pytest.MonkeyPatch, base: str) -> None:
+        """The missing name defined in the module of the dependency, which nothing completed yet: the next call on the
+        dependent model rebuilds it, as Pydantic would, and raises its refusal."""
+        m1, m2 = self._two_modules(monkeypatch, base)
+        model = m1.A3
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A3", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        # No local name of this frame changes from the first call on (an ``assert`` binds some): only B's module.
+        model.table_ddl(), model.table_ddl()
+        m2.C = int
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        assert len(calls) == 2  # the second call remembered the failure
+
+    def test_a_subclass_keeps_its_own(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class VecFwdParent(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_parent")
+
+            id: str | None = None
+            e: "Later" = None  # noqa: F821 - never defined: the model stays incomplete
+
+        VecFwdParent.table_ddl()
+        assert VecFwdParent.__dict__.get("__surreal_failed_rebuild__") is not None
+
+        class VecFwdChild(VecFwdParent):
+            model_config = SurrealConfigDict(table_name="vec_fwd_child")
+
+        assert "__surreal_failed_rebuild__" not in VecFwdChild.__dict__
+        calls = _count_rebuilds(monkeypatch, VecFwdChild)
+        VecFwdChild.table_ddl(), VecFwdChild.table_ddl()
+        assert len(calls) == 1
+        assert VecFwdChild.__pydantic_complete__ is False
+
+
 # === define_table(): the vector columns =============================================================================
 
 #: ``VecDoc.table_ddl()``: the two vector columns (the typed one under its alias) written ``option<array<float, 3>>``.

@@ -7435,7 +7435,11 @@ _SENTENCES_35 = {
         "`Score = int`) gets the kind of the type its name resolves to. Since v0.37.1, `table_ddl()` and "
         "`define_table()` complete such a model first, as its first instantiation does, so they write the same "
         "statements before and after an instance (`score` is `TYPE int DEFAULT 0`, which earlier versions wrote `TYPE "
-        "any DEFAULT 0` until the model was instantiated or rebuilt). A name still undefined gives `any`.",
+        "any DEFAULT 0` until the model was instantiated or rebuilt). A name still undefined gives `any`, and the "
+        "attempt is remembered: the ORM tries again only once the names it could use change (a local name of the "
+        "calling function, or a name of the model's module, added, removed or rebound, or a linked model of another "
+        "module, still incomplete, completing or seeing a name of its module change), so a name imported only under "
+        "`TYPE_CHECKING` does not cost a `model_rebuild()` on every call.",
         "A computed field is written `VALUE`; over a field the database defines `COMPUTED` (SurrealDB 3.x), "
         "`define_table()` writes `COMPUTED`: replacing it by `VALUE` would leave the stored records without the field "
         "until their next write.",
