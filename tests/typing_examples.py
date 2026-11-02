@@ -76,6 +76,7 @@ from surreal_orm_lite.migrations import (
     makemigrations,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
+from surreal_orm_lite.testing.factories import Faker, ModelFactory
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
 
 
@@ -811,3 +812,44 @@ async def migration_forms() -> None:
     assert_type(migration.operations[0], Operation)
     assert_type(operation.state_forwards(state), SchemaState)
     assert_type(operation.state_backwards(state), SchemaState)
+
+
+class FactoryUser(BaseSurrealModel):
+    """v0.40.0: the model a typed factory builds (a field named ``count`` too, D13)."""
+
+    id: str | None = None
+    name: str = ""
+    count: int = 0
+
+
+class FactoryUserFactory(ModelFactory[FactoryUser]):
+    """``ModelFactory[FactoryUser]`` types ``build()`` as ``FactoryUser``."""
+
+    class Meta:
+        model = FactoryUser
+
+    name = Faker("name")
+
+
+class PlainFactory(ModelFactory):
+    """The full ORM's unparametrized form: ``build()`` is a ``BaseSurrealModel`` (the TypeVar default)."""
+
+    class Meta:
+        model = FactoryUser
+
+
+def factory_build_forms() -> None:
+    """v0.40.0: ``build()``/``build_batch()`` keep the factory's model type; ``count`` is positional-only."""
+    assert_type(FactoryUserFactory.build(), FactoryUser)
+    assert_type(FactoryUserFactory.build(name="x"), FactoryUser)
+    assert_type(FactoryUserFactory.build_batch(2), list[FactoryUser])
+    assert_type(FactoryUserFactory.build_batch(2, count=5), list[FactoryUser])
+    assert_type(PlainFactory.build(), BaseSurrealModel)
+    assert_type(PlainFactory.build_batch(2), list[BaseSurrealModel])
+
+
+async def factory_create_forms() -> None:
+    """v0.40.0: ``create()``/``create_batch()`` are awaited and keep the model type."""
+    assert_type(await FactoryUserFactory.create(), FactoryUser)
+    assert_type(await FactoryUserFactory.create_batch(2), list[FactoryUser])
+    assert_type(await PlainFactory.create(), BaseSurrealModel)
