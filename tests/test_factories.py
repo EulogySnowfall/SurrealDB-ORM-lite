@@ -17,11 +17,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from surrealdb import RecordID
 
 import surreal_orm_lite.testing.factories as factories_module
-from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealFunc
+from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, SurrealFunc
 from surreal_orm_lite.testing.factories import Faker, ModelFactory
 
 
@@ -62,6 +62,34 @@ class FxFree(BaseSurrealModel):
     id: str | None = None
 
 
+class FxByColumn(BaseSurrealModel):
+    """An aliased field on a model that validates by column only (``populate_by_name=False``): P2."""
+
+    model_config = SurrealConfigDict(table_name="fx_bycol", populate_by_name=False)
+
+    id: str | None = None
+    pw: str | None = Field(None, alias="pw_hash")
+
+
+class FxCounted(BaseSurrealModel):
+    """Fields named like the classmethods' positional-only parameters ``count`` and ``cls`` (D13)."""
+
+    model_config = SurrealConfigDict(table_name="fx_counted")
+
+    id: str | None = None
+    count: int = 0
+    cls: str = ""
+
+
+class FxRequired(BaseSurrealModel):
+    """A model with a required field and no default."""
+
+    model_config = SurrealConfigDict(table_name="fx_required")
+
+    id: str | None = None
+    code: str
+
+
 class FxAddress(BaseModel):
     """A sub-model, declared as an instance on a factory."""
 
@@ -79,6 +107,17 @@ class _Callable:
 
     def __call__(self) -> int:
         return 1
+
+
+class FxRich(BaseSurrealModel):
+    """Static values a factory deep-copies: a list, a record id and a sub-model."""
+
+    model_config = SurrealConfigDict(table_name="fx_rich")
+
+    id: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    owner: RecordID | None = None
+    address: FxAddress | None = None
 
 
 class UserFactory(ModelFactory[FxUser]):
@@ -679,3 +718,318 @@ class TestFactoryDeclaration:
                 found.append(node)
                 assert id(node) in guarded, f"typing_extensions imported outside TYPE_CHECKING (line {node.lineno})"
         assert found, "the TYPE_CHECKING import of typing_extensions is gone: update this test"
+
+
+_EDGE_SUFFIX = (
+    "its save() (INSERT RELATION) cannot evaluate server values. Use DEFINE FIELD … DEFAULT on the edge table, "
+    "or a plain value."
+)
+
+
+@pytest.fixture
+def no_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any attempt to reach a database: ``build()`` must need none (AC-7)."""
+
+    async def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("build() reached for a database client")
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_refuse))
+
+
+@pytest.mark.usefixtures("no_connection")
+class TestBuild:
+    """``build()`` / ``build_batch()``: values, copies, override checks, names and the model call (AC-7/21/22)."""
+
+    def test_declarations_and_model(self) -> None:
+        user = UserFactory.build()
+        assert type(user) is FxUser
+        assert user.role == "admin"
+        assert user.name in {f"{f} {la}" for f in _FULL_FIRST_NAMES for la in _FULL_LAST_NAMES}
+        assert user.id is None
+        assert user.age == 0
+
+    def test_override_wins(self) -> None:
+        user = UserFactory.build(name="Bob", role="guest", age=33)
+        assert (user.name, user.role, user.age) == ("Bob", "guest", 33)
+
+    def test_faker_override_generated(self) -> None:
+        user = UserFactory.build(age=Faker("random_int", min=5, max=5))
+        assert user.age == 5
+
+    def test_static_values_deep_copied(self) -> None:
+        rid = RecordID("fx_user", "a")
+        address = FxAddress(city="Paris")
+
+        class RichFactory(ModelFactory[FxRich]):
+            class Meta:
+                model = FxRich
+
+            tags = ["a", "b"]
+            owner = rid
+            address = FxAddress(city="Paris")
+
+        first = RichFactory.build()
+        first.tags.append("c")
+        assert first.address is not None
+        first.address.city = "Lyon"
+        second = RichFactory.build()
+        assert second.tags == ["a", "b"]
+        assert second.address == address
+        assert RichFactory._field_defs["tags"] == ["a", "b"]
+        assert RichFactory._field_defs["address"] == address
+        assert second.owner == rid
+        assert second.owner is not RichFactory._field_defs["owner"]
+        assert second.address is not RichFactory._field_defs["address"]
+
+    def test_override_is_used_as_is(self) -> None:
+        address = FxAddress(city="Paris")
+
+        class RichFactory(ModelFactory[FxRich]):
+            class Meta:
+                model = FxRich
+
+        assert RichFactory.build(address=address).address is address
+
+    def test_unknown_override(self) -> None:
+        with pytest.raises(TypeError) as info:
+            UserFactory.build(nmae="x")
+        assert str(info.value) == "build() got 'nmae', which is not a field of FxUser (fields: age, email, id, name, role)"
+
+    def test_unknown_override_batch_names_the_method(self) -> None:
+        with pytest.raises(TypeError, match=r"^build_batch\(\) got 'nmae', which is not a field of FxUser"):
+            UserFactory.build_batch(2, nmae="x")
+
+    def test_extra_allow_model_accepts_any_override(self) -> None:
+        class FreeFactory(ModelFactory[FxFree]):
+            class Meta:
+                model = FxFree
+
+            anything = 1
+
+        free = FreeFactory.build(other="x")
+        assert free.model_extra == {"anything": 1, "other": "x"}
+
+    def test_surreal_func_attribute_left_out(self) -> None:
+        class SecretFactory(ModelFactory[FxSecret]):
+            class Meta:
+                model = FxSecret
+
+            password = SurrealFunc("rand::string(12)")
+
+        assert SecretFactory.build().password is None
+
+    def test_surreal_func_attribute_on_a_required_field(self) -> None:
+        class RequiredFactory(ModelFactory[FxRequired]):
+            class Meta:
+                model = FxRequired
+
+            code = SurrealFunc("rand::string(12)")
+
+        with pytest.raises(ValidationError):
+            RequiredFactory.build()
+
+    @pytest.mark.parametrize("method", ["build", "build_batch"])
+    def test_surreal_func_override(self, method: str) -> None:
+        with pytest.raises(TypeError) as info:
+            if method == "build":
+                UserFactory.build(age=SurrealFunc("rand::int(18, 80)"))
+            else:
+                UserFactory.build_batch(2, age=SurrealFunc("rand::int(18, 80)"))
+        assert str(info.value) == f"{method}() cannot evaluate SurrealFunc 'age': it is generated by the server on create()"
+
+    def test_invalid_value_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            UserFactory.build(age="not a number")
+
+    def test_seed_reproduces_a_batch(self) -> None:
+        random.seed(3)
+        first = [user.model_dump() for user in UserFactory.build_batch(5)]
+        random.seed(3)
+        second = [user.model_dump() for user in UserFactory.build_batch(5)]
+        assert first == second
+        assert len({user["name"] for user in first}) > 1
+
+    def test_batch_has_fresh_values_and_copies(self) -> None:
+        class RichFactory(ModelFactory[FxRich]):
+            class Meta:
+                model = FxRich
+
+            tags = ["a"]
+
+        batch = RichFactory.build_batch(3, address=FxAddress(city="Paris"))
+        assert len(batch) == 3
+        assert len({id(item.tags) for item in batch}) == 3
+        assert all(item.address == FxAddress(city="Paris") for item in batch)
+
+    # -- names (D15), both directions --------------------------------------------------------------------------
+
+    def test_override_by_python_name_beats_declared_column(self) -> None:
+        class SecretFactory(ModelFactory[FxSecret]):
+            class Meta:
+                model = FxSecret
+
+            password_hash = Faker("word")
+
+        assert SecretFactory.build(password="x").password == "x"
+
+    def test_override_by_column_beats_declared_python_name(self) -> None:
+        class SecretFactory(ModelFactory[FxSecret]):
+            class Meta:
+                model = FxSecret
+
+            password = Faker("word")
+
+        assert SecretFactory.build(password_hash="x").password == "x"
+
+    def test_both_names_in_one_call(self) -> None:
+        class SecretFactory(ModelFactory[FxSecret]):
+            class Meta:
+                model = FxSecret
+
+        with pytest.raises(TypeError) as info:
+            SecretFactory.build(password="x", password_hash="y")
+        assert str(info.value) == "build() got 'password' twice: as 'password' and as its column 'password_hash'"
+
+    def test_plain_override_beats_declared_surreal_func(self) -> None:
+        class SecretFactory(ModelFactory[FxSecret]):
+            class Meta:
+                model = FxSecret
+
+            password_hash = SurrealFunc("rand::string(12)")
+
+        assert SecretFactory.build(password="x").password == "x"
+
+    def test_declared_alias_reaches_the_instance(self) -> None:
+        class SecretFactory(ModelFactory[FxSecret]):
+            class Meta:
+                model = FxSecret
+
+            password_hash = "declared"
+
+        assert SecretFactory.build().password == "declared"
+        assert SecretFactory.build(password_hash="override").password == "override"
+
+    # -- edges (D14) -------------------------------------------------------------------------------------------
+
+    def test_edge_build_with_endpoints(self) -> None:
+        alice, bob = RecordID("fx_user", "alice"), RecordID("fx_user", "bob")
+
+        class KnowsFactory(ModelFactory[FxKnows]):
+            class Meta:
+                model = FxKnows
+
+            since = 2020
+
+        knows = KnowsFactory.build(**{"in": alice}, out=bob)
+        assert (knows.in_, knows.out, knows.since) == (alice, bob, 2020)
+
+    @pytest.mark.parametrize("method", ["build", "build_batch"])
+    def test_edge_surreal_func_override_checked_first(self, method: str) -> None:
+        class KnowsFactory(ModelFactory[FxKnows]):
+            class Meta:
+                model = FxKnows
+
+            since = 2020
+
+        func = SurrealFunc("time::now()")
+        with pytest.raises(TypeError) as info:
+            if method == "build":
+                KnowsFactory.build(since=func)
+            else:
+                KnowsFactory.build_batch(2, since=func)
+        assert str(info.value) == f"{method}() got SurrealFunc 'since', but FxKnows is an edge: {_EDGE_SUFFIX}"
+
+    # -- positional-only cls / count (D13) ---------------------------------------------------------------------
+
+    def test_count_field_overridable_on_build_batch(self) -> None:
+        class CountedFactory(ModelFactory[FxCounted]):
+            class Meta:
+                model = FxCounted
+
+        batch = CountedFactory.build_batch(3, count=5)
+        assert [item.count for item in batch] == [5, 5, 5]
+
+    def test_count_and_cls_fields_overridable_on_build(self) -> None:
+        class CountedFactory(ModelFactory[FxCounted]):
+            class Meta:
+                model = FxCounted
+
+        built = CountedFactory.build(count=7, cls="x")
+        assert (built.count, built.cls) == (7, "x")
+
+    def test_count_by_keyword_is_a_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            UserFactory.build_batch(count=3)  # type: ignore[call-arg]
+
+    # -- P2: the key handed to the model -----------------------------------------------------------------------
+
+    def test_by_column_model_measured(self) -> None:
+        assert FxByColumn(pw="x").pw is None  # type: ignore[call-arg]
+        assert FxByColumn(pw_hash="x").pw == "x"
+
+    def test_by_column_model_declared_value(self) -> None:
+        class ByColumnFactory(ModelFactory[FxByColumn]):
+            class Meta:
+                model = FxByColumn
+
+            pw = "declared"
+
+        assert ByColumnFactory.build().pw == "declared"
+
+    @pytest.mark.parametrize("key", ["pw", "pw_hash"])
+    def test_by_column_model_override_by_either_name(self, key: str) -> None:
+        class ByColumnFactory(ModelFactory[FxByColumn]):
+            class Meta:
+                model = FxByColumn
+
+            pw_hash = "declared"
+
+        assert ByColumnFactory.build(**{key: "override"}).pw == "override"
+        assert [item.pw for item in ByColumnFactory.build_batch(2, **{key: "override"})] == ["override", "override"]
+
+    @pytest.mark.parametrize("key", ["password", "password_hash"])
+    def test_by_name_model_override_by_either_name(self, key: str) -> None:
+        class SecretFactory(ModelFactory[FxSecret]):
+            class Meta:
+                model = FxSecret
+
+            password = "declared"
+
+        assert SecretFactory.build().password == "declared"
+        assert SecretFactory.build(**{key: "override"}).password == "override"
+
+    def test_validate_by_name_takes_precedence(self) -> None:
+        class FxByNameOnly(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="fx_byname", populate_by_name=False, validate_by_name=True)
+
+            id: str | None = None
+            pw: str | None = Field(None, alias="pw_hash")
+
+        class F(ModelFactory[FxByNameOnly]):
+            class Meta:
+                model = FxByNameOnly
+
+            pw_hash = "declared"
+
+        assert F.build().pw == "declared"
+
+
+@pytest.mark.usefixtures("no_connection")
+class TestCount:
+    """``count`` of ``build_batch()``: an ``int`` (not a ``bool``), ``>= 0``; ``0`` builds nothing (AC-8)."""
+
+    def test_zero(self) -> None:
+        assert UserFactory.build_batch(0) == []
+
+    def test_negative(self) -> None:
+        with pytest.raises(ValueError) as info:
+            UserFactory.build_batch(-1)
+        assert str(info.value) == "count must be >= 0, got -1"
+
+    @pytest.mark.parametrize("count", [True, 2.0, "2", None])
+    def test_not_an_int(self, count: Any) -> None:
+        with pytest.raises(TypeError, match="count must be an int"):
+            UserFactory.build_batch(count)
+
+    def test_batch_size(self) -> None:
+        assert len(UserFactory.build_batch(4)) == 4
