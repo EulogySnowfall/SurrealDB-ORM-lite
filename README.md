@@ -5476,7 +5476,9 @@ A field annotated with a name defined after the class (a forward reference: `sco
 gets the kind of the type its name resolves to. Since v0.37.1, `table_ddl()` and `define_table()` complete such a model
 first, as its first instantiation does, so they write the same statements before and after an instance (`score` is
 `TYPE int DEFAULT 0`, which earlier versions wrote `TYPE any DEFAULT 0` until the model was instantiated or rebuilt). A
-name still undefined gives `any`.
+name still undefined gives `any`, and the attempt is remembered: the ORM tries again only once the names it could use
+change (a local name of the calling function, or a name of the model's module, added, removed or rebound), so a name
+imported only under `TYPE_CHECKING` does not cost a `model_rebuild()` on every call.
 
 - **Columns**: every field but `id` (and an edge's `in_` and `out`), under its column — its alias, if any
   ([section 20](#20-field-aliases-server_fields-and-mergerefreshfalse)) —, then the Pydantic `@computed_field`s; a

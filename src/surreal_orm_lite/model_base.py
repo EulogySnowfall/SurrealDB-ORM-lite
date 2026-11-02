@@ -3,6 +3,7 @@ import copy
 import functools
 import logging
 import os
+import sys
 import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
@@ -575,6 +576,13 @@ def _own_annotation_names(cls: type) -> set[str]:
     return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
 
 
+def _bindings(namespace: Mapping[str, Any]) -> dict[str, int]:
+    """``{name: id(value)}`` for *namespace*: what ``_complete_pending_checks()`` compares to tell whether the names a
+    failed ``model_rebuild()`` could use have changed since (issue #345). Identities, never ``==``: a value's own
+    equality may run user code, or not be a ``bool``."""
+    return {name: id(value) for name, value in namespace.items()}
+
+
 def _snapshot_moment(instance: BaseModel) -> datetime | None:
     """The moment a time-travel read (``QuerySet.as_of()``) returned *instance* at; ``None`` for a current record (v0.26.0).
 
@@ -889,6 +897,14 @@ class BaseSurrealModel(BaseModel):
     completed, and checked, on its own.
     """
 
+    __surreal_failed_rebuild__: typing.ClassVar[tuple[int, dict[str, int], dict[str, int]] | None] = None
+    """The names a failed completion of ``_complete_pending_checks()`` could use (issue #345), until they change.
+
+    ``(id of the module's namespace, {caller's local name: id of its value}, {module's name: id of its value})``, set
+    when ``model_rebuild()`` leaves the model incomplete (a name still undefined), removed once it completes. Read from
+    the class's own ``__dict__`` only, never inherited: a subclass remembers its own attempt.
+    """
+
     _surreal_as_of: datetime | None = PrivateAttr(default=None)
     """The moment a time-travel read (``QuerySet.as_of()``) returned this instance at; ``None`` for a current record (v0.26.0).
 
@@ -1096,10 +1112,15 @@ class BaseSurrealModel(BaseModel):
             cls._check_vectors_and_indexes()
         except BaseException:
             # Pydantic's own mocks for a model it could not complete: the next use rebuilds it, and so checks it again.
-            from pydantic._internal._mock_val_ser import set_model_mocks
-
+            # A private name of Pydantic's (issue #345): should a release move it, the refusal is still the error
+            # raised, and the ORM's next call still checks the model again (``__pydantic_complete__`` is reset).
             cls.__pydantic_complete__ = False
-            set_model_mocks(cls)
+            try:
+                from pydantic._internal._mock_val_ser import set_model_mocks
+            except ImportError:
+                pass
+            else:
+                set_model_mocks(cls)
             raise
         cls.__surreal_checks_pending__ = False
 
@@ -1117,8 +1138,11 @@ class BaseSurrealModel(BaseModel):
         it — with the local names of the first caller outside the ORM (``utils.user_namespace()``), then the names of
         the model's module: a caller's local name wins, and the field keeps what it resolved to — and
         ``__pydantic_on_complete__()`` runs the checks: a refusal raises from here, at every call, the model staying
-        incomplete. A name still undefined leaves the model incomplete, read as before, without an error; the next call
-        tries again. A complete model costs one attribute read.
+        incomplete. A name still undefined leaves the model incomplete, read as before, without an error, and the failed
+        attempt is remembered (``__surreal_failed_rebuild__``, issue #345): the next call tries again only once the
+        names it could use have changed — a local name of the caller, or a name of the model's module, added, removed
+        or bound to another object —, so repeated calls on unchanged names cost a snapshot of those names, not a
+        ``model_rebuild()``. A complete model costs one attribute read.
 
         Every model a forward reference left incomplete is completed, with or without a vector field: its columns get
         the resolved kinds (``define_table()`` writes ``int`` for ``score: "Score" = 0`` once ``Score = int`` is
@@ -1127,7 +1151,16 @@ class BaseSurrealModel(BaseModel):
         """
         if cls.__pydantic_complete__ or not cls.__dict__.get("__surreal_checks_pending__", False):
             return
-        cls.model_rebuild(raise_errors=False, _types_namespace=user_namespace())
+        caller = user_namespace()
+        module = getattr(sys.modules.get(cls.__module__), "__dict__", {})
+        names = (id(module), _bindings(caller), _bindings(module))
+        if cls.__dict__.get("__surreal_failed_rebuild__") == names:
+            return
+        cls.model_rebuild(raise_errors=False, _types_namespace=caller)
+        if cls.__pydantic_complete__:
+            cls.__surreal_failed_rebuild__ = None
+        else:
+            cls.__surreal_failed_rebuild__ = names
 
     @classmethod
     def get_computed_fields(cls) -> dict[str, str]:
