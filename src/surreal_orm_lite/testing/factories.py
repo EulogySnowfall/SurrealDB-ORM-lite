@@ -578,13 +578,45 @@ class ModelFactory(Generic[M], metaclass=_FactoryMeta):
         return [cast(M, cls._instantiate(model, cls._values(checked)[0])) for _ in range(count)]
 
     @classmethod
+    async def _save_one(cls, model: type[BaseSurrealModel], checked: dict[str, Any]) -> M:
+        """Build one instance from checked overrides and save it (``save(server_values=…)`` when it has some)."""
+        data, server_values = cls._values(checked)
+        instance = cls._instantiate(model, data)
+        if server_values:
+            await instance.save(server_values=server_values)
+        else:
+            await instance.save()
+        return cast(M, instance)
+
+    @classmethod
     async def create(cls, /, **overrides: Any) -> M:
-        """Build one instance and save it; the saved instance is returned."""
-        cls._require_model()
-        raise NotImplementedError
+        """Build one instance and save it with ``save()``; the saved instance is returned.
+
+        A ``SurrealFunc`` (declared, or an override) is passed to ``save(server_values=…)``, keyed by Python name, so
+        the server generates it; a plain override of the same field (under either of its names) wins and is sent as
+        data. Everything ``save()`` does applies: signals, the model's connection or the active ``using()`` block,
+        the server row applied to the instance. Exceptions of ``save()`` propagate unchanged.
+
+        Raises:
+            ValueError: the factory has no model.
+            TypeError: an override names no field or names one field twice; a ``SurrealFunc`` on an edge factory.
+        """
+        model = cls._require_model()
+        return await cls._save_one(model, cls._check_overrides("create", overrides))
 
     @classmethod
     async def create_batch(cls, count: int, /, **overrides: Any) -> list[M]:
-        """Create *count* instances one by one (one ``save()`` each)."""
-        cls._require_model()
-        raise NotImplementedError
+        """Create *count* instances one by one (one ``save()`` each, signals and server values per record).
+
+        Every check runs before the first ``save()``; ``count=0`` returns ``[]``. A failing ``save()`` stops the
+        batch and propagates; the records already created stay. ``Model.objects().bulk_create(build_batch(n))`` is the
+        one-``INSERT`` path (no signals).
+
+        Raises:
+            ValueError: the factory has no model; *count* is negative.
+            TypeError: *count* is not an ``int`` (or is a ``bool``); an override is refused as by :meth:`create`.
+        """
+        model = cls._require_model()
+        cls._check_count(count)
+        checked = cls._check_overrides("create_batch", overrides)
+        return [await cls._save_one(model, checked) for _ in range(count)]
