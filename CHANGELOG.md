@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.5] - 2026-11-02
+
+`table_ddl()`, `define_table()` and the other first-use checks no longer pay a `model_rebuild()` on every
+call for a model whose forward reference cannot be resolved. No new public API.
+
+### Fixed
+
+- **A failed forward-reference rebuild is remembered** (#345). A model with a field annotated by a name
+  that stays undefined (for example one imported only under `TYPE_CHECKING`) used to run
+  `model_rebuild()` on every ORM call. The ORM now tries again only once the names it could use change:
+  a local name of the calling function, or a name of the model's module, added, removed or rebound.
+  The result of a call is unchanged: the model stays incomplete and its field reads as `any`, on both
+  SurrealDB lines.
+- **A moved private name in Pydantic no longer hides the real error.** The ORM imports Pydantic's
+  `set_model_mocks` to re-arm a model after a refused check; if a release moves it, the refusal is still
+  the error raised and the next call still checks the model again.
+
 ## [0.39.0] - 2026-10-30
 
 The `surreal-orm-lite` command line: the migration system, a SurrealQL shell and `inspectdb` from a
