@@ -15,7 +15,8 @@ call for a model whose forward reference cannot be resolved. No new public API.
 - **A failed forward-reference rebuild is remembered** (#345). A model with a field annotated by a name
   that stays undefined (for example one imported only under `TYPE_CHECKING`) used to run
   `model_rebuild()` on every ORM call. The ORM now tries again only once the names it could use change:
-  a local name of the calling function, or a name of the model's module, added, removed or rebound.
+  a local name of the calling function, or a name of the model's module, added, removed or rebound, or
+  a linked model of another module, itself incomplete, completing or seeing a name of its module change.
   The result of a call is unchanged: the model stays incomplete and its field reads as `any`, on both
   SurrealDB lines.
 - **A moved private name in Pydantic no longer hides the real error.** The ORM imports Pydantic's

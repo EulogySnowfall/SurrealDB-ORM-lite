@@ -2340,6 +2340,71 @@ class TestFailedRebuildRemembered:
         assert len(calls) == 2
         assert model.__pydantic_complete__ is True
 
+    @staticmethod
+    def _two_modules(monkeypatch: pytest.MonkeyPatch, base: str) -> tuple[types.ModuleType, types.ModuleType]:
+        """Module ``vec_fwd_dep_m2`` holds ``B``, a *base* model whose ``x: "C"`` waits for ``C``; module
+        ``vec_fwd_dep_m1`` holds ``A3``, which links ``B`` and whose vector index contradicts its vector field, a forward
+        reference the module defines after the class: ``A3`` stays incomplete while ``B`` is, its refusal waiting."""
+        m2 = types.ModuleType("vec_fwd_dep_m2")
+        m1 = types.ModuleType("vec_fwd_dep_m1")
+        monkeypatch.setitem(sys.modules, m2.__name__, m2)
+        monkeypatch.setitem(sys.modules, m1.__name__, m1)
+        exec(  # noqa: S102 - the test's own text
+            "from pydantic import BaseModel\n"
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            f"class B({base}):\n"
+            + ("    model_config = SurrealConfigDict(table_name='vec_fwd_dep_b')\n" if base == "BaseSurrealModel" else "")
+            + "    x: 'C' = None\n",
+            m2.__dict__,
+        )
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, Index, SurrealConfigDict, VectorField\n"
+            "from vec_fwd_dep_m2 import B\n"
+            "class A3(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_dep_a3',\n"
+            "        indexes=[Index('vec_fwd_e', 'e', hnsw=True, dimension=4)])\n"
+            "    id: str | None = None\n"
+            "    b: B | None = None\n"
+            "    e: 'Vec' = None\n"
+            "Vec = VectorField[3]\n",
+            m1.__dict__,
+        )
+        assert m1.A3.__pydantic_complete__ is False
+        return m1, m2
+
+    @pytest.mark.parametrize("base", ["BaseModel", "BaseSurrealModel"])
+    def test_a_dependency_completed_later(self, monkeypatch: pytest.MonkeyPatch, base: str) -> None:
+        """A model left incomplete by a model of another module, itself incomplete: once that model completes, the
+        next call completes the dependent model and raises its refusal — the memory is not stale."""
+        m1, m2 = self._two_modules(monkeypatch, base)
+        model = m1.A3
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A3", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        # No local name of this frame changes from the first call on (an ``assert`` binds some): only the dependency.
+        model.table_ddl(), model.table_ddl()
+        m2.C = int
+        m2.B.model_rebuild()
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        assert len(calls) == 3  # the second call remembered the failure; each refusal rebuilds again
+
+    @pytest.mark.parametrize("base", ["BaseModel", "BaseSurrealModel"])
+    def test_a_name_defined_later_in_a_dependency_module(self, monkeypatch: pytest.MonkeyPatch, base: str) -> None:
+        """The missing name defined in the module of the dependency, which nothing completed yet: the next call on the
+        dependent model rebuilds it, as Pydantic would, and raises its refusal."""
+        m1, m2 = self._two_modules(monkeypatch, base)
+        model = m1.A3
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A3", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        # No local name of this frame changes from the first call on (an ``assert`` binds some): only B's module.
+        model.table_ddl(), model.table_ddl()
+        m2.C = int
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        assert len(calls) == 2  # the second call remembered the failure
+
     def test_a_subclass_keeps_its_own(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class VecFwdParent(BaseSurrealModel):
             model_config = SurrealConfigDict(table_name="vec_fwd_parent")

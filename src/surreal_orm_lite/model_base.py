@@ -583,6 +583,30 @@ def _bindings(namespace: Mapping[str, Any]) -> dict[str, int]:
     return {name: id(value) for name, value in namespace.items()}
 
 
+def _incomplete_dependencies(model: type[BaseModel]) -> tuple[tuple[int, int, dict[str, int]], ...]:
+    """The Pydantic models *model*'s fields reach (``B | None``, ``list[B]``, ``Annotated[B, …]``, and theirs in turn)
+    that are still incomplete, each as ``(id of the model, id of its module's namespace, {module's name: id of its
+    value})``: what ``_complete_pending_checks()`` adds to the names it compares (issue #345). A model left
+    incomplete by another model, itself waiting for a name of its own module, completes once that model completes —
+    it leaves this list — or once that name is defined in its module: either changes the result, so the failed
+    attempt is not remembered past it."""
+    found: list[tuple[int, int, dict[str, int]]] = []
+    seen: set[int] = {id(model)}
+    pending: list[Any] = [info.annotation for info in model.model_fields.values()]
+    while pending:
+        annotation = pending.pop()
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            if id(annotation) in seen or annotation.__pydantic_complete__:
+                continue
+            seen.add(id(annotation))
+            module = getattr(sys.modules.get(annotation.__module__), "__dict__", {})
+            found.append((id(annotation), id(module), _bindings(module)))
+            pending.extend(info.annotation for info in annotation.model_fields.values())
+        else:
+            pending.extend(typing.get_args(annotation))
+    return tuple(found)
+
+
 def _snapshot_moment(instance: BaseModel) -> datetime | None:
     """The moment a time-travel read (``QuerySet.as_of()``) returned *instance* at; ``None`` for a current record (v0.26.0).
 
@@ -897,11 +921,14 @@ class BaseSurrealModel(BaseModel):
     completed, and checked, on its own.
     """
 
-    __surreal_failed_rebuild__: typing.ClassVar[tuple[int, dict[str, int], dict[str, int]] | None] = None
+    __surreal_failed_rebuild__: typing.ClassVar[
+        tuple[int, dict[str, int], dict[str, int], tuple[tuple[int, int, dict[str, int]], ...]] | None
+    ] = None
     """The names a failed completion of ``_complete_pending_checks()`` could use (issue #345), until they change.
 
-    ``(id of the module's namespace, {caller's local name: id of its value}, {module's name: id of its value})``, set
-    when ``model_rebuild()`` leaves the model incomplete (a name still undefined), removed once it completes. Read from
+    ``(id of the module's namespace, {caller's local name: id of its value}, {module's name: id of its value}, the
+    incomplete models its fields reach with their modules' names — _incomplete_dependencies())``, set when
+    ``model_rebuild()`` leaves the model incomplete (a name still undefined), removed once it completes. Read from
     the class's own ``__dict__`` only, never inherited: a subclass remembers its own attempt.
     """
 
@@ -1141,7 +1168,9 @@ class BaseSurrealModel(BaseModel):
         incomplete. A name still undefined leaves the model incomplete, read as before, without an error, and the failed
         attempt is remembered (``__surreal_failed_rebuild__``, issue #345): the next call tries again only once the
         names it could use have changed — a local name of the caller, or a name of the model's module, added, removed
-        or bound to another object —, so repeated calls on unchanged names cost a snapshot of those names, not a
+        or bound to another object —, or a model its fields reach and that was still incomplete has completed or seen a
+        name of its own module change (a link to a model of another module waiting for a name there,
+        ``_incomplete_dependencies()``), so repeated calls on unchanged names cost a snapshot of those names, not a
         ``model_rebuild()``. A complete model costs one attribute read.
 
         Every model a forward reference left incomplete is completed, with or without a vector field: its columns get
@@ -1153,7 +1182,7 @@ class BaseSurrealModel(BaseModel):
             return
         caller = user_namespace()
         module = getattr(sys.modules.get(cls.__module__), "__dict__", {})
-        names = (id(module), _bindings(caller), _bindings(module))
+        names = (id(module), _bindings(caller), _bindings(module), _incomplete_dependencies(cls))
         if cls.__dict__.get("__surreal_failed_rebuild__") == names:
             return
         cls.model_rebuild(raise_errors=False, _types_namespace=caller)
