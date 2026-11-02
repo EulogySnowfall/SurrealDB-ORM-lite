@@ -25,6 +25,7 @@ there).
 """
 
 import logging
+import math
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -636,6 +637,10 @@ class AuthenticatedUserMixin:
         First of all, SG1 (#299): a model with a field SIGNUP writes that ``Field(exclude=True)``
         keeps out of ``model_dump()`` is refused, so an access defined by hand cannot leave a
         stored record that ``update()`` or ``upsert()`` would strip of its hash.
+
+        On SIGNUP, the primary key's value becomes the record id: ``None`` (#349) and a fractional or
+        non-finite float (#352 — SurrealDB 2.x truncates ``1.5`` to ``:1``, 3.x refuses it) raise
+        ``ValueError`` before the exchange.
         """
         cls._refuse_signup_fields_excluded()
         known = set(cls._signup_fields())
@@ -692,6 +697,15 @@ class AuthenticatedUserMixin:
         if primary_key in payload and payload[primary_key] is None:
             raise ValueError(
                 f"{cls.__name__}.{action}() requires {primary_key}=: it is the primary key, which SIGNUP makes the record id."
+            )
+        # #352: a record id cannot be a fractional or non-finite float. SurrealDB 2.x truncates it (`SET id = 1.5`
+        # creates `<table>:1`, so keys 1.5 and 1.7 collide) and 3.x refuses it — refused on both before the exchange.
+        # An integral float (2.0 → `<table>:2`, on both lines), an int and a bool are left to the server.
+        key = payload.get(primary_key) if primary_key is not None else None
+        if isinstance(key, float) and not (math.isfinite(key) and key.is_integer()):
+            raise ValueError(
+                f"{cls.__name__}.{action}() got {primary_key}={key!r}: it is the primary key, which SIGNUP makes the "
+                f"record id, and a record id cannot be a fractional or non-finite number. Pass an integer or a string."
             )
         return payload
 
