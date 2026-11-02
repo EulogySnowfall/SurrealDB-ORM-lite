@@ -3706,6 +3706,27 @@ def _released_39() -> bool:
     return rows[1][0] == "✅ v0.39.0"
 
 
+def _released_40() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.40.0 (model factories and the pytest plugin) as released: its Phase H row
+    carries the ✅ the release adds."""
+    rows = [cells for _, cells in _table_rows(_subsection("### 🛠️ Phase H — Tooling", _roadmap()))]
+    return rows[2][0] == "✅ v0.40.0"
+
+
+#: The v0.25.0 entry's deferral note, once v0.40.0 is released: the factories shipped in v0.40.0.
+_RELEASED_DEFERRED_25 = "`ModelFactory` and `Faker` shipped in v0.40.0"
+#: Once released, v0.40.0 is a block of "Completed versions" right after v0.39.0's, naming the factories and the plugin.
+_RELEASED_ENTRY_40 = "### Version 0.40.0 — Test fixtures & factories"
+_RELEASED_ENTRY_NEEDLES_40 = ("`ModelFactory`", "`Faker`", "`surreal_orm_lite.testing.pytest_plugin`", "`surreal_db`")
+
+
+def _deferred_needles(heading: str) -> tuple[str, ...]:
+    """What the released entry under *heading* must say: v0.25.0's note on the factories follows their release."""
+    if heading == "### Version 0.25.0 — Embedded test engine" and _released_40():
+        return (_RELEASED_DEFERRED_25,)
+    return _DEFERRED_34[heading]
+
+
 class TestRoadmapTableDdl:
     """Issue #292: ``docs/ROADMAP.md`` inserts the model table DDL (``define_table()``) as v0.34.0, before search, and
     moves the later versions up one (search v0.35.0–v0.37.0, tooling v0.38.0–v0.40.0, Beta v0.41.0). Issue #291: the
@@ -3714,16 +3735,20 @@ class TestRoadmapTableDdl:
     Each check accepts the planned form and the released one — v0.34.0 marked ✅ or ``Done`` everywhere, its entry
     moved to "Completed versions" — and the Phase F row decides which one the whole file must be in. The checks that
     reach the search rows accept v0.35.0, v0.36.0 and v0.37.0 released too, which their Phase G rows decide, and
-    v0.38.0 (migrations) and v0.39.0 (the command line), which their Phase H rows decide."""
+    v0.38.0 (migrations), v0.39.0 (the command line) and v0.40.0 (model factories), which their Phase H rows
+    decide."""
 
     def test_next_planned_version_is_the_model_table_ddl(self) -> None:
         """Planned: v0.34.0 first, then search, tooling and fixtures. Released: the same without v0.34.0, without
         v0.35.0 once full-text search is released, without v0.36.0 once vector search is, without v0.37.0 once
-        hybrid search is, without v0.38.0 once the migrations are and without v0.39.0 once the command line is."""
+        hybrid search is, without v0.38.0 once the migrations are, without v0.39.0 once the command line is and
+        without v0.40.0 once the factories are."""
         planned = "\n".join(part for part in _roadmap().split("\n## ") if part.startswith("Planned"))
         rows = re.findall(r"^\|\s*(v\d+\.\d+\.\d+)\s*\|\s*([^|]+?)\s*\|", planned, re.MULTILINE)
         released = (
-            6
+            7
+            if _released_40()
+            else 6
             if _released_39()
             else 5
             if _released_38()
@@ -3787,7 +3812,7 @@ class TestRoadmapTableDdl:
             if _released_39():
                 assert overview[planned : planned + 3] == [
                     ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "Done"],
-                    ["v0.40.0", "Tier 3 — Test fixtures & factories", "Planned"],
+                    ["v0.40.0", "Tier 3 — Test fixtures & factories", "Done" if _released_40() else "Planned"],
                     ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"],
                 ], overview
             else:
@@ -3818,7 +3843,8 @@ class TestRoadmapTableDdl:
         """The two tables that date every feature: the model table DDL gets its row (marked ✅ once released), the
         later rows their new number; full-text search is marked ✅ once v0.35.0 is released, vector search once
         v0.36.0 is (the SDK table then names HNSW alone), hybrid search once v0.37.0 is, the migrations once
-        v0.38.0 is, and the command line once v0.39.0 is."""
+        v0.38.0 is, the command line once v0.39.0 is, and the factories once v0.40.0 is (both their releases marked in
+        the comparison cell)."""
         roadmap = _roadmap()
         mark = "✅ " if _released_34() else ""
         mark_35 = "✅ " if _released_35() else ""
@@ -3830,6 +3856,8 @@ class TestRoadmapTableDdl:
         mark_37 = "✅ " if _released_37() else ""
         mark_38 = "✅ " if _released_38() else ""
         cli_39 = "✅ v0.39.0" if _released_39() else "v0.39.0"
+        factories_40 = "✅ v0.40.0" if _released_40() else "v0.40.0"
+        fixtures_40 = "✅ v0.25.0 + ✅ v0.40.0" if _released_40() else "v0.25.0 + v0.40.0"
         migrations_38 = (
             "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)"
             if _released_39()
@@ -3848,7 +3876,7 @@ class TestRoadmapTableDdl:
             hybrid_37,
             ("Migrations (makemigrations/migrate)", f"{mark_38}v0.38.0"),
             ("CLI `surreal-orm-lite`", cli_39),
-            ("Test fixtures & factories", "v0.40.0"),
+            ("Test fixtures & factories", factories_40),
             ("QueryLogger / profiling", "v0.41.0 (Beta)"),
         ], unlocked
         comparison = [
@@ -3861,14 +3889,31 @@ class TestRoadmapTableDdl:
             ["Vector Search (KNN/HNSW)", "yes", f"{mark_36}v0.36.0"],
             ["Hybrid Search (RRF)", "yes", f"{mark_37}v0.37.0"],
             ["Migrations & CLI", "yes", migrations_38],
-            ["Test fixtures & factories", "yes", "v0.25.0 + v0.40.0"],
+            ["Test fixtures & factories", "yes", fixtures_40],
             ["QueryLogger / profiling", "yes", "v0.41.0"],
         ], comparison
 
     @pytest.mark.parametrize("heading", list(_DEFERRED_34))
     def test_released_entries_name_the_new_numbers(self, heading: str) -> None:
         entry = _normalised(_subsection(heading, _roadmap()))
-        missing = [needle for needle in _DEFERRED_34[heading] if needle not in entry]
+        missing = [needle for needle in _deferred_needles(heading) if needle not in entry]
+        assert not missing, missing
+
+    def test_phase_h_and_version_0_40_0_entry(self) -> None:
+        """Planned: the Phase H row of v0.40.0 has no ✅ and no entry of its own. Released: the row carries the ✅ and
+        a block of "Completed versions" right after v0.39.0's names the factories and the pytest plugin."""
+        roadmap = _roadmap()
+        rows = [cells for _, cells in _table_rows(_subsection("### 🛠️ Phase H — Tooling", roadmap))]
+        first = "✅ v0.40.0" if _released_40() else "v0.40.0"
+        assert rows[2] == [first, "Test fixtures & factories (`ModelFactory`, pytest)", "tooling over the ORM"], rows
+        completed = roadmap.split("\n## Completed versions\n", 1)[1].split("\n## ", 1)[0]
+        headings = re.findall(r"^### .*$", completed, re.MULTILINE)
+        if not _released_40():
+            assert _RELEASED_ENTRY_40 not in headings, headings
+            return
+        assert headings[headings.index(_RELEASED_ENTRY_40) - 1] == "### Version 0.39.0 — Command line (`surreal-orm-lite`)"
+        entry = _normalised(_subsection(_RELEASED_ENTRY_40, completed))
+        missing = [needle for needle in _RELEASED_ENTRY_NEEDLES_40 if needle not in entry]
         assert not missing, missing
 
     def test_version_0_33_0_writes_edge_methods(self) -> None:
