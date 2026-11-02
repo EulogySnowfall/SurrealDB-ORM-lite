@@ -2821,7 +2821,7 @@ class TestSubqueryDocs:
     def test_section_28_follows_section_27(self) -> None:
         """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0), section 30 (v0.29.0),
         section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0),
-        section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0) and section 40 (v0.39.0),
+        section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0),
         and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_27 = readme.index("\n### 27. Time travel (`as_of()`)\n")
@@ -2843,6 +2843,7 @@ class TestSubqueryDocs:
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
             "### 40. Command line (`surreal-orm-lite`)",
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
