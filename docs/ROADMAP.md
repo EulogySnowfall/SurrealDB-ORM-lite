@@ -48,7 +48,7 @@
 | v0.37.0           | Tier 3 — Hybrid search                              | Done    |
 | v0.38.0           | Tier 3 — Migration system                           | Done    |
 | v0.39.0           | Tier 3 — Command line (`surreal-orm-lite`)          | Done    |
-| v0.40.0           | Tier 3 — Test fixtures & factories                  | Planned |
+| v0.40.0           | Tier 3 — Test fixtures & factories                  | Done    |
 | v0.41.0           | Beta Phase (API freeze, hardening)                  | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
 | v2.1.0+           | Future (post-GA)                                    | Future  |
@@ -114,7 +114,7 @@ pieces stay out.
 | Hybrid Search (RRF)                    | `search::rrf()` (3.x) or the same fusion in the ORM (2.x)   | ✅ v0.37.0     |
 | Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`            | ✅ v0.38.0     |
 | CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                                 | ✅ v0.39.0     |
-| Test fixtures & factories              | `ModelFactory`, pytest fixtures                             | v0.40.0        |
+| Test fixtures & factories              | `ModelFactory`, pytest fixtures                             | ✅ v0.40.0     |
 | QueryLogger / profiling                | wraps `query()` calls                                       | v0.41.0 (Beta) |
 
 ¹ SDK 2.0.0 exposes **no** `run()`/`call()` method, so the call goes through `query()` with
@@ -177,7 +177,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Vector Search (KNN/HNSW)      | yes        | ✅ v0.36.0                                |
 | Hybrid Search (RRF)           | yes        | ✅ v0.37.0                                |
 | Migrations & CLI              | yes        | ✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI) |
-| Test fixtures & factories     | yes        | v0.25.0 + v0.40.0                         |
+| Test fixtures & factories     | yes        | ✅ v0.25.0 + ✅ v0.40.0                   |
 | QueryLogger / profiling       | yes        | v0.41.0                                   |
 | Custom SDK (`surreal_sdk`)    | yes        | never                                     |
 | CBOR protocol internals       | yes        | never                                     |
@@ -198,7 +198,7 @@ official SDK's in-process engine from v0.25.0.
 The embedded engine is SurrealDB core 2.3.10 with SDK 2.0.0, not the 2.x/3.x server lines the ORM
 is tested on. A bare `memory` (no `://`) is refused by SDK 2.0.0; write `memory://`. Base test
 fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; factories
-(`ModelFactory`, `Faker`) in v0.40.0.
+(`ModelFactory`, `Faker`) and the pytest plugin shipped in v0.40.0 (README section 41).
 
 ---
 
@@ -508,7 +508,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   `changes(since=<datetime>)`, model auth with `bind=False`, `ephemeral_client()`) and for a URL
   the SDK refuses (`rocksdb://`, #233, quoting the SDK)
 - `surreal_orm_lite.testing`: `embedded_database()` (an isolated in-process database per block,
-  nestable) and the full ORM's `SurrealFixture` / `@fixture`; `ModelFactory` and `Faker` stay in
+  nestable) and the full ORM's `SurrealFixture` / `@fixture`; `ModelFactory` and `Faker` shipped in
   v0.40.0
 - The engine is SurrealDB core 2.3.10 (SDK 2.0.0), so it speaks 2.x SurrealQL; its behaviour is a
   table of its own in the README. Server lines unchanged (2.7.0 and 3.3.4, 3.1.5 retro). Time travel
@@ -952,6 +952,25 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   history and a failing exit status for piped input in the SurrealQL shell; `schemadiff --check`
   exiting 1 when the models and the database differ
 
+### Version 0.40.0 — Test fixtures & factories
+
+- `ModelFactory` and `Faker` in `surreal_orm_lite.testing`, with the full SurrealDB-ORM's names: a
+  Factory Boy-style class declares a model's test data (`Faker` providers, static values copied
+  for each instance, and `SurrealFunc` expressions the server generates), `build()` and
+  `build_batch()` need no database, `create()` and `create_batch()` save through the model's own
+  `save()`. `ModelFactory[Player]` types the results as `Player`
+- Opt-in pytest plugin `surreal_orm_lite.testing.pytest_plugin` (`pytest_plugins` or `-p`): its
+  `surreal_db` fixture gives each test a fresh in-memory database and `surreal_db_url` can name a
+  `surrealkv://` path. It refuses a server URL, so a test run cannot wipe a server's database.
+  No new dependency; pytest and pytest-asyncio are needed only for the plugin
+- Deviations from the full ORM: any static value is collected (a `datetime`, `Decimal`, `Enum`,
+  `RecordID`, nested model); mistakes in a `Faker` or a factory fail at the `class` statement;
+  `create_batch()` saves one record at a time; the plugin is opt-in
+- Same code on 2.7.0, 3.3.5 and the embedded engine (3.1.5 retro). README section 41 and the
+  2.x/3.x behaviour table record it
+- Deferred: lazy values (`LazyAttribute`, `Sequence`, `SubFactory`, which the full ORM has none
+  of either), `SurrealFunc` on an edge factory
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -1175,7 +1194,7 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 | ---------- | ------------------------------------------------------ | ------------------------------------------ |
 | ✅ v0.38.0 | Migration system (makemigrations / migrate / rollback) | DDL orchestration + tracking via `query()` |
 | ✅ v0.39.0 | CLI `surreal-orm-lite` (shell, migrate, inspectdb)     | entry point over the ORM                   |
-| v0.40.0    | Test fixtures & factories (`ModelFactory`, pytest)     | tooling over the ORM                       |
+| ✅ v0.40.0 | Test fixtures & factories (`ModelFactory`, pytest)     | tooling over the ORM                       |
 
 ---
 
