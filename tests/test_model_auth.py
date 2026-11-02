@@ -498,6 +498,79 @@ class TestPrimaryKeyAccessE2E:
             assert await client.query("SELECT VALUE id FROM KeyedSlugUser;", {}) == [RecordID("KeyedSlugUser", "ada")]
 
 
+class FloatKeyUser(AuthenticatedUserMixin, BaseSurrealModel):
+    """#352: a numeric primary key. SurrealDB 2.x truncates a fractional float record id (``SET id = 1.5`` creates
+    ``:1``), 3.x refuses it — so signup refuses it on both lines before the exchange."""
+
+    model_config = SurrealConfigDict(access_name="e2e_float_key", primary_key="code")
+
+    code: int | float | str
+    email: str
+    password: str
+
+
+_BAD_FLOAT_KEYS = [1.5, -0.25, float("nan"), float("inf"), float("-inf"), 1e19, 9223372036854775808.0, -1e300]
+
+
+class TestFloatPrimaryKey:
+    """#352: the guard of ``_auth_variables()``, before any request."""
+
+    @pytest.mark.parametrize("key", _BAD_FLOAT_KEYS, ids=["1.5", "-0.25", "nan", "inf", "-inf", "1e19", "2**63", "-1e300"])
+    def test_a_fractional_or_non_finite_float_key_is_refused(self, key: float) -> None:
+        with pytest.raises(ValueError, match=r"FloatKeyUser\.signup\(\) got code=.*primary key"):
+            FloatKeyUser._auth_variables("signup", {"code": key, "email": "a@b.c", "password": "pw"}, require_all=True)
+
+    @pytest.mark.parametrize(
+        "key", [2.0, 0.0, -3.0, -9223372036854775808.0, 9223372036854774784.0, 7, 2**70, True, "ada", "ada:lovelace"]
+    )
+    def test_integral_floats_integers_and_strings_are_bound_unchanged(self, key: Any) -> None:
+        bound = FloatKeyUser._auth_variables("signup", {"code": key, "email": "a@b.c", "password": "pw"}, require_all=True)
+        assert bound["code"] is key
+
+    def test_signin_does_not_look_at_the_primary_key(self) -> None:
+        """Signin binds only the credentials; the key guard belongs to SIGNUP, which makes the record id."""
+        bound = FloatKeyUser._auth_variables("signin", {"email": "a@b.c", "password": "pw"}, require_all=False)
+        assert bound == {"email": "a@b.c", "password": "pw"}
+
+
+class TestFloatPrimaryKeyE2E:
+    """#352 on both server lines, through the access method ``access_ddl()`` renders."""
+
+    @pytest.mark.asyncio
+    async def test_a_fractional_float_key_never_reaches_the_server(self) -> None:
+        """Before #352, 2.x stored both signups as ``FloatKeyUser:1``: the second collided with the first."""
+        async with auth_model(FloatKeyUser) as model:
+            assert await model.define_access() == model.access_ddl()
+            for key in _BAD_FLOAT_KEYS:
+                with pytest.raises(ValueError, match=r"got code=.*primary key"):
+                    await model.signup(code=key, email=_unique_email(), password=AUTH_PASSWORD)
+            client = await SurrealDBConnectionManager.get_client()
+            assert await client.query("SELECT VALUE id FROM FloatKeyUser;", {}) == []
+
+    @pytest.mark.asyncio
+    async def test_integral_float_integer_and_string_keys_still_sign_up(self) -> None:
+        _connect()
+        try:
+            client = await SurrealDBConnectionManager.get_client()
+            for statement in FloatKeyUser.access_ddl():  # the statements as rendered, applied by hand
+                await client.query(statement, {})
+            cases: list[tuple[Any, Any]] = [(2.0, 2), (7, 7), ("ada", "ada"), ("ada:lovelace", "ada:lovelace")]
+            for key, record_key in cases:
+                email = _unique_email()
+                created = await FloatKeyUser.signup(code=key, email=email, password=AUTH_PASSWORD)
+                signed_in = await FloatKeyUser.signin(email=email, password=AUTH_PASSWORD)
+                assert (created.user.code, created.user.email, signed_in.user.email) == (key, email, email)
+                ids = await client.query("SELECT VALUE id FROM FloatKeyUser;", {})
+                assert RecordID("FloatKeyUser", record_key) in ids
+            assert len(await client.query("SELECT VALUE id FROM FloatKeyUser;", {})) == len(cases)
+        finally:
+            with contextlib.suppress(Exception):
+                client = await SurrealDBConnectionManager.get_client()
+                await client.query("REMOVE ACCESS e2e_float_key ON DATABASE;", {})
+                await client.query("REMOVE TABLE FloatKeyUser;", {})
+            await SurrealDBConnectionManager.unset_connection()
+
+
 class TestSignupE2E:
     @pytest.mark.asyncio
     async def test_returns_a_hydrated_instance(self) -> None:
