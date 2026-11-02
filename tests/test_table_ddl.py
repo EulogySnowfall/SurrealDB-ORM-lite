@@ -926,7 +926,8 @@ class TestOldNumbers:
         from surreal_orm_lite import testing
 
         doc = " ".join((testing.__doc__ or "").split())
-        assert "``ModelFactory`` comes in v0.40.0." in doc
+        assert "``ModelFactory`` comes in v0.40.0." not in doc
+        assert "``ModelFactory`` and ``Faker`` (v0.40.0) declare test data as Factory Boy-style classes." in doc
 
     def test_computed_field_ddl_note(self) -> None:
         doc = " ".join((BaseSurrealModel.computed_field_ddl.__doc__ or "").split())
