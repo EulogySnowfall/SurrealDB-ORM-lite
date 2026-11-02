@@ -25,6 +25,7 @@ there).
 """
 
 import logging
+import math
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -55,6 +56,10 @@ _M = TypeVar("_M")
 #: SurrealQL password-hashing families. The access method calls
 #: ``crypto::<algorithm>::generate`` / ``::compare``, so an unknown value would only fail
 #: server-side, buried in a DDL string — caught here instead.
+# The range of a SurrealDB integer record id (i64): a float key outside it is refused by signup() (#352).
+_I64_MIN = -(2**63)
+_I64_END = 2**63
+
 _HASH_ALGORITHMS = frozenset({"argon2", "bcrypt", "pbkdf2", "scrypt"})
 
 #: A SurrealQL duration literal (``15m``, ``12h``, ``30d``). Durations are interpolated into the
@@ -636,6 +641,11 @@ class AuthenticatedUserMixin:
         First of all, SG1 (#299): a model with a field SIGNUP writes that ``Field(exclude=True)``
         keeps out of ``model_dump()`` is refused, so an access defined by hand cannot leave a
         stored record that ``update()`` or ``upsert()`` would strip of its hash.
+
+        On SIGNUP, the primary key's value becomes the record id: ``None`` (#349) and a float that is
+        not an integer within the 64-bit range (#352 — SurrealDB 2.x truncates ``1.5`` to ``:1`` and
+        saturates ``1e19`` to ``:9223372036854775807``, 3.x refuses both) raise ``ValueError`` before
+        the exchange.
         """
         cls._refuse_signup_fields_excluded()
         known = set(cls._signup_fields())
@@ -692,6 +702,17 @@ class AuthenticatedUserMixin:
         if primary_key in payload and payload[primary_key] is None:
             raise ValueError(
                 f"{cls.__name__}.{action}() requires {primary_key}=: it is the primary key, which SIGNUP makes the record id."
+            )
+        # #352: a float record id must be an integer that fits an i64. SurrealDB 2.x truncates a fractional one
+        # (`SET id = 1.5` creates `<table>:1`, so keys 1.5 and 1.7 collide) and saturates an out-of-range one
+        # (`1e19` and `1e20` both become `<table>:9223372036854775807`); 3.x refuses both — refused on both before
+        # the exchange. An integral float within range (2.0 → `<table>:2`, on both lines), an int and a bool are left
+        # to the server.
+        key = payload.get(primary_key) if primary_key is not None else None
+        if isinstance(key, float) and not (math.isfinite(key) and key.is_integer() and _I64_MIN <= key < _I64_END):
+            raise ValueError(
+                f"{cls.__name__}.{action}() got {primary_key}={key!r}: it is the primary key, which SIGNUP makes the "
+                f"record id, and a float record id must be an integer in [-2**63, 2**63). Pass an integer or a string."
             )
         return payload
 
