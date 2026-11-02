@@ -146,10 +146,10 @@ _NEEDLES_40: dict[str, list[str]] = {
 
 
 def _section_40() -> str:
-    """Section 40, as written, without the ``---`` that ends it."""
-    body, separator, rest = _readme_part(_SECTION_40).rpartition("\n---\n")
-    assert separator and not rest.strip(), "section 40 ends with the --- of the next part"
-    return f"{body}\n"
+    """Section 40, as written: section 41 (v0.40.0) follows it, so the ``---`` of the next part is no longer its end."""
+    section = _readme_part(_SECTION_40)
+    assert "\n---\n" not in section, "section 41 follows section 40"
+    return section
 
 
 def _part_40(heading: str) -> str:
@@ -173,8 +173,8 @@ class TestReadmeSection40:
     """README section 40: its place, its parts, its fences and what each part states."""
 
     def test_section_40_follows_section_39(self) -> None:
-        """Sections 38, 39 and 40 in that order after section 37, section 40 the last before the ``---`` of
-        "Configuration Options"."""
+        """Sections 38, 39 and 40 in that order after section 37, then section 41 (v0.40.0), the last before the
+        ``---`` of "Configuration Options"."""
         text = _readme()
         start_37 = text.index(f"\n{_SECTION_37}\n")
         configuration = text.index("\n## Configuration Options\n")
@@ -184,8 +184,9 @@ class TestReadmeSection40:
             _SECTION_38,
             _SECTION_39,
             _SECTION_40,
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 40 ends before the --- of the next part"
+        assert text[:configuration].rstrip().endswith("\n---"), "section 41 ends before the --- of the next part"
         assert "\n---\n" not in _readme_part(_SECTION_39), "section 39 no longer ends with the ---"
 
     def test_anchor(self) -> None:
@@ -282,7 +283,7 @@ _ROADMAP_ROWS_39 = [
     ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
     ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
     ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "✅ Released"],
-    ["v0.40.0", "Tier 3 — Test fixtures & factories", "📋 Planned"],
+    ["v0.40.0", "Tier 3 — Test fixtures & factories", "✅ Released"],
     ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
 ]
 _COMPARISON_ROW_39 = ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"]
@@ -327,7 +328,7 @@ class TestReadmeRows39:
         assert firsts.index(_FEATURES_ROW_39[0]) == migrations + 1
 
     def test_roadmap_rows(self) -> None:
-        """v0.39.0 released, v0.40.0 planned on its own row, the old range gone."""
+        """v0.39.0 released, v0.40.0 released on its own row (README changed with v0.40.0), the old range gone."""
         roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.37.0")
         assert roadmap[start : start + 5] == _ROADMAP_ROWS_39, roadmap

@@ -394,8 +394,8 @@ class TestReadmeSection39:
     """README section 39: its place, its parts, its blocks, its operations table and what each part states."""
 
     def test_section_39_follows_section_38(self) -> None:
-        """Right after section 38 (after its "Coming from" bullets), then section 40 (v0.39.0), the last section
-        before the ``---`` of "Configuration Options"."""
+        """Right after section 38 (after its "Coming from" bullets), then section 40 (v0.39.0) and section 41
+        (v0.40.0), the last section before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_38 = text.index(f"\n{_SECTION_38}\n")
         start_39 = text.index(f"\n{_SECTION_39}\n")
@@ -405,6 +405,7 @@ class TestReadmeSection39:
             _SECTION_38,
             _SECTION_39,
             "### 40. Command line (`surreal-orm-lite`)",
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -570,7 +571,7 @@ _ROADMAP_ROWS_39 = [
     ["v0.37.0", "Tier 3 — Hybrid search", "✅ Released"],
     ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
     ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "✅ Released"],
-    ["v0.40.0", "Tier 3 — Test fixtures & factories", "📋 Planned"],
+    ["v0.40.0", "Tier 3 — Test fixtures & factories", "✅ Released"],
     ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
 ]
 _COMPARISON_ROW_39 = ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"]

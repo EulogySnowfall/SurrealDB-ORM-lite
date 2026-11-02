@@ -1203,7 +1203,8 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
     modules of v0.23.0, v0.24.0 and v0.24.3 (#235), and for ``tests/test_time_travel.py`` (v0.26.0),
     ``tests/test_subqueries.py`` (v0.27.0), ``tests/test_query_cache.py`` (v0.28.0),
     ``tests/test_introspection.py`` (v0.30.0), ``tests/test_table_ddl.py`` (v0.34.0), ``tests/test_vector.py``
-    (v0.36.0) and ``tests/test_factories.py`` (v0.40.0), new too."""
+    (v0.36.0), ``tests/test_factories.py``, ``tests/test_pytest_plugin.py`` and ``tests/test_factories_docs.py``
+    (v0.40.0), new too."""
     assert (
         frozenset(
             {
@@ -1221,6 +1222,8 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
                 "tests.test_table_ddl",
                 "tests.test_vector",
                 "tests.test_factories",
+                "tests.test_pytest_plugin",
+                "tests.test_factories_docs",
             }
         )
         == _REWRITE_MODULES
@@ -2577,7 +2580,7 @@ class TestReadmeEmbeddedWording:
         """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0), section 29
         (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34
         (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39
-        (v0.38.0) and section 40 (v0.39.0), up to "Configuration Options"."""
+        (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), up to "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
@@ -2599,6 +2602,7 @@ class TestReadmeEmbeddedWording:
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
             "### 40. Command line (`surreal-orm-lite`)",
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
 
     def test_subsections_in_order(self) -> None:
@@ -2672,7 +2676,8 @@ class TestReadmeEmbeddedWording:
         text = _normalised(_subsection("#### Coming from the full SurrealDB-ORM", _section_26()))
         for word in ("resets", "id", "TypeError", "is_embedded()", "embedded_database()"):
             assert word in text, word
-        assert "**`ModelFactory` and `Faker`** come in v0.40.0." in text, text
+        assert "**`ModelFactory` and `Faker`**, and a pytest plugin with the `surreal_db` fixture, are in" in text, text
+        assert "come in v0.40.0" not in text, text
 
     def test_embedded_behaviour_table(self) -> None:
         """Four cells a row, each "Since" a release; v0.25.0's rows first and together, in a table in version order
@@ -2729,7 +2734,7 @@ class TestReadmeEmbeddedWording:
         assert embedded == ["Embedded engine", "✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)", "❌ (HTTP/WebSocket only)"]
         [fixtures] = [cells for cells in rows if cells[0] == "Test Fixtures & Factories"]
         assert "v0.25.0" in fixtures[1] and "v0.40.0" in fixtures[1], fixtures
-        assert fixtures == ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.40.0", "✅"]
+        assert fixtures == ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; ✅ v0.40.0 factories", "✅"]
         assert [cells[0] for cells in rows].index("Embedded engine") == [cells[0] for cells in rows].index(
             "Geospatial Fields"
         ) + 1

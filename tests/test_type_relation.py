@@ -3336,7 +3336,7 @@ _COMPARISON_ROWS_34 = [
     ["Vector Search (KNN/HNSW)", "✅ v0.36.0 (`similar_to()`)", "✅"],
     ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"],
     ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"],
-    ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.40.0", "✅"],
+    ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; ✅ v0.40.0 factories", "✅"],
     ["Retry, Logging, Metrics", "v0.41.0", "✅"],
     ["Connection Pool", "post-GA (tentative)", "✅"],
     ["Custom SDK / CBOR Protocol", "❌ never", "✅"],
@@ -3416,7 +3416,7 @@ class TestReadmeSection34:
 
     def test_section_34_follows_section_33(self) -> None:
         """Right after section 33 (after its "Coming from" bullets), then section 35 (v0.34.0), section 36 (v0.35.0),
-        section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0) and section 40 (v0.39.0), and before the
+        section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the
         ``---`` of "Configuration Options"."""
         text = _readme()
         start_33 = text.index(f"\n{_SECTION_33}\n")
@@ -3432,6 +3432,7 @@ class TestReadmeSection34:
             "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
             "### 40. Command line (`surreal-orm-lite`)",
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

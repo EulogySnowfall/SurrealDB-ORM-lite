@@ -65,7 +65,7 @@ from surreal_orm_lite.testing import embedded_database
 #: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
 #: hook, v0.25.0's embedded engine, v0.26.0's time travel, v0.27.0's subqueries, v0.28.0's query cache,
 #: v0.30.0's schema introspection, v0.34.0's model table DDL (whose ORM writes cover every kind), v0.36.0's
-#: vector search (a ``nearby()`` point) and v0.40.0's model factories (``date``/``datetime`` Faker values) and pytest plugin (in-process pytester sessions): the only ones whose values ``encode()`` may rewrite. Never list a module
+#: vector search (a ``nearby()`` point) and v0.40.0's model factories (``date``/``datetime`` Faker values) and pytest plugin (in-process pytester sessions), with their README section 41 (run on ``mem://``): the only ones whose values ``encode()`` may rewrite. Never list a module
 #: that existed at v0.22.2 here.
 _REWRITE_MODULES = frozenset(
     {
@@ -84,6 +84,7 @@ _REWRITE_MODULES = frozenset(
         "tests.test_vector",
         "tests.test_factories",
         "tests.test_pytest_plugin",
+        "tests.test_factories_docs",
     }
 )
 

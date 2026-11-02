@@ -3467,7 +3467,8 @@ class TestReadmeSection38:
     the bullets of sections 36 and 37 that point to it; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_38_follows_section_37(self) -> None:
-        """Right after section 37 (after its "Coming from" bullets), then section 39 (v0.38.0) and section 40 (v0.39.0),
+        """Right after section 37 (after its "Coming from" bullets), then section 39 (v0.38.0), section 40 (v0.39.0) and
+        section 41 (v0.40.0),
         and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_37 = text.index(f"\n{_SECTION_37}\n")
@@ -3479,6 +3480,7 @@ class TestReadmeSection38:
             _SECTION_38,
             "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
             "### 40. Command line (`surreal-orm-lite`)",
+            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
