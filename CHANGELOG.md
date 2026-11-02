@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<<<<<<< HEAD
 ## [0.39.5] - 2026-11-02
 
 `table_ddl()`, `define_table()` and the other first-use checks no longer pay a `model_rebuild()` on every
@@ -22,6 +23,22 @@ call for a model whose forward reference cannot be resolved. No new public API.
 - **A moved private name in Pydantic no longer hides the real error.** The ORM imports Pydantic's
   `set_model_mocks` to re-arm a model after a refused check; if a release moves it, the refusal is still
   the error raised and the next call still checks the model again.
+=======
+## [0.39.4] - 2026-11-02
+
+`signup()` refuses a float primary key that cannot be a record id. No new public API.
+
+### Fixed
+
+- **`signup()` refuses a fractional, non-finite or out-of-range float primary key before the exchange**
+  (#352). On SIGNUP the primary key becomes the record id, and SurrealDB 2.x truncates a fractional
+  float (`1.5` and `1.7` both create `<table>:1`) and saturates one outside the 64-bit integer range
+  (`1e19` and `1e20` both create `<table>:9223372036854775807`), so two signups collided on one
+  record; 3.x refuses them as invalid ids. `signup()` now raises `ValueError` for a float key that is
+  not an integer in [-2\*\*63, 2\*\*63), on both lines. String, integer, record-id and in-range
+  integral float keys (`2.0` creates `<table>:2`) are unchanged. This narrows the 0.37.2 note that
+  the record id is `<table>:<key>` on every line: it holds for these keys only.
+>>>>>>> origin/main
 
 ## [0.39.0] - 2026-10-30
 
