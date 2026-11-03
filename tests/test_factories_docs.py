@@ -317,12 +317,12 @@ class TestReadmeSection41:
         assert "SurrealFunc" not in factory
 
     def test_coming_from_one_bullet_per_departure(self) -> None:
-        """Fifteen bullets, each holding exactly one departure's phrase, in order; the positional-only bullet gives
+        """Sixteen bullets, each holding exactly one departure's phrase, in order; the positional-only bullet gives
         its reasons."""
         bullets = _bullets(_part_41("Coming from the full SurrealDB-ORM"))
         phrases = _NEEDLES_41["Coming from the full SurrealDB-ORM"]
         assert len(phrases) == 16
-        assert len(bullets) == 15, bullets
+        assert len(bullets) == 16, bullets
         for bullet, phrase in zip(bullets, phrases, strict=True):
             assert _normalised(phrase) in bullet, (phrase, bullet)
         [positional] = [bullet for bullet in bullets if "positional-only" in bullet]
