@@ -31,6 +31,10 @@ them by identity and follows type aliases. No new public API.
   defining one there tries again. An alias whose value raises (an undefined name,
   or an error such as `AttributeError`) never makes an ORM call fail: the field stays `any`, as before, and
   on Python 3.14+ defining a name the alias mentions tries again.
+- **Forward references in the return annotations of computed fields and serializers count** (#395): a name
+  mentioned by the return annotation of a `@computed_field`, `@field_serializer` or `@model_serializer` (or by
+  its explicit `return_type`), which Pydantic evaluates to complete the model, is remembered too, so defining
+  it completes the model at the next call.
 - Same behaviour on SurrealDB 2.x and 3.x.
 
 ## [0.40.0] - 2026-11-02

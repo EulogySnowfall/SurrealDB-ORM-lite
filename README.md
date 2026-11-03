@@ -5483,8 +5483,9 @@ gets the kind of the type its name resolves to. Since v0.37.1, `table_ddl()` and
 first, as its first instantiation does, so they write the same statements before and after an instance (`score` is
 `TYPE int DEFAULT 0`, which earlier versions wrote `TYPE any DEFAULT 0` until the model was instantiated or rebuilt). A
 name still undefined gives `any`, and the attempt is remembered: the ORM tries again only once a name the model's
-string annotations mention changes (in the calling function's local names or in the model's module: added, removed or
-bound to another object), or a linked model of another module, still incomplete, completes or sees a name its own
+string annotations mention changes — those of its fields and the return annotations of its `@computed_field`s and
+serializers (`@field_serializer`, `@model_serializer`), which Pydantic evaluates too — (in the calling function's local
+names or in the model's module: added, removed or bound to another object), or a linked model of another module, still incomplete, completes or sees a name its own
 annotations mention change — a link reached through a type alias (`type BA = B | None`) or the field of a dataclass or
 a `TypedDict` included. Other names do not count, so a name imported only under `TYPE_CHECKING` costs one
 `model_rebuild()`, not one per call, even from a loop.
