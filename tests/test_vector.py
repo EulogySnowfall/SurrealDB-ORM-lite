@@ -2390,8 +2390,9 @@ class TestFailedRebuildRemembered:
             "Annotated[int, 'user', Field(description='admin')] = 0",
             "Annotated[Literal['user'], 'admin'] | None = None",
             "list[Annotated[int, 'admin']] = []",
+            "Annotated[int, Field(description='user')] = 0",
         ],
-        ids=["literal", "dotted_literal", "annotated", "annotated_literal", "nested"],
+        ids=["literal", "dotted_literal", "annotated", "annotated_literal", "nested", "metadata_call"],
     )
     def test_literal_values_and_annotated_metadata_are_not_names(
         self, monkeypatch: pytest.MonkeyPatch, future: str, annotation: str
@@ -2420,6 +2421,45 @@ class TestFailedRebuildRemembered:
             model.table_ddl()  # from this frame, whose ``user`` and ``admin`` change at every turn
         assert len(calls) == 1
         assert model.__pydantic_complete__ is False
+
+    @pytest.mark.parametrize(
+        ("annotation", "definition"),
+        [
+            ("Literal[Color.RED] | None = None", "import enum\nclass Color(enum.Enum):\n    RED = 'red'\n"),
+            ("Annotated[int, Field(ge=LIMIT)] = 0", "LIMIT = 0\n"),
+        ],
+        ids=["literal_value", "annotated_metadata"],
+    )
+    def test_names_inside_literal_values_and_annotated_metadata(
+        self, monkeypatch: pytest.MonkeyPatch, annotation: str, definition: str
+    ) -> None:
+        """As a string, a ``Literal`` value (``Color.RED``) or an ``Annotated`` metadata (``Field(ge=LIMIT)``) is
+        evaluated by Pydantic too: a name it mentions counts for the memory, so once the module defines it, the next
+        call completes the model (issue #395)."""
+        module = types.ModuleType("vec_fwd_module_value_names")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            "from __future__ import annotations\n"
+            "from typing import Annotated, Literal\n"
+            "from pydantic import Field\n"
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            "class VecFwdValueNames(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_module_value_names')\n"
+            "    id: str | None = None\n"
+            f"    role: {annotation}\n",
+            module.__dict__,
+        )
+        model = module.VecFwdValueNames
+        assert model.__pydantic_complete__ is False
+        calls = _count_rebuilds(monkeypatch, model)
+        _table_ddl(model)
+        _table_ddl(model)
+        assert len(calls) == 1
+        assert model.__pydantic_complete__ is False
+        exec(definition, module.__dict__)  # noqa: S102 - the test's own text
+        _table_ddl(model)
+        assert len(calls) == 2
+        assert model.__pydantic_complete__ is True
 
     @pytest.mark.parametrize(
         "decorator",

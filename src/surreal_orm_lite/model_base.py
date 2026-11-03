@@ -632,17 +632,19 @@ def _subscripted_name(node: ast.expr) -> str:
 @functools.lru_cache(maxsize=1024)
 def _mentioned_names(text: str) -> tuple[str, ...]:
     """The names the forward reference *text* mentions, dotted for an attribute of a name (``"mod.B"``), each once, in
-    the order met; the texts of its string constants (``"list['B']"``) read in turn — except the values of a
-    ``Literal[…]`` and the metadata of an ``Annotated[…]`` (all its arguments but the first), which are not
-    annotations. ``()`` for a text that is not an expression: Pydantic cannot evaluate it either."""
+    the order met; the texts of its string constants (``"list['B']"``) read in turn. The values of a ``Literal[…]``
+    and the metadata of an ``Annotated[…]`` (all its arguments but the first) are values, not annotations: their names
+    count (``Literal[Color.RED]``, ``Field(ge=LIMIT)``: Pydantic evaluates them), their strings are never read as
+    forward references (``Literal['user']``, ``Field(description='admin')``). ``()`` for a text that is not an
+    expression: Pydantic cannot evaluate it either."""
     try:
         tree = ast.parse(text.strip(), mode="eval")
     except (SyntaxError, ValueError):
         return ()
     found: dict[str, None] = {}
-    nodes: list[ast.AST] = [tree.body]
+    nodes: list[tuple[ast.AST, bool]] = [(tree.body, False)]  # each node, and whether it is part of a value
     while nodes:
-        node = nodes.pop(0)
+        node, in_value = nodes.pop(0)
         if isinstance(node, ast.Name):
             found[node.id] = None
         elif isinstance(node, ast.Attribute):
@@ -654,17 +656,20 @@ def _mentioned_names(text: str) -> tuple[str, ...]:
             if isinstance(current, ast.Name):
                 found[".".join([current.id, *reversed(parts)])] = None
             else:  # ``f().x``: the names of the expression the attribute is read from
-                nodes.append(current)
-        elif isinstance(node, ast.Subscript) and _subscripted_name(node.value) in ("Literal", "Annotated"):
-            nodes.append(node.value)
-            if _subscripted_name(node.value) == "Annotated":
-                annotated = node.slice
-                nodes.append(annotated.elts[0] if isinstance(annotated, ast.Tuple) and annotated.elts else annotated)
+                nodes.append((current, in_value))
+        elif not in_value and isinstance(node, ast.Subscript) and _subscripted_name(node.value) in ("Literal", "Annotated"):
+            nodes.append((node.value, False))
+            arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if _subscripted_name(node.value) == "Annotated" and arguments:
+                nodes.append((arguments[0], False))
+                arguments = arguments[1:]
+            nodes.extend((argument, True) for argument in arguments)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            for name in _mentioned_names(node.value):
-                found[name] = None
+            if not in_value:
+                for name in _mentioned_names(node.value):
+                    found[name] = None
         else:
-            nodes.extend(ast.iter_child_nodes(node))
+            nodes.extend((child, in_value) for child in ast.iter_child_nodes(node))
     return tuple(found)
 
 
