@@ -69,6 +69,7 @@ from tests._readme_tables import (
     assert_server_rows,
     assert_server_table,
 )
+from tests._retry import apply_reset
 from tests.conftest import default_connection_class
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
@@ -715,9 +716,8 @@ async def _reset_databases(*, define: bool) -> None:
     """Remove the databases ``md_a`` and ``md_b`` of the line under test, and define them again when asked."""
     async with _root("db") as client:
         for database in ("md_a", "md_b"):
-            await client.query(f"REMOVE DATABASE IF EXISTS {database};", {})
-            if define:
-                await client.query(f"DEFINE DATABASE {database};", {})
+            define_it = f" DEFINE DATABASE {database};" if define else ""
+            await apply_reset(client, f"REMOVE DATABASE IF EXISTS {database};{define_it}")
 
 
 @contextlib.asynccontextmanager
@@ -4512,7 +4512,7 @@ async def _server_side(name: str, url: str, database: str) -> _Side:
     """Register *name* as root on *database* of namespace ``ns`` at the WebSocket *url*, the database removed and
     defined again with :data:`_DECISION_TABLES` first."""
     async with _root("db", url) as root:
-        await root.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
+        await apply_reset(root, f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};")
     async with _root(database, url) as root:
         await root.query(_DECISION_TABLES, {})
     SurrealDBConnectionManager.add_connection(name, url=url, user="root", password="root", namespace="ns", database=database)

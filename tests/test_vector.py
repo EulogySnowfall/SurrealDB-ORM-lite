@@ -261,6 +261,7 @@ from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
 from tests._readme_tables import unresolved_links as _unresolved_links
+from tests._retry import apply_reset
 
 _EXPORTS = ["VectorField", "Vector"]
 
@@ -2540,7 +2541,7 @@ async def _vec(kind: str, name: str = "vec", database: str = "vec_db") -> AsyncI
             name, url=_url(kind), user="root", password="root", namespace="ns", database=database
         )
     client = await SurrealDBConnectionManager.get_client(name)
-    await _apply_ddl(client, _VEC_RESET.format(database))
+    await apply_reset(client, _VEC_RESET.format(database))
     try:
         yield client
     finally:

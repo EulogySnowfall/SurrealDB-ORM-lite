@@ -35,6 +35,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from surreal_orm_lite.testing.factories import Faker, ModelFactory
+from tests._retry import apply_reset
 from tests.conftest import _ws_url, orm_client
 from tests.test_embedded import _embedded_engine_available
 
@@ -1389,7 +1390,7 @@ async def _other_connection(client: Any) -> AsyncIterator[str]:
     and ``REMOVE DATABASE IF EXISTS`` on exit — the pattern of ``tests.conftest.change_feed_database()`` — so nothing
     of a run survives into the next one.
     """
-    await client.query(f"REMOVE DATABASE IF EXISTS {_OTHER_DATABASE}; DEFINE DATABASE {_OTHER_DATABASE};", {})
+    await apply_reset(client, f"REMOVE DATABASE IF EXISTS {_OTHER_DATABASE}; DEFINE DATABASE {_OTHER_DATABASE};")
     SurrealDBConnectionManager.add_connection(
         "fx_other", url=_ws_url(), user="root", password="root", namespace="ns", database=_OTHER_DATABASE
     )

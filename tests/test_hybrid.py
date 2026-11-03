@@ -115,6 +115,7 @@ from tests._readme_tables import normalised as _normalised
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._retry import apply_reset
 
 #: The subject ``hybrid_search()`` gives the shared refusal texts.
 _SUBJECT = "hybrid_search()"
@@ -2091,7 +2092,7 @@ async def _hy(kind: str, name: str = "hy", database: str = "hy_db") -> AsyncIter
             name, url=_url(kind), user="root", password="root", namespace="ns", database=database
         )
     client = await SurrealDBConnectionManager.get_client(name)
-    await _apply_ddl(client, _HY_RESET.format(database=database))
+    await apply_reset(client, _HY_RESET.format(database=database))
     try:
         yield client
     finally:
