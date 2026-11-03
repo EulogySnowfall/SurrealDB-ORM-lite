@@ -133,14 +133,16 @@ from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
 from tests._readme_tables import SERVER_BEHAVIOUR as _SERVER_BEHAVIOUR
 from tests._readme_tables import (
     assert_embedded_rows,
+    assert_guide_sections,
+    assert_links_resolve,
+    assert_manual_order,
     assert_server_header_sentence,
     assert_server_rows,
     assert_server_table,
 )
 from tests._readme_tables import cells as _cells
+from tests._readme_tables import doc_part as _doc_part
 from tests._readme_tables import normalised as _normalised
-from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
@@ -4924,9 +4926,9 @@ class TestViewRoundTripE2E:
 
 # --- README: section 33, section 31 and the tables (spec §11.1; AC-18) -----------------------------------------------
 
-_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
-_SECTION_32 = "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)"
-_SECTION_33 = "### 33. Materialized views (`view_query`, `define_view()`)"
+_SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_32 = "## 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)"
+_SECTION_33 = "## 33. Materialized views (`view_query`, `define_view()`)"
 #: Spec §11.1 item 1: section 33's subsections, in order, after an untitled intro paragraph that holds example A.
 _SUBSECTIONS_33 = [
     "Declaring a view",
@@ -5023,7 +5025,7 @@ _INTRO_NEEDLES_33 = (
     "idempotently",
     "every write of the model is refused",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
     "`mem://`",
 )
 _PART_NEEDLES_33 = {
@@ -5137,7 +5139,7 @@ _PART_NEEDLES_33 = {
         "`connection`",
         "`using()`",
         "another connection raises `SurrealDbError` before any request",
-        "(#29-query-cache-cache-querycache)",
+        "(querying.md#29-query-cache-cache-querycache)",
         "dropped by every ORM write",
         "a write to a source table changes the view",
         "system user",
@@ -5165,7 +5167,7 @@ _PART_NEEDLES_33 = {
         "keeping their last records",
         "surrealdb#7447",
         "`math::sum(amount ?? 0)`",
-        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
     ),
     "Security": (
         "identifier",
@@ -5303,12 +5305,12 @@ _GENERATING_NEEDLES_31 = (
 
 
 def _section_33() -> str:
-    return _readme_part(_SECTION_33)
+    return _doc_part(_SECTION_33)
 
 
 def _part_33(heading: str) -> str:
-    """One ``####`` subsection of section 33, as written."""
-    return _subsection(f"#### {heading}", _section_33())
+    """One ``###`` subsection of section 33, as written."""
+    return _subsection(f"### {heading}", _section_33())
 
 
 def _readme_blocks(text: str) -> list[str]:
@@ -5339,37 +5341,30 @@ class TestReadmeSection33:
     (spec §11.1)."""
 
     def test_section_33_follows_section_32(self) -> None:
-        """Right after section 32 (after its "Coming from" bullets), then section 34 (v0.33.0), section 35 (v0.34.0),
-        section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0),
-        and before the ``---`` of "Configuration Options"."""
-        text = _readme()
-        start_32 = text.index(f"\n{_SECTION_32}\n")
-        start_33 = text.index(f"\n{_SECTION_33}\n")
-        configuration = text.index("\n## Configuration Options\n")
-        assert start_32 < start_33 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_32 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_32,
-            _SECTION_33,
-            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 33 is in the Schema and DDL guide, ``docs/schema.md``, with its other sections in this order; section
+        32 comes before it in the manual."""
+        assert_guide_sections(
+            "schema.md",
+            [
+                "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+                "## 33. Materialized views (`view_query`, `define_view()`)",
+                "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+            ],
+        )
+        assert_manual_order(
+            "## 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+            "## 33. Materialized views (`view_query`, `define_view()`)",
+        )
 
     def test_subsections_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_33(), re.MULTILINE) == _SUBSECTIONS_33
+        assert re.findall(r"^### (.*)$", _section_33(), re.MULTILINE) == _SUBSECTIONS_33
 
     def test_the_spec_examples_open_their_parts(self) -> None:
         """Example A exactly, the first block of the untitled intro; example B exactly, the first block of "Declaring a
         view"; no other block; ``python`` fences only."""
         section = _section_33()
         assert _readme_blocks(section) == _README_EXAMPLES_33
-        intro = section.split("\n#### ", 1)[0]
+        intro = section.split("\n### ", 1)[0]
         assert _readme_blocks(intro) == [_README_EXAMPLE_A]
         part = _part_33("Declaring a view")
         assert part.split("\n\n", 1)[1].startswith(f"```python\n{_README_EXAMPLE_B}```"), part
@@ -5409,10 +5404,7 @@ class TestReadmeSection33:
 
     def test_links_resolve(self) -> None:
         """Every in-page link of section 33 names a heading of the README."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
-        links = re.findall(r"\]\(#([^)]+)\)", _section_33())
-        assert links, "section 33 links to the behaviour tables and to section 29"
-        assert [link for link in links if link not in anchors] == []
+        assert_links_resolve(_section_33(), "schema.md")
 
     def test_issue_286_follow_ups(self) -> None:
         """Issue #286 (v0.32.1): section 33 says that V7 allows a listed function inside the argument of each of several
@@ -5432,21 +5424,21 @@ class TestReadmeSection33:
         assert [needle for text, needle in needles if needle not in text] == []
 
     def test_features_row(self) -> None:
-        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        features = [row for _, row in _table_rows(_doc_part("## Features"))]
         firsts = [row[0] for row in features]
         assert _FEATURES_ROW_33 in features, features
         events = "Server-side events & function DDL (`Event`, `define_function()`)"
         assert firsts.index(_FEATURES_ROW_33[0]) == firsts.index(events) + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [row for _, row in _table_rows(_doc_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.31.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_33, roadmap
 
     def test_comparison_row(self) -> None:
         """The materialized views row filled in, after the ``define_function()`` row and before the ``TYPE RELATION``
         row (v0.33.0)."""
-        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [row for _, row in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [row[0] for row in comparison]
         start = firsts.index("`define_function()` (DDL)")
         assert comparison[start + 1] == _COMPARISON_ROW_33, comparison
@@ -5474,11 +5466,11 @@ class TestReadmeSection33:
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.32.0 touches keeps one cell count per line and no escaped pipe; section 33 has no table."""
         parts = [
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part(_EMBEDDED_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part(_EMBEDDED_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         found = [lines for part in parts for lines in _md_tables(part)]
         assert len(found) == len(parts)
@@ -5489,11 +5481,11 @@ class TestReadmeSection33:
     def test_section_31_generated_models(self) -> None:
         """Spec §11.1 item 7: section 31's generated-models bullet, its long-line sentence and its prose on generated
         classes say that a view is generated with ``view_query=``."""
-        section_31 = _readme_part(_SECTION_31)
-        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_31))
+        section_31 = _doc_part(_SECTION_31)
+        bullets = _readme_bullets(_subsection("### Coming from the full SurrealDB-ORM", section_31))
         assert _GENERATED_MODELS_BULLET_31 in bullets, [b for b in bullets if "Generated models" in b]
-        assert _LONG_LINES_31 in _normalised(_subsection("#### What the generator does not do", section_31))
-        generating = _normalised(_subsection("#### Generating models", section_31))
+        assert _LONG_LINES_31 in _normalised(_subsection("### What the generator does not do", section_31))
+        generating = _normalised(_subsection("### Generating models", section_31))
         missing = [needle for needle in _GENERATING_NEEDLES_31 if needle not in generating]
         assert not missing, missing
 

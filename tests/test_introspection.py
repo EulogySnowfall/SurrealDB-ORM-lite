@@ -81,6 +81,8 @@ from surreal_orm_lite.testing import embedded_database
 from tests._proxy import CuttableProxy
 from tests._readme_tables import (
     assert_embedded_rows,
+    assert_guide_sections,
+    assert_manual_order,
     assert_server_header_sentence,
     assert_server_rows,
     assert_server_table,
@@ -89,9 +91,8 @@ from tests.conftest import orm_client
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
     _cells,
+    _doc_part,
     _normalised,
-    _readme,
-    _readme_part,
     _subsection,
     _table_rows,
     _tables,
@@ -2201,8 +2202,8 @@ class TestSubFieldDefaultsE2E:
 
 # --- AC-16: README section 31, the tables it touches and its examples (spec §6.5, §11.1 items 1–8; D18, D26) --------
 
-_SECTION_30 = "### 30. Multiple databases (`add_connection()`, `using()`)"
-_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_30 = "## 30. Multiple databases (`add_connection()`, `using()`)"
+_SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
 #: Spec §11.1 item 1: section 31's subsections, in order, after an untitled intro paragraph.
 _SUBSECTIONS_31 = [
     "Reading the schema",
@@ -2302,9 +2303,9 @@ _COMING_FROM_31 = [
     '`SchemaState.other["configs"]`, as SurrealDB returns them (full ORM: `ApiState`, `GraphQLConfigState`).',
     # v0.38.0: the migrations bring them (README section 39).
     "- **`SchemaState.diff()`, `schema_diff()` and `applied_migrations`** come with the migrations "
-    "([section 39](#39-migrations-makemigrations-migrationexecutor-operations)): `applied_migrations` is filled from "
+    "([section 39](migrations.md#39-migrations-makemigrations-migrationexecutor-operations)): `applied_migrations` is filled from "
     "the tracking table when the database has one (full ORM: declared, never filled; it is the 2nd attribute, "
-    "positional as in the full ORM); the `inspectdb` command is in [section 40](#40-command-line-surreal-orm-lite).",
+    "positional as in the full ORM); the `inspectdb` command is in [section 40](cli.md#40-command-line-surreal-orm-lite).",
     "- **A refused or failed `INFO FOR DB` raises** `SurrealDbAuthenticationError` or `SurrealDbError`, and a "
     "definition that cannot be read or parsed becomes a `SchemaIssue` in `schema.issues` and a logged warning (full "
     "ORM: an empty state, and definitions dropped with a debug log).",
@@ -2374,7 +2375,7 @@ _DEFAULT_BULLET_31 = (
     "field required, because SurrealDB refuses a create that leaves it to that default. Any other default — an "
     "expression such as `time::now()`, a record id, `math::INF`, a non-empty object, a datetime with nanoseconds, a "
     "literal of another type — makes the field `T | None = None` and lists its attribute in `server_fields` "
-    "([section 20](#20-field-aliases-server_fields-and-mergerefreshfalse)): omitted on create, so that the server's "
+    "([section 20](models.md#20-field-aliases-server_fields-and-mergerefreshfalse)): omitted on create, so that the server's "
     "default applies, and read back after `save()`. A value you set on such a field before `save()` is not written: "
     "set it with `merge()` once the record exists."
 )
@@ -2383,7 +2384,7 @@ _UPDATE_BULLET_31 = (
     "(`address.at`), a `tuple`, an array (`array<datetime>`, `items.*.at`) or a set, after `get()` as after `save()`: "
     "Python keeps microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the "
     "top-level `READONLY` datetimes to the nanosecond, up to 32 per record; below the top level it keeps one only while "
-    "the fields before it leave room, which depends on the data (see [Precision and `Decimal`](#precision-and-decimal)). "
+    "the fields before it leave room, which depends on the data (see [Precision and `Decimal`](fields.md#precision-and-decimal)). "
     "The generated class says so, as does a class with more than 32 top-level fields that may hold a datetime: change "
     "such a record with `merge()`."
 )
@@ -2547,12 +2548,12 @@ _PART_NEEDLES_31 = {
 
 
 def _section_31() -> str:
-    return _readme_part(_SECTION_31)
+    return _doc_part(_SECTION_31)
 
 
 def _part_31(heading: str) -> str:
-    """One ``####`` subsection of section 31, as written."""
-    return _subsection(f"#### {heading}", _section_31())
+    """One ``###`` subsection of section 31, as written."""
+    return _subsection(f"### {heading}", _section_31())
 
 
 def _python_blocks_31() -> list[str]:
@@ -2587,32 +2588,23 @@ class TestReadmeSection31:
     roadmap, comparison and both behaviour tables (spec §11.1 items 2–6)."""
 
     def test_section_31_follows_section_30(self) -> None:
-        """Right after section 30 (after its "Coming from" bullets), then section 32 (v0.31.0), section 33 (v0.32.0),
-        section 34 (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0),
-        section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the ``---`` of "Configuration Options"."""
-        readme = _readme()
-        start_30 = readme.index(f"\n{_SECTION_30}\n")
-        start_31 = readme.index(f"\n{_SECTION_31}\n")
-        configuration = readme.index("\n## Configuration Options\n")
-        assert start_30 < start_31 < configuration
-        assert re.findall(r"^#{2,3} .*$", readme[start_30 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_30,
-            _SECTION_31,
-            "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
-            "### 33. Materialized views (`view_query`, `define_view()`)",
-            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 31 is in the Schema and DDL guide, ``docs/schema.md``, with its other sections in this order; section
+        30 comes before it in the manual."""
+        assert_guide_sections(
+            "schema.md",
+            [
+                "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+                "## 33. Materialized views (`view_query`, `define_view()`)",
+                "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+            ],
+        )
+        assert_manual_order(
+            "## 30. Multiple databases (`add_connection()`, `using()`)",
+            "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+        )
 
     def test_subsections_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_31(), re.MULTILINE) == _SUBSECTIONS_31
+        assert re.findall(r"^### (.*)$", _section_31(), re.MULTILINE) == _SUBSECTIONS_31
 
     def test_the_spec_examples_open_their_subsections(self) -> None:
         """Spec §11.1 item 1: each example exactly, first in its subsection; the printed source right after the
@@ -2630,7 +2622,7 @@ class TestReadmeSection31:
 
     def test_intro_paragraph(self) -> None:
         """Read-only, the two INFO statements, a system user; one shape on both lines, expressions as rendered."""
-        intro = _normalised(_section_31().split("\n#### ", 1)[0])
+        intro = _normalised(_section_31().split("\n### ", 1)[0])
         for needle in ("`INFO FOR DB`", "`INFO FOR TABLE`", "system user", "2.x", "3.x", "as each line renders them"):
             assert needle in intro, needle
 
@@ -2684,13 +2676,13 @@ class TestReadmeSection31:
             assert phrase in bullet, (phrase, bullet)
 
     def test_features_row(self) -> None:
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         firsts = [cells[0] for cells in features]
         assert _FEATURES_ROW_31 in features, features
         assert firsts.index(_FEATURES_ROW_31[0]) == firsts.index("Multiple databases (named connections, `using()`)") + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
         start = [cells[0] for cells in roadmap].index("v0.29.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_31, roadmap
         assert roadmap[start + 4][0] == "v0.33.0", roadmap
@@ -2698,7 +2690,7 @@ class TestReadmeSection31:
     def test_comparison_row(self) -> None:
         """Spec §11.1 item 4: the label stays ``Schema Introspection``, the lite cell names the API, the full ORM's
         cell stays ``✅``; right after the Multi-database row."""
-        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [cells for _, cells in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [cells[0] for cells in comparison]
         assert comparison[firsts.index("Multi-database") + 1] == _COMPARISON_ROW_31, comparison
 
@@ -2724,11 +2716,11 @@ class TestReadmeSection31:
         """Every table v0.30.0 touches keeps one cell count per line and no escaped pipe."""
         parts = [
             _section_31(),
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part(_EMBEDDED_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part(_EMBEDDED_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         tables = [lines for part in parts for lines in _tables(part)]
         assert len(tables) == len(parts), "section 31 has its kinds table"

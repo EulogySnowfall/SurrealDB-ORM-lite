@@ -71,7 +71,7 @@ from tests._readme_tables import (
     assert_server_table,
 )
 from tests.conftest import orm_client
-from tests.test_embedded import _cells, _normalised, _readme_part, _subsection, _table_rows, _tables
+from tests.test_embedded import _cells, _doc_part, _normalised, _subsection, _table_rows, _tables
 
 # --- shared models and moments (later tasks reuse them) --------------------------------------------
 
@@ -2621,8 +2621,8 @@ class TestVersionedServerE2E:
 # --- README section 27, the behaviour tables and the ROADMAP (spec §11; AC-18, AC-19; P2, P4, P5, D14) ----
 
 _REPO = Path(__file__).resolve().parents[1]
-_SECTION_27 = "### 27. Time travel (`as_of()`)"
-_COMING_FROM = "#### Coming from the full SurrealDB-ORM"
+_SECTION_27 = "## 27. Time travel (`as_of()`)"
+_COMING_FROM = "### Coming from the full SurrealDB-ORM"
 
 #: P5: the five rows v0.26.0 adds to the 2.x/3.x table, cell by cell, exactly as spec §11 writes them.
 _TIME_TRAVEL_ROWS = [
@@ -2673,7 +2673,7 @@ _EMBEDDED_TIME_TRAVEL_ROW = [
 
 
 def _section_27() -> str:
-    return _readme_part(_SECTION_27)
+    return _doc_part(_SECTION_27)
 
 
 def _section_27_examples() -> list[str]:
@@ -2701,8 +2701,8 @@ class TestTimeTravelDocs:
     def test_section_27_ends_with_coming_from_the_full_orm(self) -> None:
         """P4: the heading, found with the regex of ``tests/test_geo_fields.py``, closes the section."""
         section = _section_27()
-        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "P4 heading missing"
-        assert re.findall(r"^#### .*$", section, re.MULTILINE)[-1] == _COMING_FROM
+        assert re.search(r"^### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "P4 heading missing"
+        assert re.findall(r"^### .*$", section, re.MULTILINE)[-1] == _COMING_FROM
         text = _normalised(_subsection(_COMING_FROM, section))
         for needle in ("The full ORM has no time travel", "`as_of()`", "`version()`", "`==`", "`model_dump()`"):
             assert needle in text, needle
@@ -2755,18 +2755,18 @@ class TestTimeTravelDocs:
         assert_embedded_rows([_EMBEDDED_TIME_TRAVEL_ROW])
 
     def test_section_26_url_row_points_to_section_27(self) -> None:
-        rows = _table_rows(_readme_part("### 26. Embedded engine and test fixtures"), "Embedded URL")
+        rows = _table_rows(_doc_part("## 26. Embedded engine and test fixtures"), "Embedded URL")
         [versioned] = [cells for _, cells in rows if cells[0] == "`surrealkv+versioned://<path>`"]
         assert versioned[1] == "✅ on disk, keeps history: time travel with `as_of()` (section 27)", versioned
 
     def test_features_comparison_and_roadmap_rows(self) -> None:
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         assert ["Time travel (`as_of()`, versioned storage)", "✅"] in features, features
-        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [cells for _, cells in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         assert ["Time travel (`VERSION`)", "✅ v0.26.0 (`as_of()`)", "❌"] in comparison, comparison
         firsts = [cells[0] for cells in comparison]
         assert firsts.index("Time travel (`VERSION`)") == firsts.index("Embedded engine") + 1
-        roadmap = [cells[:2] for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells[:2] for _, cells in _table_rows(_doc_part("## Roadmap"))]
         assert ["v0.26.0", "Time travel (versioned storage)"] in roadmap, roadmap
         assert not [cells for cells in roadmap if cells[0] == "v0.26.0 – v0.29.0"], roadmap
 
@@ -2774,12 +2774,12 @@ class TestTimeTravelDocs:
         """AC-19: every table v0.26.0 touches keeps one cell count per line and no escaped pipe."""
         parts = [
             _section_27(),
-            _readme_part("### 26. Embedded engine and test fixtures"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part(_EMBEDDED_BEHAVIOUR),
-            _readme_part("## Features"),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## 26. Embedded engine and test fixtures"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part(_EMBEDDED_BEHAVIOUR),
+            _doc_part("## Features"),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
             _roadmap_part("### Embedded URLs"),
             _roadmap_part("## Planned — Tier 2: Extended (SDK-2.0-native)"),
         ]

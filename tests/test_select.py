@@ -19,7 +19,7 @@ from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import line_major
 from tests._readme_tables import assert_server_header_sentence, assert_server_rows
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part, _subsection
+from tests.test_embedded import _doc_part, _normalised, _subsection
 from tests.test_query_cache import _SECTION_29
 
 
@@ -303,7 +303,7 @@ class TestSelectDocs:
     """Unit: what the README says ``select()`` accepts, and the 2.x/3.x row of a path followed by ``.*``."""
 
     def test_what_select_accepts(self) -> None:
-        text = _normalised(_subsection("#### What `select()` accepts", _readme_part("### 4. QuerySet Methods")))
+        text = _normalised(_subsection("### What `select()` accepts", _doc_part("## 4. QuerySet Methods")))
         for needle in (
             '"author.name"',
             '"author.*"',
@@ -324,6 +324,6 @@ class TestSelectDocs:
         assert_server_header_sentence(_HEADER_CLAUSE_281)
 
     def test_the_cache_section_names_select_paths_only(self) -> None:
-        text = _normalised(_readme_part(_SECTION_29))
+        text = _normalised(_doc_part(_SECTION_29))
         assert '`select()` item that is not a plain field, such as `"author.*"` (the projection reads the linked' in text
         assert "select()` expression" not in text and '"author.*"` or an expression' not in text

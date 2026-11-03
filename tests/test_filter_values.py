@@ -50,7 +50,7 @@ from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests._readme_tables import assert_server_rows
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part, _subsection
+from tests.test_embedded import _doc_part, _normalised, _subsection
 
 
 class FvItem(BaseSurrealModel):
@@ -1373,7 +1373,7 @@ class TestFilterValueDocs:
     """Unit: what the README says of string filter values and ``Var()``."""
 
     def test_section(self) -> None:
-        text = _normalised(_subsection("#### String filter values and `Var()`", _readme_part("### Supported Filter Lookups")))
+        text = _normalised(_subsection("### String filter values and `Var()`", _doc_part("## Supported Filter Lookups")))
         for needle in (
             'compares `name` with the string `"$admin"`',
             "`Var(...)` is the only way to reference a query variable",
@@ -1414,7 +1414,7 @@ class TestFilterValueDocs:
 
     def test_upsert_section(self) -> None:
         """Section 12 says the lookup binds ``variables()`` (issue #252)."""
-        text = _normalised(_readme_part("### 12. Upsert & get_or_create / update_or_create"))
+        text = _normalised(_doc_part("## 12. Upsert & get_or_create / update_or_create"))
         for needle in (
             "The lookup binds the queryset's `variables()`, as `filter()` does",
             '`User.objects().variables(e="bob@example.com").get_or_create(email=Var("e"))`',
@@ -1423,7 +1423,7 @@ class TestFilterValueDocs:
             assert needle in text, needle
 
     def test_live_query_note(self) -> None:
-        text = _normalised(_readme_part("### 21. Live queries (real-time notifications)"))
+        text = _normalised(_doc_part("## 21. Live queries (real-time notifications)"))
         assert "server parameters such as `$auth` and `$session` are allowed" not in text
         for needle in ('`filter(owner=Var("auth"))` streams the signed-in record user\'s own records', "written as `'$auth'`"):
             assert needle in text, needle

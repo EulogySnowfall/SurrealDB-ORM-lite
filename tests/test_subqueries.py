@@ -55,9 +55,15 @@ from surreal_orm_lite.subquery import (
 )
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
-from tests._readme_tables import assert_server_header_sentence, assert_server_rows, assert_server_table
+from tests._readme_tables import (
+    assert_guide_sections,
+    assert_manual_order,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
 from tests.conftest import _ws_url
-from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
+from tests.test_embedded import _cells, _doc_part, _normalised, _subsection, _table_rows, _tables
 from tests.test_time_travel import (
     _SERVER_BEHAVIOUR,
     _assert_refused_by_the_server,
@@ -2738,9 +2744,9 @@ class TestSubqueryAsOfE2E:
 
 # --- AC-12: README section 28, the tables it touches and its examples (spec §11; D13, D14, P1, P4) -------------
 
-_SECTION_28 = "### 28. Subqueries (`Subquery`)"
+_SECTION_28 = "## 28. Subqueries (`Subquery`)"
 _SECTION_28_ANCHOR = "(#28-subqueries-subquery)"
-_COMING_FROM_28 = "#### Coming from the full SurrealDB-ORM"
+_COMING_FROM_28 = "### Coming from the full SurrealDB-ORM"
 #: Spec §11: section 28's subsections, in order, after an untitled intro.
 _SUBSECTIONS_28 = [
     "What a subquery selects",
@@ -2801,7 +2807,7 @@ _P4_BULLETS = {
 
 
 def _section_28() -> str:
-    return _readme_part(_SECTION_28)
+    return _doc_part(_SECTION_28)
 
 
 def _section_28_blocks(language: str) -> list[str]:
@@ -2819,44 +2825,33 @@ class TestSubqueryDocs:
     roadmap say about subqueries (spec §11, AC-12)."""
 
     def test_section_28_follows_section_27(self) -> None:
-        """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0), section 30 (v0.29.0),
-        section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0),
-        section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0),
-        and before the ``---`` of "Configuration Options"."""
-        readme = _readme()
-        start_27 = readme.index("\n### 27. Time travel (`as_of()`)\n")
-        start_28 = readme.index(f"\n{_SECTION_28}\n")
-        configuration = readme.index("\n## Configuration Options\n")
-        assert start_27 < start_28 < configuration
-        assert re.findall(r"^#{2,3} .*$", readme[start_27 + 1 : configuration], re.MULTILINE) == [
-            "### 27. Time travel (`as_of()`)",
-            _SECTION_28,
-            "### 29. Query cache (`cache()`, `QueryCache`)",
-            "### 30. Multiple databases (`add_connection()`, `using()`)",
-            "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
-            "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
-            "### 33. Materialized views (`view_query`, `define_view()`)",
-            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 28 is in the querying guide, ``docs/querying.md``, with its other sections in this order; section
+        27 comes before it in the manual."""
+        assert_guide_sections(
+            "querying.md",
+            [
+                "## 4. QuerySet Methods",
+                "## Supported Filter Lookups",
+                "## 5. Q Objects (Complex Queries)",
+                "## 8. FETCH Clause",
+                "## 9. Aggregations",
+                "## 27. Time travel (`as_of()`)",
+                "## 28. Subqueries (`Subquery`)",
+                "## 29. Query cache (`cache()`, `QueryCache`)",
+            ],
+        )
+        assert_manual_order("## 27. Time travel (`as_of()`)", "## 28. Subqueries (`Subquery`)")
 
     def test_subsections_in_order(self) -> None:
         section = _section_28()
-        assert re.findall(r"^#### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_28
-        intro = section.split("\n#### ", 1)[0]
+        assert re.findall(r"^### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_28
+        intro = section.split("\n### ", 1)[0]
         assert "```python\n" in intro, "the untitled intro holds the first example"
 
     def test_coming_from_the_full_orm_names(self) -> None:
         """P4: the last subsection, found with the regex of ``tests/test_geo_fields.py``, names what differs."""
         section = _section_28()
-        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "heading missing"
+        assert re.search(r"^### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "heading missing"
         text = _normalised(_subsection(_COMING_FROM_28, section))
         for name in (
             "`Subquery",
@@ -2876,7 +2871,7 @@ class TestSubqueryDocs:
 
     def test_what_a_subquery_selects_says_fetch_is_ignored(self) -> None:
         """P1: the inner ``fetch()`` is ignored, as in the full ORM."""
-        text = _normalised(_subsection("#### What a subquery selects", _section_28()))
+        text = _normalised(_subsection("### What a subquery selects", _section_28()))
         assert "`fetch()` on the inner queryset is ignored, as in the full ORM" in text, text
 
     def test_section_28_names(self) -> None:
@@ -2889,20 +2884,20 @@ class TestSubqueryDocs:
 
     def test_missing_table_prose(self) -> None:
         """Plan Task 7's note: on 3.x three requests (statement, table probe, re-send); any other error relayed."""
-        text = _normalised(_subsection("#### Where subqueries apply", _section_28()))
+        text = _normalised(_subsection("### Where subqueries apply", _section_28()))
         for name in ("three requests", "table probe", "relayed", "never read as empty", "`SurrealDbNotFoundError`"):
             assert name in text, name
 
     def test_lookups_bullet(self) -> None:
-        bullets = [line for line in _readme_part("### Supported Filter Lookups").splitlines() if line.startswith("- ")]
+        bullets = [line for line in _doc_part("## Supported Filter Lookups").splitlines() if line.startswith("- ")]
         assert _LOOKUPS_BULLET in bullets, bullets
 
     def test_q_objects_sentence(self) -> None:
-        section = _readme_part("### 5. Q Objects (Complex Queries)")
+        section = _doc_part("## 5. Q Objects (Complex Queries)")
         assert "Q(author__in=Subquery(" in section and _SECTION_28_ANCHOR in section, section
 
     def test_features_row(self) -> None:
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         firsts = [cells[0] for cells in features]
         row = ["Subqueries (`Subquery`, a QuerySet as a filter value)", "✅"]
         assert row in features, features
@@ -2924,7 +2919,7 @@ class TestSubqueryDocs:
         assert_server_header_sentence(_HEADER_CLAUSE)
 
     def test_comparison_rows(self) -> None:
-        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [cells for _, cells in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [cells[0] for cells in comparison]
         start = firsts.index("Time travel (`VERSION`)") + 1
         assert comparison[start : start + 2] == [
@@ -2934,7 +2929,7 @@ class TestSubqueryDocs:
         assert "Subqueries & Query Cache" not in firsts
 
     def test_roadmap_split(self) -> None:
-        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
         firsts = [cells[0] for cells in roadmap]
         start = firsts.index("v0.26.0") + 1
         assert roadmap[start : start + 3] == [
@@ -2948,10 +2943,10 @@ class TestSubqueryDocs:
         """Every table v0.27.0 touches keeps one cell count per line and no escaped pipe."""
         parts = [
             _section_28(),
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         assert all(_tables(part) for part in parts), "section 28 has a table of its own (the lookups)"
         tables = [lines for part in parts for lines in _tables(part)]

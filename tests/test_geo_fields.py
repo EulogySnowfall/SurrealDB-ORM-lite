@@ -15,7 +15,6 @@ from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from decimal import Decimal
 from fractions import Fraction
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -62,7 +61,15 @@ from surreal_orm_lite import (
 from surreal_orm_lite.model_base import _read_kind
 from surreal_orm_lite.surql_literal import inline_variables
 from surreal_orm_lite.utils import build_filter_condition
-from tests._readme_tables import assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import (
+    assert_guide_sections,
+    assert_manual_order,
+    assert_server_header_sentence,
+    assert_server_rows,
+    manual,
+    readme,
+)
+from tests._readme_tables import doc_part as _doc_part
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_geo_types import (
@@ -1611,8 +1618,6 @@ class TestSpatialLookupLiveE2E:
 
 # --- README (spec §11, AC-15; P1, P2) --------------------------------------------------------------------
 
-_README = Path(__file__).resolve().parents[1] / "README.md"
-
 #: Section 25's example tables and the test tables they run against: everything else runs as written.
 _README_TABLES = {"restaurant": "geo_readme_restaurant", "zone": "geo_readme_zone", "route": "geo_readme_route"}
 
@@ -1626,32 +1631,27 @@ _D16_PHRASES = tuple(
 _V0_24_0_SINCE = ("v0.24.0", "pre-existing (documented in v0.24.0)")
 
 #: The subsections of section 25 that section 24 links (P2): each heading exists exactly once.
-_LINKED_HEADINGS = ("#### Geometries the SDK cannot read",)
+_LINKED_HEADINGS = ("### Geometries the SDK cannot read",)
 
 #: What the README's distance example shows: SurrealDB's ``geo::distance`` from Times Square, rounded.
 _CLOSEST = [("Corner Pizza", 411), ("Park Burgers", 1826), ("Village Deli", 3365)]
 
 
 def _readme() -> str:
-    return _README.read_text(encoding="utf-8")
-
-
-def _readme_part(heading: str) -> str:
-    """The README text from the ``heading`` line up to the next ``##``/``###`` heading."""
-    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", _readme(), re.MULTILINE | re.DOTALL)
-    assert match, f"README has no {heading!r} section"
-    return match.group(0)
+    """The whole documentation: the README, then every guide in the index's order."""
+    return f"{readme()}\n{manual()}"
 
 
 def _section_25() -> str:
-    return _readme_part("### 25. Geospatial fields")
+    return _doc_part("## 25. Geospatial fields")
 
 
 def _subsection(heading: str, text: str | None = None) -> str:
-    """The ``heading`` line of ``text`` (the README by default) up to the next heading of level 2 to 4, or the end."""
+    """The ``heading`` line of ``text`` (the whole documentation by default) up to the next heading of level 2 or 3,
+    or the end."""
     source = _readme() if text is None else text
-    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,4}} |\Z)", source, re.MULTILINE | re.DOTALL)
-    assert match, f"README has no {heading!r} part"
+    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} |\Z)", source, re.MULTILINE | re.DOTALL)
+    assert match, f"the documentation has no {heading!r} part"
     return match.group(0)
 
 
@@ -1669,7 +1669,7 @@ def _table_rows(text: str) -> list[tuple[str, list[str]]]:
 
 def _v0_24_0_rows() -> list[tuple[str, list[str]]]:
     """The behaviour-table rows v0.24.0 adds: the two ``v0.24.0`` rows and the retroactive untyped-field row."""
-    rows = _table_rows(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x"))
+    rows = _table_rows(_doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"))
     return [(line, cells) for line, cells in rows if cells[-1] in _V0_24_0_SINCE]
 
 
@@ -1794,16 +1794,16 @@ class TestReadmeGeoWording:
         assert_server_header_sentence("rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5")
 
     def test_filter_lookups_list_names_the_spatial_lookups(self) -> None:
-        bullets = [line for line in _readme_part("### Supported Filter Lookups").splitlines() if line.startswith("- ")]
+        bullets = [line for line in _doc_part("## Supported Filter Lookups").splitlines() if line.startswith("- ")]
         for lookup in ("inside", "outside", "intersects"):
             assert any(f"`{lookup}`" in bullet for bullet in bullets), lookup
 
     def test_features_roadmap_and_comparison_rows(self) -> None:
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         assert any(cells[0].startswith("Geospatial fields") and cells[1] == "✅" for cells in features), features
-        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
         assert ["v0.24.0", "Geospatial fields", "✅ Released"] in roadmap, roadmap
-        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [cells for _, cells in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         assert ["Geospatial Fields", "✅ v0.24.0", "✅"] in comparison, comparison
 
     def test_section_25_tables_have_no_raw_pipe_in_a_cell(self) -> None:
@@ -1821,8 +1821,8 @@ class TestReadmeGeoWording:
     def test_coming_from_the_full_orm(self) -> None:
         """P1: section 25 ends with what a full SurrealDB-ORM user meets."""
         section = _section_25()
-        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "P1 heading missing"
-        text = _subsection("#### Coming from the full SurrealDB-ORM", section)
+        assert re.search(r"^### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "P1 heading missing"
+        text = _subsection("### Coming from the full SurrealDB-ORM", section)
         for needle in ("to_geojson", '"line"', "nearby()"):
             assert needle in text, needle
 
@@ -1831,7 +1831,7 @@ class TestReadmeSection24Consistency:
     """P2: section 24 says what v0.24.0 converts and links section 25's notes (prose only)."""
 
     def test_after_a_write_names_geometries_and_sub_models(self) -> None:
-        text = _normalised(_subsection("#### After a write that returns the row"))
+        text = _normalised(_subsection("### After a write that returns the row"))
         assert "geometry" in text, text
         assert "top-level" in text, text
         # #228: sub-models get what a read gives, the model's own validators included, so writing the
@@ -1844,13 +1844,13 @@ class TestReadmeSection24Consistency:
     def test_the_sub_model_limitation_is_gone(self) -> None:
         """#228: the "Rich values inside sub-models" note and its full-ORM bullet are removed, with every link to them."""
         readme = _readme()
-        assert "#### Rich values inside sub-models" not in readme
+        assert "### Rich values inside sub-models" not in readme
         assert "(#rich-values-inside-sub-models)" not in readme
         assert "Sub-models after a write that returns the row" not in readme
         assert "converts only durations and geometries" not in readme
 
     def test_values_the_sdk_cannot_read_links_the_geometry_note(self) -> None:
-        text = _normalised(_subsection("#### Values the SDK cannot read"))
+        text = _normalised(_subsection("### Values the SDK cannot read"))
         assert "(#geometries-the-sdk-cannot-read)" in text, text
 
     def test_linked_headings_exist_once_in_section_25(self) -> None:
@@ -1860,11 +1860,6 @@ class TestReadmeSection24Consistency:
             assert re.search(rf"^{re.escape(heading)}$", section, re.MULTILINE), heading
 
     def test_section_25_follows_section_24(self) -> None:
-        readme = _readme()
-        start_24 = readme.index("\n### 24. Rich field types\n")
-        start_25 = readme.index("\n### 25. Geospatial fields\n")
-        start_26 = readme.index("\n### 26. Embedded engine and test fixtures\n")
-        assert start_24 < start_25 < start_26
-        # Section 24 keeps all its subsections, and so does section 25, up to section 26 (v0.25.0).
-        assert re.findall(r"^#{2,3} .*$", readme[start_24 + 1 : start_25], re.MULTILINE) == ["### 24. Rich field types"]
-        assert re.findall(r"^#{2,3} .*$", readme[start_25 + 1 : start_26], re.MULTILINE) == ["### 25. Geospatial fields"]
+        """Sections 24 and 25 make the field types guide, ``docs/fields.md``; section 26 comes later in the manual."""
+        assert_guide_sections("fields.md", ["## 24. Rich field types", "## 25. Geospatial fields"])
+        assert_manual_order("## 24. Rich field types", "## 25. Geospatial fields", "## 26. Embedded engine and test fixtures")

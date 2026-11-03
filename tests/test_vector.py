@@ -247,13 +247,20 @@ from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import user_namespace, validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
 from tests import _compaction
-from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import DOCS as _DOCS
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_guide_sections,
+    assert_manual_order,
+    assert_server_header_sentence,
+    assert_server_rows,
+)
+from tests._readme_tables import doc_part as _doc_part
 from tests._readme_tables import normalised as _normalised
-from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._readme_tables import unresolved_links as _unresolved_links
 
 _EXPORTS = ["VectorField", "Vector"]
 
@@ -6377,8 +6384,8 @@ class TestLinePinsE2E:
 
 # === README: section 37, the behaviour tables, the features, roadmap and comparison rows; docs/ROADMAP.md ===========
 
-_SECTION_36 = "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
-_SECTION_37 = "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)"
+_SECTION_36 = "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
+_SECTION_37 = "## 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)"
 #: Section 37's subsections, in order, after an untitled intro.
 _SUBSECTIONS_37 = [
     "Declare and apply",
@@ -6484,7 +6491,7 @@ _PART_NEEDLES_37 = {
         "`Index(hnsw=True)`",
         "binds the query vector",
         "SurrealDB 2.x, 3.x and the embedded engine",
-        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
         "`mem://`",
     ),
     "Declare and apply": (
@@ -6695,14 +6702,14 @@ _PINNED_ROWS = [_VECTOR_INDEX_ROW, _ROW_EF, _ROW_CONDITIONS, _ROW_SEARCH, _ROW_W
 
 
 def _section_37() -> str:
-    return _readme_part(_SECTION_37)
+    return _doc_part(_SECTION_37)
 
 
 def _part_37(heading: str) -> str:
-    """One ``####`` subsection of section 37, as written (the intro for ``""``)."""
+    """One ``###`` subsection of section 37, as written (the intro for ``""``)."""
     if not heading:
-        return _section_37().split("\n#### ", 1)[0]
-    return _subsection(f"#### {heading}", _section_37())
+        return _section_37().split("\n### ", 1)[0]
+    return _subsection(f"### {heading}", _section_37())
 
 
 def _readme_blocks(text: str) -> list[str]:
@@ -6747,25 +6754,23 @@ class TestReadmeSection37:
     features, roadmap, comparison and both behaviour tables."""
 
     def test_section_37_follows_section_36(self) -> None:
-        """Right after section 36 (after its "Coming from" bullets), then section 38 (v0.37.0), section 39 (v0.38.0),
-        section 40 (v0.39.0) and section 41 (v0.40.0), and before the ``---`` of "Configuration Options"."""
-        text = _readme()
-        start_36 = text.index(f"\n{_SECTION_36}\n")
-        start_37 = text.index(f"\n{_SECTION_37}\n")
-        configuration = text.index("\n## Configuration Options\n")
-        assert start_36 < start_37 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_36 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_36,
-            _SECTION_37,
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 37 is in the search guide, ``docs/search.md``, with its other sections in this order; section
+        36 comes before it in the manual."""
+        assert_guide_sections(
+            "search.md",
+            [
+                "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
+                "## 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+                "## 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            ],
+        )
+        assert_manual_order(
+            "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
+            "## 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+        )
 
     def test_subsections_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_37(), re.MULTILINE) == _SUBSECTIONS_37
+        assert re.findall(r"^### (.*)$", _section_37(), re.MULTILINE) == _SUBSECTIONS_37
 
     def test_where_the_examples_stand(self) -> None:
         """Each part that shows code opens with prose and holds ``python`` blocks; the intro and the other parts hold
@@ -6832,10 +6837,9 @@ class TestReadmeSection37:
 
     def test_links_resolve(self) -> None:
         """Every in-page link of section 37 names a heading."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
-        links = re.findall(r"\]\(#([^)]+)\)", _section_37())
+        links = re.findall(r"\]\(([\w-]*\.md)?#([^)]+)\)", _section_37())
         assert len(links) >= 5, links
-        assert [link for link in links if link not in anchors] == []
+        assert _unresolved_links(_section_37(), _DOCS / "search.md") == []
 
     def test_server_behaviour_rows(self) -> None:
         """Exactly eight rows, Since v0.36.0, together and in version order before the table's last row; the table
@@ -6855,21 +6859,21 @@ class TestReadmeSection37:
         assert_embedded_rows([_EMBEDDED_VECTOR_ROW])
 
     def test_features_row(self) -> None:
-        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        features = [row for _, row in _table_rows(_doc_part("## Features"))]
         firsts = [row[0] for row in features]
         assert _FEATURES_ROW_37 in features, features
         full_text = "Full-text search (`search()`, BM25 score and highlights)"
         assert firsts.index(_FEATURES_ROW_37[0]) == firsts.index(full_text) + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [row for _, row in _table_rows(_doc_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.35.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_37, roadmap
         assert "v0.36.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
 
     def test_comparison_row(self) -> None:
         """Released, right after full-text search and before hybrid search."""
-        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [row for _, row in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [row[0] for row in comparison]
         start = firsts.index("Full-Text Search")
         assert comparison[start + 1] == _COMPARISON_ROW_37, comparison
@@ -6878,11 +6882,11 @@ class TestReadmeSection37:
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.36.0 touches keeps one cell count per line and no escaped pipe; section 37 has no table."""
         parts = [
-            _readme_part("## Features"),
-            _readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x"),
-            _readme_part("### ORM behaviour: the embedded engine"),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _doc_part("## ORM behaviour: the embedded engine"),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         found = [lines for part in parts for lines in _md_tables(part)]
         assert len(found) == len(parts)

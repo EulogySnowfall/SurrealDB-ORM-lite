@@ -64,11 +64,11 @@ from surreal_orm_lite.live import require_websocket
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction
 from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
-from tests._readme_tables import assert_embedded_rows, release
+from tests._readme_tables import assert_embedded_rows, assert_guide_sections, assert_manual_order, release
 from tests._readme_tables import cells as _cells
+from tests._readme_tables import doc_part as _doc_part
 from tests._readme_tables import normalised as _normalised
 from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _tables
@@ -2514,7 +2514,7 @@ class TestConcurrentBindEmbeddedE2E:
 # README section 26, the comparison tables and the ROADMAP parity notes (spec §11, AC-14; P1, P2, P3, P5)
 
 _ROADMAP = Path(__file__).resolve().parents[1] / "docs" / "ROADMAP.md"
-_SECTION_26 = "### 26. Embedded engine and test fixtures"
+_SECTION_26 = "## 26. Embedded engine and test fixtures"
 #: The last sentence of the ROADMAP's "Embedded URLs" note, whitespace normalised: planned, and once v0.40.0 is
 #: released (the factories and the pytest plugin shipped).
 _PLANNED_FIXTURES_NOTE_40 = (
@@ -2535,7 +2535,7 @@ def _released_40(roadmap: str) -> bool:
 
 
 def _section_26() -> str:
-    return _readme_part(_SECTION_26)
+    return _doc_part(_SECTION_26)
 
 
 def _section_26_examples() -> list[str]:
@@ -2594,36 +2594,31 @@ class TestReadmeEmbeddedWording:
             assert name in section, name
 
     def test_section_26_follows_section_25(self) -> None:
-        """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0), section 29
-        (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34
-        (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39
-        (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), up to "Configuration Options"."""
-        readme = _readme()
-        start_25 = readme.index("\n### 25. Geospatial fields\n")
-        start_26 = readme.index(f"\n{_SECTION_26}\n")
-        configuration = readme.index("\n## Configuration Options\n")
-        assert start_25 < start_26 < configuration
-        assert re.findall(r"^#{2,3} .*$", readme[start_26 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_26,
-            "### 27. Time travel (`as_of()`)",
-            "### 28. Subqueries (`Subquery`)",
-            "### 29. Query cache (`cache()`, `QueryCache`)",
-            "### 30. Multiple databases (`add_connection()`, `using()`)",
-            "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
-            "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
-            "### 33. Materialized views (`view_query`, `define_view()`)",
-            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
+        """Section 26 is the embedded engine guide, ``docs/embedded.md``, its only section; in the manual it comes
+        after section 25, and sections 27 (v0.26.0) to 41 (v0.40.0) all exist after the field types guide."""
+        assert_guide_sections("embedded.md", [_SECTION_26])
+        assert_manual_order("## 25. Geospatial fields", _SECTION_26)
+        for section in (
+            "## 27. Time travel (`as_of()`)",
+            "## 28. Subqueries (`Subquery`)",
+            "## 29. Query cache (`cache()`, `QueryCache`)",
+            "## 30. Multiple databases (`add_connection()`, `using()`)",
+            "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+            "## 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+            "## 33. Materialized views (`view_query`, `define_view()`)",
+            "## 34. Relation constraints (`relation_in`, `define_relation()`)",
+            "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+            "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
+            "## 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+            "## 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            "## 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
+            "## 40. Command line (`surreal-orm-lite`)",
+            "## 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
+        ):
+            assert_manual_order("## 25. Geospatial fields", section)
 
     def test_subsections_in_order(self) -> None:
-        headings = re.findall(r"^#### (.*)$", _section_26(), re.MULTILINE)
+        headings = re.findall(r"^### (.*)$", _section_26(), re.MULTILINE)
         assert headings == [
             "In-process databases",
             "One engine per process",
@@ -2652,7 +2647,7 @@ class TestReadmeEmbeddedWording:
         assert "keeps no list of embedded schemes" in sentence
 
     def test_section_26_tables_have_no_raw_pipe_in_a_cell(self) -> None:
-        tables = _tables(_section_26()) + _tables(_readme_part(_EMBEDDED_BEHAVIOUR))
+        tables = _tables(_section_26()) + _tables(_doc_part(_EMBEDDED_BEHAVIOUR))
         assert len(tables) == 2, tables
         for lines in tables:
             widths = {len(_cells(line)) for line in lines}
@@ -2660,23 +2655,23 @@ class TestReadmeEmbeddedWording:
 
     def test_closed_client_rule_and_concurrency_advice(self) -> None:
         section = _section_26()
-        engine = _normalised(_subsection("#### One engine per process", section))
+        engine = _normalised(_subsection("### One engine per process", section))
         assert "closing does not stop an in-process engine" in engine and "`del client`" in engine
         assert "Never open one path from two processes" in engine
-        fixtures = _normalised(_subsection("#### Test fixtures", section))
+        fixtures = _normalised(_subsection("### Test fixtures", section))
         assert "`DEFINE TABLE`" in fixtures and "@retry_on_conflict()" in fixtures, fixtures
 
     def test_identity_subsection(self) -> None:
-        identity = _normalised(_subsection("#### Identity on the embedded engine", _section_26()))
+        identity = _normalised(_subsection("### Identity on the embedded engine", _section_26()))
         assert "in-process owner" in identity and "`invalidate()`" in identity and "bind=True" in identity
         assert "the record does not fit the model, the session stays signed in as that record" in identity
 
     def test_server_clients_after_an_embedded_close(self) -> None:
         """``is_connected()`` stays true on a loop that keeps a server client, and a lost identity stays lost."""
-        engine = _normalised(_subsection("#### One engine per process", _section_26()))
+        engine = _normalised(_subsection("### One engine per process", _section_26()))
         assert "`is_connected()` stays `True` on an event loop that keeps one" in engine
         assert "does not end that state" in engine
-        rows = [cells for _, cells in _table_rows(_readme_part(_EMBEDDED_BEHAVIOUR))]
+        rows = [cells for _, cells in _table_rows(_doc_part(_EMBEDDED_BEHAVIOUR))]
         [closing] = [cells for cells in rows if cells[0].startswith("Closing")]
         assert "`close_connection()` and `reconnect()` leave the server clients open" in closing[1], closing
 
@@ -2690,7 +2685,7 @@ class TestReadmeEmbeddedWording:
 
     def test_coming_from_the_full_orm(self) -> None:
         """P5 and spec §11: the bullets of a full SurrealDB-ORM user."""
-        text = _normalised(_subsection("#### Coming from the full SurrealDB-ORM", _section_26()))
+        text = _normalised(_subsection("### Coming from the full SurrealDB-ORM", _section_26()))
         for word in ("resets", "id", "TypeError", "is_embedded()", "embedded_database()"):
             assert word in text, word
         assert "**`ModelFactory` and `Faker`**, and a pytest plugin with the `surreal_db` fixture, are in" in text, text
@@ -2699,7 +2694,7 @@ class TestReadmeEmbeddedWording:
     def test_embedded_behaviour_table(self) -> None:
         """Four cells a row, each "Since" a release; v0.25.0's rows first and together, in a table in version order
         that keeps its widths and its catch-all last row (later releases add their rows in version order)."""
-        part = _readme_part(_EMBEDDED_BEHAVIOUR)
+        part = _doc_part(_EMBEDDED_BEHAVIOUR)
         [lines] = _tables(part)
         assert _cells(lines[0]) == ["ORM capability", "Embedded engine (SDK 2.0.0)", "Servers (2.x and 3.x)", "Since"]
         rows = [cells for _, cells in _table_rows(part)]
@@ -2724,25 +2719,25 @@ class TestReadmeEmbeddedWording:
             assert row in firsts, row
 
     def test_behaviour_tables_point_to_each_other(self) -> None:
-        header = _normalised(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
+        header = _normalised(_doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
         assert "(#orm-behaviour-the-embedded-engine)" in header, header
-        assert "(#26-embedded-engine-and-test-fixtures)" in _readme_part(_EMBEDDED_BEHAVIOUR)
+        assert "(embedded.md#26-embedded-engine-and-test-fixtures)" in _doc_part(_EMBEDDED_BEHAVIOUR)
 
     def test_connections_requirements_compatibility_features_and_roadmap(self) -> None:
-        loops = _normalised(_readme_part("### Connections and event loops"))
+        loops = _normalised(_doc_part("## Connections and event loops"))
         assert "An embedded URL is the exception" in loops and "one client for the whole process" in loops
-        requirements = [cells for _, cells in _table_rows(_readme_part("## Requirements"))]
+        requirements = [cells for _, cells in _table_rows(_doc_part("## Requirements"))]
         assert any(cells[0] == "SurrealDB" and "the SDK's embedded engine" in cells[1] for cells in requirements)
-        compatibility = [cells for _, cells in _table_rows(_readme_part("## Compatibility"))]
+        compatibility = [cells for _, cells in _table_rows(_doc_part("# Compatibility"))]
         assert ["Embedded engine (SDK 2.0.0: SurrealDB 2.3.10 core)", "2.0", "✅ Tested (in-process)"] in compatibility
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         assert ["Embedded engine (mem://, surrealkv://) & test fixtures", "✅"] in features, features
-        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
         assert ["v0.25.0", "Embedded test engine", "✅ Released"] in roadmap, roadmap
 
     def test_readme_comparison_table(self) -> None:
         """P1: the lite cell is the 2nd; the full SurrealDB-ORM has no embedded engine."""
-        part = _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM")
+        part = _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM")
         [lines] = _tables(part)
         assert _cells(lines[0]) == ["Feature", "ORM-lite (official SDK)", "ORM (custom SDK)"]
         rows = [cells for _, cells in _table_rows(part)]
