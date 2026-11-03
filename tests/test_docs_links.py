@@ -37,6 +37,11 @@ from tests._readme_tables import (
 README_MAX_LINES = 300
 #: The last numbered section of the manual.
 LAST_SECTION = 41
+#: Where ``llms.txt`` and the AI guide's download point: the raw Markdown of a file of ``main``.
+GITHUB_RAW = "https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/"
+#: The guide for AI coding assistants (issue #401) and the llms.txt index at the repository root.
+AI_GUIDE = DOCS / "ai" / "CLAUDE.md"
+LLMS_TXT = ROOT / "llms.txt"
 
 
 def _markdown_files() -> list[Path]:
@@ -45,6 +50,22 @@ def _markdown_files() -> list[Path]:
 
 def _links(text: str) -> list[str]:
     return re.findall(r"\]\(([^)\s]+)\)", text)
+
+
+def _repository_links(text: str) -> list[str]:
+    """The links of *text* into this repository's ``main``: a page (``blob``), a folder (``tree``) or a raw file."""
+    return [link for link in _links(text) if link.startswith((GITHUB_BLOB, GITHUB_TREE, GITHUB_RAW))]
+
+
+def _broken(links: list[str]) -> list[str]:
+    """The repository *links* that name no file (or folder) of the checkout, or, after ``#``, no heading of it."""
+    broken = []
+    for link in links:
+        path, _, fragment = link.removeprefix(GITHUB_BLOB).removeprefix(GITHUB_TREE).removeprefix(GITHUB_RAW).partition("#")
+        target = ROOT / path
+        if not target.exists() or fragment and fragment not in anchors(target.read_text(encoding="utf-8")):
+            broken.append(link)
+    return broken
 
 
 def _quick_start() -> str:
@@ -92,15 +113,9 @@ class TestReadme:
 
     def test_repository_links_resolve(self) -> None:
         """A link into this repository names a file (or folder) of ``main`` and, after ``#``, one of its headings."""
-        links = [link for link in _links(readme()) if link.startswith((GITHUB_BLOB, GITHUB_TREE))]
+        links = _repository_links(readme())
         assert len(links) >= 18, links
-        broken = []
-        for link in links:
-            path, _, fragment = link.removeprefix(GITHUB_BLOB).removeprefix(GITHUB_TREE).partition("#")
-            target = ROOT / path
-            if not target.exists() or fragment and fragment not in anchors(target.read_text(encoding="utf-8")):
-                broken.append(link)
-        assert broken == []
+        assert _broken(links) == []
 
     def test_links_every_guide(self) -> None:
         linked = {link.removeprefix(f"{GITHUB_BLOB}docs/").partition("#")[0] for link in _links(readme())}
@@ -160,3 +175,48 @@ class TestGuides:
 
     def test_readme_is_not_a_guide(self) -> None:
         assert README not in guide_paths()
+
+
+class TestAiGuideAndLlmsTxt:
+    """The guide for AI coding assistants, ``llms.txt`` and the README part that points to them (issue #401)."""
+
+    def test_ai_guide_links_resolve(self) -> None:
+        """Every link of the guide into this repository names a file of ``main`` and, after ``#``, one of its
+        headings; the guide links to every guide and to the compatibility tables."""
+        text = AI_GUIDE.read_text(encoding="utf-8")
+        links = _repository_links(text)
+        assert _broken(links) == []
+        linked = {link.removeprefix(f"{GITHUB_BLOB}docs/").partition("#")[0] for link in links}
+        assert set(guide_order()) | {"README.md"} <= linked, sorted(set(guide_order()) - linked)
+        assert f"{GITHUB_BLOB}docs/compatibility.md#orm-behaviour-surrealdb-2x-vs-3x" in links
+
+    def test_llms_txt_shape(self) -> None:
+        """The llms.txt convention: a ``#`` title, a ``>`` summary, then ``##`` sections of ``- [name](url): notes``
+        items."""
+        lines = LLMS_TXT.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == "# Surreal ORM Lite"
+        assert lines[1] == "" and lines[2].startswith("> "), lines[:3]
+        sections = [line for line in lines if line.startswith("## ")]
+        assert sections[:1] == ["## Docs"] and sections[-1] == "## Optional", sections
+        items = [line for line in lines if line.startswith("- ")]
+        assert items and all(re.fullmatch(r"- \[[^]]+\]\(https://\S+\)(: .+)?", item) for item in items), items
+
+    def test_llms_txt_links_resolve(self) -> None:
+        """Its links are raw Markdown files of ``main`` that exist: the README, every guide and the AI guide."""
+        text = LLMS_TXT.read_text(encoding="utf-8")
+        links = _links(text)
+        assert links and _broken(_repository_links(text)) == []
+        assert {f"{GITHUB_RAW}README.md", f"{GITHUB_RAW}docs/ai/CLAUDE.md", f"{GITHUB_RAW}docs/README.md"} <= set(links)
+        guides = {link.removeprefix(f"{GITHUB_RAW}docs/") for link in links}
+        assert set(guide_order()) <= guides, sorted(set(guide_order()) - guides)
+
+    def test_readme_part(self) -> None:
+        """A few lines in the README: what the guide is, how to import it, and ``llms.txt``."""
+        section = doc_part("## Using with AI assistants")
+        assert section.count("\n") <= 15, section
+        assert f"{GITHUB_BLOB}docs/ai/CLAUDE.md" in section and f"{GITHUB_BLOB}llms.txt" in section
+        assert "@docs/surreal-orm-lite.md" in section
+
+    def test_index_links_the_ai_guide(self) -> None:
+        """The documentation index lists the AI guide among its other documents."""
+        assert "(ai/CLAUDE.md)" in doc_part("## Other documents")
