@@ -4,7 +4,7 @@
 # patch went unnoticed — 3.2.1 through 3.2.4 all shipped without a single signal.
 #
 # Its first run will therefore propose a jump of several versions at once, not the usual
-# single patch. Check that README's compatibility table and CHANGELOG follow that PR; the
+# single patch. Check that docs/compatibility.md's table and CHANGELOG follow that PR; the
 # monitor updates the pin and the CI matrix, nothing else.
 #
 # Resolves versions from Docker Hub rather than GitHub releases, because SurrealDB publishes

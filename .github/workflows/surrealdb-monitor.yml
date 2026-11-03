@@ -372,7 +372,7 @@ jobs:
           # python3, not python: this job has no setup-python. The script is stdlib-only.
           python3 scripts/sync_surrealdb_pins.py --fix
 
-          git add "$PIN_FILE" .github/workflows/ci.yml README.md docs/ROADMAP.md
+          git add "$PIN_FILE" .github/workflows/ci.yml README.md docs/
 
           if git diff --staged --quiet; then
             # Reachable with force-update on an already-current pin. `exit 0` ends only this
