@@ -69,7 +69,9 @@ attribute is a declaration:
 
 Methods, `classmethod`s, `staticmethod`s, properties and nested classes are not declarations. A class assigned to a
 field of the model, though, raises `TypeError` at the `class` statement: `role = Role` was meant as `Role.ADMIN`, and a
-class for a `type[...]` field is passed as an override (`build(kind=Role)`). Any other callable
+class for a `type[...]` field is passed as an override (`build(kind=Role)`). Only the most-derived definition of a field
+counts, as for any class attribute: a subclass that sets `role = Role.ADMIN` over a base's `role = Role` is accepted.
+Any other callable
 (`datetime.now`, `functools.partial(…)`) is refused with `TypeError` at the `class` statement: lazy values are not
 supported yet, so pass such a value at the call.
 

@@ -320,8 +320,8 @@ def _collect_own(name: str, namespace: dict[str, Any]) -> tuple[dict[str, Any], 
     """Collect one class body's declarations, in declaration order, names as written, and its classes.
 
     Ignored: a ``_`` name, ``Meta``, a function (lambdas included) and a ``classmethod``/``staticmethod``/``property``.
-    A class is returned apart: the metaclass refuses it once the model is known if its name is a model field (#399),
-    and ignores it otherwise. Refused: any other callable (``datetime.now``, ``functools.partial(...)``, an instance
+    A class is returned apart: once the model is known, the metaclass refuses it if its name is a model field and it is
+    that field's most-derived definition in the MRO (#399), and ignores it otherwise. Refused: any other callable (``datetime.now``, ``functools.partial(...)``, an instance
     with ``__call__``), which F1 may later give a lazy meaning. Collected: everything else.
     """
     own: dict[str, Any] = {}
@@ -386,19 +386,12 @@ class _FactoryMeta(type):
     def _normalized_defs(name: str, cls: "_FactoryMeta", model: type[BaseSurrealModel]) -> dict[str, Any]:
         """Merge the MRO's declarations keyed by the model's Python field names, then check them (D14, D15)."""
         model_fields = model.model_fields
-        for klass in reversed(cls.__mro__):
-            own_classes: dict[str, type] = klass.__dict__.get("_own_classes", {})
-            for raw, value in own_classes.items():
-                py_name = model.to_py_field(raw)
-                if py_name in model_fields:
-                    raise TypeError(
-                        f"{name}.{raw} is a class ({value.__qualname__}) assigned to the field {py_name!r} of "
-                        f"{model.__name__}; a factory attribute is a static value, a Faker or a SurrealFunc — give an "
-                        "instance (an Enum member, for example), or pass the class as an override at the call"
-                    )
         per_class: list[list[tuple[str, str, Any]]] = []
+        # The most-derived definition of each model field: a value (None) or the class that holds a class there.
+        winners: dict[str, tuple[str, str, type] | None] = {}
         for klass in reversed(cls.__mro__):
             own: dict[str, Any] = klass.__dict__.get("_own_defs", {})
+            own_classes: dict[str, type] = klass.__dict__.get("_own_classes", {})
             entries = [(raw, model.to_py_field(raw), value) for raw, value in own.items()]
             seen: dict[str, str] = {}
             for raw, py_name, _value in entries:
@@ -407,7 +400,27 @@ class _FactoryMeta(type):
                         f"{name} declares {py_name!r} twice: as {py_name!r} and as its column {model.to_db_field(py_name)!r}"
                     )
                 seen[py_name] = raw
+                winners[py_name] = None
+            for raw, value in own_classes.items():
+                py_name = model.to_py_field(raw)
+                if py_name not in model_fields:
+                    continue
+                if py_name in seen:
+                    raise TypeError(
+                        f"{name} declares {py_name!r} twice: as {py_name!r} and as its column {model.to_db_field(py_name)!r}"
+                    )
+                seen[py_name] = raw
+                winners[py_name] = (klass.__name__, raw, value)
             per_class.append(entries)
+        for py_name, winner in winners.items():
+            if winner is not None:
+                holder, raw, value = winner
+                inherited = "" if holder == name else f" (inherited by {name})"
+                raise TypeError(
+                    f"{holder}.{raw} is a class ({value.__qualname__}) assigned to the field {py_name!r} of "
+                    f"{model.__name__}{inherited}; a factory attribute is a static value, a Faker or a SurrealFunc — give an "
+                    "instance (an Enum member, for example), or pass the class as an override at the call"
+                )
         if model.model_config.get("extra") != "allow":
             known = set(model.model_fields)
             for entries in per_class:

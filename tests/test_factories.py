@@ -533,11 +533,76 @@ class TestFactoryDeclaration:
         class Base(ModelFactory):
             role = FxColour
 
-        with pytest.raises(TypeError, match=re.escape("Child.role is a class (FxColour) assigned to the field")):
+        # The message names the class that holds the class, and the factory that inherits it.
+        expected = "Base.role is a class (FxColour) assigned to the field 'role' of FxUser (inherited by Child)"
+        with pytest.raises(TypeError, match=re.escape(expected)):
 
             class Child(Base):
                 class Meta:
                     model = FxUser
+
+    def test_value_on_an_abstract_base_shadowed_by_a_class_refused(self) -> None:
+        class Base(ModelFactory):
+            role = FxColour.RED
+
+        with pytest.raises(TypeError, match=re.escape("Child.role is a class (FxColour) assigned to the field 'role'")):
+
+            class Child(Base):
+                class Meta:
+                    model = FxUser
+
+                role = FxColour
+
+    def test_class_on_an_abstract_base_shadowed_by_a_value_accepted(self) -> None:
+        # The most-derived definition wins, as Python resolves ``Child.role`` itself.
+        class Base(ModelFactory):
+            role = FxColour
+
+        class Child(Base):
+            class Meta:
+                model = FxUser
+
+            role = "admin"
+
+        assert Child._field_defs == {"role": "admin"}
+        assert Child.build().role == "admin"
+
+    def test_class_on_an_abstract_base_shadowed_through_the_column_accepted(self) -> None:
+        class Base(ModelFactory):
+            password_hash = FxColour
+
+        class Child(Base):
+            class Meta:
+                model = FxSecret
+
+            password = "s3cret"
+
+        assert Child._field_defs == {"password": "s3cret"}
+        assert Child.build().password == "s3cret"
+
+    def test_class_on_an_abstract_base_shadowed_by_an_intermediate_class_accepted(self) -> None:
+        class Base(ModelFactory):
+            role = FxColour
+
+        class Mid(Base):
+            role = "moderator"
+
+        class Child(Mid):
+            class Meta:
+                model = FxUser
+
+        assert Child._field_defs == {"role": "moderator"}
+        assert Child.build().role == "moderator"
+
+    def test_class_and_its_column_value_in_one_class_body_refused(self) -> None:
+        with pytest.raises(TypeError, match=re.escape("declares 'password' twice")):
+
+            class Both(ModelFactory):
+                class Meta:
+                    model = FxSecret
+
+                password = "s3cret"
+                password_hash = FxColour
 
     def test_class_on_a_name_that_is_no_field_ignored(self) -> None:
         class WithModel(ModelFactory[FxUser]):
