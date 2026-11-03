@@ -242,6 +242,7 @@ from tests._readme_tables import server_rows as _server_rows
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._retry import apply_reset
 
 # --- the exact texts of the class-time refusals ---------------------------------------------------------------------
 
@@ -4187,7 +4188,7 @@ async def _tdl(kind: str) -> AsyncIterator[Any]:
     exit."""
     _register_tdl(kind)
     client = await SurrealDBConnectionManager.get_client("tdl")
-    await _apply_ddl(client, _TDL_RESET)
+    await apply_reset(client, _TDL_RESET)
     try:
         yield client
     finally:
@@ -7118,7 +7119,7 @@ async def _tdl2(kind: str) -> AsyncIterator[Any]:
     """The connection ``"tdl2"`` on *kind*, on a fresh database ``tdl_db2``; removed, then unregistered, on exit."""
     _register_tdl(kind, "tdl2", database="tdl_db2")
     client = await SurrealDBConnectionManager.get_client("tdl2")
-    await _apply_ddl(client, "REMOVE DATABASE IF EXISTS tdl_db2; DEFINE DATABASE tdl_db2;")
+    await apply_reset(client, "REMOVE DATABASE IF EXISTS tdl_db2; DEFINE DATABASE tdl_db2;")
     try:
         yield client
     finally:

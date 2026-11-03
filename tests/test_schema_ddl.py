@@ -84,6 +84,7 @@ from tests._readme_tables import (
     assert_server_rows,
     assert_server_table,
 )
+from tests._retry import apply_reset
 from tests.conftest import default_connection_class
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
@@ -2110,7 +2111,7 @@ async def _evt(kind: str) -> AsyncIterator[Any]:
     on exit."""
     _register_evt(kind)
     client = await SurrealDBConnectionManager.get_client("evt")
-    await _apply_ddl(client, _EVT_RESET)
+    await apply_reset(client, _EVT_RESET)
     try:
         yield client
     finally:

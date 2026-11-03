@@ -96,6 +96,7 @@ from surreal_orm_lite.schema_state import (
     TableState,
 )
 from surreal_orm_lite.time_travel import cached_major
+from tests._retry import apply_reset
 from tests.conftest import _migration_url as _url
 from tests.conftest import migration_database
 from tests.conftest import new_database_name as _database_name
@@ -2420,7 +2421,7 @@ class TestDataE2E:
         """The executor's named connection is the one its data functions talk to (``using()``), not the default."""
         other = _database_name()
         async with migration_database("ws") as client:
-            await client.query(f"DEFINE DATABASE {other};", {})
+            await apply_reset(client, f"REMOVE DATABASE IF EXISTS {other}; DEFINE DATABASE {other};")
             try:
                 SurrealDBConnectionManager.add_connection(
                     "dm_other", url=_url("ws"), user="root", password="root", namespace="ns", database=other
