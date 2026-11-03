@@ -727,6 +727,23 @@ def _is_typeddict(cls: type) -> bool:
     return False
 
 
+def _alias_value_text(alias: object) -> str | None:
+    """The value of the type alias *alias* as written, unevaluated (``annotationlib``'s ``STRING`` format, Python
+    3.14+); ``None`` before 3.14, for an alias without ``evaluate_value``, or when even that text cannot be read."""
+    evaluate = getattr(alias, "evaluate_value", None)
+    if evaluate is None:
+        return None
+    try:
+        import annotationlib  # type: ignore[import-not-found]
+    except ImportError:  # Python < 3.14
+        return None
+    try:
+        text = annotationlib.call_evaluate_function(evaluate, annotationlib.Format.STRING)
+    except Exception:  # an evaluation function that raises even for its text: the alias alone is remembered
+        return None
+    return text if isinstance(text, str) else None
+
+
 def _module_namespace(obj: object) -> Mapping[str, Any]:
     """The namespace of the module *obj* (a class, an alias) was defined in; ``{}`` when that module is gone."""
     return getattr(sys.modules.get(getattr(obj, "__module__", None) or ""), "__dict__", {})
@@ -742,7 +759,9 @@ def _incomplete_dependencies(model: type[BaseModel], roots: Iterable[object] = (
 
     The walk goes through a type alias (issue #395: ``typing.TypeAliasType``, PEP 695's ``type BA = B | None``, and
     ``typing_extensions``'s backport) by its ``__value__`` — an alias whose value names a name still undefined is
-    remembered with that name in its module —, and through the fields of a dataclass and of a ``TypedDict``."""
+    remembered with that name in its module; one whose value raises another error (``type BA = os.Missing``) never
+    raises from here: the alias is remembered, with the names its value mentions in its module on Python 3.14+ —, and
+    through the fields of a dataclass and of a ``TypedDict``."""
     aliases = _alias_types()
     found: list[_Binding] = []
     seen: set[int] = {id(model)}
@@ -771,6 +790,14 @@ def _incomplete_dependencies(model: type[BaseModel], roots: Iterable[object] = (
             except NameError as error:  # ``type BA = Missing``: the alias waits for that name in its module
                 name = error.name or ""
                 found.append((f"alias {len(found)} {name}", _lookup(_module_namespace(annotation), name)))
+            except Exception:  # ``type BA = os.Missing``: never raised from here, the model's fields stay ``any``
+                label = f"alias {len(found)}"
+                found.append((label, annotation))
+                text = _alias_value_text(annotation)
+                if text is not None:  # the names its value mentions, in its module: defining one tries again
+                    bindings, values = _bindings((_module_namespace(annotation),), [text], f"{label} ")
+                    found.extend(bindings)
+                    pending.extend(values)
         elif isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
             container = {field.name: field.type for field in dataclasses.fields(annotation)}
         elif isinstance(annotation, type) and _is_typeddict(annotation):

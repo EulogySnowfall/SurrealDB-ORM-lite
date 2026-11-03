@@ -2527,6 +2527,56 @@ class TestFailedRebuildRemembered:
             _table_ddl(model)
         assert len(calls) == 2
 
+    @pytest.mark.parametrize(
+        ("value", "error", "rebind"),
+        [("m3.Missing | None", AttributeError, ("Missing", int)), ("m3.Number | 3", TypeError, ("Number", str))],
+        ids=["attribute-error", "type-error"],
+    )
+    def test_an_alias_whose_value_raises(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, error: type[Exception], rebind: tuple[str, type]
+    ) -> None:
+        """An alias of another module whose value raises another error than ``NameError``: no ORM call raises it, the
+        fields stay ``any`` as before issue #395, the failed rebuild is remembered; on Python 3.14+, defining a name
+        the value mentions tries again."""
+        if sys.version_info < (3, 12):
+            pytest.skip("the type statement (PEP 695) needs Python 3.12")
+        m3 = types.ModuleType("vec_fwd_alias_err_m3")
+        m3.Number = int
+        m2 = types.ModuleType("vec_fwd_alias_err_m2")
+        m1 = types.ModuleType("vec_fwd_alias_err_m1")
+        for module in (m3, m2, m1):
+            monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(f"import vec_fwd_alias_err_m3 as m3\ntype BA = {value}\n", m2.__dict__)  # noqa: S102 - the test's own text
+        with pytest.raises(error):
+            m2.BA.__value__  # noqa: B018 - the evaluation the completion must not let escape
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            "from vec_fwd_alias_err_m2 import BA\n"
+            "class A(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_alias_err_a')\n"
+            "    b: BA = None\n"
+            "    e: 'Later' = None\n",
+            m1.__dict__,
+        )
+        model = m1.A
+        calls = _count_rebuilds(monkeypatch, model)
+        expected = [
+            "DEFINE TABLE OVERWRITE `vec_fwd_alias_err_a` TYPE NORMAL;",
+            "DEFINE FIELD OVERWRITE `b` ON `vec_fwd_alias_err_a` TYPE any;",
+            "DEFINE FIELD OVERWRITE `e` ON `vec_fwd_alias_err_a` TYPE any;",
+        ]
+        assert _table_ddl(model) == expected
+        assert _table_ddl(model) == expected
+        assert model.get_indexes() == ()
+        assert type(model.objects()).__name__ == "QuerySet"
+        assert len(calls) == 1
+        if sys.version_info >= (3, 14):  # the names the value mentions are read unevaluated
+            setattr(m3, *rebind)
+            assert _table_ddl(model) == expected
+            assert _table_ddl(model) == expected
+            assert len(calls) == 2
+        assert model.__pydantic_complete__ is False
+
     @pytest.mark.parametrize("base", ["BaseModel", "BaseSurrealModel"])
     def test_a_name_defined_later_in_a_dependency_module(self, monkeypatch: pytest.MonkeyPatch, base: str) -> None:
         """The missing name defined in the module of the dependency, which nothing completed yet: the next call on the
@@ -2635,6 +2685,34 @@ class TestFailedRebuildHelpers:
         assert found == [("alias 0 Missing", model_base._UNBOUND)]
         module.Missing = int
         assert model_base._incomplete_dependencies(Plain, [module.BA]) == []
+
+    def test_the_text_of_an_alias_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``_alias_value_text()``: the value as written on Python 3.14+, ``None`` otherwise — before 3.14, for an
+        object without ``evaluate_value``, or when its evaluation function raises even for the text."""
+        text = model_base._alias_value_text
+        assert text(object()) is None
+
+        def evaluate(format: int) -> object:
+            raise RuntimeError("not today")
+
+        assert text(types.SimpleNamespace(evaluate_value=evaluate)) is None
+        if sys.version_info < (3, 12):
+            return
+        module = types.ModuleType("vec_fwd_alias_text")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec("import os\ntype BA = os.Missing | None\n", module.__dict__)  # noqa: S102 - the test's own text
+        expected = "os.Missing | None" if sys.version_info >= (3, 14) else None
+        assert text(module.BA) == expected
+
+        class Plain(BaseModel):
+            x: int = 0
+
+        found = model_base._incomplete_dependencies(Plain, [module.BA])
+        assert found[0] == ("alias 0", module.BA)
+        if sys.version_info >= (3, 14):
+            assert found[1:] == [("alias 0 0:os.Missing", model_base._UNBOUND)]
+        else:
+            assert found[1:] == []
 
     def test_a_generic_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``BL[int]``: the alias behind the subscription is walked, and the model its value holds is found."""
