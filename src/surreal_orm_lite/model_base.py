@@ -606,21 +606,35 @@ def _raw_annotations(cls: type) -> dict[str, Any]:
 
 def _forward_texts(annotation: Any, texts: list[str]) -> None:
     """Append to *texts* the forward references *annotation* holds: itself when it is a string, the text of a
-    ``ForwardRef``, and those of its arguments (``list["B"]``, ``Annotated["B", …]``) in turn."""
+    ``ForwardRef``, and those of its arguments (``list["B"]``, ``Annotated["B", …]``) in turn. The values of a
+    ``Literal`` and the metadata of an ``Annotated`` are not annotations: never read as forward references."""
     if isinstance(annotation, str):
         texts.append(annotation)
     elif isinstance(annotation, typing.ForwardRef):
         texts.append(annotation.__forward_arg__)
     else:
-        for argument in typing.get_args(annotation):
+        origin = typing.get_origin(annotation)
+        if origin is Literal:
+            return
+        arguments = typing.get_args(annotation)
+        for argument in arguments[:1] if origin is typing.Annotated else arguments:
             _forward_texts(argument, texts)
+
+
+def _subscripted_name(node: ast.expr) -> str:
+    """The last name of the expression a subscript reads from: ``"Literal"`` for ``Literal[…]`` and
+    ``typing.Literal[…]``, ``""`` for anything else than a name or an attribute."""
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return node.id if isinstance(node, ast.Name) else ""
 
 
 @functools.lru_cache(maxsize=1024)
 def _mentioned_names(text: str) -> tuple[str, ...]:
     """The names the forward reference *text* mentions, dotted for an attribute of a name (``"mod.B"``), each once, in
-    the order met; the texts of its string constants (``"list['B']"``) read in turn. ``()`` for a text that is not an
-    expression: Pydantic cannot evaluate it either."""
+    the order met; the texts of its string constants (``"list['B']"``) read in turn — except the values of a
+    ``Literal[…]`` and the metadata of an ``Annotated[…]`` (all its arguments but the first), which are not
+    annotations. ``()`` for a text that is not an expression: Pydantic cannot evaluate it either."""
     try:
         tree = ast.parse(text.strip(), mode="eval")
     except (SyntaxError, ValueError):
@@ -641,6 +655,11 @@ def _mentioned_names(text: str) -> tuple[str, ...]:
                 found[".".join([current.id, *reversed(parts)])] = None
             else:  # ``f().x``: the names of the expression the attribute is read from
                 nodes.append(current)
+        elif isinstance(node, ast.Subscript) and _subscripted_name(node.value) in ("Literal", "Annotated"):
+            nodes.append(node.value)
+            if _subscripted_name(node.value) == "Annotated":
+                annotated = node.slice
+                nodes.append(annotated.elts[0] if isinstance(annotated, ast.Tuple) and annotated.elts else annotated)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             for name in _mentioned_names(node.value):
                 found[name] = None

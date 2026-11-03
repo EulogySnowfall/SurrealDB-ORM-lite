@@ -2381,6 +2381,46 @@ class TestFailedRebuildRemembered:
         assert len(calls) == 2
         assert model.__pydantic_complete__ is True
 
+    @pytest.mark.parametrize("future", ["", "from __future__ import annotations\n"], ids=["objects", "strings"])
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            "Literal['user', 'admin'] = 'user'",
+            "typing.Literal['user', 'admin'] = 'user'",
+            "Annotated[int, 'user', Field(description='admin')] = 0",
+            "Annotated[Literal['user'], 'admin'] | None = None",
+            "list[Annotated[int, 'admin']] = []",
+        ],
+        ids=["literal", "dotted_literal", "annotated", "annotated_literal", "nested"],
+    )
+    def test_literal_values_and_annotated_metadata_are_not_names(
+        self, monkeypatch: pytest.MonkeyPatch, future: str, annotation: str
+    ) -> None:
+        """The values of ``Literal[...]`` and the metadata of ``Annotated[...]`` are not forward references: a loop
+        variable named after one of them (``for user in users``) does not rebuild the model again — as objects
+        (Python < 3.14) or as strings (``from __future__ import annotations``, Python 3.14's lazy annotations)
+        (issue #395)."""
+        module = types.ModuleType("vec_fwd_module_literal")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            future + "import typing\n"
+            "from typing import Annotated, Literal\n"
+            "from pydantic import Field\n"
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            "class VecFwdLiteral(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_module_literal')\n"
+            "    id: str | None = None\n"
+            f"    role: {annotation}\n"
+            "    e: 'Later' = None\n",
+            module.__dict__,
+        )
+        model = module.VecFwdLiteral
+        calls = _count_rebuilds(monkeypatch, model)
+        for user, admin in [(object(), object()) for _ in range(5)]:  # noqa: B007 - rebound at every turn
+            model.table_ddl()  # from this frame, whose ``user`` and ``admin`` change at every turn
+        assert len(calls) == 1
+        assert model.__pydantic_complete__ is False
+
     @pytest.mark.parametrize(
         "decorator",
         [

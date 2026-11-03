@@ -35,6 +35,11 @@ them by identity and follows type aliases. No new public API.
   mentioned by the return annotation of a `@computed_field`, `@field_serializer` or `@model_serializer` (or by
   its explicit `return_type`), which Pydantic evaluates to complete the model, is remembered too, so defining
   it completes the model at the next call.
+- **`Literal` values and `Annotated` metadata are not read as names** (#395): the strings in
+  `Literal["user", "admin"]` and the metadata of `Annotated[int, "doc"]` (all its arguments but the first) are
+  no longer looked up as forward references, as objects or as string annotations (Python 3.14's lazy
+  annotations, `from __future__ import annotations`), so a loop variable named `user` no longer rebuilds the
+  model at every turn.
 - Same behaviour on SurrealDB 2.x and 3.x.
 
 ## [0.40.0] - 2026-11-02
