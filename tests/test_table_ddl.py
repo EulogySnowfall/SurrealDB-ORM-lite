@@ -227,21 +227,25 @@ from surreal_orm_lite import (
 from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_table, parse_kind, render_kind
 from surreal_orm_lite.schema_state import FieldState, TableState
 from surreal_orm_lite.testing import embedded_database
+from tests._readme_tables import DOCS as _DOCS
 from tests._readme_tables import (
     assert_embedded_rows,
+    assert_guide_sections,
+    assert_manual_order,
     assert_server_header_sentence,
     assert_server_rows,
     assert_server_table,
 )
 from tests._readme_tables import cells as _cells
+from tests._readme_tables import doc_part as _doc_part
 from tests._readme_tables import embedded_rows as _embedded_rows
 from tests._readme_tables import normalised as _normalised
-from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import server_rows as _server_rows
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._readme_tables import unresolved_links as _unresolved_links
+from tests._retry import apply_reset
 
 # --- the exact texts of the class-time refusals ---------------------------------------------------------------------
 
@@ -4187,7 +4191,7 @@ async def _tdl(kind: str) -> AsyncIterator[Any]:
     exit."""
     _register_tdl(kind)
     client = await SurrealDBConnectionManager.get_client("tdl")
-    await _apply_ddl(client, _TDL_RESET)
+    await apply_reset(client, _TDL_RESET)
     try:
         yield client
     finally:
@@ -7118,7 +7122,7 @@ async def _tdl2(kind: str) -> AsyncIterator[Any]:
     """The connection ``"tdl2"`` on *kind*, on a fresh database ``tdl_db2``; removed, then unregistered, on exit."""
     _register_tdl(kind, "tdl2", database="tdl_db2")
     client = await SurrealDBConnectionManager.get_client("tdl2")
-    await _apply_ddl(client, "REMOVE DATABASE IF EXISTS tdl_db2; DEFINE DATABASE tdl_db2;")
+    await apply_reset(client, "REMOVE DATABASE IF EXISTS tdl_db2; DEFINE DATABASE tdl_db2;")
     try:
         yield client
     finally:
@@ -7211,16 +7215,18 @@ class TestRoundTripE2E:
 
 # === README: section 35, the sections it changes, the tables ========================================================
 
-_SECTION_16 = "### 16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`"
-_SECTION_19 = "### 19. Model-level authentication (`AuthenticatedUserMixin`)"
-_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
-_SECTION_33 = "### 33. Materialized views (`view_query`, `define_view()`)"
-_SECTION_34 = "### 34. Relation constraints (`relation_in`, `define_relation()`)"
-_SECTION_35 = "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
-_SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
-_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+_SECTION_16 = "## 16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`"
+_SECTION_19 = "## 19. Model-level authentication (`AuthenticatedUserMixin`)"
+_SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_33 = "## 33. Materialized views (`view_query`, `define_view()`)"
+_SECTION_34 = "## 34. Relation constraints (`relation_in`, `define_relation()`)"
+_SECTION_35 = "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
+_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x vs 3.x"
+_EMBEDDED_BEHAVIOUR = "## ORM behaviour: the embedded engine"
 #: Section 35's anchor, as the sections that point to it write it.
 _LINK_35 = "(#35-model-table-ddl-define_table-schema_mode-permissions)"
+#: The same link from another guide than the schema guide (sections 16 and 34).
+_LINK_35_ELSEWHERE = "(schema.md#35-model-table-ddl-define_table-schema_mode-permissions)"
 #: Section 35's subsections, in order, after an untitled intro that holds example A.
 _SUBSECTIONS_35 = [
     "Declaring the table",
@@ -7470,7 +7476,7 @@ _SENTENCES_35 = {
         "`define_table()`: `define_relation()` defines no field and raises before any request.",
     ),
     "User models": (
-        "`define_access()` ([section 19](#19-model-level-authentication-authenticatedusermixin)) and `define_table()` "
+        "`define_access()` ([section 19](authentication.md#19-model-level-authentication-authenticatedusermixin)) and `define_table()` "
         "read the same schema mode. A model with `table_type=TableType.USER` (the full ORM's key for an auth table) or "
         "`schema_mode=SchemaMode.SCHEMAFULL` gets from `define_access()` a `SCHEMAFULL` table with one `DEFINE FIELD` "
         "per field and the access's permissions, then the access: signup and signin work on SurrealDB 2.x and 3.x, "
@@ -7494,7 +7500,7 @@ _INTRO_NEEDLES_35 = (
     "one `DEFINE FIELD` per column from the annotations",
     "keeping what the model does not declare",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
     "`mem://`",
 )
 _PART_NEEDLES_35 = {
@@ -7630,8 +7636,8 @@ _PART_NEEDLES_35 = {
         "sub-models `define_table()` writes), on 2.x and the embedded engine of a list `define_table()` writes "
         "`FLEXIBLE`. The 3.x exception is a gap fixed in SurrealDB 3.4 (nightly at the time of writing).",
         "`COMPUTED` fields are SurrealDB 3.x's",
-        "(#orm-behaviour-surrealdb-2x-vs-3x)",
-        "(#orm-behaviour-the-embedded-engine)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-the-embedded-engine)",
     ),
     "Transactions, connections and the cache": (
         "`tx=`",
@@ -7644,7 +7650,7 @@ _PART_NEEDLES_35 = {
         "`connection`",
         "`using()`",
         "another connection raises `SurrealDbError` before any request",
-        "(#29-query-cache-cache-querycache)",
+        "(querying.md#29-query-cache-cache-querycache)",
         "drops the model's cached reads",
         "`define_events()` runs before or after",
         "`define_computed_fields()` still writes `VALUE` alone",
@@ -7686,7 +7692,7 @@ _COMING_FROM_PHRASES_35 = (
 )
 #: Sections 16 and 19: what they say of ``define_table()``, word for word (whitespace normalised).
 _SECTION_16_SENTENCE = (
-    f"Since v0.34.0, `define_table()` ([section 35]{_LINK_35}) writes a computed field's `TYPE` too "
+    f"Since v0.34.0, `define_table()` ([section 35]{_LINK_35_ELSEWHERE}) writes a computed field's `TYPE` too "
     "(`TYPE option<T> VALUE …`), checks its expression, and keeps a field the database defines `COMPUTED` (SurrealDB "
     "3.x) `COMPUTED`; `define_computed_fields()` turns such a field into `VALUE`."
 )
@@ -7725,22 +7731,22 @@ _SECTION_34_DECLARED = (
     "written, the others kept from the database** (the full ORM renders every clause from the model and resets the "
     "others)."
 )
-_SECTION_34_TABLE_TYPE = f"its other members take effect in `define_table()` ([section 35]{_LINK_35})"
+_SECTION_34_TABLE_TYPE = f"its other members take effect in `define_table()` ([section 35]{_LINK_35_ELSEWHERE})"
 _SECTION_31_EDGE_SCHEMAFULL = (
     "A `SCHEMAFULL` relation table with data fields gives an edge model with `schema_mode=SchemaMode.SCHEMAFULL` (since "
     "v0.34.0): apply it with `define_table()`, which defines those fields, not `define_relation()`, which raises "
-    "`SurrealDbError` before any request ([section 34](#34-relation-constraints-relation_in-define_relation))."
+    "`SurrealDbError` before any request ([section 34](relations.md#34-relation-constraints-relation_in-define_relation))."
 )
 _SECTION_34_EDGE_SCHEMAFULL = (
     "- An edge model that declares `schema_mode=SchemaMode.SCHEMAFULL` and has data fields — the model "
     "`generate_models_from_db()` writes for a `SCHEMAFULL` relation table with data fields, since v0.34.0 — is applied "
     "with `define_table()`, not `define_relation()`: `define_relation()` defines no field, so it raises `SurrealDbError` "
-    f"before any request, and `define_table()` applies the same relation statement, then the data fields ([section 35]{_LINK_35})."
+    f"before any request, and `define_table()` applies the same relation statement, then the data fields ([section 35]{_LINK_35_ELSEWHERE})."
 )
 _SECTION_34_DEFINE_TABLE = (
     "`define_table()` (since v0.34.0) applies an edge model through the statement `define_relation()` carries, then its "
     "data fields; migrations (`CreateTable`/`AlterTable` with the relation keys) are in "
-    "[section 39](#39-migrations-makemigrations-migrationexecutor-operations)."
+    "[section 39](migrations.md#39-migrations-makemigrations-migrationexecutor-operations)."
 )
 #: Exactly the four rows v0.34.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
 _TABLE_DDL_ROWS = [
@@ -7813,14 +7819,14 @@ _COMPARISON_ROW_35 = ["Model table DDL", "✅ v0.34.0 (`define_table()`)", "✅"
 
 
 def _section_35() -> str:
-    return _readme_part(_SECTION_35)
+    return _doc_part(_SECTION_35)
 
 
 def _part_35(heading: str) -> str:
-    """One ``####`` subsection of section 35, as written (the intro for ``""``)."""
+    """One ``###`` subsection of section 35, as written (the intro for ``""``)."""
     if not heading:
-        return _section_35().split("\n#### ", 1)[0]
-    return _subsection(f"#### {heading}", _section_35())
+        return _section_35().split("\n### ", 1)[0]
+    return _subsection(f"### {heading}", _section_35())
 
 
 def _readme_blocks(text: str) -> list[str]:
@@ -7850,28 +7856,23 @@ class TestReadmeSection35:
     sections 16, 19, 31, 33 and 34; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_35_follows_section_34(self) -> None:
-        """Right after section 34 (after its "Coming from" bullets), then section 36 (v0.35.0), section 37 (v0.36.0),
-        section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the ``---``
-        of "Configuration Options"."""
-        text = _readme()
-        start_34 = text.index(f"\n{_SECTION_34}\n")
-        start_35 = text.index(f"\n{_SECTION_35}\n")
-        configuration = text.index("\n## Configuration Options\n")
-        assert start_34 < start_35 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_34 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_34,
-            _SECTION_35,
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 35 is in the Schema and DDL guide, ``docs/schema.md``, with its other sections in this order; section
+        34 comes before it in the manual."""
+        assert_guide_sections(
+            "schema.md",
+            [
+                "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+                "## 33. Materialized views (`view_query`, `define_view()`)",
+                "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+            ],
+        )
+        assert_manual_order(
+            "## 34. Relation constraints (`relation_in`, `define_relation()`)",
+            "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+        )
 
     def test_subsections_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_35(), re.MULTILINE) == _SUBSECTIONS_35
+        assert re.findall(r"^### (.*)$", _section_35(), re.MULTILINE) == _SUBSECTIONS_35
 
     def test_the_examples_and_where_they_stand(self) -> None:
         """Example A exactly, the block of the untitled intro; example B exactly, the first thing of "Applying it";
@@ -7909,7 +7910,7 @@ class TestReadmeSection35:
     def test_no_prescribed_order_and_no_list_return(self) -> None:
         """``define_table()`` returns a ``str`` and needs no call order with ``define_access()``: neither section 35
         nor section 19 says otherwise."""
-        for text in (_normalised(_section_35()), _normalised(_readme_part(_SECTION_19))):
+        for text in (_normalised(_section_35()), _normalised(_doc_part(_SECTION_19))):
             for claim in ("before `define_table()`", "returns a list", "after `define_access()`"):
                 assert claim not in text, claim
 
@@ -7996,59 +7997,60 @@ class TestReadmeSection35:
 
     def test_links_resolve(self) -> None:
         """Every in-page link of section 35, and of the sentences that point to it, names a heading of the README."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
         pointers = _SECTION_16_SENTENCE + _ONE_CLASS_PER_TABLE_35 + _SECTION_33_DEFINE_TABLE + _SECTION_34_TABLE_TYPE
-        links = re.findall(r"\]\(#([^)]+)\)", _section_35() + pointers)
+        links = re.findall(r"\]\(([\w-]*\.md)?#([^)]+)\)", _section_35() + pointers)
         assert len(links) >= 12, links
-        assert [link for link in links if link not in anchors] == []
+        assert _unresolved_links(_section_35() + _ONE_CLASS_PER_TABLE_35 + _SECTION_33_DEFINE_TABLE, _DOCS / "schema.md") == []
+        assert _unresolved_links(_SECTION_16_SENTENCE, _DOCS / "models.md") == []
+        assert _unresolved_links(_SECTION_34_TABLE_TYPE, _DOCS / "relations.md") == []
 
     def test_section_16_sentence(self) -> None:
-        assert _normalised(_readme_part(_SECTION_16)).count(_SECTION_16_SENTENCE) == 1
+        assert _normalised(_doc_part(_SECTION_16)).count(_SECTION_16_SENTENCE) == 1
 
     def test_section_19_sentences(self) -> None:
         """Right after the ``with_table=False`` sentence."""
-        section_19 = _normalised(_readme_part(_SECTION_19))
+        section_19 = _normalised(_doc_part(_SECTION_19))
         opt_out = "`define_access(with_table=False)` opts out when you manage the table yourself."
         assert section_19.count(f"{opt_out} {_SECTION_19_SENTENCES}") == 1, section_19
 
     def test_section_31_generated_models(self) -> None:
         """The generated-models bullet exactly; the class prose lists the table keys and keeps the comments only where
         the class statement would refuse a key."""
-        section_31 = _readme_part(_SECTION_31)
-        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_31))
+        section_31 = _doc_part(_SECTION_31)
+        bullets = _readme_bullets(_subsection("### Coming from the full SurrealDB-ORM", section_31))
         assert _GENERATED_MODELS_BULLET_35 in bullets, [bullet for bullet in bullets if "Generated models" in bullet]
         assert not any("Generated models use comments" in bullet for bullet in bullets)
-        generating = _normalised(_subsection("#### Generating models", section_31))
+        generating = _normalised(_subsection("### Generating models", section_31))
         assert _ONE_CLASS_PER_TABLE_35 in generating, generating
         assert generating.count(_SECTION_31_EDGE_SCHEMAFULL) == 1, generating
         assert "where the class statement would refuse the key" in generating, generating
         for stale in ("`# Changefeed: 1d`", "are comments of its class, and the module's header"):
             assert stale not in generating, stale
-        limits = _normalised(_subsection("#### What the generator does not do", section_31))
+        limits = _normalised(_subsection("### What the generator does not do", section_31))
         assert "only comments of its class" not in limits, limits
         assert "`define_table()` keeps them" in limits, limits
 
     def test_section_33_sentences(self) -> None:
         """Its Security paragraph says what a view's permissions are now, and ``define_table()`` is in the present."""
-        section_33 = _readme_part(_SECTION_33)
-        security = _normalised(_subsection("#### Security", section_33))
+        section_33 = _doc_part(_SECTION_33)
+        security = _normalised(_subsection("### Security", section_33))
         assert security.count(_SECTION_33_PERMISSIONS) == 1, security
         assert "resets permissions set by hand" not in security, security
-        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_33))
+        bullets = _readme_bullets(_subsection("### Coming from the full SurrealDB-ORM", section_33))
         assert _SECTION_33_DEFINE_TABLE in bullets[2], bullets[2]
         assert "comes with v0.34.0" not in _normalised(section_33)
 
     def test_section_34_sentences(self) -> None:
         """The declared clauses are written, ``TableType``'s other members take effect, ``define_table()`` is in the
         present."""
-        section_34 = _readme_part(_SECTION_34)
-        declaring = _normalised(_subsection("#### Declaring the constraint", section_34))
+        section_34 = _doc_part(_SECTION_34)
+        declaring = _normalised(_subsection("### Declaring the constraint", section_34))
         assert _SECTION_34_TABLE_TYPE in declaring, declaring
-        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_34))
+        bullets = _readme_bullets(_subsection("### Coming from the full SurrealDB-ORM", section_34))
         assert _SECTION_34_DECLARED in bullets, bullets
         assert _SECTION_34_DEFINE_TABLE in bullets[2], bullets[2]
         assert "**`TableType`'s other members take effect in `define_table()`**" in bullets[9], bullets[9]
-        applying = _readme_bullets(_subsection("#### Applying it", section_34))
+        applying = _readme_bullets(_subsection("### Applying it", section_34))
         assert _SECTION_34_EDGE_SCHEMAFULL in applying, applying
         text = _normalised(section_34)
         for stale in ("no effect until v0.34.0", "comes with v0.34.0", "keys yet", "recorded for the table DDL"):
@@ -8104,20 +8106,20 @@ class TestReadmeSection35:
         assert "when the 3.x pin moves to 3.4, rewrite that note in all four" in _UNDECLARED_CHANGED, _UNDECLARED_CHANGED
 
     def test_features_row(self) -> None:
-        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        features = [row for _, row in _table_rows(_doc_part("## Features"))]
         firsts = [row[0] for row in features]
         assert _FEATURES_ROW_35 in features, features
         relations = "Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)"
         assert firsts.index(_FEATURES_ROW_35[0]) == firsts.index(relations) + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [row for _, row in _table_rows(_doc_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.33.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_35, roadmap
 
     def test_comparison_row(self) -> None:
         """Released, right after ``TYPE RELATION`` enforcement and before full-text search."""
-        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [row for _, row in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [row[0] for row in comparison]
         start = firsts.index("TYPE RELATION enforcement")
         assert comparison[start + 1] == _COMPARISON_ROW_35, comparison
@@ -8126,11 +8128,11 @@ class TestReadmeSection35:
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.34.0 touches, section 35's included, keeps one cell count per line and no escaped pipe."""
         parts = [
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part(_EMBEDDED_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part(_EMBEDDED_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         found = [lines for part in parts for lines in _md_tables(part)]
         assert len(found) == len(parts)
@@ -8191,13 +8193,13 @@ class TestReadmeSg1:
     "User models" bullet (:data:`_SENTENCES_35`); the row and the sentence of the 2.x/3.x table."""
 
     def test_section_19_paragraph(self) -> None:
-        section_19 = _normalised(_readme_part(_SECTION_19))
+        section_19 = _normalised(_doc_part(_SECTION_19))
         assert section_19.count(_SECTION_19_SG1) == 1, section_19
         assert section_19.index("**The password field holds the hash.**") < section_19.index(_SECTION_19_SG1)
 
     def test_no_stale_schemafull_only_wording(self) -> None:
         """Neither section limits SG1 to a ``SCHEMAFULL`` schema mode any more."""
-        for text in (_normalised(_section_35()), _normalised(_readme_part(_SECTION_19))):
+        for text in (_normalised(_section_35()), _normalised(_doc_part(_SECTION_19))):
             assert "(with a `SCHEMAFULL` schema mode)" not in text
             assert "`define_access()` with `with_table=True` and `define_table()` both refuse it" not in text
 

@@ -80,17 +80,19 @@ from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import apply_ddl_statements
 from tests._readme_tables import (
     assert_embedded_rows,
+    assert_guide_sections,
+    assert_links_resolve,
     assert_server_header_sentence,
     assert_server_rows,
     assert_server_table,
 )
+from tests._retry import apply_reset
 from tests.conftest import default_connection_class
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
     _cells,
+    _doc_part,
     _normalised,
-    _readme,
-    _readme_part,
     _subsection,
     _table_rows,
 )
@@ -2110,7 +2112,7 @@ async def _evt(kind: str) -> AsyncIterator[Any]:
     on exit."""
     _register_evt(kind)
     client = await SurrealDBConnectionManager.get_client("evt")
-    await _apply_ddl(client, _EVT_RESET)
+    await apply_reset(client, _EVT_RESET)
     try:
         yield client
     finally:
@@ -3298,9 +3300,9 @@ class TestRoundTripE2E:
 
 # --- README: section 32, section 17 and the tables (spec §11.1; AC-17) ----------------------------------------------
 
-_SECTION_17 = "### 17. Stored functions: `call_function()`"
-_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
-_SECTION_32 = "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)"
+_SECTION_17 = "## 17. Stored functions: `call_function()`"
+_SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_32 = "## 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)"
 #: Spec §11.1 item 1: section 32's subsections, in order, after an untitled intro paragraph.
 _SUBSECTIONS_32 = [
     "Declaring events on a model",
@@ -3647,12 +3649,12 @@ _SIGNATURE_CACHE_32 = (
 
 
 def _section_32() -> str:
-    return _readme_part(_SECTION_32)
+    return _doc_part(_SECTION_32)
 
 
 def _part_32(heading: str) -> str:
-    """One ``####`` subsection of section 32, as written."""
-    return _subsection(f"#### {heading}", _section_32())
+    """One ``###`` subsection of section 32, as written."""
+    return _subsection(f"### {heading}", _section_32())
 
 
 def _python_blocks(text: str) -> list[str]:
@@ -3678,31 +3680,18 @@ class TestReadmeSection32:
     tables (spec §11.1)."""
 
     def test_section_32_follows_section_31(self) -> None:
-        """Right after section 31 (after its "Coming from" bullets), then section 33 (v0.32.0), section 34 (v0.33.0),
-        section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0),
-        section 40 (v0.39.0) and section 41 (v0.40.0), and before the ``---`` of "Configuration Options"."""
-        readme = _readme()
-        start_31 = readme.index(f"\n{_SECTION_31}\n")
-        start_32 = readme.index(f"\n{_SECTION_32}\n")
-        configuration = readme.index("\n## Configuration Options\n")
-        assert start_31 < start_32 < configuration
-        assert re.findall(r"^#{2,3} .*$", readme[start_31 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_31,
-            _SECTION_32,
-            "### 33. Materialized views (`view_query`, `define_view()`)",
-            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 32 is in the stored functions and events guide, ``docs/functions-and-events.md``, after section 17
+        (calling stored functions); section 31 is in the schema guide."""
+        assert_guide_sections(
+            "functions-and-events.md",
+            [
+                "## 17. Stored functions: `call_function()`",
+                "## 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+            ],
+        )
 
     def test_subsections_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_32(), re.MULTILINE) == _SUBSECTIONS_32
+        assert re.findall(r"^### (.*)$", _section_32(), re.MULTILINE) == _SUBSECTIONS_32
 
     def test_the_spec_examples_open_their_subsections(self) -> None:
         """Examples A–D exactly, each the first block of its subsection, and no other block; ``python`` fences only."""
@@ -3715,7 +3704,7 @@ class TestReadmeSection32:
         assert fences == ["python", ""] * len(_EXAMPLES_32), fences
 
     def test_intro_paragraph(self) -> None:
-        intro = _normalised(_section_32().split("\n#### ", 1)[0])
+        intro = _normalised(_section_32().split("\n### ", 1)[0])
         missing = [needle for needle in _INTRO_NEEDLES_32 if needle not in intro]
         assert not missing, missing
 
@@ -3747,28 +3736,27 @@ class TestReadmeSection32:
         assert "`RemoveEvent(name, table)`" in bullets[0] and ".remove_event(event, table)`" in bullets[0]
 
     def test_links_resolve(self) -> None:
-        """Every in-page link of section 32 and of section 17's new paragraph names a heading of the README."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
-        links = re.findall(r"\]\(#([^)]+)\)", _section_32() + _readme_part(_SECTION_17))
-        assert links, "section 32 links to sections 17 and 31"
-        assert [link for link in links if link not in anchors] == []
+        """Every link of section 32 and of section 17's new paragraph names a heading: both sections are in the stored
+        functions and events guide."""
+        assert_links_resolve(_section_32(), "functions-and-events.md")
+        assert_links_resolve(_doc_part(_SECTION_17), "functions-and-events.md")
 
     def test_features_row(self) -> None:
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         firsts = [cells[0] for cells in features]
         assert _FEATURES_ROW_32 in features, features
         introspection = "Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
         assert firsts.index(_FEATURES_ROW_32[0]) == firsts.index(introspection) + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
         start = [cells[0] for cells in roadmap].index("v0.30.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_32, roadmap
 
     def test_comparison_rows(self) -> None:
         """The DEFINE EVENT row filled in and a ``define_function()`` row after it, between the introspection row and
         the materialized views."""
-        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [cells for _, cells in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         start = [cells[0] for cells in comparison].index("Schema Introspection")
         assert comparison[start : start + 4] == _COMPARISON_ROWS_32, comparison
 
@@ -3794,11 +3782,11 @@ class TestReadmeSection32:
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.31.0 touches keeps one cell count per line and no escaped pipe."""
         parts = [
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part(_EMBEDDED_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part(_EMBEDDED_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         tables = [lines for part in parts for lines in _md_tables(part)]
         assert len(tables) == len(parts)
@@ -3810,13 +3798,13 @@ class TestReadmeSection32:
         """Spec §11.1 item 8: a redefinition through ``define_function()``/``remove_function()`` is followed at once,
         on every connection to the same database, whatever its URL; only an out-of-band one still needs
         ``clear_function_signature_cache()``."""
-        paragraphs = [_normalised(paragraph) for paragraph in _readme_part(_SECTION_17).split("\n\n")]
+        paragraphs = [_normalised(paragraph) for paragraph in _doc_part(_SECTION_17).split("\n\n")]
         assert _SIGNATURE_CACHE_32 in paragraphs, [p for p in paragraphs if p.startswith("Signature caching")]
 
     async def test_section_17_declares_its_function_with_define_function(self) -> None:
         """Spec §11.1 item 2: the first example declares ``fn::acquire_lock`` with ``define_function()``; run on
         ``mem://`` up to its positional call, which returns the function's object."""
-        section = _readme_part(_SECTION_17)
+        section = _doc_part(_SECTION_17)
         block = _python_blocks(section)[0]
         assert 'await SurrealDBConnectionManager.define_function(\n    "fn::acquire_lock",' in block, block
         assert "client.query(" not in block and "lands in v0.31.0" not in section

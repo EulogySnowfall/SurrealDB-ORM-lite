@@ -61,6 +61,7 @@ import pytest_asyncio
 
 from surreal_orm_lite import SurrealDBConnectionManager, connection_manager, encoding
 from surreal_orm_lite.testing import embedded_database
+from tests._retry import apply_reset
 
 #: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
 #: hook, v0.25.0's embedded engine, v0.26.0's time travel, v0.27.0's subqueries, v0.28.0's query cache,
@@ -181,7 +182,7 @@ async def change_feed_database(database: str) -> AsyncIterator[Any]:
     """
     SurrealDBConnectionManager.set_connection(url=_ws_url(), user="root", password="root", namespace="ns", database=database)
     client = await SurrealDBConnectionManager.get_client()
-    await client.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
+    await apply_reset(client, f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};")
     try:
         yield client
     finally:
@@ -217,7 +218,7 @@ async def migration_database(kind: str, database: str | None = None) -> AsyncIte
         url=_migration_url(kind), user="root", password="root", namespace="ns", database=database
     )
     client = await SurrealDBConnectionManager.get_client()
-    await client.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
+    await apply_reset(client, f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};")
     try:
         yield client
     finally:

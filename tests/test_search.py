@@ -208,14 +208,23 @@ from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyz
 from surreal_orm_lite.functions import normalize_function_name
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import validate_field_name
-from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
+from tests import _retry
+from tests._readme_tables import DOCS as _DOCS
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_guide_sections,
+    assert_manual_order,
+    assert_server_header_sentence,
+    assert_server_rows,
+)
 from tests._readme_tables import cells as _cells
+from tests._readme_tables import doc_part as _doc_part
 from tests._readme_tables import normalised as _normalised
-from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._readme_tables import unresolved_links as _unresolved_links
+from tests._retry import apply_reset
 
 FTS_ENGLISH = Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"], comment="English text")
 
@@ -3101,6 +3110,95 @@ class TestAnnotateCompile:
         )
 
 
+#: SurrealDB 2.7.0's refusal of the ``DEFINE DATABASE`` of a reset that raced a server transaction (issue #396).
+_RESET_CONFLICT = "Failed to commit transaction due to a read or write conflict. This transaction can be retried"
+
+
+def _reset_answer(*refusals: str) -> dict[str, Any]:
+    """``query_raw()``'s answer to ``REMOVE DATABASE …; DEFINE DATABASE …;``: the removal accepted, then the definition
+    accepted (no *refusals*) or refused with each of *refusals*."""
+    results: list[dict[str, Any]] = [{"status": "OK", "result": None}]
+    results += [{"status": "ERR", "result": refusal} for refusal in refusals] or [{"status": "OK", "result": None}]
+    return {"result": results}
+
+
+class _ResetClient:
+    """A client whose ``query_raw()`` returns *answers* in turn (the last one repeated) and records what it sent."""
+
+    def __init__(self, *answers: dict[str, Any]) -> None:
+        self.answers = answers
+        self.sent: list[str] = []
+
+    async def query_raw(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        assert variables == {}
+        self.sent.append(query)
+        return self.answers[min(len(self.sent), len(self.answers)) - 1]
+
+
+@pytest.fixture
+def reset_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Every pause the reset's replay takes, recorded instead of slept."""
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(_retry.asyncio, "sleep", sleep)
+    return sleeps
+
+
+class TestResetReplay:
+    """``tests._retry.apply_reset()``, the database reset of every E2E helper that removes and redefines a database of
+    its own (issue #396): every statement is checked, the whole reset is replayed — at most five times, with a short
+    growing pause — only while every refusal is SurrealDB's retryable conflict ("can be retried"), and any other
+    refusal fails the test at once with the server's text."""
+
+    async def test_an_accepted_reset_is_sent_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer())
+        await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+        assert reset_sleeps == []
+
+    async def test_a_retryable_conflict_replays_the_reset(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer(_RESET_CONFLICT), _reset_answer(_RESET_CONFLICT), _reset_answer())
+        await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET] * 3
+        assert reset_sleeps == pytest.approx([0.05, 0.1])
+
+    async def test_another_refusal_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer("The database 'fts_db' already exists"), _reset_answer())
+        with pytest.raises(AssertionError, match="already exists"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+        assert reset_sleeps == []
+
+    async def test_a_conflict_next_to_another_refusal_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer(_RESET_CONFLICT, "Parse error"), _reset_answer())
+        with pytest.raises(AssertionError, match="Parse error"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+        assert reset_sleeps == []
+
+    async def test_a_query_level_error_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient({"error": {"code": -32000, "message": _RESET_CONFLICT}}, _reset_answer())
+        with pytest.raises(AssertionError, match="can be retried"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+
+    async def test_an_empty_answer_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient({"result": []}, _reset_answer())
+        with pytest.raises(AssertionError, match="no statement"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+
+    async def test_a_conflict_on_every_attempt_fails_after_five(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer(_RESET_CONFLICT))
+        with pytest.raises(AssertionError, match="refused 5 times"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET] * 5
+        assert reset_sleeps == pytest.approx([0.05, 0.1, 0.15, 0.2])
+
+
 # === E2E: the connection "fts" on the database fts_db, over WebSocket and HTTP, and mem:// =========================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -3158,7 +3256,7 @@ async def _fts(kind: str) -> AsyncIterator[Any]:
     exit."""
     _register_fts(kind)
     client = await SurrealDBConnectionManager.get_client("fts")
-    await _apply_ddl(client, _FTS_RESET)
+    await apply_reset(client, _FTS_RESET)
     try:
         yield client
     finally:
@@ -6304,10 +6402,10 @@ class TestSearchMultiDbE2E:
 
 # === README: section 36, the tables, the lookup sentence; docs/ROADMAP.md ===========================================
 
-_SECTION_35 = "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
-_SECTION_36 = "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
+_SECTION_35 = "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
+_SECTION_36 = "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
 #: Section 36's anchor, as the "Supported Filter Lookups" sentence writes it.
-_LINK_36 = "(#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)"
+_LINK_36 = "(search.md#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)"
 #: Section 36's subsections, in order, after an untitled intro.
 _SUBSECTIONS_36 = [
     "Declare and apply",
@@ -6360,7 +6458,7 @@ _PART_NEEDLES_36 = {
         "the full SurrealDB-ORM's",
         "`SearchOffsets`",
         "SurrealDB 2.x, 3.x and the embedded engine",
-        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
         "`mem://`",
     ),
     "Declare and apply": (
@@ -6617,14 +6715,14 @@ _LOOKUP_CLAUSE_36 = f"full-text search is the separate `search()` API ([section 
 
 
 def _section_36() -> str:
-    return _readme_part(_SECTION_36)
+    return _doc_part(_SECTION_36)
 
 
 def _part_36(heading: str) -> str:
-    """One ``####`` subsection of section 36, as written (the intro for ``""``)."""
+    """One ``###`` subsection of section 36, as written (the intro for ``""``)."""
     if not heading:
-        return _section_36().split("\n#### ", 1)[0]
-    return _subsection(f"#### {heading}", _section_36())
+        return _section_36().split("\n### ", 1)[0]
+    return _subsection(f"### {heading}", _section_36())
 
 
 def _readme_blocks(text: str) -> list[str]:
@@ -6654,26 +6752,23 @@ class TestReadmeSection36:
     "Supported Filter Lookups" sentence; the features, roadmap, comparison and both behaviour tables."""
 
     def test_section_36_follows_section_35(self) -> None:
-        """Right after section 35 (after its "Coming from" bullets), then section 37 (v0.36.0), section 38 (v0.37.0),
-        section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the ``---`` of "Configuration Options"."""
-        text = _readme()
-        start_35 = text.index(f"\n{_SECTION_35}\n")
-        start_36 = text.index(f"\n{_SECTION_36}\n")
-        configuration = text.index("\n## Configuration Options\n")
-        assert start_35 < start_36 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_35 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_35,
-            _SECTION_36,
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 36 is in the search guide, ``docs/search.md``, with its other sections in this order; section
+        35 comes before it in the manual."""
+        assert_guide_sections(
+            "search.md",
+            [
+                "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
+                "## 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
+                "## 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
+            ],
+        )
+        assert_manual_order(
+            "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+            "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
+        )
 
     def test_subsections_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_36(), re.MULTILINE) == _SUBSECTIONS_36
+        assert re.findall(r"^### (.*)$", _section_36(), re.MULTILINE) == _SUBSECTIONS_36
 
     def test_where_the_examples_stand(self) -> None:
         """Each part that shows code opens with prose and holds ``python`` blocks; the intro and the other parts hold
@@ -6719,15 +6814,15 @@ class TestReadmeSection36:
 
     def test_links_resolve(self) -> None:
         """Every in-page link of section 36, and of the lookup sentence that points to it, names a heading."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
-        links = re.findall(r"\]\(#([^)]+)\)", _section_36() + _LOOKUP_CLAUSE_36)
+        links = re.findall(r"\]\(([\w-]*\.md)?#([^)]+)\)", _section_36() + _LOOKUP_CLAUSE_36)
         assert len(links) >= 3, links
-        assert [link for link in links if link not in anchors] == []
-        assert _anchor(_SECTION_36.removeprefix("### ")) == _LINK_36.strip("(#)")
+        assert _unresolved_links(_section_36(), _DOCS / "search.md") == []
+        assert _unresolved_links(_LOOKUP_CLAUSE_36, _DOCS / "querying.md") == []
+        assert _anchor(_SECTION_36.removeprefix("## ")) == _LINK_36.partition("#")[2].rstrip(")")
 
     def test_the_lookup_sentence_points_to_search(self) -> None:
         """The ``match``/``regex`` item of "Supported Filter Lookups" ends on the ``search()`` API, no longer planned."""
-        lookups = _normalised(_readme_part("### Supported Filter Lookups"))
+        lookups = _normalised(_doc_part("## Supported Filter Lookups"))
         assert lookups.count(_LOOKUP_CLAUSE_36) == 1, lookups
         assert "planned for v0.35.0" not in lookups, lookups
 
@@ -6764,21 +6859,21 @@ class TestReadmeSection36:
         assert_server_header_sentence(_HEADER_SENTENCE_373)
 
     def test_features_row(self) -> None:
-        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        features = [row for _, row in _table_rows(_doc_part("## Features"))]
         firsts = [row[0] for row in features]
         assert _FEATURES_ROW_36 in features, features
         table_ddl = "Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
         assert firsts.index(_FEATURES_ROW_36[0]) == firsts.index(table_ddl) + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [row for _, row in _table_rows(_doc_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.34.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_36, roadmap
         assert "v0.35.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
 
     def test_comparison_row(self) -> None:
         """Released, right after the model table DDL and before vector search."""
-        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [row for _, row in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [row[0] for row in comparison]
         start = firsts.index("Model table DDL")
         assert comparison[start + 1] == _COMPARISON_ROW_36, comparison
@@ -6787,11 +6882,11 @@ class TestReadmeSection36:
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.35.0 touches keeps one cell count per line and no escaped pipe; section 36 has no table."""
         parts = [
-            _readme_part("## Features"),
-            _readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x"),
-            _readme_part("### ORM behaviour: the embedded engine"),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _doc_part("## ORM behaviour: the embedded engine"),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         found = [lines for part in parts for lines in _md_tables(part)]
         assert len(found) == len(parts)

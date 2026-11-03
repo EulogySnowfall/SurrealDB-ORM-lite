@@ -63,17 +63,20 @@ from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from tests._proxy import CuttableProxy
 from tests._readme_tables import (
     assert_embedded_rows,
+    assert_guide_sections,
+    assert_manual_order,
     assert_server_header_sentence,
     assert_server_rows,
     assert_server_table,
 )
+from tests._retry import apply_reset
 from tests.conftest import default_connection_class
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
     _cells,
+    _doc_part,
     _normalised,
     _readme,
-    _readme_part,
     _subsection,
     _table_rows,
     _tables,
@@ -713,9 +716,8 @@ async def _reset_databases(*, define: bool) -> None:
     """Remove the databases ``md_a`` and ``md_b`` of the line under test, and define them again when asked."""
     async with _root("db") as client:
         for database in ("md_a", "md_b"):
-            await client.query(f"REMOVE DATABASE IF EXISTS {database};", {})
-            if define:
-                await client.query(f"DEFINE DATABASE {database};", {})
+            define_it = f" DEFINE DATABASE {database};" if define else ""
+            await apply_reset(client, f"REMOVE DATABASE IF EXISTS {database};{define_it}")
 
 
 @contextlib.asynccontextmanager
@@ -4510,7 +4512,7 @@ async def _server_side(name: str, url: str, database: str) -> _Side:
     """Register *name* as root on *database* of namespace ``ns`` at the WebSocket *url*, the database removed and
     defined again with :data:`_DECISION_TABLES` first."""
     async with _root("db", url) as root:
-        await root.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
+        await apply_reset(root, f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};")
     async with _root(database, url) as root:
         await root.query(_DECISION_TABLES, {})
     SurrealDBConnectionManager.add_connection(name, url=url, user="root", password="root", namespace="ns", database=database)
@@ -4947,8 +4949,8 @@ class TestThreadsE2E:
 
 # --- AC-24: README section 30, the tables and sentences it touches, and its examples (spec §11; C4, C7, P5, P8, P9) --
 
-_SECTION_29 = "### 29. Query cache (`cache()`, `QueryCache`)"
-_SECTION_30 = "### 30. Multiple databases (`add_connection()`, `using()`)"
+_SECTION_29 = "## 29. Query cache (`cache()`, `QueryCache`)"
+_SECTION_30 = "## 30. Multiple databases (`add_connection()`, `using()`)"
 #: Spec §11 item 1: section 30's subsections, in order, after an untitled intro holding the first example.
 _SUBSECTIONS_30 = [
     "Routing a model",
@@ -5163,7 +5165,7 @@ _HOLDERS = {
 
 
 def _section_30() -> str:
-    return _readme_part(_SECTION_30)
+    return _doc_part(_SECTION_30)
 
 
 def _python_blocks(text: str) -> list[str]:
@@ -5172,8 +5174,8 @@ def _python_blocks(text: str) -> list[str]:
 
 
 def _part_30(heading: str) -> str:
-    """One ``####`` subsection of section 30, as written."""
-    return _subsection(f"#### {heading}", _section_30())
+    """One ``###`` subsection of section 30, as written."""
+    return _subsection(f"### {heading}", _section_30())
 
 
 class TestMultiDatabaseDocs:
@@ -5182,36 +5184,24 @@ class TestMultiDatabaseDocs:
     C4, C7, P5, P8, P9)."""
 
     def test_section_30_follows_section_29(self) -> None:
-        """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), section 32 (v0.31.0),
-        section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0), section 37 (v0.36.0),
-        section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the ``---`` of "Configuration
-        Options"."""
-        readme = _readme()
-        start_29 = readme.index(f"\n{_SECTION_29}\n")
-        start_30 = readme.index(f"\n{_SECTION_30}\n")
-        configuration = readme.index("\n## Configuration Options\n")
-        assert start_29 < start_30 < configuration
-        assert re.findall(r"^#{2,3} .*$", readme[start_29 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_29,
-            _SECTION_30,
-            "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
-            "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
-            "### 33. Materialized views (`view_query`, `define_view()`)",
-            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
+        """Section 30 is in the connections guide, ``docs/connections.md``, with its other sections in this order; section
+        29 comes before it in the manual."""
+        assert_guide_sections(
+            "connections.md",
+            [
+                "## Context Manager",
+                "## Connections and event loops",
+                "## 30. Multiple databases (`add_connection()`, `using()`)",
+            ],
+        )
+        assert_manual_order(
+            "## 29. Query cache (`cache()`, `QueryCache`)", "## 30. Multiple databases (`add_connection()`, `using()`)"
+        )
 
     def test_subsections_in_order(self) -> None:
         section = _section_30()
-        assert re.findall(r"^#### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_30
-        intro = section.split("\n#### ", 1)[0]
+        assert re.findall(r"^### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_30
+        intro = section.split("\n### ", 1)[0]
         assert _python_blocks(intro)[:1] == [_INTRO_EXAMPLE]
 
     def test_examples_as_the_spec_writes_them(self) -> None:
@@ -5226,7 +5216,7 @@ class TestMultiDatabaseDocs:
         assert "mem://" in blocks[0].splitlines()[2], "the first example says it runs on mem://"
 
     def test_registry_names(self) -> None:
-        intro = _normalised(_section_30().split("\n#### ", 1)[0])
+        intro = _normalised(_section_30().split("\n### ", 1)[0])
         for name in (
             "`add_connection(",
             "`get_config(",
@@ -5318,14 +5308,14 @@ class TestMultiDatabaseDocs:
         assert _bullets(_part_30("Coming from the full SurrealDB-ORM")) == _COMING_FROM_30
 
     def test_features_row(self) -> None:
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         firsts = [cells[0] for cells in features]
         row = ["Multiple databases (named connections, `using()`)", "✅"]
         assert row in features, features
         assert firsts.index(row[0]) == firsts.index("Query cache (`cache()`, TTL, invalidated by ORM writes)") + 1
 
     def test_roadmap_row(self) -> None:
-        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
         firsts = [cells[0] for cells in roadmap]
         start = firsts.index("v0.28.0")
         assert roadmap[start : start + 5] == [
@@ -5337,7 +5327,7 @@ class TestMultiDatabaseDocs:
         ], roadmap
 
     def test_comparison_row(self) -> None:
-        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [cells for _, cells in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [cells[0] for cells in comparison]
         start = firsts.index("Query Cache") + 1
         assert comparison[start] == ["Multi-database", "✅ v0.29.0 (`add_connection()`, `using()`)", "✅"], comparison
@@ -5364,7 +5354,7 @@ class TestMultiDatabaseDocs:
 
     def test_connections_and_event_loops(self) -> None:
         """Spec §11 item 7: the two bullets rewritten exactly, the third kept, a paragraph pointing to section 30."""
-        part = _readme_part("### Connections and event loops")
+        part = _doc_part("## Connections and event loops")
         bullets = _bullets(part)
         assert bullets[:2] == _EVENT_LOOP_BULLETS, bullets
         assert bullets[2].startswith("- `is_connected()` answers for the loop asking"), bullets
@@ -5376,18 +5366,18 @@ class TestMultiDatabaseDocs:
         assert _SECTION_30_LINK in after and "per-loop clients" in after, after
 
     def test_context_manager_sentence(self) -> None:
-        part = _readme_part("### Context Manager")
+        part = _doc_part("## Context Manager")
         assert _normalised(part.split("```", 2)[2]) == _CONTEXT_MANAGER_SENTENCE, part
 
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.29.0 touches keeps one cell count per line and no escaped pipe."""
         parts = [
             _section_30(),
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part(_EMBEDDED_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part(_EMBEDDED_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         tables = [lines for part in parts for lines in _tables(part)]
         assert len(tables) == len(parts), "section 30 has its table"

@@ -22,7 +22,7 @@ from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import line_major
 from tests._readme_tables import assert_server_rows
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part, _subsection
+from tests.test_embedded import _doc_part, _normalised, _subsection
 
 
 class PgItem(BaseSurrealModel):
@@ -290,7 +290,7 @@ class TestPagingDocs:
     """Unit: what the README says ``limit()`` and ``offset()`` take."""
 
     def test_section_4(self) -> None:
-        text = _normalised(_subsection("#### `limit()` and `offset()`", _readme_part("### 4. QuerySet Methods")))
+        text = _normalised(_subsection("### `limit()` and `offset()`", _doc_part("## 4. QuerySet Methods")))
         for needle in (
             "a non-negative integer",
             "`TypeError`",

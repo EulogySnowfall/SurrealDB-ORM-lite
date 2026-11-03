@@ -62,9 +62,15 @@ from surreal_orm_lite._sdk import AsyncSurreal, cbor_encode
 from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
-from tests._readme_tables import assert_server_header_sentence, assert_server_rows, assert_server_table
+from tests._readme_tables import (
+    assert_guide_sections,
+    assert_manual_order,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
 from tests.conftest import _ws_url, default_connection_class
-from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
+from tests.test_embedded import _cells, _doc_part, _normalised, _subsection, _table_rows, _tables
 from tests.test_time_travel import (
     _SERVER_BEHAVIOUR,
     M2021,
@@ -4436,9 +4442,9 @@ class TestRaceE2E:
 
 # --- AC-14: README section 29, the tables it touches and its examples (spec §11; D13, D16, P1, P2, P3, P5) -----
 
-_SECTION_28 = "### 28. Subqueries (`Subquery`)"
-_SECTION_29 = "### 29. Query cache (`cache()`, `QueryCache`)"
-_COMING_FROM_29 = "#### Coming from the full SurrealDB-ORM"
+_SECTION_28 = "## 28. Subqueries (`Subquery`)"
+_SECTION_29 = "## 29. Query cache (`cache()`, `QueryCache`)"
+_COMING_FROM_29 = "### Coming from the full SurrealDB-ORM"
 #: Spec §11: section 29's subsections, in order, after an untitled intro.
 _SUBSECTIONS_29 = [
     "What is cached",
@@ -4471,7 +4477,7 @@ _CANNOT_SEE = {
 
 
 def _section_29() -> str:
-    return _readme_part(_SECTION_29)
+    return _doc_part(_SECTION_29)
 
 
 def _section_29_blocks(language: str) -> list[str]:
@@ -4480,8 +4486,8 @@ def _section_29_blocks(language: str) -> list[str]:
 
 
 def _part_29(heading: str) -> str:
-    """One ``####`` subsection of section 29, whitespace normalised."""
-    return _normalised(_subsection(f"#### {heading}", _section_29()))
+    """One ``###`` subsection of section 29, whitespace normalised."""
+    return _normalised(_subsection(f"### {heading}", _section_29()))
 
 
 def _bullets(text: str) -> list[str]:
@@ -4494,43 +4500,33 @@ class TestQueryCacheDocs:
     roadmap say about the query cache (spec §11, AC-14; P1, P2, P3, P5)."""
 
     def test_section_29_follows_section_28(self) -> None:
-        """Right after section 28 (after its "Coming from" bullets), then section 30 (v0.29.0), section 31 (v0.30.0),
-        section 32 (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0), section 35 (v0.34.0), section 36 (v0.35.0),
-        section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the
-        ``---`` of "Configuration Options"."""
-        readme = _readme()
-        start_28 = readme.index(f"\n{_SECTION_28}\n")
-        start_29 = readme.index(f"\n{_SECTION_29}\n")
-        configuration = readme.index("\n## Configuration Options\n")
-        assert start_28 < start_29 < configuration
-        assert re.findall(r"^#{2,3} .*$", readme[start_28 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_28,
-            _SECTION_29,
-            "### 30. Multiple databases (`add_connection()`, `using()`)",
-            "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
-            "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
-            "### 33. Materialized views (`view_query`, `define_view()`)",
-            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "section 29 ends before the --- of the next part"
+        """Section 29 is in the querying guide, ``docs/querying.md``, with its other sections in this order; section
+        28 comes before it in the manual."""
+        assert_guide_sections(
+            "querying.md",
+            [
+                "## 4. QuerySet Methods",
+                "## Supported Filter Lookups",
+                "## 5. Q Objects (Complex Queries)",
+                "## 8. FETCH Clause",
+                "## 9. Aggregations",
+                "## 27. Time travel (`as_of()`)",
+                "## 28. Subqueries (`Subquery`)",
+                "## 29. Query cache (`cache()`, `QueryCache`)",
+            ],
+        )
+        assert_manual_order("## 28. Subqueries (`Subquery`)", "## 29. Query cache (`cache()`, `QueryCache`)")
 
     def test_subsections_in_order(self) -> None:
         section = _section_29()
-        assert re.findall(r"^#### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_29
-        intro = section.split("\n#### ", 1)[0]
+        assert re.findall(r"^### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_29
+        intro = section.split("\n### ", 1)[0]
         assert "```python\n" in intro, "the untitled intro holds the first example"
 
     def test_coming_from_the_full_orm(self) -> None:
         """What differs from the full ORM; no bullet about ``configure()``'s semantics, which are the same (P1)."""
         section = _section_29()
-        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "heading missing"
+        assert re.search(r"^### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "heading missing"
         text = _normalised(_subsection(_COMING_FROM_29, section))
         for name in (
             "`cache(",
@@ -4606,7 +4602,7 @@ class TestQueryCacheDocs:
 
     @pytest.mark.parametrize("needles", list(_CANNOT_SEE.values()), ids=list(_CANNOT_SEE))
     def test_what_the_cache_cannot_see_is_a_bullet_list(self, needles: tuple[str, ...]) -> None:
-        bullets = _bullets(_subsection("#### Invalidation", _section_29()))
+        bullets = _bullets(_subsection("### Invalidation", _section_29()))
         assert [bullet for bullet in bullets if all(needle in bullet for needle in needles)], bullets
 
     def test_one_cache_per_connection_and_identity(self) -> None:
@@ -4640,7 +4636,7 @@ class TestQueryCacheDocs:
             assert f"`{key}`" in text, key
 
     def test_features_row(self) -> None:
-        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         firsts = [cells[0] for cells in features]
         row = ["Query cache (`cache()`, TTL, invalidated by ORM writes)", "✅"]
         assert row in features, features
@@ -4661,14 +4657,14 @@ class TestQueryCacheDocs:
         assert_server_header_sentence(_HEADER_CLAUSE_28)
 
     def test_comparison_row(self) -> None:
-        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [cells for _, cells in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [cells[0] for cells in comparison]
         start = firsts.index("Subqueries") + 1
         assert comparison[start] == ["Query Cache", "✅ v0.28.0 (`cache()`, `QueryCache`)", "✅"], comparison
         assert comparison[start + 1][0] == "Multi-database", comparison
 
     def test_roadmap_split(self) -> None:
-        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
         firsts = [cells[0] for cells in roadmap]
         start = firsts.index("v0.27.0") + 1
         assert roadmap[start : start + 2] == [
@@ -4681,10 +4677,10 @@ class TestQueryCacheDocs:
         """Every table v0.28.0 touches keeps one cell count per line and no escaped pipe."""
         parts = [
             _section_29(),
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         tables = [lines for part in parts for lines in _tables(part)]
         assert len(tables) >= 4, "the four tables v0.28.0 touches"

@@ -122,19 +122,22 @@ from surreal_orm_lite.define_parser import parse_define_field, parse_define_tabl
 from surreal_orm_lite.edge import insert_edges
 from surreal_orm_lite.schema_state import TableState
 from surreal_orm_lite.testing import embedded_database
+from tests._readme_tables import DOCS as _DOCS
 from tests._readme_tables import (
     assert_embedded_rows,
+    assert_guide_sections,
     assert_server_header_sentence,
     assert_server_rows,
     assert_server_table,
 )
 from tests._readme_tables import cells as _cells
+from tests._readme_tables import doc_part as _doc_part
 from tests._readme_tables import normalised as _normalised
-from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._readme_tables import unresolved_links as _unresolved_links
+from tests._retry import apply_reset
 
 # --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
 
@@ -1459,7 +1462,7 @@ async def _rel(kind: str) -> AsyncIterator[Any]:
     exit (spec §9.2)."""
     _register_rel(kind)
     client = await SurrealDBConnectionManager.get_client("rel")
-    await _apply_ddl(client, _REL_RESET)
+    await apply_reset(client, _REL_RESET)
     try:
         yield client
     finally:
@@ -2926,7 +2929,7 @@ class TestRoundTripE2E:
                 assert edge.is_enforced() is model.is_enforced() is stored[table][3]
                 assert edge.relation_ddl() == model.relation_ddl()
 
-            await _apply_ddl(client, _REL_RESET)
+            await apply_reset(client, _REL_RESET)
             assert await _tables(client) == {}
             for edge in generated.values():
                 await _apply_ddl(client, edge.relation_ddl())
@@ -2936,12 +2939,12 @@ class TestRoundTripE2E:
 
 # === README: section 34, sections 23 and 31, the tables (spec §11.1; AC-17; P1–P4) ==================================
 
-_SECTION_23 = "### 23. Typed edges (`BaseSurrealEdge`)"
-_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
-_SECTION_33 = "### 33. Materialized views (`view_query`, `define_view()`)"
-_SECTION_34 = "### 34. Relation constraints (`relation_in`, `define_relation()`)"
-_SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
-_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+_SECTION_23 = "## 23. Typed edges (`BaseSurrealEdge`)"
+_SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_33 = "## 33. Materialized views (`view_query`, `define_view()`)"
+_SECTION_34 = "## 34. Relation constraints (`relation_in`, `define_relation()`)"
+_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x vs 3.x"
+_EMBEDDED_BEHAVIOUR = "## ORM behaviour: the embedded engine"
 #: Spec §11.1 item 1: section 34's subsections, in order, after an untitled intro paragraph that holds example A.
 _SUBSECTIONS_34 = [
     "Declaring the constraint",
@@ -3121,7 +3124,7 @@ _INTRO_NEEDLES_34 = (
     "`define_relation()` applies the constraint",
     "SurrealDB enforces it",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
     "`mem://`",
 )
 _PART_NEEDLES_34 = {
@@ -3156,7 +3159,7 @@ _PART_NEEDLES_34 = {
         "keeps the table's schema mode, `DROP`, comment, change feed and permissions",
         "`relation_ddl()` returns the bare statement",
         "`PERMISSIONS NONE`, which hides every edge from record users",
-        "the views that read it ([section 33](#33-materialized-views-view_query-define_view))",
+        "the views that read it ([section 33](schema.md#33-materialized-views-view_query-define_view))",
         "the views keep counting the edges written afterwards",
         "its live queries and its change feed's history are kept",
         _P4_SENTENCE,
@@ -3232,7 +3235,7 @@ _PART_NEEDLES_34 = {
         "`connection`",
         "`using()`",
         "another connection raises `SurrealDbError` before any request",
-        "(#29-query-cache-cache-querycache)",
+        "(querying.md#29-query-cache-cache-querycache)",
         "drops no cached read",
         "`OWNER` or `EDITOR`",
         "`SurrealDbAuthenticationError`",
@@ -3249,8 +3252,8 @@ _PART_NEEDLES_34 = {
         _P3_SENTENCE,
         "A raw `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced on 2.x",
         "The ORM never sends `ALTER TABLE`",
-        "(#orm-behaviour-surrealdb-2x-vs-3x)",
-        "(#orm-behaviour-the-embedded-engine)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-the-embedded-engine)",
     ),
     "Security": (
         "checked as identifiers",
@@ -3312,7 +3315,7 @@ _GENERATED_MODELS_BULLET_31 = (
 #: Spec §11.1 item 6: section 31's "One class per table" bullet names the relation keys.
 _ONE_CLASS_PER_TABLE_31 = (
     "`relation_in`/`relation_out`/`enforced` for a relation table (since v0.33.0, "
-    "[section 34](#34-relation-constraints-relation_in-define_relation))"
+    "[section 34](relations.md#34-relation-constraints-relation_in-define_relation))"
 )
 #: Spec §11.1 items 7–9: the features row, the roadmap rows and the comparison rows.
 _FEATURES_ROW_34 = ["Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)", "✅"]
@@ -3378,14 +3381,14 @@ _EMBEDDED_RELATION_ROW = [
 
 
 def _section_34() -> str:
-    return _readme_part(_SECTION_34)
+    return _doc_part(_SECTION_34)
 
 
 def _part_34(heading: str) -> str:
-    """One ``####`` subsection of section 34, as written (the intro for ``""``)."""
+    """One ``###`` subsection of section 34, as written (the intro for ``""``)."""
     if not heading:
-        return _section_34().split("\n#### ", 1)[0]
-    return _subsection(f"#### {heading}", _section_34())
+        return _section_34().split("\n### ", 1)[0]
+    return _subsection(f"### {heading}", _section_34())
 
 
 def _readme_blocks(text: str) -> list[str]:
@@ -3415,29 +3418,19 @@ class TestReadmeSection34:
     and the features, roadmap, comparison and both behaviour tables (spec §11.1)."""
 
     def test_section_34_follows_section_33(self) -> None:
-        """Right after section 33 (after its "Coming from" bullets), then section 35 (v0.34.0), section 36 (v0.35.0),
-        section 37 (v0.36.0), section 38 (v0.37.0), section 39 (v0.38.0), section 40 (v0.39.0) and section 41 (v0.40.0), and before the
-        ``---`` of "Configuration Options"."""
-        text = _readme()
-        start_33 = text.index(f"\n{_SECTION_33}\n")
-        start_34 = text.index(f"\n{_SECTION_34}\n")
-        configuration = text.index("\n## Configuration Options\n")
-        assert start_33 < start_34 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_33 + 1 : configuration], re.MULTILINE) == [
-            _SECTION_33,
-            _SECTION_34,
-            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
-            "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
-            "### 37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)",
-            "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)",
-            "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)",
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+        """Section 34 ends the relations and graph guide, ``docs/relations.md``, after sections 7 and 23; section 33
+        is in the schema guide."""
+        assert_guide_sections(
+            "relations.md",
+            [
+                "## 7. Relations & Graph",
+                "## 23. Typed edges (`BaseSurrealEdge`)",
+                "## 34. Relation constraints (`relation_in`, `define_relation()`)",
+            ],
+        )
 
     def test_subsections_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_34(), re.MULTILINE) == _SUBSECTIONS_34
+        assert re.findall(r"^### (.*)$", _section_34(), re.MULTILINE) == _SUBSECTIONS_34
 
     def test_the_examples_and_where_they_stand(self) -> None:
         """Example A exactly, the block of the untitled intro; example B exactly, the first thing of "Applying it";
@@ -3499,15 +3492,17 @@ class TestReadmeSection34:
 
     def test_links_resolve(self) -> None:
         """Every in-page link of section 34, and of section 23's new sentence, names a heading of the README."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
-        links = re.findall(r"\]\(#([^)]+)\)", _section_34() + _SECTION_23_DEFINED_BY_HAND + _ONE_CLASS_PER_TABLE_31)
+        links = re.findall(
+            r"\]\(([\w-]*\.md)?#([^)]+)\)", _section_34() + _SECTION_23_DEFINED_BY_HAND + _ONE_CLASS_PER_TABLE_31
+        )
         assert len(links) >= 10, links
-        assert [link for link in links if link not in anchors] == []
+        assert _unresolved_links(_section_34() + _SECTION_23_DEFINED_BY_HAND, _DOCS / "relations.md") == []
+        assert _unresolved_links(_ONE_CLASS_PER_TABLE_31, _DOCS / "schema.md") == []
 
     def test_section_23_sentences(self) -> None:
         """Spec §11.1 items 2 and 3: section 23 points to section 34 and says that the string ``relate()`` translates
         server errors since v0.33.0; the v0.33.0 announcements and the SDK's ``ServerError`` sentence are gone."""
-        section_23 = _normalised(_readme_part(_SECTION_23))
+        section_23 = _normalised(_doc_part(_SECTION_23))
         for sentence in (_SECTION_23_DEFINED_BY_HAND, _SECTION_23_MIGRATING_3, _SECTION_23_IDEMPOTENT):
             assert section_23.count(sentence) == 1, sentence
         for stale in (
@@ -3521,23 +3516,23 @@ class TestReadmeSection34:
     def test_section_31_generated_models(self) -> None:
         """Spec §11.1 item 6: section 31's generated-models bullet exactly, its "One class per table" bullet names the
         relation keys, and its class-comments sentence no longer lists the relation ends."""
-        section_31 = _readme_part(_SECTION_31)
-        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_31))
+        section_31 = _doc_part(_SECTION_31)
+        bullets = _readme_bullets(_subsection("### Coming from the full SurrealDB-ORM", section_31))
         assert _GENERATED_MODELS_BULLET_31 in bullets, [bullet for bullet in bullets if "Generated models" in bullet]
-        generating = _normalised(_subsection("#### Generating models", section_31))
+        generating = _normalised(_subsection("### Generating models", section_31))
         assert _ONE_CLASS_PER_TABLE_31 in generating
         assert "relation ends" not in generating
         assert "`# IN … OUT …` comment" in generating
 
     def test_features_row(self) -> None:
-        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        features = [row for _, row in _table_rows(_doc_part("## Features"))]
         firsts = [row[0] for row in features]
         assert _FEATURES_ROW_34 in features, features
         views = "Materialized views (`view_query`, `define_view()`, read-only)"
         assert firsts.index(_FEATURES_ROW_34[0]) == firsts.index(views) + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [row for _, row in _table_rows(_doc_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.32.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_34, roadmap
         firsts = [row[0] for row in roadmap]
@@ -3547,7 +3542,7 @@ class TestReadmeSection34:
         """The "Native typed relations" row no longer announces v0.33.0; the ``TYPE RELATION`` row comes right after
         the materialized views, then the model table DDL of v0.34.0, before full-text search; every later row, to the
         end of the table, names its new number (issue #292)."""
-        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [row for _, row in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         assert _COMPARISON_TYPED_RELATIONS in comparison, comparison
         start = [row[0] for row in comparison].index("Materialized views")
         assert comparison[start:] == _COMPARISON_ROWS_34, comparison
@@ -3574,11 +3569,11 @@ class TestReadmeSection34:
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.33.0 touches keeps one cell count per line and no escaped pipe; section 34 has no table."""
         parts = [
-            _readme_part("## Features"),
-            _readme_part(_SERVER_BEHAVIOUR),
-            _readme_part(_EMBEDDED_BEHAVIOUR),
-            _readme_part("## Roadmap"),
-            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _doc_part("## Features"),
+            _doc_part(_SERVER_BEHAVIOUR),
+            _doc_part(_EMBEDDED_BEHAVIOUR),
+            _doc_part("## Roadmap"),
+            _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
         ]
         found = [lines for part in parts for lines in _md_tables(part)]
         assert len(found) == len(parts)
@@ -3937,7 +3932,5 @@ class TestRenumberedReferences:
     queries v0.41.0)."""
 
     def test_readme_retry_sentence(self) -> None:
-        part = _subsection(
-            "#### Surviving a dropped connection", _readme_part("### 21. Live queries (real-time notifications)")
-        )
+        part = _subsection("### Surviving a dropped connection", _doc_part("## 21. Live queries (real-time notifications)"))
         assert _RETRY_SENTENCE_292 in _normalised(part), part

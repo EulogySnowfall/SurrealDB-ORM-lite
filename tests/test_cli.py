@@ -58,6 +58,7 @@ from surreal_orm_lite.introspection import generate_models_from_db
 from surreal_orm_lite.migrations import MigrationExecutor, introspector
 from surreal_orm_lite.migrations.operations import DefineEvent
 from surreal_orm_lite.time_travel import cached_major
+from tests._retry import apply_reset
 from tests.conftest import _migration_url, new_database_name
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -786,9 +787,11 @@ def _write_migration(directory: Path, name: str, operations: str, dependencies: 
     (directory / f"{name}.py").write_text(source, encoding="utf-8")
 
 
-def _admin(kind: str, database: str, sql: str) -> Any:
+def _admin(kind: str, database: str, sql: str, *, reset: bool = False) -> Any:
     """Run *sql* on ``ns``/*database* of the line under test through a private connection (opened, closed and
-    unregistered here, in an ``asyncio.run()`` of its own) and return the answer of its last statement."""
+    unregistered here, in an ``asyncio.run()`` of its own) and return the answer of its last statement. With *reset*,
+    *sql* is a database reset run by ``tests._retry.apply_reset()`` (every statement checked, a retryable conflict
+    replayed, issue #396), and ``None`` is returned."""
 
     async def run() -> Any:
         SurrealDBConnectionManager.add_connection(
@@ -796,6 +799,9 @@ def _admin(kind: str, database: str, sql: str) -> Any:
         )
         try:
             client = await SurrealDBConnectionManager.get_client("cli_admin")
+            if reset:
+                await apply_reset(client, sql)
+                return None
             return await client.query(sql, {})
         finally:
             await SurrealDBConnectionManager.remove_connection("cli_admin")
@@ -809,7 +815,7 @@ def database(request: pytest.FixtureRequest) -> Iterator[str]:
     x;``), removed afterwards. The protocol is the test's ``kind`` parameter."""
     kind: str = request.node.callspec.params["kind"]
     name = new_database_name()
-    _admin(kind, name, f"REMOVE DATABASE IF EXISTS {name}; DEFINE DATABASE {name};")
+    _admin(kind, name, f"REMOVE DATABASE IF EXISTS {name}; DEFINE DATABASE {name};", reset=True)
     try:
         yield name
     finally:

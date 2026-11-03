@@ -35,18 +35,27 @@ from surreal_orm_lite.migrations import (
     RemoveEvent,
     RemoveFunction,
 )
-from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import anchors as _anchors
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_guide_sections,
+    assert_links_resolve,
+    assert_manual_order,
+    assert_server_header_sentence,
+    assert_server_rows,
+)
+from tests._readme_tables import doc_part as _doc_part
+from tests._readme_tables import guide as _guide
+from tests._readme_tables import manual as _manual
 from tests._readme_tables import normalised as _normalised
-from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
 
-_SECTION_38 = "### 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)"
-_SECTION_39 = "### 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)"
+_SECTION_38 = "## 38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)"
+_SECTION_39 = "## 39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)"
 _ANCHOR_39 = "#39-migrations-makemigrations-migrationexecutor-operations"
-_LINK_39 = f"[section 39]({_ANCHOR_39})"
+_LINK_39 = f"[section 39](migrations.md{_ANCHOR_39})"
 #: The eleven parts of section 39, in order, after its untitled intro.
 _PARTS_39 = [
     "Write a migration",
@@ -242,7 +251,7 @@ _NEEDLES_39 = {
         "A second `makemigrations()`, run before `migrate()`, writes nothing: the pending file is replayed over the "
         "database, so a new migration never repeats a pending one",
         "a clause the model does not declare stays as the database has it, as with `define_table()`",
-        "[section 35](#35-model-table-ddl-define_table-schema_mode-permissions) says how to remove one",
+        "[section 35](schema.md#35-model-table-ddl-define_table-schema_mode-permissions) says how to remove one",
         "Without `drop_missing=True`, removals",
         "reversible or not, are left out and named in a warning",
         "With `from_db=False` a removal is relative to the files: a model deleted since the last migration",
@@ -307,7 +316,7 @@ _NEEDLES_39 = {
         "`from_db=True` they are read and kept)",
         "`migrate()` and `rollback()` read the schema once, before their first change",
         "Functions are not compared",
-        "the command line is in [section 40](#40-command-line-surreal-orm-lite)",
+        "the command line is in [section 40](cli.md#40-command-line-surreal-orm-lite)",
     ),
 }
 #: What "Limits" no longer says (revision 4's analyzer and ``AlterTable`` wording).
@@ -355,16 +364,16 @@ _REGISTRY_BULLET = (
 
 def _section_39() -> str:
     """Section 39, as written: section 40 (v0.39.0) follows it, so it no longer ends with a ``---``."""
-    section = _readme_part(_SECTION_39)
+    section = _doc_part(_SECTION_39)
     assert "\n---\n" not in section, "section 39 is followed by section 40, not by the --- of the next part"
     return section
 
 
 def _part_39(heading: str) -> str:
-    """One ``####`` part of section 39, as written (the intro, its heading included, for ``""``)."""
+    """One ``###`` part of section 39, as written (the intro, its heading included, for ``""``)."""
     if not heading:
-        return _section_39().split("\n#### ", 1)[0]
-    return _subsection(f"#### {heading}", _section_39())
+        return _section_39().split("\n### ", 1)[0]
+    return _subsection(f"### {heading}", _section_39())
 
 
 def _blocks(text: str) -> list[str]:
@@ -394,24 +403,19 @@ class TestReadmeSection39:
     """README section 39: its place, its parts, its blocks, its operations table and what each part states."""
 
     def test_section_39_follows_section_38(self) -> None:
-        """Right after section 38 (after its "Coming from" bullets), then section 40 (v0.39.0) and section 41
-        (v0.40.0), the last section before the ``---`` of "Configuration Options"."""
-        text = _readme()
-        start_38 = text.index(f"\n{_SECTION_38}\n")
-        start_39 = text.index(f"\n{_SECTION_39}\n")
-        configuration = text.index("\n## Configuration Options\n")
-        assert start_38 < start_39 < configuration
-        assert re.findall(r"^#{2,3} .*$", text[start_38 + 1 : configuration], re.MULTILINE) == [
+        """Section 39 is the migrations guide, ``docs/migrations.md``, its only section; in the manual it comes after
+        section 38 (the search guide) and before section 40 (the command line guide) and section 41."""
+        assert_guide_sections("migrations.md", [_SECTION_39])
+        assert_manual_order(
             _SECTION_38,
             _SECTION_39,
-            "### 40. Command line (`surreal-orm-lite`)",
-            "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
-        ]
-        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
+            "## 40. Command line (`surreal-orm-lite`)",
+            "## 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin",
+        )
 
     def test_parts_in_order(self) -> None:
-        """The intro, then the ten titled parts of the design, in order, as ``####`` headings."""
-        assert re.findall(r"^#### (.*)$", _section_39(), re.MULTILINE) == _PARTS_39
+        """The intro, then the ten titled parts of the design, in order, as ``###`` headings."""
+        assert re.findall(r"^### (.*)$", _section_39(), re.MULTILINE) == _PARTS_39
 
     def test_the_blocks_word_for_word(self) -> None:
         """Each part's blocks exactly and in order; the intro and the other parts hold none; ``python`` fences only."""
@@ -511,16 +515,15 @@ class TestReadmeSection39:
 
     def test_links_resolve(self) -> None:
         """Every in-page link of section 39 names a heading: section 35, the embedded table, the 2.x/3.x table."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
-        links = re.findall(r"\]\(#([^)]+)\)", _section_39())
+        links = re.findall(r"\]\(([\w-]*\.md#[^)]+)\)", _section_39())
         assert links == [
-            "35-model-table-ddl-define_table-schema_mode-permissions",
-            "orm-behaviour-the-embedded-engine",
-            "orm-behaviour-surrealdb-2x-vs-3x",
-            "40-command-line-surreal-orm-lite",
+            "schema.md#35-model-table-ddl-define_table-schema_mode-permissions",
+            "compatibility.md#orm-behaviour-the-embedded-engine",
+            "compatibility.md#orm-behaviour-surrealdb-2x-vs-3x",
+            "cli.md#40-command-line-surreal-orm-lite",
         ], links
-        assert [link for link in links if link not in anchors] == []
-        assert _ANCHOR_39.lstrip("#") in anchors
+        assert_links_resolve(_section_39(), "migrations.md")
+        assert _ANCHOR_39.lstrip("#") in _anchors(_guide("migrations.md"))
 
 
 # --- The tables of the README -----------------------------------------------------------------------------------------
@@ -594,14 +597,14 @@ class TestReadmeRows38:
 
     def test_features_row(self) -> None:
         """Right after hybrid search."""
-        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        features = [row for _, row in _table_rows(_doc_part("## Features"))]
         firsts = [row[0] for row in features]
         assert _FEATURES_ROW_39 in features, features
         hybrid = firsts.index("Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)")
         assert firsts.index(_FEATURES_ROW_39[0]) == hybrid + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [row for _, row in _table_rows(_doc_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.37.0")
         assert roadmap[start : start + 5] == _ROADMAP_ROWS_39, roadmap
         assert "v0.38.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
@@ -609,7 +612,7 @@ class TestReadmeRows38:
 
     def test_comparison_row(self) -> None:
         """Right after hybrid search, before the fixtures."""
-        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [row for _, row in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [row[0] for row in comparison]
         start = firsts.index("Hybrid Search (RRF)")
         assert comparison[start + 1] == _COMPARISON_ROW_39, comparison
@@ -622,40 +625,40 @@ class TestReadmeRows38:
 #: (whitespace normalised).
 _FORWARD_REFERENCES = [
     (
-        "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+        "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
         "- **`SchemaState.diff()` and `schema_diff()` come with v0.38.0** (migrations), as does `applied_migrations`; "
         "the `inspectdb` command comes with v0.39.0.",
         f"- **`SchemaState.diff()`, `schema_diff()` and `applied_migrations`** come with the migrations ({_LINK_39}): "
         "`applied_migrations` is filled from the tracking table when the database has one (full ORM: declared, never "
         "filled; it is the 2nd attribute, positional as in the full ORM); the `inspectdb` command is in "
-        "[section 40](#40-command-line-surreal-orm-lite).",
+        "[section 40](cli.md#40-command-line-surreal-orm-lite).",
     ),
     (
-        "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+        "## 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
         "`define_events()` does not compare the database with the model (that comes with migrations, v0.38.0).",
         "`define_events()` does not compare the database with the model; the migrations do, and "
         f"`makemigrations(drop_missing=True)` writes its `RemoveEvent` ({_LINK_39}).",
     ),
     (
-        "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+        "## 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
         "- **The migration operations** (`DefineEvent`, `RemoveEvent`, `RawSQL`) and the removal of the events a model "
         "no longer declares **come with migrations (v0.38.0)**.",
         "- **The migration operations** (`DefineEvent`, `RemoveEvent`, `RawSQL`) are in `surreal_orm_lite.migrations`, "
         f"and `makemigrations(drop_missing=True)` removes the events a model no longer declares ({_LINK_39}).",
     ),
     (
-        "### 33. Materialized views (`view_query`, `define_view()`)",
+        "## 33. Materialized views (`view_query`, `define_view()`)",
         "full-ORM code calling `define_table()` on a view works. Migrations come with v0.38.0.",
         "full-ORM code calling `define_table()` on a view works. Migrations (`CreateTable`/`AlterTable` with "
         f"`view_query`) are in {_LINK_39}.",
     ),
     (
-        "### 34. Relation constraints (`relation_in`, `define_relation()`)",
+        "## 34. Relation constraints (`relation_in`, `define_relation()`)",
         "then its data fields; migrations come with v0.38.0.",
         f"then its data fields; migrations (`CreateTable`/`AlterTable` with the relation keys) are in {_LINK_39}.",
     ),
     (
-        "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+        "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
         "A key left out never removes a stored clause: remove a field, a change feed or a comment with raw SurrealQL "
         "(migrations come with v0.38.0).",
         f"A key left out never removes a stored clause, and the migrations' diff leaves it too ({_LINK_39}): to remove "
@@ -663,7 +666,7 @@ _FORWARD_REFERENCES = [
         "model no longer declares is removed by the `DropField` that `makemigrations(drop_missing=True)` writes.",
     ),
     (
-        "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
+        "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
         "The full ORM raises `MigrationStatementError` (a `RuntimeError` from `surreal_orm.migrations`) with the SQL in "
         "its message.",
         "The full ORM raises `MigrationStatementError` (a `RuntimeError` from `surreal_orm.migrations`) with the SQL in "
@@ -671,7 +674,7 @@ _FORWARD_REFERENCES = [
         "`define_table()` keeps `SurrealDbError`.",
     ),
     (
-        "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
+        "## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)",
         "the full ORM declares analyzers and indexes in migrations, which this library adds in v0.38.0.",
         "the full ORM declares analyzers and indexes in migrations, which this library also has (`DefineAnalyzer`, "
         f"`CreateIndex`, {_LINK_39}).",
@@ -685,19 +688,19 @@ class TestReadmeForwardReferences:
     @pytest.mark.parametrize(("section", "old", "new"), _FORWARD_REFERENCES, ids=range(len(_FORWARD_REFERENCES)))
     def test_rewritten(self, section: str, old: str, new: str) -> None:
         """The old sentence is gone, the new one is in its section."""
-        text = _normalised(_readme_part(section))
+        text = _normalised(_doc_part(section))
         assert _normalised(old) not in text
         assert _normalised(new) in text
 
     def test_no_section_promises_v0_38_0(self) -> None:
         """No section before section 39 still says the migrations come with v0.38.0."""
-        before = _normalised(_readme()[: _readme().index(f"\n{_SECTION_39}\n")])
+        before = _normalised(_manual()[: _manual().index(f"\n{_SECTION_39}\n")])
         for promise in ("come with v0.38.0", "comes with migrations", "come with migrations", "adds in v0.38.0"):
             assert promise not in before, promise
 
     def test_the_removal_rule_is_stated_once(self) -> None:
         """How to remove a clause a model no longer declares is said in section 35 only; section 39 links to it."""
-        text = _normalised(_readme())
+        text = _normalised(_manual())
         assert text.count("write an `AlterTable` or `AlterField` migration by hand") == 1
         assert text.count("A key left out never removes a stored clause") == 1
-        assert "[section 35](#35-model-table-ddl-define_table-schema_mode-permissions) says how to remove one" in text
+        assert "[section 35](schema.md#35-model-table-ddl-define_table-schema_mode-permissions) says how to remove one" in text

@@ -33,7 +33,7 @@ from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests._readme_tables import assert_server_header_sentence, assert_server_rows
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part
+from tests.test_embedded import _doc_part, _normalised
 
 TABLE = "tl_item"
 
@@ -315,7 +315,7 @@ _HEADER_SENTENCE_292 = "The row added in v0.29.2 was measured on 2.7.0, 3.3.4 an
 
 class TestReadme:
     def test_the_lookup_list_says_what_each_text_lookup_compiles_to(self) -> None:
-        section = _normalised(_readme_part("### Supported Filter Lookups"))
+        section = _normalised(_doc_part("## Supported Filter Lookups"))
         for text in ("string::starts_with", "string::ends_with", "string::matches", "is_string()", "(?i)"):
             assert text in section, text
         assert "full-text search is the separate `search()` API" in section, section
