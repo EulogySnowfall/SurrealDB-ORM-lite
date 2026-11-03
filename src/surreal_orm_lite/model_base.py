@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar, overload
 
 import pydantic
 from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, PrivateAttr, TypeAdapter, model_validator
-from pydantic_core import ValidationError
+from pydantic_core import PydanticUndefined, ValidationError
 
 from . import cache as _cache
 from . import encoding as _encoding
@@ -707,6 +707,55 @@ def _field_annotations(model: type[BaseModel]) -> list[Any]:
     return annotations
 
 
+def _return_annotation(func: object) -> object:
+    """The ``return`` annotation of the function *func*, unevaluated (``annotationlib``'s ``STRING`` format on Python
+    3.14+, its ``__annotations__`` before); ``None`` when it has none or is not a plain function (a property's
+    ``fget`` and a ``classmethod``'s or ``staticmethod``'s ``__func__`` are read in its place). Never raises."""
+    try:
+        if isinstance(func, property):
+            func = func.fget
+        if isinstance(func, classmethod | staticmethod):
+            func = func.__func__
+        if not isinstance(func, types.FunctionType):
+            return None
+        try:
+            import annotationlib  # type: ignore[import-not-found]
+        except ImportError:  # Python < 3.14
+            annotations = func.__annotations__
+        else:
+            annotations = annotationlib.get_annotations(func, format=annotationlib.Format.STRING)
+        return annotations.get("return") if isinstance(annotations, dict) else None
+    except Exception:  # an ``__annotate__`` of the user's own that raises: nothing to read
+        return None
+
+
+def _decorator_annotations(model: type[BaseModel]) -> list[Any]:
+    """The return annotations, unevaluated, of *model*'s ``@computed_field``s, ``@field_serializer``s and
+    ``@model_serializer``s — which Pydantic evaluates when it completes the model, so a forward reference there keeps
+    it incomplete too (issue #395): the ``return_type`` a decorator was given explicitly, otherwise the one its function
+    declares (``_return_annotation()``). Read from ``__pydantic_decorators__`` only, no user code runs; any shape this
+    does not expect contributes what was read so far. Never raises."""
+    annotations: list[Any] = []
+    try:
+        decorators = model.__pydantic_decorators__
+        groups = (decorators.computed_fields, decorators.field_serializers, decorators.model_serializers)
+        for group in groups:
+            for decorator in group.values():
+                explicit = getattr(decorator.info, "return_type", PydanticUndefined)
+                annotation = _return_annotation(decorator.func) if explicit is PydanticUndefined else explicit
+                if annotation is not None:
+                    annotations.append(annotation)
+    except Exception:  # an internal shape of Pydantic's this does not know: nothing more to read
+        pass
+    return annotations
+
+
+def _own_annotations(model: type[BaseModel]) -> list[Any]:
+    """The annotations, unevaluated, Pydantic evaluates to complete *model*: its fields' (``_field_annotations()``)
+    and the return annotations of its computed fields and serializers (``_decorator_annotations()``)."""
+    return [*_field_annotations(model), *_decorator_annotations(model)]
+
+
 def _alias_types() -> tuple[type, ...]:
     """The ``TypeAliasType`` classes this interpreter has: ``typing``'s (PEP 695, Python 3.12+) and that of
     ``typing_extensions`` when Pydantic loaded it (its backport, never imported here)."""
@@ -787,7 +836,7 @@ def _incomplete_dependencies(
             label = f"dependency {len(found)}"
             module = _module_namespace(annotation)
             found.extend(((label, annotation), (f"{label} module", module)))
-            bindings, values = _bindings((local, module), _field_annotations(annotation), f"{label} ")
+            bindings, values = _bindings((local, module), _own_annotations(annotation), f"{label} ")
             found.extend(bindings)
             pending.extend(values)
             pending.extend(info.annotation for info in annotation.model_fields.values())
@@ -1426,7 +1475,7 @@ class BaseSurrealModel(BaseModel):
             return
         caller = user_namespace()
         module = _module_namespace(cls)
-        bindings, values = _bindings((caller, module), _field_annotations(cls), "")
+        bindings, values = _bindings((caller, module), _own_annotations(cls), "")
         names = (("module", module), *bindings, *_incomplete_dependencies(cls, values, caller))
         if _same_bindings(cls.__dict__.get("__surreal_failed_rebuild__"), names):
             return

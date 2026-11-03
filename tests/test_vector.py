@@ -2373,6 +2373,46 @@ class TestFailedRebuildRemembered:
         assert len(calls) == 2
         assert model.__pydantic_complete__ is True
 
+    @pytest.mark.parametrize(
+        "decorator",
+        [
+            "    @computed_field\n    @property\n    def c(self) -> 'Later':\n        return self.score\n",
+            "    @field_serializer('score')\n    def ser(self, value: int) -> 'Later':\n        return value\n",
+            "    @model_serializer(mode='wrap')\n    def ms(self, handler: Any) -> 'Later':\n        return handler(self)\n",
+            "    @field_serializer('score', return_type='Later')\n    def ser(self, value: int) -> int:\n        return value\n",
+        ],
+        ids=["computed_field", "field_serializer", "model_serializer", "explicit_return_type"],
+    )
+    def test_a_forward_reference_in_a_return_annotation(self, monkeypatch: pytest.MonkeyPatch, decorator: str) -> None:
+        """Pydantic evaluates the return annotation of a computed field or a serializer to complete the model: a name
+        it mentions counts for the memory too — once the module defines it, the next call completes the model
+        (issue #395)."""
+        module = types.ModuleType("vec_fwd_module_return")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            "from typing import Any\n"
+            "from pydantic import computed_field, field_serializer, model_serializer\n"
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            "class VecFwdReturn(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_module_return')\n"
+            "    id: str | None = None\n"
+            "    score: int = 0\n" + decorator,
+            module.__dict__,
+        )
+        model = module.VecFwdReturn
+        assert model.__pydantic_complete__ is False
+        calls = _count_rebuilds(monkeypatch, model)
+        _table_ddl(model)
+        _table_ddl(model)
+        assert len(calls) == 1
+        assert model.__pydantic_complete__ is False
+        module.Later = int
+        _table_ddl(model)
+        assert len(calls) == 2
+        assert model.__pydantic_complete__ is True
+        _table_ddl(model)
+        assert len(calls) == 2
+
     def test_the_model_completes_once_the_name_is_defined(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class VecFwdLater(BaseSurrealModel):
             model_config = SurrealConfigDict(table_name="vec_fwd_later")
@@ -2790,6 +2830,46 @@ class TestFailedRebuildHelpers:
 
         Raising.__annotate__ = annotate  # type: ignore[attr-defined]
         assert model_base._raw_annotations(Raising) == {}
+
+    def test_the_return_annotation_of_a_function(self) -> None:
+        """Read unevaluated, through a property, a ``classmethod`` or a ``staticmethod``; ``None`` for anything else
+        (issue #395)."""
+
+        def later() -> "Later":  # noqa: F821 - never evaluated
+            raise AssertionError
+
+        def bare():  # type: ignore[no-untyped-def]  # noqa: ANN202 - no return annotation on purpose
+            raise AssertionError
+
+        read = model_base._return_annotation
+        assert [read(later), read(property(later)), read(classmethod(later)), read(staticmethod(later))] == ["Later"] * 4
+        assert [read(bare), read(property()), read(len), read("later"), read(None)] == [None] * 5
+
+    def test_a_return_annotation_that_raises(self) -> None:
+        if sys.version_info < (3, 14):
+            pytest.skip("``__annotate__`` (PEP 649) needs Python 3.14")
+
+        def later() -> int:
+            raise AssertionError
+
+        def annotate(format: int) -> dict[str, Any]:
+            raise RuntimeError("not today")
+
+        later.__annotate__ = annotate  # type: ignore[attr-defined]
+        assert model_base._return_annotation(later) is None
+
+    def test_the_decorator_annotations_never_raise(self) -> None:
+        """A shape of ``__pydantic_decorators__`` this does not know contributes what was read before it (issue
+        #395)."""
+
+        class Odd:
+            __pydantic_decorators__ = types.SimpleNamespace(computed_fields={}, field_serializers=None)
+
+        class Plain(BaseModel):
+            x: int = 0
+
+        assert model_base._decorator_annotations(Odd) == []  # type: ignore[arg-type]
+        assert model_base._decorator_annotations(Plain) == []
 
     def test_an_alias_waiting_for_a_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``type BA = Missing``: the alias is remembered with the name its value waits for, in its module."""
