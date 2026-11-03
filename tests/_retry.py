@@ -2,7 +2,8 @@
 
 Shared by the tests that write to a ``CHANGEFEED`` table, so that a conflict raised by the
 server itself does not make them flaky, and by every E2E helper that resets a database of its
-own (``REMOVE DATABASE IF EXISTS x; DEFINE DATABASE x; …``, issue #396).
+own (``REMOVE DATABASE IF EXISTS x; DEFINE DATABASE x; …``, issue #396) or writes one raw statement to a
+``CHANGEFEED`` table (issue #406).
 """
 
 from __future__ import annotations
@@ -70,6 +71,22 @@ async def apply_reset(client: Any, query: str) -> None:
 
     *client* is the SDK client of the database's connection; *query* is a constant of the test, never user input.
     """
+    await _replay(client, query)
+
+
+async def apply_write(client: Any, statement: str) -> None:
+    """Run the single raw *statement* — a write or a definition on a ``CHANGEFEED`` table — and check it.
+
+    On SurrealDB 2.x the change-feed GC can refuse it with the retryable conflict :func:`retry_write` describes (issue
+    #406). One refused statement is one refused transaction, which writes nothing, so the statement is replayed as
+    :func:`apply_reset` replays a reset: only on that retryable text, at most :data:`RESET_ATTEMPTS` times in all. Pass
+    one statement per call: replaying a query whose other statements were applied would fail on them.
+    """
+    await _replay(client, statement)
+
+
+async def _replay(client: Any, query: str) -> None:
+    """:func:`apply_reset`'s loop: send *query*, replay it while every refusal is retryable, fail on anything else."""
     for attempt in range(1, RESET_ATTEMPTS + 1):
         refusals = await _reset_refusals(client, query)
         if not refusals:

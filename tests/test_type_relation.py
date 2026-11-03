@@ -137,7 +137,7 @@ from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
 from tests._readme_tables import unresolved_links as _unresolved_links
-from tests._retry import apply_reset
+from tests._retry import apply_reset, apply_write, retry_write
 
 # --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
 
@@ -1029,6 +1029,9 @@ _K7 = (
     "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE;"
 )
 
+#: K6's change feed clause: the E2E tests of AC-20 run on AC-6's table without it (issue #406).
+_FEED_CLAUSE = " CHANGEFEED 1h INCLUDE ORIGINAL"
+
 _TABLE_OPERATIONS = ("select", "create", "update", "delete")
 
 #: (permissions, text) — the generator's cases (``tests/test_model_generator.py``) and K1's rules: SurrealDB's
@@ -1570,15 +1573,16 @@ _REL_G1_READ_BACK = (
 
 #: AC-6's fixture, as written in spec AC-6 (M17): ``TYPE ANY`` spelled out — a ``SCHEMAFULL`` table without ``TYPE``
 #: is stored ``TYPE NORMAL`` and refuses the edges —, and ``in``/``out`` defined before the ``UNIQUE`` index — a
-#: ``SCHEMAFULL`` table refuses an index on undefined fields.
+#: ``SCHEMAFULL`` table refuses an index on undefined fields. One statement each, so that each one is replayed alone on
+#: 2.x's retryable change-feed conflict (issue #406).
 _AC6_FIXTURE = (
     "DEFINE TABLE rel_likes TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
-    "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL; "
-    "DEFINE FIELD in ON rel_likes TYPE record; "
-    "DEFINE FIELD out ON rel_likes TYPE record; "
-    "DEFINE FIELD stars ON rel_likes TYPE int DEFAULT 1; "
-    "DEFINE INDEX rel_likes_pair ON rel_likes FIELDS in, out UNIQUE; "
-    "DEFINE EVENT rel_likes_ev ON rel_likes WHEN $event = 'CREATE' THEN {};"
+    "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL;",
+    "DEFINE FIELD in ON rel_likes TYPE record;",
+    "DEFINE FIELD out ON rel_likes TYPE record;",
+    "DEFINE FIELD stars ON rel_likes TYPE int DEFAULT 1;",
+    "DEFINE INDEX rel_likes_pair ON rel_likes FIELDS in, out UNIQUE;",
+    "DEFINE EVENT rel_likes_ev ON rel_likes WHEN $event = 'CREATE' THEN {};",
 )
 
 #: AC-6's two raw edges, with explicit ids.
@@ -1638,6 +1642,13 @@ def _sent(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
     return statements
 
 
+def _sent_per_attempt(calls: list[tuple[str, tuple[object, ...]]], expected: list[object]) -> None:
+    """:func:`_sent`'s statements are *expected*, once per attempt of a call :func:`retry_write` replayed."""
+    sent = _sent(calls)
+    attempts = max(1, len(sent) // len(expected))
+    assert sent == expected * attempts, sent
+
+
 async def _table_info(client: Any, table: str) -> dict[str, Any]:
     """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
     info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
@@ -1654,11 +1665,23 @@ async def _like_counts(client: Any) -> dict[str, int]:
     return {str(row["out"]): row["n"] for row in await client.query("SELECT n, out FROM rel_like_counts;", {})}
 
 
-async def _ac6(client: Any) -> dict[str, BaseSurrealModel]:
+def _without_feed(text: str) -> str:
+    """*text* (a statement or definition of AC-6's table) without its change feed clause."""
+    assert _FEED_CLAUSE in text, text
+    return text.replace(_FEED_CLAUSE, "")
+
+
+async def _ac6(client: Any, *, changefeed: bool = True) -> dict[str, BaseSurrealModel]:
     """Spec AC-6's fixture on ``rel_db``: the table, its fields, index and event (each statement checked), the five
     nodes saved through the ORM, the edges ``e1`` and ``e2`` written raw, then the view of P2 — and the stored
-    definition is K6's stored text. Returns the nodes by name."""
-    await _apply_ddl(client, _AC6_FIXTURE)
+    definition is K6's stored text. Returns the nodes by name.
+
+    With ``changefeed=False`` the table has no change feed (issue #406), and the stored definition is K6's stored text
+    without it. Each raw statement goes through :func:`apply_write`: on SurrealDB 2.x the change-feed GC can refuse a
+    write to the table with a retryable conflict."""
+    table, *others = _AC6_FIXTURE
+    for statement in (table if changefeed else _without_feed(table), *others):
+        await apply_write(client, statement)
     nodes: dict[str, BaseSurrealModel] = {
         "ada": await RelPerson(id="ada").save(),
         "bob": await RelPerson(id="bob").save(),
@@ -1666,10 +1689,10 @@ async def _ac6(client: Any) -> dict[str, BaseSurrealModel]:
         "b1": await RelBook(id="b1").save(),
         "c": await RelCompany(id="c").save(),
     }
-    await _apply_ddl(client, _AC6_EDGES)
-    await _apply_ddl(client, _AC6_VIEW)
+    await apply_write(client, _AC6_EDGES)
+    await apply_write(client, _AC6_VIEW)
     assert await _like_counts(client) == {"rel_post:p1": 1, "rel_book:b1": 1}
-    assert (await _tables(client))["rel_likes"] == _K6_STORED
+    assert (await _tables(client))["rel_likes"] == (_K6_STORED if changefeed else _without_feed(_K6_STORED))
     return nodes
 
 
@@ -1713,8 +1736,8 @@ class TestDefineRelationE2E:
                         RecordID("rel_likes", "e2"),
                     ]
                 calls = _spy(monkeypatch, client)
-                assert await RelLikes.define_relation() == _K6
-                assert _sent(calls) == [_INFO, _K6]
+                assert await retry_write(RelLikes.define_relation) == _K6
+                _sent_per_attempt(calls, [_INFO, _K6])
                 tables = await _tables(client)
                 assert tables["rel_likes"] == _K6_READ_BACK
                 assert parse_define_table(tables["rel_like_counts"]).view_query is not None
@@ -1728,24 +1751,24 @@ class TestDefineRelationE2E:
                 assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
 
                 # P2, M23: the view that reads the table keeps updating.
-                edge = await nodes["bob"].relate(RelLikes, nodes["p1"])
+                edge = await retry_write(lambda: nodes["bob"].relate(RelLikes, nodes["p1"]))
                 assert (edge.in_, edge.out, edge.stars) == (RecordID("rel_person", "bob"), RecordID("rel_post", "p1"), 1)
                 assert await _like_counts(client) == {"rel_post:p1": 2, "rel_book:b1": 1}
 
                 # The UNIQUE index is kept.
                 with pytest.raises(SurrealDbError) as duplicate:
-                    await nodes["ada"].relate(RelLikes, nodes["p1"])
+                    await retry_write(lambda: nodes["ada"].relate(RelLikes, nodes["p1"]))
                 assert type(duplicate.value) is SurrealDbError
                 assert "rel_likes_pair" in str(duplicate.value)
 
                 # A wrong-table endpoint is refused at once (M9), also on the second connection.
                 with pytest.raises(SurrealDbError) as company:
-                    await nodes["c"].relate(RelLikes, nodes["p1"])
+                    await retry_write(lambda: nodes["c"].relate(RelLikes, nodes["p1"]))
                 assert type(company.value) is SurrealDbError
                 if kind != "mem":
                     async with SurrealDBConnectionManager.using("rel2"):
                         with pytest.raises(SurrealDbError) as other:
-                            await nodes["c"].relate(RelLikes, nodes["b1"])
+                            await retry_write(lambda: nodes["c"].relate(RelLikes, nodes["b1"]))
                     assert type(other.value) is SurrealDbError
                 # e1, e2 and bob's edge (an auto id: compared as a set), nothing else.
                 ids = await _edge_ids(client)
@@ -1761,8 +1784,8 @@ class TestDefineRelationE2E:
         """Applied again, the carried statement is the same K6 and the table reads back the same."""
         async with _rel(kind) as client:
             await _ac6(client)
-            assert await RelLikes.define_relation() == _K6
-            assert await RelLikes.define_relation() == _K6
+            assert await retry_write(RelLikes.define_relation) == _K6
+            assert await retry_write(RelLikes.define_relation) == _K6
             assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -2262,21 +2285,29 @@ async def _ends(client: Any) -> list[list[RecordID]]:
     return sorted(await client.query("SELECT VALUE [in, out] FROM rel_likes;", {}), key=str)
 
 
+#: K6, its read-back and K7 on AC-6's table without its change feed (issue #406): AC-20's E2E tests do not need it,
+#: and on SurrealDB 2.x the change-feed GC can refuse a write to the table with a retryable conflict.
+_K6_PLAIN = _without_feed(_K6)
+_K6_READ_BACK_PLAIN = _without_feed(_K6_READ_BACK)
+_K7_PLAIN = _without_feed(_K7)
+
+
 async def _k6(client: Any) -> dict[str, BaseSurrealModel]:
-    """AC-6's fixture, then ``RelLikes.define_relation()`` (K6): the table holds the constraint, its other clauses and
-    ``e1``, ``e2``. Returns the nodes by name."""
-    nodes = await _ac6(client)
-    assert await RelLikes.define_relation() == _K6
-    assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+    """AC-6's fixture without its change feed, then ``RelLikes.define_relation()`` (K6 without it): the table holds the
+    constraint, its other clauses and ``e1``, ``e2``. Returns the nodes by name."""
+    nodes = await _ac6(client, changefeed=False)
+    assert await retry_write(RelLikes.define_relation) == _K6_PLAIN
+    assert (await _tables(client))["rel_likes"] == _K6_READ_BACK_PLAIN
     return nodes
 
 
 async def _assert_removed(client: Any) -> None:
-    """``rel_likes`` reads back K7's form: a relation table without ``IN``, ``OUT`` or ``ENFORCED``, K6's other clauses,
-    ``in``/``out`` rewritten ``TYPE record``, its field ``stars``, index, event and view kept."""
+    """``rel_likes`` reads back K7's form: a relation table without ``IN``, ``OUT`` or ``ENFORCED``, K6's other clauses
+    (:func:`_k6`'s, without a change feed), ``in``/``out`` rewritten ``TYPE record``, its field ``stars``, index, event
+    and view kept."""
     state = parse_define_table((await _tables(client))["rel_likes"])
     assert (state.table_type, state.relation_in, state.relation_out, state.enforced) == ("relation", (), (), False)
-    assert _carried(state) == _carried(parse_define_table(_K6_READ_BACK))
+    assert _carried(state) == _carried(parse_define_table(_K6_READ_BACK_PLAIN))
     info = await _table_info(client, "rel_likes")
     assert (_field_type(info, "in"), _field_type(info, "out")) == ("record", "record")
     assert {"in", "out", "stars"} <= set(info["fields"])
@@ -2322,7 +2353,8 @@ class TestRemoveConstraintE2E:
     reads back without ``IN``/``OUT``/``ENFORCED``, ``in``/``out`` as ``TYPE record``, its fields, index, event, view and
     edges kept; edges from or to any table, and to a missing record, are accepted at once, on every connection; and
     ``RelLikes.define_relation()`` puts K6 back. ``overwrite=False`` removes nothing (D8). In a transaction the removal
-    is applied at commit, and not at all when the block raises."""
+    is applied at commit, and not at all when the block raises. The table is AC-6's without its change feed (issue
+    #406): K6 and K7 carry its other clauses."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_removal_out_of_a_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2339,14 +2371,14 @@ class TestRemoveConstraintE2E:
                         RecordID("rel_likes", "e2"),
                     ]
                 calls = _spy(monkeypatch, client)
-                assert await RelLikesAny.define_relation() == _K7
-                assert _sent(calls) == [_INFO, _K7]
+                assert await retry_write(RelLikesAny.define_relation) == _K7_PLAIN
+                _sent_per_attempt(calls, [_INFO, _K7_PLAIN])
                 await _assert_removed(client)
                 assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
 
                 # At once: an endpoint outside the old ends, and a missing one (no ENFORCED any more).
-                company = await nodes["c"].relate(RelLikesAny, nodes["p1"])
-                ghost = await nodes["ada"].relate(RelLikesAny, _GHOST_BOOK)
+                company = await retry_write(lambda: nodes["c"].relate(RelLikesAny, nodes["p1"]))
+                ghost = await retry_write(lambda: nodes["ada"].relate(RelLikesAny, _GHOST_BOOK))
                 assert (company.in_, company.out) == (RecordID("rel_company", "c"), RecordID("rel_post", "p1"))
                 assert (ghost.in_, ghost.out) == (RecordID("rel_person", "ada"), _GHOST_BOOK)
                 expected = [
@@ -2357,23 +2389,23 @@ class TestRemoveConstraintE2E:
                 ]
                 if kind != "mem":
                     async with SurrealDBConnectionManager.using("rel2"):
-                        other = await nodes["c"].relate(RelLikesAny, nodes["b1"])
+                        other = await retry_write(lambda: nodes["c"].relate(RelLikesAny, nodes["b1"]))
                     assert (other.in_, other.out) == (RecordID("rel_company", "c"), RecordID("rel_book", "b1"))
                     expected.append([RecordID("rel_company", "c"), RecordID("rel_book", "b1")])
                 assert await _ends(client) == sorted(expected, key=str)
 
                 # The round trip: the constraint back, the edges written meanwhile kept (not checked, M5).
                 calls.clear()
-                assert await RelLikes.define_relation() == _K6
-                assert _sent(calls) == [_INFO, _K6]
-                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+                assert await retry_write(RelLikes.define_relation) == _K6_PLAIN
+                _sent_per_attempt(calls, [_INFO, _K6_PLAIN])
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK_PLAIN
                 info = await _table_info(client, "rel_likes")
                 assert (_field_type(info, "in"), _field_type(info, "out")) == (
                     "record<rel_person>",
                     "record<rel_post | rel_book>",
                 )
                 with pytest.raises(SurrealDbError) as refused:
-                    await nodes["bob"].relate(RelLikes, nodes["c"])
+                    await retry_write(lambda: nodes["bob"].relate(RelLikes, nodes["c"]))
                 assert type(refused.value) is SurrealDbError
                 assert await _ends(client) == sorted(expected, key=str)
             finally:
@@ -2387,10 +2419,10 @@ class TestRemoveConstraintE2E:
         async with _rel(kind) as client:
             await _k6(client)
             for model in _KEYLESS_MODELS:
-                assert await model.define_relation() == _K7, model.__name__
+                assert await retry_write(model.define_relation) == _K7_PLAIN, model.__name__
                 await _assert_removed(client)
-                assert await RelLikes.define_relation() == _K6, model.__name__
-                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK, model.__name__
+                assert await retry_write(RelLikes.define_relation) == _K6_PLAIN, model.__name__
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK_PLAIN, model.__name__
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_overwrite_false_removes_nothing(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2400,9 +2432,9 @@ class TestRemoveConstraintE2E:
             calls = _spy(monkeypatch, client)
             assert await RelLikesAny.define_relation(overwrite=False) == _REL_KEYLESS_IF_NOT_EXISTS
             assert _sent(calls) == [_INFO, _REL_KEYLESS_IF_NOT_EXISTS]
-            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK_PLAIN
             with pytest.raises(SurrealDbError) as refused:
-                await nodes["c"].relate(RelLikesAny, nodes["p1"])
+                await retry_write(lambda: nodes["c"].relate(RelLikesAny, nodes["p1"]))
             assert type(refused.value) is SurrealDbError
             assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
 
@@ -2415,10 +2447,10 @@ class TestRemoveConstraintE2E:
             interactive = kind == "ws" and await _major(client) >= 3
             async with SurrealDBConnectionManager.transaction("rel") as tx:
                 assert tx.is_interactive is interactive
-                assert await RelLikesAny.define_relation(tx=tx) == _K7
-                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+                assert await RelLikesAny.define_relation(tx=tx) == _K7_PLAIN
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK_PLAIN
             await _assert_removed(client)
-            await nodes["c"].relate(RelLikesAny, nodes["p1"])
+            await retry_write(lambda: nodes["c"].relate(RelLikesAny, nodes["p1"]))
             assert [RecordID("rel_company", "c"), RecordID("rel_post", "p1")] in await _ends(client)
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -2429,11 +2461,11 @@ class TestRemoveConstraintE2E:
             with pytest.raises(_Rollback):
                 async with SurrealDBConnectionManager.transaction("rel") as tx:
                     assert tx.is_interactive is interactive
-                    assert await RelLikesAny.define_relation(tx=tx) == _K7
+                    assert await RelLikesAny.define_relation(tx=tx) == _K7_PLAIN
                     raise _Rollback
-            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK_PLAIN
             with pytest.raises(SurrealDbError) as refused:
-                await nodes["c"].relate(RelLikesAny, nodes["p1"])
+                await retry_write(lambda: nodes["c"].relate(RelLikesAny, nodes["p1"]))
             assert type(refused.value) is SurrealDbError
             assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
 
@@ -2643,7 +2675,7 @@ class TestRelationLineFactsE2E:
         async with _rel(kind) as client:
             await _ac6(client)
             await _apply_ddl(client, "DEFINE TABLE rel_dropped TYPE ANY DROP;")
-            await _apply_ddl(client, RelLikes.relation_ddl())
+            await apply_write(client, RelLikes.relation_ddl())
             await _apply_ddl(client, "DEFINE TABLE OVERWRITE rel_dropped TYPE RELATION;")
             tables = await _tables(client)
             assert tables["rel_likes"] == _REL_G1_READ_BACK
@@ -2752,11 +2784,11 @@ class TestExistingRecordsE2E:
 
 
 #: ``rel_likes`` with a change feed, defined by hand (``TYPE ANY`` spelled out), and its two first edges, one statement
-#: each.
+#: each (each one replayed alone on 2.x's retryable change-feed conflict, issue #406).
 _FEED_TABLE = "DEFINE TABLE rel_likes TYPE ANY CHANGEFEED 1h;"
 _FEED_EDGES = (
-    "INSERT RELATION INTO rel_likes {id: 'e1', in: rel_person:ada, out: rel_post:p1}; "
-    "INSERT RELATION INTO rel_likes {id: 'e2', in: rel_person:ada, out: rel_book:b1};"
+    "INSERT RELATION INTO rel_likes {id: 'e1', in: rel_person:ada, out: rel_post:p1};",
+    "INSERT RELATION INTO rel_likes {id: 'e2', in: rel_person:ada, out: rel_book:b1};",
 )
 
 #: ``RelLikes.define_relation()`` on ``_FEED_TABLE``: the change feed carried.
@@ -2776,10 +2808,11 @@ async def _take(stream: Any, count: int) -> list[Any]:
 
 async def _feed(client: Any) -> None:
     """``_FEED_TABLE``, the nodes ``ada``, ``bob``, ``p1`` and ``b1``, then the edges ``e1`` and ``e2``."""
-    await _apply_ddl(client, _FEED_TABLE)
+    await apply_write(client, _FEED_TABLE)
     for node in (RelPerson(id="ada"), RelPerson(id="bob"), RelPost(id="p1"), RelBook(id="b1")):
         await node.save()
-    await _apply_ddl(client, _FEED_EDGES)
+    for edge in _FEED_EDGES:
+        await apply_write(client, edge)
 
 
 class TestChangeFeedAndLiveE2E:
@@ -2792,8 +2825,8 @@ class TestChangeFeedAndLiveE2E:
     async def test_changes_yields_the_edges_around_the_define(self, kind: str) -> None:
         async with _rel(kind) as client:
             await _feed(client)
-            assert await RelLikes.define_relation() == _FEED_DEFINE
-            e3 = await RelPerson(id="bob").relate(RelLikes, _P1)
+            assert await retry_write(RelLikes.define_relation) == _FEED_DEFINE
+            e3 = await retry_write(lambda: RelPerson(id="bob").relate(RelLikes, _P1))
 
             stream = RelLikes.objects().changes(since=0)
             try:
@@ -2819,7 +2852,7 @@ class TestChangeFeedAndLiveE2E:
             try:
                 lives = {str(live_id): "LIVE SELECT * FROM rel_likes"}
                 assert (await _table_info(client, "rel_likes"))["lives"] == lives
-                assert await RelLikes.define_relation() == _FEED_DEFINE
+                assert await retry_write(RelLikes.define_relation) == _FEED_DEFINE
                 assert (await _table_info(client, "rel_likes"))["lives"] == lives
             finally:
                 with contextlib.suppress(Exception):

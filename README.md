@@ -103,6 +103,20 @@ lists every QuerySet method and filter lookup.
 
 The [documentation index](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/README.md) lists every section of the guides.
 
+## Using with AI assistants
+
+The [guide for AI coding assistants](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/ai/CLAUDE.md)
+gives an assistant such as Claude Code the idioms, the 2.x/3.x differences and the common mistakes in one page,
+each example checked by the test suite. Download it into your project, then add the line `@docs/surreal-orm-lite.md`
+to your `CLAUDE.md` to import it:
+
+```bash
+curl -fsSL -o docs/surreal-orm-lite.md https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ai/CLAUDE.md
+```
+
+Tools that read the [llms.txt](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/llms.txt) convention
+find every guide listed there.
+
 ## Features
 
 | Feature                                                                       | Status |

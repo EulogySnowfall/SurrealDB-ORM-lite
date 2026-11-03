@@ -1,0 +1,34 @@
+# Surreal ORM Lite
+
+> Surreal ORM Lite (`pip install surreal-orm-lite`, imported as `surreal_orm_lite`) is an async, Django-style ORM for SurrealDB with Pydantic models, built on the official SurrealDB Python SDK. The same code runs on SurrealDB 2.x, 3.x and the SDK's embedded engine (`mem://`, `surrealkv://`).
+
+Every database call is a coroutine. Models subclass `BaseSurrealModel`; queries go through `Model.objects()` QuerySets with Django-style lookups and `Q` objects; values are always bound as SurrealQL parameters. Start with the guide for AI coding assistants: it holds the idioms, the 2.x/3.x differences and the common mistakes in one page.
+
+## Docs
+
+- [Guide for AI coding assistants](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ai/CLAUDE.md): connection, models and idioms, 2.x vs 3.x, common mistakes, errors, testing
+- [README](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/README.md): overview, installation and quick start
+- [Documentation index](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/README.md): every guide and numbered section
+- [Getting started](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/getting-started.md): requirements, installation, connection, a first model and CRUD
+- [Models](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/models.md): primary keys, table names, server-side values, computed fields, field aliases
+- [Field types](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/fields.md): datetimes, durations, decimals, sets, ranges, record links, geospatial fields
+- [Querying](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/querying.md): QuerySet methods, filter lookups, Q objects, FETCH, aggregations, time travel, subqueries, query cache
+- [Writing data](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/writing.md): bulk operations, signals, transactions, upserts, patches, retry on conflict
+- [Relations and graph](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/relations.md): graph relations, typed edges, TYPE RELATION constraints
+- [Stored functions and events](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/functions-and-events.md): call_function(), DEFINE EVENT and DEFINE FUNCTION from Python
+- [Authentication](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/authentication.md): signin and signup, record access, AuthenticatedUserMixin
+- [Live queries and change feeds](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/realtime.md): live queries, typed streams, auto-resubscribe, change feeds
+- [Connections](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/connections.md): the connection manager, event loops, several databases
+- [Embedded engine](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/embedded.md): mem:// and surrealkv:// in-process databases, test fixtures
+- [Schema and DDL](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/schema.md): schema introspection, materialized views, table DDL and permissions
+- [Search](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/search.md): full-text (BM25), vector (KNN, HNSW) and hybrid search
+- [Migrations](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/migrations.md): makemigrations(), operations, MigrationExecutor
+- [Command line](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/cli.md): surreal-orm-lite migrate, rollback, inspectdb, schemadiff, shell
+- [Testing](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/testing.md): ModelFactory, Faker and the pytest plugin
+- [Compatibility](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/compatibility.md): tested versions and every behaviour that differs between SurrealDB 2.x, 3.x and the embedded engine
+
+## Optional
+
+- [Contributing](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/contributing.md): how to contribute
+- [Changelog](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/CHANGELOG.md): what changed in each version
+- [Roadmap](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ROADMAP.md): every release and its design notes
