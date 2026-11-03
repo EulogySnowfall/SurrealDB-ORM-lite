@@ -321,7 +321,7 @@ class TestReadmeSection41:
         its reasons."""
         bullets = _bullets(_part_41("Coming from the full SurrealDB-ORM"))
         phrases = _NEEDLES_41["Coming from the full SurrealDB-ORM"]
-        assert len(phrases) == 15
+        assert len(phrases) == 16
         assert len(bullets) == 15, bullets
         for bullet, phrase in zip(bullets, phrases, strict=True):
             assert _normalised(phrase) in bullet, (phrase, bullet)
