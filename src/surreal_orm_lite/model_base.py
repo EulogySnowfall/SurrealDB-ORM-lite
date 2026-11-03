@@ -749,11 +749,14 @@ def _module_namespace(obj: object) -> Mapping[str, Any]:
     return getattr(sys.modules.get(getattr(obj, "__module__", None) or ""), "__dict__", {})
 
 
-def _incomplete_dependencies(model: type[BaseModel], roots: Iterable[object] = ()) -> list[_Binding]:
+def _incomplete_dependencies(
+    model: type[BaseModel], roots: Iterable[object] = (), caller: Mapping[str, Any] | None = None
+) -> list[_Binding]:
     """What ``_complete_pending_checks()`` remembers of the models *model*'s fields reach and that are still incomplete
     (``B | None``, ``list[B]``, ``Annotated[B, …]``, and theirs in turn; issue #345), *roots* — the values its
     forward references resolved to — included: each such model, its module, and the names its own forward references
-    mention there (``_bindings()``). A model left incomplete by another model, itself waiting for a name of its own
+    mention in *caller* — the local names of the call (``_complete_pending_checks()``'s), with which Pydantic resolves
+    them too (``model_rebuild(_types_namespace=…)``) — and in its module (``_bindings()``). A model left incomplete by another model, itself waiting for a name of its own
     module, completes once that model completes — it leaves this list — or once that name is defined in its module:
     either changes the result, so the failed attempt is not remembered past it.
 
@@ -761,8 +764,11 @@ def _incomplete_dependencies(model: type[BaseModel], roots: Iterable[object] = (
     ``typing_extensions``'s backport) by its ``__value__`` — an alias whose value names a name still undefined is
     remembered with that name in its module; one whose value raises another error (``type BA = os.Missing``) never
     raises from here: the alias is remembered, with the names its value mentions in its module on Python 3.14+ —, and
-    through the fields of a dataclass and of a ``TypedDict``."""
+    through the fields of a dataclass and of a ``TypedDict``, whose names are looked up in *caller* and their module
+    alike. The names an alias's value mentions are looked up in its module only: an alias evaluates its value in its
+    own globals."""
     aliases = _alias_types()
+    local: Mapping[str, Any] = caller if caller is not None else {}
     found: list[_Binding] = []
     seen: set[int] = {id(model)}
     pending: list[Any] = [info.annotation for info in model.model_fields.values()]
@@ -777,7 +783,7 @@ def _incomplete_dependencies(model: type[BaseModel], roots: Iterable[object] = (
             label = f"dependency {len(found)}"
             module = _module_namespace(annotation)
             found.extend(((label, annotation), (f"{label} module", module)))
-            bindings, values = _bindings((module,), _field_annotations(annotation), f"{label} ")
+            bindings, values = _bindings((local, module), _field_annotations(annotation), f"{label} ")
             found.extend(bindings)
             pending.extend(values)
             pending.extend(info.annotation for info in annotation.model_fields.values())
@@ -811,7 +817,8 @@ def _incomplete_dependencies(model: type[BaseModel], roots: Iterable[object] = (
             if id(annotation) in seen:
                 continue
             seen.add(id(annotation))
-            bindings, values = _bindings((_module_namespace(annotation),), container.values(), f"{len(found)} ")
+            namespaces = (local, _module_namespace(annotation))
+            bindings, values = _bindings(namespaces, container.values(), f"{len(found)} ")
             found.extend(bindings)
             pending.extend(values)
             pending.extend(container.values())
@@ -1148,7 +1155,7 @@ class BaseSurrealModel(BaseModel):
 
     ``(label, value)`` pairs: the module's namespace, the value of each name the model's forward references mention
     in the caller's local names and in the module (``_bindings()``), and the incomplete models its fields reach with
-    the names theirs mention in their modules (``_incomplete_dependencies()``) — the values themselves, kept alive and
+    the names theirs mention in the caller's local names and in their modules (``_incomplete_dependencies()``) — the values themselves, kept alive and
     compared by identity (``_same_bindings()``). Set when ``model_rebuild()`` leaves the model incomplete (a name still
     undefined), removed once it completes. Read from the class's own ``__dict__`` only, never inherited: a subclass
     remembers its own attempt.
@@ -1392,8 +1399,8 @@ class BaseSurrealModel(BaseModel):
         a name the model's forward references mention has changed — in the caller's local names or in the model's
         module, added, removed or bound to another object (``_bindings()``); other names never count, so a loop
         rebuilds once —, or a model its fields reach and that was still incomplete has completed or seen a name its own
-        forward references mention change in its module (a link to a model of another module waiting for a name
-        there, through a type alias, a dataclass or a ``TypedDict`` too: ``_incomplete_dependencies()``), so repeated
+        forward references mention change in the caller's local names or in its module (a link to a model of another
+        module waiting for a name there, through a type alias, a dataclass or a ``TypedDict`` too: ``_incomplete_dependencies()``), so repeated
         calls on unchanged names cost a lookup of those names, not a ``model_rebuild()``. The values are kept and
         compared by identity (``_same_bindings()``). A complete model costs one attribute read.
 
@@ -1407,7 +1414,7 @@ class BaseSurrealModel(BaseModel):
         caller = user_namespace()
         module = _module_namespace(cls)
         bindings, values = _bindings((caller, module), _field_annotations(cls), "")
-        names = (("module", module), *bindings, *_incomplete_dependencies(cls, values))
+        names = (("module", module), *bindings, *_incomplete_dependencies(cls, values, caller))
         if _same_bindings(cls.__dict__.get("__surreal_failed_rebuild__"), names):
             return
         cls.model_rebuild(raise_errors=False, _types_namespace=caller)

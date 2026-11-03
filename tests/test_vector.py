@@ -2481,6 +2481,55 @@ class TestFailedRebuildRemembered:
             model.table_ddl()
         assert len(calls) == 3  # the second call remembered the failure; each refusal rebuilds again
 
+    @pytest.mark.parametrize("base", ["BaseModel", "BaseSurrealModel"])
+    def test_a_dependency_waiting_for_a_callers_local_name(self, monkeypatch: pytest.MonkeyPatch, base: str) -> None:
+        """A model of another module waiting for a name the caller then binds as a local name: Pydantic resolves the
+        dependency's forward references with the caller's names too (``model_rebuild(_types_namespace=…)``), so the
+        next call rebuilds the dependent model and raises its refusal — the memory looks the dependency's names up in
+        the caller's local names as well as in its module (issue #395)."""
+        m1, _ = self._two_modules(monkeypatch, base)
+        model = m1.A3
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A3", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        model.table_ddl(), model.table_ddl()  # one expression: no local name of this frame changes between them
+        C = int  # noqa: F841 - read by the completion, from this frame's local names
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        assert len(calls) == 2
+
+    def test_a_container_waiting_for_a_callers_local_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same through the field of a dataclass of another module: its forward reference ``"C"`` resolves with the
+        caller's local names, so binding ``C`` there tries again (issue #395)."""
+        m2 = types.ModuleType("vec_fwd_dc_m2")
+        m1 = types.ModuleType("vec_fwd_dc_m1")
+        monkeypatch.setitem(sys.modules, m2.__name__, m2)
+        monkeypatch.setitem(sys.modules, m1.__name__, m1)
+        exec(  # noqa: S102 - the test's own text
+            "import dataclasses\n@dataclasses.dataclass\nclass D:\n    x: 'C' = None\n",
+            m2.__dict__,
+        )
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, Index, SurrealConfigDict, VectorField\n"
+            "from vec_fwd_dc_m2 import D\n"
+            "class A3(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_dc_a3',\n"
+            "        indexes=[Index('vec_fwd_e', 'e', hnsw=True, dimension=4)])\n"
+            "    id: str | None = None\n"
+            "    d: D | None = None\n"
+            "    e: 'Vec' = None\n"
+            "Vec = VectorField[3]\n",
+            m1.__dict__,
+        )
+        model = m1.A3
+        assert model.__pydantic_complete__ is False
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A3", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        model.table_ddl(), model.table_ddl()  # one expression: no local name of this frame changes between them
+        C = int  # noqa: F841 - read by the completion, from this frame's local names
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        assert len(calls) == 2
+
     @pytest.mark.parametrize("spelling", ["TypeAliasType", "type statement", "dataclass", "TypedDict"])
     def test_a_dependency_through_an_alias(self, monkeypatch: pytest.MonkeyPatch, spelling: str) -> None:
         """A dependency reached through a type alias (``typing_extensions.TypeAliasType``, PEP 695's ``type``
@@ -2727,10 +2776,11 @@ class TestFailedRebuildHelpers:
         class Plain(BaseModel):
             x: int = 0
 
-        found = model_base._incomplete_dependencies(Plain, [alias[int]])
+        found = model_base._incomplete_dependencies(Plain, [alias[int]], {"C": int})
         assert found[0] == ("dependency 0", module.B)
         assert found[1][0] == "dependency 0 module" and found[1][1] is module.__dict__
-        assert found[2:] == [("dependency 0 0:C", model_base._UNBOUND)]
+        # The dependency's names, in the caller's local names (0) then in its module (1).
+        assert found[2:] == [("dependency 0 0:C", int), ("dependency 0 1:C", model_base._UNBOUND)]
 
 
 # === define_table(): the vector columns =============================================================================

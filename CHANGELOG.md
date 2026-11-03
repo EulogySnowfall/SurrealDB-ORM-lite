@@ -16,7 +16,9 @@ them by identity and follows type aliases. No new public API.
   `model_rebuild()` now holds only the names the model's string annotations mention, looked up in the
   calling function's local names and in the model's module, instead of whole namespaces: a loop variable or
   any other unrelated name changing no longer triggers a new `model_rebuild()`. A mentioned name bound to
-  another forward reference adds the names that one mentions.
+  another forward reference adds the names that one mentions. The names a still-incomplete linked model of
+  another module mentions are looked up in the calling function's local names too, as Pydantic resolves them
+  there: binding one as a local name tries again.
 - **The remembered values are compared with `is`** (#395), and kept alive by the memory, instead of being
   compared by `id()`: a value freed and replaced by another object at the same address can no longer leave
   the memory stale.
