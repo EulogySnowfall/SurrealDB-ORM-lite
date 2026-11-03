@@ -85,6 +85,7 @@ from tests._readme_tables import (
     assert_server_rows,
     assert_server_table,
 )
+from tests._retry import apply_reset
 from tests.conftest import orm_client
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
@@ -1358,7 +1359,7 @@ async def _isp(kind: str, ddl: str = FIXTURE_DDL) -> AsyncIterator[Any]:
     removed, then unregistered, on exit."""
     _register_isp(kind)
     client = await SurrealDBConnectionManager.get_client("isp")
-    await client.query("REMOVE DATABASE IF EXISTS isp_db; DEFINE DATABASE isp_db;", {})
+    await apply_reset(client, "REMOVE DATABASE IF EXISTS isp_db; DEFINE DATABASE isp_db;")
     await _apply_ddl(client, ddl)
     try:
         yield client

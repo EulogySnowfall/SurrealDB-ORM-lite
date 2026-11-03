@@ -144,6 +144,7 @@ from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._retry import apply_reset
 from tests.conftest import default_connection_class
 
 # --- the goldens of spec §5.3 ----------------------------------------------------------------------------------------
@@ -3187,7 +3188,7 @@ async def _mv(kind: str) -> AsyncIterator[Any]:
     exit (spec §9.2)."""
     _register_mv(kind)
     client = await SurrealDBConnectionManager.get_client("mv")
-    await _apply_ddl(client, _MV_RESET)
+    await apply_reset(client, _MV_RESET)
     try:
         yield client
     finally:
@@ -4910,7 +4911,7 @@ class TestViewRoundTripE2E:
                 assert model.get_view_query() == _MV_ROUND_TRIP[table]
             assert generated["mv_order_stats"].view_ddl() == MvStats.view_ddl()
 
-            await _apply_ddl(client, _MV_RESET)
+            await apply_reset(client, _MV_RESET)
             await _save_orders()
             for model in generated.values():
                 assert await model.define_view() == model.view_ddl()

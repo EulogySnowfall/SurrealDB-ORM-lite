@@ -208,6 +208,7 @@ from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyz
 from surreal_orm_lite.functions import normalize_function_name
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import validate_field_name
+from tests import _retry
 from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
 from tests._readme_tables import cells as _cells
 from tests._readme_tables import normalised as _normalised
@@ -216,6 +217,7 @@ from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._retry import apply_reset
 
 FTS_ENGLISH = Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"], comment="English text")
 
@@ -3101,6 +3103,95 @@ class TestAnnotateCompile:
         )
 
 
+#: SurrealDB 2.7.0's refusal of the ``DEFINE DATABASE`` of a reset that raced a server transaction (issue #396).
+_RESET_CONFLICT = "Failed to commit transaction due to a read or write conflict. This transaction can be retried"
+
+
+def _reset_answer(*refusals: str) -> dict[str, Any]:
+    """``query_raw()``'s answer to ``REMOVE DATABASE …; DEFINE DATABASE …;``: the removal accepted, then the definition
+    accepted (no *refusals*) or refused with each of *refusals*."""
+    results: list[dict[str, Any]] = [{"status": "OK", "result": None}]
+    results += [{"status": "ERR", "result": refusal} for refusal in refusals] or [{"status": "OK", "result": None}]
+    return {"result": results}
+
+
+class _ResetClient:
+    """A client whose ``query_raw()`` returns *answers* in turn (the last one repeated) and records what it sent."""
+
+    def __init__(self, *answers: dict[str, Any]) -> None:
+        self.answers = answers
+        self.sent: list[str] = []
+
+    async def query_raw(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        assert variables == {}
+        self.sent.append(query)
+        return self.answers[min(len(self.sent), len(self.answers)) - 1]
+
+
+@pytest.fixture
+def reset_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Every pause the reset's replay takes, recorded instead of slept."""
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(_retry.asyncio, "sleep", sleep)
+    return sleeps
+
+
+class TestResetReplay:
+    """``tests._retry.apply_reset()``, the database reset of every E2E helper that removes and redefines a database of
+    its own (issue #396): every statement is checked, the whole reset is replayed — at most five times, with a short
+    growing pause — only while every refusal is SurrealDB's retryable conflict ("can be retried"), and any other
+    refusal fails the test at once with the server's text."""
+
+    async def test_an_accepted_reset_is_sent_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer())
+        await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+        assert reset_sleeps == []
+
+    async def test_a_retryable_conflict_replays_the_reset(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer(_RESET_CONFLICT), _reset_answer(_RESET_CONFLICT), _reset_answer())
+        await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET] * 3
+        assert reset_sleeps == pytest.approx([0.05, 0.1])
+
+    async def test_another_refusal_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer("The database 'fts_db' already exists"), _reset_answer())
+        with pytest.raises(AssertionError, match="already exists"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+        assert reset_sleeps == []
+
+    async def test_a_conflict_next_to_another_refusal_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer(_RESET_CONFLICT, "Parse error"), _reset_answer())
+        with pytest.raises(AssertionError, match="Parse error"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+        assert reset_sleeps == []
+
+    async def test_a_query_level_error_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient({"error": {"code": -32000, "message": _RESET_CONFLICT}}, _reset_answer())
+        with pytest.raises(AssertionError, match="can be retried"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+
+    async def test_an_empty_answer_fails_at_once(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient({"result": []}, _reset_answer())
+        with pytest.raises(AssertionError, match="no statement"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET]
+
+    async def test_a_conflict_on_every_attempt_fails_after_five(self, reset_sleeps: list[float]) -> None:
+        client = _ResetClient(_reset_answer(_RESET_CONFLICT))
+        with pytest.raises(AssertionError, match="refused 5 times"):
+            await apply_reset(client, _FTS_RESET)
+        assert client.sent == [_FTS_RESET] * 5
+        assert reset_sleeps == pytest.approx([0.05, 0.1, 0.15, 0.2])
+
+
 # === E2E: the connection "fts" on the database fts_db, over WebSocket and HTTP, and mem:// =========================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -3158,7 +3249,7 @@ async def _fts(kind: str) -> AsyncIterator[Any]:
     exit."""
     _register_fts(kind)
     client = await SurrealDBConnectionManager.get_client("fts")
-    await _apply_ddl(client, _FTS_RESET)
+    await apply_reset(client, _FTS_RESET)
     try:
         yield client
     finally:

@@ -135,6 +135,7 @@ from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
+from tests._retry import apply_reset
 
 # --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
 
@@ -1459,7 +1460,7 @@ async def _rel(kind: str) -> AsyncIterator[Any]:
     exit (spec §9.2)."""
     _register_rel(kind)
     client = await SurrealDBConnectionManager.get_client("rel")
-    await _apply_ddl(client, _REL_RESET)
+    await apply_reset(client, _REL_RESET)
     try:
         yield client
     finally:
@@ -2926,7 +2927,7 @@ class TestRoundTripE2E:
                 assert edge.is_enforced() is model.is_enforced() is stored[table][3]
                 assert edge.relation_ddl() == model.relation_ddl()
 
-            await _apply_ddl(client, _REL_RESET)
+            await apply_reset(client, _REL_RESET)
             assert await _tables(client) == {}
             for edge in generated.values():
                 await _apply_ddl(client, edge.relation_ddl())

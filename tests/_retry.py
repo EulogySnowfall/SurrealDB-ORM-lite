@@ -1,13 +1,15 @@
 """Retry a test's own writes on SurrealDB's retryable conflicts.
 
 Shared by the tests that write to a ``CHANGEFEED`` table, so that a conflict raised by the
-server itself does not make them flaky.
+server itself does not make them flaky, and by every E2E helper that resets a database of its
+own (``REMOVE DATABASE IF EXISTS x; DEFINE DATABASE x; …``, issue #396).
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 T = TypeVar("T")
 
@@ -31,3 +33,49 @@ async def retry_write(operation: Callable[[], Awaitable[T]]) -> T:
         return await operation()
 
     return await _run()
+
+
+#: The text SurrealDB puts in a refusal that may be replayed as is.
+RETRYABLE_CONFLICT = "can be retried"
+
+#: How many times :func:`apply_reset` sends a reset before it fails the test.
+RESET_ATTEMPTS = 5
+
+#: The pause before the n-th replay of a reset is ``n`` times this many seconds.
+_RESET_BACKOFF = 0.05
+
+
+async def _reset_refusals(client: Any, query: str) -> list[str]:
+    """Send *query* through ``query_raw()`` and return the text of every refused statement (``[]`` when SurrealDB
+    accepted them all): ``query()`` checks only the first statement. A query-level error or an answer without any
+    statement result fails the test at once."""
+    response = await client.query_raw(query, {})
+    if "error" in response:
+        raise AssertionError(f"{query!r} was refused: {response['error']}")
+    results = response.get("result") or []
+    if not results:
+        raise AssertionError(f"{query!r} answered no statement result: {response!r}")
+    return [str(result.get("result")) for result in results if result.get("status") != "OK"]
+
+
+async def apply_reset(client: Any, query: str) -> None:
+    """Run the database reset *query* (``REMOVE DATABASE IF EXISTS x; DEFINE DATABASE x; …``) and check every statement.
+
+    SurrealDB 2.x (seen once on 2.7.0, issue #396) can refuse the ``DEFINE DATABASE`` of a reset with "Failed to commit
+    transaction due to a read or write conflict. This transaction can be retried" when a background server transaction
+    (change-feed GC, database reclaim) races it. A reset starts with ``REMOVE DATABASE IF EXISTS``, so replaying the
+    whole of it is safe: it is replayed — at most :data:`RESET_ATTEMPTS` times in all, with a short growing pause — only
+    while **every** refusal carries that retryable text. Any other refusal, a query-level error or an empty answer
+    fails the test at once with ``AssertionError`` and the server's text.
+
+    *client* is the SDK client of the database's connection; *query* is a constant of the test, never user input.
+    """
+    for attempt in range(1, RESET_ATTEMPTS + 1):
+        refusals = await _reset_refusals(client, query)
+        if not refusals:
+            return
+        if not all(RETRYABLE_CONFLICT in refusal for refusal in refusals):
+            raise AssertionError(f"{query!r} was refused: {refusals}")
+        if attempt == RESET_ATTEMPTS:
+            raise AssertionError(f"{query!r} was refused {RESET_ATTEMPTS} times with a retryable conflict: {refusals}")
+        await asyncio.sleep(_RESET_BACKOFF * attempt)
