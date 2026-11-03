@@ -642,7 +642,8 @@ def _mentioned_names(text: str) -> tuple[str, ...]:
             else:  # ``f().x``: the names of the expression the attribute is read from
                 nodes.append(current)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            found.update(dict.fromkeys(_mentioned_names(node.value)))
+            for name in _mentioned_names(node.value):
+                found[name] = None
         else:
             nodes.extend(ast.iter_child_nodes(node))
     return tuple(found)
