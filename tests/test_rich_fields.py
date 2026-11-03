@@ -18,7 +18,6 @@ import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, Self
 from uuid import UUID
 
@@ -72,6 +71,7 @@ from surreal_orm_lite.signals import post_save
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import _KEEP_LIMIT, _KEEP_MAX_DEPTH, PLAIN_CONTENT, build_filter_condition, replace_content
 from tests._readme_tables import assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import doc_part as _doc_part
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_model_auth import AUTH_PASSWORD, _connect, _unique_email
@@ -3888,7 +3888,6 @@ class TestLiveFiltersE2E:
 
 # --- README (spec §11, AC-25; D9, D10) -----------------------------------------------------------
 
-_README = Path(__file__).resolve().parents[1] / "README.md"
 
 #: Section 24's example tables and the test tables they run against: everything else runs as written.
 _README_TABLES = {"subscription": "rf_subscription", "slot": "rf_slot"}
@@ -3908,16 +3907,8 @@ _SET_ADVICE = (
 _D9_SINCE = "pre-existing (documented in v0.23.0)"
 
 
-def _readme_part(heading: str) -> str:
-    """The README text from the ``heading`` line up to the next ``##``/``###`` heading."""
-    text = _README.read_text(encoding="utf-8")
-    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", text, re.MULTILINE | re.DOTALL)
-    assert match, f"README has no {heading!r} section"
-    return match.group(0)
-
-
 def _section_24() -> str:
-    return _readme_part("### 24. Rich field types")
+    return _doc_part("## 24. Rich field types")
 
 
 def _normalised(text: str) -> str:
@@ -3926,7 +3917,7 @@ def _normalised(text: str) -> str:
 
 def _behaviour_rows() -> list[tuple[str, list[str]]]:
     """Each row of the "ORM behaviour: SurrealDB 2.x vs 3.x" table: its raw line and its cells."""
-    table = _readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x")
+    table = _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x")
     lines = [line.strip() for line in table.splitlines() if line.startswith("|")]
     return [(line, [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip("|"))]) for line in lines[2:]]
 

@@ -16,19 +16,28 @@ from typing import Any
 import pytest
 
 from surreal_orm_lite import SurrealDBConnectionManager
-from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import anchors as _anchors
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_guide_sections,
+    assert_links_resolve,
+    assert_manual_order,
+    assert_server_header_sentence,
+    assert_server_rows,
+)
+from tests._readme_tables import doc_part as _doc_part
+from tests._readme_tables import guide as _guide
+from tests._readme_tables import manual as _manual
 from tests._readme_tables import normalised as _normalised
-from tests._readme_tables import readme as _readme
-from tests._readme_tables import readme_part as _readme_part
 from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _md_tables
 
-_SECTION_26 = "### 26. Embedded engine and test fixtures"
-_SECTION_40 = "### 40. Command line (`surreal-orm-lite`)"
-_SECTION_41 = "### 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin"
+_SECTION_26 = "## 26. Embedded engine and test fixtures"
+_SECTION_40 = "## 40. Command line (`surreal-orm-lite`)"
+_SECTION_41 = "## 41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin"
 _ANCHOR_41 = "#41-test-data-factories-modelfactory-faker-and-the-pytest-plugin"
-_LINK_41 = f"[section 41]({_ANCHOR_41})"
+_LINK_41 = f"[section 41](testing.md{_ANCHOR_41})"
 #: The parts of section 41, in order, after its untitled intro.
 _PARTS_41 = [
     "Declare and use a factory",
@@ -187,17 +196,17 @@ _POSITIONAL_REASONS = [
 
 
 def _section_41() -> str:
-    """Section 41, as written, without the ``---`` that ends it."""
-    body, separator, rest = _readme_part(_SECTION_41).rpartition("\n---\n")
-    assert separator and not rest.strip(), "section 41 ends with the --- of the next part"
-    return f"{body}\n"
+    """Section 41, as written: the last part of the testing guide, no ``---`` in it."""
+    section = _doc_part(_SECTION_41)
+    assert "\n---\n" not in section
+    return section
 
 
 def _part_41(heading: str) -> str:
-    """One ``####`` part of section 41, as written (the intro, its heading included, for ``""``)."""
+    """One ``###`` part of section 41, as written (the intro, its heading included, for ``""``)."""
     if not heading:
-        return _section_41().split("\n#### ", 1)[0]
-    return _subsection(f"#### {heading}", _section_41())
+        return _section_41().split("\n### ", 1)[0]
+    return _subsection(f"### {heading}", _section_41())
 
 
 def _examples_41() -> list[str]:
@@ -253,19 +262,16 @@ class TestReadmeSection41:
     """README section 41: its place, its parts, its provider table and what each part states."""
 
     def test_section_41_follows_section_40(self) -> None:
-        """Section 41 right after section 40, the last before the ``---`` of "Configuration Options"."""
-        text = _readme()
-        start_40 = text.index(f"\n{_SECTION_40}\n")
-        configuration = text.index("\n## Configuration Options\n")
-        assert re.findall(r"^#{2,3} .*$", text[start_40 + 1 : configuration], re.MULTILINE) == [_SECTION_40, _SECTION_41]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 41 ends before the --- of the next part"
-        assert "\n---\n" not in _readme_part(_SECTION_40), "section 40 no longer ends with the ---"
+        """Section 41 is the testing guide, ``docs/testing.md``, its only section, right after section 40 (the command
+        line guide) in the manual."""
+        assert_guide_sections("testing.md", [_SECTION_41])
+        assert_manual_order(_SECTION_40, _SECTION_41)
 
     def test_anchor(self) -> None:
-        assert f"#{_anchor(_SECTION_41.removeprefix('### '))}" == _ANCHOR_41
+        assert f"#{_anchor(_SECTION_41.removeprefix('## '))}" == _ANCHOR_41
 
     def test_parts_in_order(self) -> None:
-        assert re.findall(r"^#### (.*)$", _section_41(), re.MULTILINE) == _PARTS_41
+        assert re.findall(r"^### (.*)$", _section_41(), re.MULTILINE) == _PARTS_41
 
     def test_fences(self) -> None:
         """Only ``python`` blocks."""
@@ -334,11 +340,8 @@ class TestReadmeSection41:
 
     def test_links_resolve(self) -> None:
         """Every in-page link of section 41 names a heading."""
-        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
-        links = re.findall(r"\]\(#([^)]+)\)", _section_41())
-        assert links, "no link"
-        assert [link for link in links if link not in anchors] == []
-        assert _ANCHOR_41.lstrip("#") in anchors
+        assert_links_resolve(_section_41(), "testing.md")
+        assert _ANCHOR_41.lstrip("#") in _anchors(_guide("testing.md"))
 
 
 # --- The tables of the README and section 26 ------------------------------------------------------------------------
@@ -393,36 +396,36 @@ class TestReadmeRows40:
 
     def test_features_row(self) -> None:
         """Right after the command line."""
-        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        features = [row for _, row in _table_rows(_doc_part("## Features"))]
         firsts = [row[0] for row in features]
         assert _FEATURES_ROW_40 in features, features
         cli = firsts.index("Command line (`surreal-orm-lite`: migrations, inspectdb, shell)")
         assert firsts.index(_FEATURES_ROW_40[0]) == cli + 1
 
     def test_roadmap_rows(self) -> None:
-        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        roadmap = [row for _, row in _table_rows(_doc_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.39.0")
         assert roadmap[start : start + 3] == _ROADMAP_ROWS_40, roadmap
 
     def test_comparison_row(self) -> None:
         """Right after the migrations and the CLI."""
-        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        comparison = [row for _, row in _table_rows(_doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [row[0] for row in comparison]
         assert comparison[firsts.index("Migrations & CLI") + 1] == _COMPARISON_ROW_40, comparison
 
     def test_section_26_points_to_section_41(self) -> None:
         """The hand-written ``surreal_db`` recipe stays, followed by the plugin sentence; the bullet that promised the
         factories in v0.40.0 points to section 41."""
-        section = _readme_part(_SECTION_26)
-        fixtures = _normalised(_subsection("#### Test fixtures", section))
+        section = _doc_part(_SECTION_26)
+        fixtures = _normalised(_subsection("### Test fixtures", section))
         assert _normalised(_PLUGIN_SENTENCE_26) in fixtures, fixtures
-        coming = _subsection("#### Coming from the full SurrealDB-ORM", section)
+        coming = _subsection("### Coming from the full SurrealDB-ORM", section)
         assert _FACTORIES_BULLET_26 in _bullets(coming), coming
         assert "come in v0.40.0" not in _normalised(section)
 
     def test_no_section_promises_v0_40_0(self) -> None:
         """No section before section 41 still says the factories come in v0.40.0."""
-        before = _normalised(_readme()[: _readme().index(f"\n{_SECTION_41}\n")])
+        before = _normalised(_manual()[: _manual().index(f"\n{_SECTION_41}\n")])
         for promise in ("come in v0.40.0", "comes in v0.40.0", "factories v0.40.0"):
             assert promise not in before, promise
 
@@ -432,6 +435,6 @@ class TestReadmeRows40:
         ids=["features", "roadmap", "comparison"],
     )
     def test_no_pipe_in_a_cell(self, heading: str) -> None:
-        for table in _md_tables(_readme_part(heading)):
+        for table in _md_tables(_doc_part(heading)):
             assert len({line.count("|") for line in table}) == 1, table
             assert "\\|" not in "".join(table)

@@ -32,7 +32,13 @@ LEGACY_PIN = ROOT / ".surrealdb-version2x"
 # verified against, which stays true after a later bump — rewriting them would falsify the
 # history. The dated design specs and plans are out of reach for the same reason: they live
 # with the maintainer's working notes, outside the repository.
-TARGETS = ["README.md", "docs/ROADMAP.md", ".github/workflows/ci.yml"]
+# The guides under docs/ restate the pins too (the compatibility tables, the "tested against" note): every one of them
+# is read, so a sentence moved from one guide to another stays covered.
+TARGETS = [
+    "README.md",
+    *sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "docs").glob("*.md")),
+    ".github/workflows/ci.yml",
+]
 
 
 def read_pin(path: Path) -> str:
@@ -58,34 +64,34 @@ def rules(primary: str, legacy: str) -> list[tuple[str, str, str]]:
             rf"\g<1>{legacy}\g<2>{primary}\g<3>",
         ),
         (
-            "README 'tested against' note",
+            "'tested against' note",
             r"(It is tested against SurrealDB \*\*v)\d+\.\d+\.\d+(\*\* and \*\*v)\d+\.\d+\.\d+(\*\*)",
             rf"\g<1>{legacy}\g<2>{primary}\g<3>",
         ),
         (
-            "README function-catalog coverage",
+            "function-catalog coverage",
             r"(member is tested against SurrealDB )\d+\.\d+\.\d+( and )\d+\.\d+\.\d+",
             rf"\g<1>{legacy}\g<2>{primary}",
         ),
         (
-            "README compatibility table (primary)",
+            "compatibility table (primary)",
             rf"(\|\s*){p_major}\.\d+\.\d+(\s*\|\s*2\.0\s*\|\s*✅ Tested)",
             rf"\g<1>{primary}\g<2>",
         ),
         (
-            "README compatibility table (legacy)",
+            "compatibility table (legacy)",
             rf"(\|\s*){l_major}\.\d+\.\d+(\s*\|\s*2\.0\s*\|\s*✅ Tested)",
             rf"\g<1>{legacy}\g<2>",
         ),
         # Two columns, one per line — anchor on the major or the primary rule rewrites the
         # 2.6.x cell and silently corrupts the table.
         (
-            "README behaviour table (primary column)",
+            "behaviour table (primary column)",
             rf"(catalogued member verified on ){p_major}\.\d+\.\d+",
             rf"\g<1>{primary}",
         ),
         (
-            "README behaviour table (legacy column)",
+            "behaviour table (legacy column)",
             rf"(catalogued member verified on ){l_major}\.\d+\.\d+",
             rf"\g<1>{legacy}",
         ),
@@ -127,7 +133,8 @@ def main() -> None:
             match = re.search(pattern, content)
             if not match:
                 continue
-            unmatched.remove(name)
+            if name in unmatched:  # a sentence may be restated in several files (README and a guide)
+                unmatched.remove(name)
             updated = re.sub(pattern, replacement, content)
             if updated == content:
                 print(f"  OK  {target}: {name}")

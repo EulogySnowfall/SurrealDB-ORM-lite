@@ -1,9 +1,14 @@
-"""Read the README and check the structure of its two behaviour tables.
+"""Read the README and the guides under ``docs/``, and check the structure of the two behaviour tables.
 
-Shared by the documentation tests. Each release adds rows to "ORM behaviour: SurrealDB 2.x vs 3.x" (and maybe to
-"ORM behaviour: the embedded engine") and a sentence to the intro paragraph of the first table; the test of that
-release owns them. It checks their exact text, that the releases are in version order and that the table keeps its
-column widths and its final row (:func:`assert_server_rows`, :func:`assert_embedded_rows`,
+Shared by the documentation tests. The README is the project's front page; the user guide is ``docs/*.md`` (index
+``docs/README.md``), one guide per topic, each holding numbered sections of the manual (``## 40. Command line…``).
+:func:`doc_part` finds a heading in the README or in a guide, wherever it lives, so a test names the heading it pins,
+not the file.
+
+Each release adds rows to "ORM behaviour: SurrealDB 2.x vs 3.x" (and maybe to "ORM behaviour: the embedded engine"),
+both in ``docs/compatibility.md``, and a sentence to the intro paragraph of the first table; the test of that release
+owns them. It checks their exact text, that the releases are in version order and that the table keeps its column
+widths and its final row (:func:`assert_server_rows`, :func:`assert_embedded_rows`,
 :func:`assert_server_header_sentence`).
 
 No test checks which release sits next to its own: a release prepared in parallel with another inserts its rows and
@@ -15,10 +20,17 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-README = Path(__file__).resolve().parents[1] / "README.md"
+ROOT = Path(__file__).resolve().parents[1]
+README = ROOT / "README.md"
+DOCS = ROOT / "docs"
+#: The development roadmap: read by its own helpers, not a guide.
+ROADMAP = DOCS / "ROADMAP.md"
+#: Where the README links to the guides: PyPI shows the README too, so its links are absolute.
+GITHUB_BLOB = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/"
+GITHUB_TREE = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/tree/main/"
 
-SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
-EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x vs 3.x"
+EMBEDDED_BEHAVIOUR = "## ORM behaviour: the embedded engine"
 
 #: Every line of the 2.x/3.x table is 535 characters, its columns 136, 175, 181 and 38 wide between the pipes:
 #: a new row is padded to them.
@@ -37,27 +49,141 @@ SERVER_ORDERED_FROM = (0, 20, 0)
 _RELEASE = re.compile(r"v(\d+)\.(\d+)\.(\d+)|pre-existing \(documented in v(\d+)\.(\d+)\.(\d+)\)")
 #: How a sentence of the 2.x/3.x table's intro paragraph names its release.
 _ADDED_IN = re.compile(r"\badded in (v\d+\.\d+\.\d+)")
+_HEADING = re.compile(r"^(#{1,6}) (.*)$")
 
 
-# --- Reading the README ---------------------------------------------------------------------------------------------
+# --- Reading the README and the guides ------------------------------------------------------------------------------
 
 
 def readme() -> str:
+    """The README, the project's front page (also PyPI's long description)."""
     return README.read_text(encoding="utf-8")
 
 
-def readme_part(heading: str) -> str:
-    """The README text from the ``heading`` line up to the next ``##``/``###`` heading."""
-    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", readme(), re.MULTILINE | re.DOTALL)
-    assert match, f"README has no {heading!r} section"
-    return match.group(0)
+def guide_paths() -> list[Path]:
+    """Every guide of ``docs/``, the index ``docs/README.md`` included, the roadmap left out."""
+    return sorted(path for path in DOCS.glob("*.md") if path != ROADMAP)
+
+
+def guide(name: str) -> str:
+    """The text of the guide ``docs/<name>``."""
+    return (DOCS / name).read_text(encoding="utf-8")
+
+
+def headings(text: str) -> list[tuple[int, str, int]]:
+    """``(level, title, line index)`` of every heading of *text*, code blocks skipped."""
+    found = []
+    fence = False
+    for index, line in enumerate(text.split("\n")):
+        if line.startswith("```"):
+            fence = not fence
+            continue
+        match = _HEADING.match(line)
+        if match and not fence:
+            found.append((len(match.group(1)), match.group(2), index))
+    return found
+
+
+def part(heading: str, text: str) -> str:
+    """The ``heading`` line of *text* (``"## 40. Command line…"``, its level included) up to the next heading of the
+    same level or above, or the end."""
+    level = len(heading) - len(heading.lstrip("#"))
+    lines = text.split("\n")
+    found = [(lvl, index) for lvl, title, index in headings(text) if lvl == level and f"{'#' * lvl} {title}" == heading]
+    assert len(found) == 1, f"{len(found)} {heading!r} headings"
+    start = found[0][1]
+    end = next((index for lvl, _, index in headings(text) if index > start and lvl <= level), len(lines))
+    return "\n".join(lines[start:end]) + ("\n" if end < len(lines) else "")
+
+
+def doc_file(heading: str) -> Path:
+    """The README or the guide holding ``heading`` (its level included); exactly one does."""
+    holders = [
+        path
+        for path in [README, *guide_paths()]
+        if any(f"{'#' * lvl} {title}" == heading for lvl, title, _ in headings(path.read_text(encoding="utf-8")))
+    ]
+    assert len(holders) == 1, f"{heading!r} is in {[path.name for path in holders]}"
+    return holders[0]
+
+
+def doc_part(heading: str) -> str:
+    """The ``heading`` part of the README or of the guide holding it, up to the next heading of its level or above."""
+    return part(heading, doc_file(heading).read_text(encoding="utf-8"))
 
 
 def subsection(heading: str, text: str) -> str:
-    """The ``heading`` line of ``text`` up to the next heading of level 2 to 4, or the end."""
-    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,4}} |\Z)", text, re.MULTILINE | re.DOTALL)
-    assert match, f"no {heading!r} part"
-    return match.group(0)
+    """The ``heading`` part of ``text`` (a part :func:`doc_part` returned), up to the next heading of its level or
+    above, or the end."""
+    return part(heading, text)
+
+
+def anchor(heading: str) -> str:
+    """GitHub's anchor of a heading's title (without its ``#``)."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+def anchors(text: str) -> set[str]:
+    """Every anchor GitHub gives the headings of *text*: a repeated title gets ``-1``, ``-2``… after the first."""
+    seen: dict[str, int] = {}
+    found = set()
+    for _, title, _ in headings(text):
+        base = anchor(title)
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        found.add(base if count == 0 else f"{base}-{count}")
+    return found
+
+
+def guide_order() -> list[str]:
+    """The guides in the order of the index's "Guides" list (``docs/README.md``)."""
+    guides_part = part("## Guides", guide("README.md"))
+    return re.findall(r"^- \*\*\[[^]]+\]\(([\w-]+\.md)\)\*\*$", guides_part, re.MULTILINE)
+
+
+def manual() -> str:
+    """Every guide, in the index's order, as one text: what a reader goes through from section 1 to the end."""
+    return "\n".join(guide(name) for name in guide_order())
+
+
+def unresolved_links(text: str, here: Path) -> list[str]:
+    """The relative links of *text* (written in the file *here*) that name no file, or no heading of their file.
+
+    ``(#anchor)`` names a heading of *here*, ``(other.md#anchor)`` one of ``other.md`` next to it; a link to a
+    directory or to a file other than Markdown only needs the path to exist. Absolute URLs are not checked here."""
+    broken = []
+    for target in re.findall(r"\]\(([^)\s]+)\)", text):
+        if re.match(r"[a-z]+:", target):
+            continue
+        path, _, fragment = target.partition("#")
+        file = (here.parent / path).resolve() if path else here
+        if (
+            not file.exists()
+            or fragment
+            and (file.suffix != ".md" or fragment not in anchors(file.read_text(encoding="utf-8")))
+        ):
+            broken.append(target)
+    return broken
+
+
+def assert_guide_sections(name: str, sections: list[str]) -> None:
+    """The guide ``docs/<name>`` has one ``#`` title, then exactly *sections* as its ``##`` headings, in order."""
+    found = [(level, title) for level, title, _ in headings(guide(name)) if level <= 2]
+    assert [level for level, _ in found].count(1) == 1 and found[0][0] == 1, found[:2]
+    assert [f"## {title}" for _, title in found[1:]] == sections
+
+
+def assert_manual_order(*sections: str) -> None:
+    """*sections* (headings, level included) come in this order in the manual (:func:`manual`)."""
+    text = manual()
+    positions = [text.index(f"\n{section}\n") for section in sections]
+    assert positions == sorted(positions), list(zip(sections, positions, strict=True))
+
+
+def assert_links_resolve(text: str, name: str) -> None:
+    """*text*, a part of the guide ``docs/<name>``, has relative links and each names a file and a heading."""
+    assert re.search(r"\]\(([\w-]*\.md)?#", text), "no link"
+    assert unresolved_links(text, DOCS / name) == []
 
 
 def normalised(text: str) -> str:
@@ -163,7 +289,7 @@ def assert_header_sentence(header: str, sentence: str) -> None:
 
 
 def _assert_widths(heading: str, line_length: int, widths: list[int]) -> None:
-    [lines] = tables(readme_part(heading))
+    [lines] = tables(doc_part(heading))
     assert {len(line) for line in lines} == {line_length}, [line for line in lines if len(line) != line_length]
     for line in lines:
         assert [len(cell) for cell in line.split("|")[1:-1]] == widths, line
@@ -171,17 +297,17 @@ def _assert_widths(heading: str, line_length: int, widths: list[int]) -> None:
 
 def server_rows() -> list[list[str]]:
     """The cells of every body row of the 2.x/3.x table, in order."""
-    return [row for _, row in table_rows(readme_part(SERVER_BEHAVIOUR))]
+    return [row for _, row in table_rows(doc_part(SERVER_BEHAVIOUR))]
 
 
 def embedded_rows() -> list[list[str]]:
     """The cells of every body row of the embedded table, in order."""
-    return [row for _, row in table_rows(readme_part(EMBEDDED_BEHAVIOUR))]
+    return [row for _, row in table_rows(doc_part(EMBEDDED_BEHAVIOUR))]
 
 
 def server_header() -> str:
     """The 2.x/3.x table's heading and intro paragraph, whitespace normalised."""
-    return normalised(readme_part(SERVER_BEHAVIOUR).split("\n|", 1)[0])
+    return normalised(doc_part(SERVER_BEHAVIOUR).split("\n|", 1)[0])
 
 
 def assert_server_table() -> None:
