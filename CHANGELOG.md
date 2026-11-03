@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.1] - 2026-11-02
+
+The remembered forward-reference rebuild of v0.39.5 keys on the names a model's annotations mention, compares
+them by identity and follows type aliases. No new public API.
+
+### Fixed
+
+- **A loop no longer rebuilds an incomplete model at every turn** (#395). The memory of a failed
+  `model_rebuild()` now holds only the names the model's string annotations mention, looked up in the
+  calling function's local names and in the model's module, instead of whole namespaces: a loop variable or
+  any other unrelated name changing no longer triggers a new `model_rebuild()`. A mentioned name bound to
+  another forward reference adds the names that one mentions. The names a still-incomplete linked model of
+  another module mentions are looked up in the calling function's local names too, as Pydantic resolves them
+  there: binding one as a local name tries again.
+- **The remembered values are compared with `is`** (#395), and kept alive by the memory, instead of being
+  compared by `id()`: a value freed and replaced by another object at the same address can no longer leave
+  the memory stale.
+- **Links through a type alias, a dataclass or a `TypedDict` are followed** (#395). A linked model reached
+  through `typing.TypeAliasType` (PEP 695's `type BA = B | None`, or the `typing_extensions` backport, read
+  through its `__value__`), or through the fields of a dataclass or a `TypedDict`, now ends the memory when
+  it completes, so the next call raises the model's refusal. An alias whose value is itself a forward
+  reference (`TypeAliasType("BA", "C | None")`, `list["C"] | None`, `type BA = "C | None"`) is remembered
+  with the names it mentions, looked up in the calling function's local names and in the alias's module:
+  defining one there tries again. An alias whose value raises (an undefined name,
+  or an error such as `AttributeError`) never makes an ORM call fail: the field stays `any`, as before, and
+  on Python 3.14+ defining a name the alias mentions tries again.
+- **Forward references in the return annotations of computed fields and serializers count** (#395): a name
+  mentioned by the return annotation of a `@computed_field`, `@field_serializer` or `@model_serializer` (or by
+  its explicit `return_type`), which Pydantic evaluates to complete the model, is remembered too, so defining
+  it completes the model at the next call.
+- **`Literal` values and `Annotated` metadata are not read as names** (#395): the strings in
+  `Literal["user", "admin"]` and the metadata of `Annotated[int, "doc"]` (all its arguments but the first) are
+  no longer looked up as forward references, as objects or as string annotations (Python 3.14's lazy
+  annotations, `from __future__ import annotations`), so a loop variable named `user` no longer rebuilds the
+  model at every turn.
+- Same behaviour on SurrealDB 2.x and 3.x.
+
 ## [0.40.0] - 2026-11-02
 
 Test data factories (`ModelFactory`, `Faker`) and an opt-in pytest plugin in `surreal_orm_lite.testing`, with
