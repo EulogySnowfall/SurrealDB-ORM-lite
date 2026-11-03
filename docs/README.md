@@ -132,6 +132,7 @@ The guides keep the section numbers of the manual, so a reference such as "secti
 - [Changelog](../CHANGELOG.md): what changed in each version.
 - [Security policy](../SECURITY.md): supported versions and how to report a vulnerability.
 - [Runnable examples](../examples/): one Jupyter notebook per feature release.
+- [Guide for AI coding assistants](ai/CLAUDE.md): a compact page to import into an assistant's `CLAUDE.md`.
 
 ## Roadmap
 
