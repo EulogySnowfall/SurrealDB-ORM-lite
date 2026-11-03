@@ -1,9 +1,12 @@
+import ast
 import contextlib
 import copy
+import dataclasses
 import functools
 import logging
 import os
 import sys
+import types
 import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
@@ -576,35 +579,227 @@ def _own_annotation_names(cls: type) -> set[str]:
     return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
 
 
-def _bindings(namespace: Mapping[str, Any]) -> dict[str, int]:
-    """``{name: id(value)}`` for *namespace*: what ``_complete_pending_checks()`` compares to tell whether the names a
-    failed ``model_rebuild()`` could use have changed since (issue #345). Identities, never ``==``: a value's own
-    equality may run user code, or not be a ``bool``."""
-    return {name: id(value) for name, value in namespace.items()}
+#: A name the completion's memory looked up and found unbound (issue #345): never a value a namespace holds.
+_UNBOUND: typing.Final = object()
+
+#: One remembered binding of ``_complete_pending_checks()`` (issues #345, #395): ``(label, value)``, the label naming
+#: where the value was read (``"module"``, a dependency, or a name in a namespace), the value kept and compared by
+#: identity.
+_Binding = tuple[str, object]
 
 
-def _incomplete_dependencies(model: type[BaseModel]) -> tuple[tuple[int, int, dict[str, int]], ...]:
-    """The Pydantic models *model*'s fields reach (``B | None``, ``list[B]``, ``Annotated[B, …]``, and theirs in turn)
-    that are still incomplete, each as ``(id of the model, id of its module's namespace, {module's name: id of its
-    value})``: what ``_complete_pending_checks()`` adds to the names it compares (issue #345). A model left
-    incomplete by another model, itself waiting for a name of its own module, completes once that model completes —
-    it leaves this list — or once that name is defined in its module: either changes the result, so the failed
-    attempt is not remembered past it."""
-    found: list[tuple[int, int, dict[str, int]]] = []
+def _raw_annotations(cls: type) -> dict[str, Any]:
+    """The annotations written in *cls*'s own body, unevaluated: strings and ``ForwardRef`` left as they are.
+
+    Python 3.14 (PEP 649) keeps them behind ``__annotate__``; ``annotationlib``'s ``STRING`` format returns them as
+    text without evaluating them, so an undefined name cannot raise here (see ``_own_annotation_names()``).
+    """
+    try:
+        import annotationlib  # type: ignore[import-not-found]
+    except ImportError:  # Python < 3.14
+        return dict(cls.__dict__.get("__annotations__", {}))
+    try:
+        return dict(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
+    except Exception:  # an ``__annotate__`` of the user's own that raises: nothing to read
+        return {}
+
+
+def _forward_texts(annotation: Any, texts: list[str]) -> None:
+    """Append to *texts* the forward references *annotation* holds: itself when it is a string, the text of a
+    ``ForwardRef``, and those of its arguments (``list["B"]``, ``Annotated["B", …]``) in turn."""
+    if isinstance(annotation, str):
+        texts.append(annotation)
+    elif isinstance(annotation, typing.ForwardRef):
+        texts.append(annotation.__forward_arg__)
+    else:
+        for argument in typing.get_args(annotation):
+            _forward_texts(argument, texts)
+
+
+@functools.lru_cache(maxsize=1024)
+def _mentioned_names(text: str) -> tuple[str, ...]:
+    """The names the forward reference *text* mentions, dotted for an attribute of a name (``"mod.B"``), each once, in
+    the order met; the texts of its string constants (``"list['B']"``) read in turn. ``()`` for a text that is not an
+    expression: Pydantic cannot evaluate it either."""
+    try:
+        tree = ast.parse(text.strip(), mode="eval")
+    except (SyntaxError, ValueError):
+        return ()
+    found: dict[str, None] = {}
+    nodes: list[ast.AST] = [tree.body]
+    while nodes:
+        node = nodes.pop(0)
+        if isinstance(node, ast.Name):
+            found[node.id] = None
+        elif isinstance(node, ast.Attribute):
+            parts: list[str] = []
+            current: ast.expr = node
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                found[".".join([current.id, *reversed(parts)])] = None
+            else:  # ``f().x``: the names of the expression the attribute is read from
+                nodes.append(current)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.update(dict.fromkeys(_mentioned_names(node.value)))
+        else:
+            nodes.extend(ast.iter_child_nodes(node))
+    return tuple(found)
+
+
+def _lookup(namespace: Mapping[str, Any], name: str) -> object:
+    """The value *name* (dotted: ``"mod.B"``) has in *namespace*, ``_UNBOUND`` when it has none. An attribute is read
+    from the ``__dict__`` of a module or a class only, never through ``getattr()``: no user code runs here."""
+    root, *attributes = name.split(".")
+    value: object = namespace.get(root, _UNBOUND)
+    for attribute in attributes:
+        if not isinstance(value, type | types.ModuleType):
+            break
+        value = vars(value).get(attribute, _UNBOUND)
+    return value
+
+
+def _bindings(
+    namespaces: Sequence[Mapping[str, Any]], annotations: Iterable[Any], label: str
+) -> tuple[list[_Binding], list[object]]:
+    """What ``_complete_pending_checks()`` remembers of *namespaces* (issue #395): the value of each name the forward
+    references of *annotations* mention, in each namespace, ``_UNBOUND`` when it has none — and, a value being itself
+    a forward reference (``Later = "Missing"``), the names that one mentions in turn. Never a whole namespace: a name
+    no annotation mentions can change without a new ``model_rebuild()``. Returns those bindings and the values found,
+    for ``_incomplete_dependencies()`` to walk."""
+    texts: list[str] = []
+    for annotation in annotations:
+        _forward_texts(annotation, texts)
+    pending = [name for text in texts for name in _mentioned_names(text)]
+    seen: set[str] = set()
+    found: list[_Binding] = []
+    values: list[object] = []
+    while pending:
+        name = pending.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        for index, namespace in enumerate(namespaces):
+            value = _lookup(namespace, name)
+            found.append((f"{label}{index}:{name}", value))
+            if value is not _UNBOUND:
+                values.append(value)
+                more: list[str] = []
+                _forward_texts(value, more)
+                pending.extend(name for text in more for name in _mentioned_names(text))
+    return found, values
+
+
+def _field_annotations(model: type[BaseModel]) -> list[Any]:
+    """The annotation each field of *model* was declared with, unevaluated, read from the first class of its MRO that
+    declares it (an inherited field from its parent's body)."""
+    declared: dict[type, dict[str, Any]] = {}
+    annotations: list[Any] = []
+    for name in model.model_fields:
+        for cls in model.__mro__:
+            if cls not in declared:
+                declared[cls] = _raw_annotations(cls)
+            if name in declared[cls]:
+                annotations.append(declared[cls][name])
+                break
+    return annotations
+
+
+def _alias_types() -> tuple[type, ...]:
+    """The ``TypeAliasType`` classes this interpreter has: ``typing``'s (PEP 695, Python 3.12+) and that of
+    ``typing_extensions`` when Pydantic loaded it (its backport, never imported here)."""
+    found: list[type] = []
+    for module in (typing, sys.modules.get("typing_extensions")):
+        alias = getattr(module, "TypeAliasType", None)
+        if isinstance(alias, type) and alias not in found:
+            found.append(alias)
+    return tuple(found)
+
+
+def _is_typeddict(cls: type) -> bool:
+    """Whether *cls* is a ``TypedDict``: ``typing``'s, or that of ``typing_extensions`` when Pydantic loaded it (its
+    own class on some Python versions, which ``typing.is_typeddict()`` does not recognise)."""
+    for module in (typing, sys.modules.get("typing_extensions")):
+        check = getattr(module, "is_typeddict", None)
+        if callable(check) and check(cls):
+            return True
+    return False
+
+
+def _module_namespace(obj: object) -> Mapping[str, Any]:
+    """The namespace of the module *obj* (a class, an alias) was defined in; ``{}`` when that module is gone."""
+    return getattr(sys.modules.get(getattr(obj, "__module__", None) or ""), "__dict__", {})
+
+
+def _incomplete_dependencies(model: type[BaseModel], roots: Iterable[object] = ()) -> list[_Binding]:
+    """What ``_complete_pending_checks()`` remembers of the models *model*'s fields reach and that are still incomplete
+    (``B | None``, ``list[B]``, ``Annotated[B, …]``, and theirs in turn; issue #345), *roots* — the values its
+    forward references resolved to — included: each such model, its module, and the names its own forward references
+    mention there (``_bindings()``). A model left incomplete by another model, itself waiting for a name of its own
+    module, completes once that model completes — it leaves this list — or once that name is defined in its module:
+    either changes the result, so the failed attempt is not remembered past it.
+
+    The walk goes through a type alias (issue #395: ``typing.TypeAliasType``, PEP 695's ``type BA = B | None``, and
+    ``typing_extensions``'s backport) by its ``__value__`` — an alias whose value names a name still undefined is
+    remembered with that name in its module —, and through the fields of a dataclass and of a ``TypedDict``."""
+    aliases = _alias_types()
+    found: list[_Binding] = []
     seen: set[int] = {id(model)}
     pending: list[Any] = [info.annotation for info in model.model_fields.values()]
+    pending.extend(roots)
     while pending:
         annotation = pending.pop()
+        container: dict[str, Any] | None = None
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             if id(annotation) in seen or annotation.__pydantic_complete__:
                 continue
             seen.add(id(annotation))
-            module = getattr(sys.modules.get(annotation.__module__), "__dict__", {})
-            found.append((id(annotation), id(module), _bindings(module)))
+            label = f"dependency {len(found)}"
+            module = _module_namespace(annotation)
+            found.extend(((label, annotation), (f"{label} module", module)))
+            bindings, values = _bindings((module,), _field_annotations(annotation), f"{label} ")
+            found.extend(bindings)
+            pending.extend(values)
             pending.extend(info.annotation for info in annotation.model_fields.values())
+        elif aliases and isinstance(annotation, aliases):
+            if id(annotation) in seen:
+                continue
+            seen.add(id(annotation))
+            try:
+                pending.append(typing.cast(Any, annotation).__value__)  # evaluated here: may raise
+            except NameError as error:  # ``type BA = Missing``: the alias waits for that name in its module
+                name = error.name or ""
+                found.append((f"alias {len(found)} {name}", _lookup(_module_namespace(annotation), name)))
+        elif isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+            container = {field.name: field.type for field in dataclasses.fields(annotation)}
+        elif isinstance(annotation, type) and _is_typeddict(annotation):
+            container = _raw_annotations(annotation)
         else:
+            origin = typing.get_origin(annotation)
+            if aliases and isinstance(origin, aliases):  # ``BA[int]``: the alias itself, then its arguments
+                pending.append(origin)
             pending.extend(typing.get_args(annotation))
-    return tuple(found)
+        if container is not None:
+            if id(annotation) in seen:
+                continue
+            seen.add(id(annotation))
+            bindings, values = _bindings((_module_namespace(annotation),), container.values(), f"{len(found)} ")
+            found.extend(bindings)
+            pending.extend(values)
+            pending.extend(container.values())
+    return found
+
+
+def _same_bindings(remembered: Sequence[_Binding] | None, current: Sequence[_Binding]) -> bool:
+    """Whether *current* holds the bindings *remembered*: the same labels, each value the **same object** (``is``,
+    never ``==``: a value's own equality may run user code, or not be a ``bool``; issue #395 — the remembered values
+    are kept alive, so none can be freed and another land at its address)."""
+    return (
+        remembered is not None
+        and len(remembered) == len(current)
+        and all(old[0] == new[0] and old[1] is new[1] for old, new in zip(remembered, current, strict=True))
+    )
 
 
 def _snapshot_moment(instance: BaseModel) -> datetime | None:
@@ -921,15 +1116,15 @@ class BaseSurrealModel(BaseModel):
     completed, and checked, on its own.
     """
 
-    __surreal_failed_rebuild__: typing.ClassVar[
-        tuple[int, dict[str, int], dict[str, int], tuple[tuple[int, int, dict[str, int]], ...]] | None
-    ] = None
-    """The names a failed completion of ``_complete_pending_checks()`` could use (issue #345), until they change.
+    __surreal_failed_rebuild__: typing.ClassVar[tuple[_Binding, ...] | None] = None
+    """The names a failed completion of ``_complete_pending_checks()`` could use (issues #345, #395), until they change.
 
-    ``(id of the module's namespace, {caller's local name: id of its value}, {module's name: id of its value}, the
-    incomplete models its fields reach with their modules' names — _incomplete_dependencies())``, set when
-    ``model_rebuild()`` leaves the model incomplete (a name still undefined), removed once it completes. Read from
-    the class's own ``__dict__`` only, never inherited: a subclass remembers its own attempt.
+    ``(label, value)`` pairs: the module's namespace, the value of each name the model's forward references mention
+    in the caller's local names and in the module (``_bindings()``), and the incomplete models its fields reach with
+    the names theirs mention in their modules (``_incomplete_dependencies()``) — the values themselves, kept alive and
+    compared by identity (``_same_bindings()``). Set when ``model_rebuild()`` leaves the model incomplete (a name still
+    undefined), removed once it completes. Read from the class's own ``__dict__`` only, never inherited: a subclass
+    remembers its own attempt.
     """
 
     _surreal_as_of: datetime | None = PrivateAttr(default=None)
@@ -1166,12 +1361,14 @@ class BaseSurrealModel(BaseModel):
         the model's module: a caller's local name wins, and the field keeps what it resolved to — and
         ``__pydantic_on_complete__()`` runs the checks: a refusal raises from here, at every call, the model staying
         incomplete. A name still undefined leaves the model incomplete, read as before, without an error, and the failed
-        attempt is remembered (``__surreal_failed_rebuild__``, issue #345): the next call tries again only once the
-        names it could use have changed — a local name of the caller, or a name of the model's module, added, removed
-        or bound to another object —, or a model its fields reach and that was still incomplete has completed or seen a
-        name of its own module change (a link to a model of another module waiting for a name there,
-        ``_incomplete_dependencies()``), so repeated calls on unchanged names cost a snapshot of those names, not a
-        ``model_rebuild()``. A complete model costs one attribute read.
+        attempt is remembered (``__surreal_failed_rebuild__``, issues #345, #395): the next call tries again only once
+        a name the model's forward references mention has changed — in the caller's local names or in the model's
+        module, added, removed or bound to another object (``_bindings()``); other names never count, so a loop
+        rebuilds once —, or a model its fields reach and that was still incomplete has completed or seen a name its own
+        forward references mention change in its module (a link to a model of another module waiting for a name
+        there, through a type alias, a dataclass or a ``TypedDict`` too: ``_incomplete_dependencies()``), so repeated
+        calls on unchanged names cost a lookup of those names, not a ``model_rebuild()``. The values are kept and
+        compared by identity (``_same_bindings()``). A complete model costs one attribute read.
 
         Every model a forward reference left incomplete is completed, with or without a vector field: its columns get
         the resolved kinds (``define_table()`` writes ``int`` for ``score: "Score" = 0`` once ``Score = int`` is
@@ -1181,9 +1378,10 @@ class BaseSurrealModel(BaseModel):
         if cls.__pydantic_complete__ or not cls.__dict__.get("__surreal_checks_pending__", False):
             return
         caller = user_namespace()
-        module = getattr(sys.modules.get(cls.__module__), "__dict__", {})
-        names = (id(module), _bindings(caller), _bindings(module), _incomplete_dependencies(cls))
-        if cls.__dict__.get("__surreal_failed_rebuild__") == names:
+        module = _module_namespace(cls)
+        bindings, values = _bindings((caller, module), _field_annotations(cls), "")
+        names = (("module", module), *bindings, *_incomplete_dependencies(cls, values))
+        if _same_bindings(cls.__dict__.get("__surreal_failed_rebuild__"), names):
             return
         cls.model_rebuild(raise_errors=False, _types_namespace=caller)
         if cls.__pydantic_complete__:
