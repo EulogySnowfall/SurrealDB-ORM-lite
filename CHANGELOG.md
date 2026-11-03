@@ -25,7 +25,10 @@ them by identity and follows type aliases. No new public API.
 - **Links through a type alias, a dataclass or a `TypedDict` are followed** (#395). A linked model reached
   through `typing.TypeAliasType` (PEP 695's `type BA = B | None`, or the `typing_extensions` backport, read
   through its `__value__`), or through the fields of a dataclass or a `TypedDict`, now ends the memory when
-  it completes, so the next call raises the model's refusal. An alias whose value raises (an undefined name,
+  it completes, so the next call raises the model's refusal. An alias whose value is itself a forward
+  reference (`TypeAliasType("BA", "C | None")`, `list["C"] | None`, `type BA = "C | None"`) is remembered
+  with the names it mentions, looked up in the calling function's local names and in the alias's module:
+  defining one there tries again. An alias whose value raises (an undefined name,
   or an error such as `AttributeError`) never makes an ORM call fail: the field stays `any`, as before, and
   on Python 3.14+ defining a name the alias mentions tries again.
 - Same behaviour on SurrealDB 2.x and 3.x.

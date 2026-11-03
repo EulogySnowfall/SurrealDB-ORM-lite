@@ -765,8 +765,11 @@ def _incomplete_dependencies(
     remembered with that name in its module; one whose value raises another error (``type BA = os.Missing``) never
     raises from here: the alias is remembered, with the names its value mentions in its module on Python 3.14+ —, and
     through the fields of a dataclass and of a ``TypedDict``, whose names are looked up in *caller* and their module
-    alike. The names an alias's value mentions are looked up in its module only: an alias evaluates its value in its
-    own globals."""
+    alike. An alias whose value holds a forward reference (``TypeAliasType("BA", "C | None")``, ``list["C"] | None``,
+    ``type BA = "C | None"``) is remembered with the names it mentions in *caller*, then in the alias's module: Pydantic
+    resolves it with the alias's module as globals and the caller's names as locals. Only a name its value's own
+    evaluation raises for (``type BA = Missing``) is looked up in the alias's module alone, which that evaluation
+    reads."""
     aliases = _alias_types()
     local: Mapping[str, Any] = caller if caller is not None else {}
     found: list[_Binding] = []
@@ -792,7 +795,7 @@ def _incomplete_dependencies(
                 continue
             seen.add(id(annotation))
             try:
-                pending.append(typing.cast(Any, annotation).__value__)  # evaluated here: may raise
+                value = typing.cast(Any, annotation).__value__  # evaluated here: may raise
             except NameError as error:  # ``type BA = Missing``: the alias waits for that name in its module
                 name = error.name or ""
                 found.append((f"alias {len(found)} {name}", _lookup(_module_namespace(annotation), name)))
@@ -804,6 +807,11 @@ def _incomplete_dependencies(
                     bindings, values = _bindings((_module_namespace(annotation),), [text], f"{label} ")
                     found.extend(bindings)
                     pending.extend(values)
+            else:  # its forward references (``'C | None'``, ``list['C']``): the caller's local names, then its module
+                bindings, values = _bindings((local, _module_namespace(annotation)), [value], f"alias {len(found)} ")
+                found.extend(bindings)
+                pending.extend(values)
+                pending.append(value)
         elif isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
             container = {field.name: field.type for field in dataclasses.fields(annotation)}
         elif isinstance(annotation, type) and _is_typeddict(annotation):
@@ -1155,7 +1163,9 @@ class BaseSurrealModel(BaseModel):
 
     ``(label, value)`` pairs: the module's namespace, the value of each name the model's forward references mention
     in the caller's local names and in the module (``_bindings()``), and the incomplete models its fields reach with
-    the names theirs mention in the caller's local names and in their modules (``_incomplete_dependencies()``) — the values themselves, kept alive and
+    the names theirs mention in the caller's local names and in their modules — through type aliases too, a forward
+    reference in an alias's value looked up in the caller's local names then in the alias's module
+    (``_incomplete_dependencies()``) — the values themselves, kept alive and
     compared by identity (``_same_bindings()``). Set when ``model_rebuild()`` leaves the model incomplete (a name still
     undefined), removed once it completes. Read from the class's own ``__dict__`` only, never inherited: a subclass
     remembers its own attempt.
@@ -1400,7 +1410,9 @@ class BaseSurrealModel(BaseModel):
         module, added, removed or bound to another object (``_bindings()``); other names never count, so a loop
         rebuilds once —, or a model its fields reach and that was still incomplete has completed or seen a name its own
         forward references mention change in the caller's local names or in its module (a link to a model of another
-        module waiting for a name there, through a type alias, a dataclass or a ``TypedDict`` too: ``_incomplete_dependencies()``), so repeated
+        module waiting for a name there, through a type alias — a forward reference in its value looked up in the
+        caller's local names then in the alias's module —, a dataclass or a ``TypedDict`` too:
+        ``_incomplete_dependencies()``), so repeated
         calls on unchanged names cost a lookup of those names, not a ``model_rebuild()``. The values are kept and
         compared by identity (``_same_bindings()``). A complete model costs one attribute read.
 
