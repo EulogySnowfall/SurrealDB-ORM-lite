@@ -67,7 +67,11 @@ attribute is a declaration:
 - any other value — a string, a number, a list, a `datetime`, a `Decimal`, an `Enum`, a `RecordID`, a nested model —
   is a static value, deep-copied for each instance, so two instances never share a list.
 
-Methods, nested classes, `classmethod`s, `staticmethod`s and properties are not declarations. Any other callable
+Methods, `classmethod`s, `staticmethod`s, properties and nested classes are not declarations. A class assigned to a
+field of the model, though, raises `TypeError` at the `class` statement: `role = Role` was meant as `Role.ADMIN`, and a
+class for a `type[...]` field is passed as an override (`build(kind=Role)`). Only the most-derived definition of a field
+counts, as for any class attribute: a subclass that sets `role = Role.ADMIN` over a base's `role = Role` is accepted.
+Any other callable
 (`datetime.now`, `functools.partial(…)`) is refused with `TypeError` at the `class` statement: lazy values are not
 supported yet, so pass such a value at the call.
 
@@ -81,6 +85,8 @@ supported yet, so pass such a value at the call.
   `Player.objects().bulk_create(PlayerFactory.build_batch(100))`.
 
 An override replaces the declaration of that field for the call, and a `Faker` passed as an override is generated.
+An override is used as is, not copied: `build_batch(3, address=Address(city="Paris"))` gives the three instances the
+same `Address` object, so declare a mutable value on the factory, or draw it with a `Faker`, to get one per instance.
 `count` is positional (`build_batch(3)`), so a model field named `count` stays overridable: `build_batch(3, count=5)`.
 A `count` that is not an `int` (or is a `bool`) raises `TypeError`, a negative one `ValueError`, and `0` returns `[]`.
 
@@ -101,12 +107,13 @@ A `count` that is not an `int` (or is a `bool`) raises `TypeError`, a negative o
 | `boolean`      | `True` or `False`                                      | none                          |
 | `date`         | a `date` from the last 365 days                        | none                          |
 | `datetime`     | an aware UTC `datetime` from the last 365 days         | none                          |
-| `choice`       | one of `items`                                         | `items` (required, not empty) |
+| `choice`       | a deep copy of one of `items`                          | `items` (required, not empty) |
 
 The providers, their pools and their formats are the full ORM's. A `Faker` checks its provider and keywords when it is
 built: `Faker("nme")` raises `ValueError("Unknown Faker provider: 'nme'")`, `Faker("random_int", minimum=1)` raises
 `TypeError` and names the accepted keywords, and `Faker("choice")` without `items` raises `ValueError`. `choice` keeps
-a copy of its `items`, as a list.
+a copy of its `items`, as a list, and returns a deep copy of the item it draws, so a list, a dict or a nested model is
+never shared between two instances.
 
 ### Server-generated values (`SurrealFunc`)
 
@@ -251,7 +258,10 @@ server (core 2.3.10). The [2.x/3.x table](compatibility.md#orm-behaviour-surreal
   left out by `build()`.
 - **Mistakes fail early**: a `Faker` checks its provider and keywords when it is built, a factory its names at the
   `class` statement and the overrides at the call, with `TypeError` for a name that is no field, where the full ORM
-  raises at the first value and passes unknown names to the model, which drops them.
+  raises at the first value and passes unknown names to the model, which drops them. A class assigned to a field
+  (`role = Role`) raises `TypeError` too, where the full ORM ignores it and the model default applies.
+- **`choice` returns a deep copy** of the item it draws, where the full ORM returns the item itself, shared by every
+  instance that draws it.
 - **`uuid` follows `random.seed()`**: it draws from `random`, where the full ORM calls `uuid.uuid4()`.
 - **The pytest plugin is opt-in**: `pytest_plugins` or `-p`, no entry point and no extra to install; the full ORM has
   no `surreal_db` fixture.

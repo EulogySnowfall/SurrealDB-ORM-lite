@@ -424,6 +424,17 @@ class TestFaker:
         items[0] = "z"
         assert set(_many(faker, 50)) == {"a"}
 
+    def test_choice_returns_a_deep_copy(self) -> None:
+        # #399: a mutable item is never shared between two draws, nor with the stored items.
+        faker = Faker("choice", items=[{"tags": [1]}])
+        first, second = faker.generate(), faker.generate()
+        assert first == second == {"tags": [1]}
+        assert first is not second
+        assert first["tags"] is not second["tags"]
+        assert first is not faker.kwargs["items"][0]
+        first["tags"].append(2)
+        assert faker.generate() == {"tags": [1]}
+
     @pytest.mark.parametrize("items", [("a", "b"), ["a", "b"]])
     def test_items_stored_as_a_new_list(self, items: Any) -> None:
         faker = Faker("choice", items=items)
@@ -508,6 +519,116 @@ class TestFactoryDeclaration:
                 pass
 
         assert Free._field_defs == {"kept": 1}
+
+    @pytest.mark.parametrize("attr", ["password", "password_hash"])
+    def test_class_on_a_declared_field_refused(self, attr: str) -> None:
+        # #399: ``role = Role`` (meant ``Role.ADMIN``) must not fall back to the model default silently.
+        with pytest.raises(TypeError) as info:
+            type("Bad", (ModelFactory,), {"Meta": type("Meta", (), {"model": FxSecret}), attr: FxColour})
+        message = str(info.value)
+        assert message.startswith(f"Bad.{attr} is a class (FxColour) assigned to the field 'password' of FxSecret")
+        assert "pass the class as an override" in message
+
+    def test_class_on_a_declared_field_refused_through_an_abstract_base(self) -> None:
+        class Base(ModelFactory):
+            role = FxColour
+
+        # The message names the class that holds the class, and the factory that inherits it.
+        expected = "Base.role is a class (FxColour) assigned to the field 'role' of FxUser (inherited by Child)"
+        with pytest.raises(TypeError, match=re.escape(expected)):
+
+            class Child(Base):
+                class Meta:
+                    model = FxUser
+
+    def test_value_on_an_abstract_base_shadowed_by_a_class_refused(self) -> None:
+        class Base(ModelFactory):
+            role = FxColour.RED
+
+        with pytest.raises(TypeError, match=re.escape("Child.role is a class (FxColour) assigned to the field 'role'")):
+
+            class Child(Base):
+                class Meta:
+                    model = FxUser
+
+                role = FxColour
+
+    def test_class_on_an_abstract_base_shadowed_by_a_value_accepted(self) -> None:
+        # The most-derived definition wins, as Python resolves ``Child.role`` itself.
+        class Base(ModelFactory):
+            role = FxColour
+
+        class Child(Base):
+            class Meta:
+                model = FxUser
+
+            role = "admin"
+
+        assert Child._field_defs == {"role": "admin"}
+        assert Child.build().role == "admin"
+
+    def test_class_on_an_abstract_base_shadowed_through_the_column_accepted(self) -> None:
+        class Base(ModelFactory):
+            password_hash = FxColour
+
+        class Child(Base):
+            class Meta:
+                model = FxSecret
+
+            password = "s3cret"
+
+        assert Child._field_defs == {"password": "s3cret"}
+        assert Child.build().password == "s3cret"
+
+    def test_class_on_an_abstract_base_shadowed_by_an_intermediate_class_accepted(self) -> None:
+        class Base(ModelFactory):
+            role = FxColour
+
+        class Mid(Base):
+            role = "moderator"
+
+        class Child(Mid):
+            class Meta:
+                model = FxUser
+
+        assert Child._field_defs == {"role": "moderator"}
+        assert Child.build().role == "moderator"
+
+    def test_class_and_its_column_value_in_one_class_body_refused(self) -> None:
+        with pytest.raises(TypeError, match=re.escape("declares 'password' twice")):
+
+            class Both(ModelFactory):
+                class Meta:
+                    model = FxSecret
+
+                password = "s3cret"
+                password_hash = FxColour
+
+    def test_class_on_a_name_that_is_no_field_ignored(self) -> None:
+        class WithModel(ModelFactory[FxUser]):
+            class Meta:
+                model = FxUser
+
+            role = "admin"
+
+            class Helper:
+                pass
+
+        assert WithModel._field_defs == {"role": "admin"}
+        assert WithModel.build().role == "admin"
+
+    def test_class_passed_as_override_is_used_as_is(self) -> None:
+        class Typed(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="fx_typed_cls")
+
+            id: str | None = None
+            kind: type | None = None
+
+        class TypedFactory(ModelFactory[Typed]):
+            class Meta:
+                model = Typed
+
+        assert TypedFactory.build(kind=FxColour).kind is FxColour
 
     @pytest.mark.parametrize(
         ("value", "shown"),
@@ -818,6 +939,22 @@ class TestBuild:
         assert second.owner == rid
         assert second.owner is not RichFactory._field_defs["owner"]
         assert second.address is not RichFactory._field_defs["address"]
+
+    def test_build_batch_choice_items_not_shared(self) -> None:
+        # #399: build_batch(2) with a sub-model drawn by Faker("choice") gives each instance its own copy.
+        class RichFactory(ModelFactory[FxRich]):
+            class Meta:
+                model = FxRich
+
+            address = Faker("choice", items=[FxAddress(city="Paris")])
+
+        first, second = RichFactory.build_batch(2)
+        assert first.address is not None
+        assert second.address is not None
+        assert first.address is not second.address
+        first.address.city = "Lyon"
+        assert second.address.city == "Paris"
+        assert RichFactory.build().address == FxAddress(city="Paris")
 
     def test_override_is_used_as_is(self) -> None:
         address = FxAddress(city="Paris")
