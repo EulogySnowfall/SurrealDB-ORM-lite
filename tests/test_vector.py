@@ -2576,6 +2576,78 @@ class TestFailedRebuildRemembered:
             _table_ddl(model)
         assert len(calls) == 2
 
+    @staticmethod
+    def _string_alias(monkeypatch: pytest.MonkeyPatch, spelling: str, place: str) -> types.ModuleType:
+        """Module ``vec_fwd_salias_m2`` (or ``vec_fwd_salias_m1`` itself, *place* ``"same module"``) holds ``BA``, a
+        type alias whose value is a forward reference to ``C``, still undefined; ``vec_fwd_salias_m1`` holds ``A``,
+        whose field ``b: BA`` waits for it and whose vector index contradicts its vector field: ``A`` stays
+        incomplete, its refusal waiting. Returns the module that holds the alias."""
+        m2 = types.ModuleType("vec_fwd_salias_m2")
+        m1 = types.ModuleType("vec_fwd_salias_m1")
+        monkeypatch.setitem(sys.modules, m2.__name__, m2)
+        monkeypatch.setitem(sys.modules, m1.__name__, m1)
+        alias = {
+            "string value": "from typing_extensions import TypeAliasType\nBA = TypeAliasType('BA', 'C | None')\n",
+            "string argument": "from typing_extensions import TypeAliasType\nBA = TypeAliasType('BA', list['C'] | None)\n",
+            "type statement": "type BA = 'C | None'\n",
+        }[spelling]
+        holder = m1 if place == "same module" else m2
+        if holder is m2:
+            exec(alias, m2.__dict__)  # noqa: S102 - the test's own text
+            alias = "from vec_fwd_salias_m2 import BA\n"
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, Index, SurrealConfigDict, VectorField\n"
+            + alias
+            + "class A(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_salias_a',\n"
+            "        indexes=[Index('vec_fwd_e', 'e', hnsw=True, dimension=4)])\n"
+            "    id: str | None = None\n"
+            "    b: BA = None\n"
+            "    e: 'Vec' = None\n"
+            "Vec = VectorField[3]\n",
+            m1.__dict__,
+        )
+        assert m1.A.__pydantic_complete__ is False
+        return holder
+
+    @pytest.mark.parametrize("place", ["same module", "other module"])
+    @pytest.mark.parametrize("spelling", ["string value", "string argument", "type statement"])
+    def test_an_alias_whose_value_is_a_forward_reference(
+        self, monkeypatch: pytest.MonkeyPatch, spelling: str, place: str
+    ) -> None:
+        """A type alias whose value holds a forward reference (``TypeAliasType('BA', 'C | None')``,
+        ``list['C'] | None``, PEP 695's ``type BA = 'C | None'``): defining ``C`` in the alias's module tries again, so
+        the next call raises the refusal (issue #395) — the name is remembered, not lost in the string."""
+        if spelling == "type statement" and sys.version_info < (3, 12):
+            pytest.skip("the type statement (PEP 695) needs Python 3.12")
+        holder = self._string_alias(monkeypatch, spelling, place)
+        model = sys.modules["vec_fwd_salias_m1"].A
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        _table_ddl(model)
+        _table_ddl(model)
+        assert len(calls) == 1
+        holder.C = int
+        with pytest.raises(ValueError, match=text):
+            _table_ddl(model)
+        assert len(calls) == 2
+
+    @pytest.mark.parametrize("spelling", ["string value", "string argument", "type statement"])
+    def test_an_alias_value_waiting_for_a_callers_local_name(self, monkeypatch: pytest.MonkeyPatch, spelling: str) -> None:
+        """The same alias of another module, ``C`` then bound as a local name of the caller: Pydantic resolves an
+        alias's forward reference with the caller's local names too, so the next call raises the refusal."""
+        if spelling == "type statement" and sys.version_info < (3, 12):
+            pytest.skip("the type statement (PEP 695) needs Python 3.12")
+        self._string_alias(monkeypatch, spelling, "other module")
+        model = sys.modules["vec_fwd_salias_m1"].A
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        model.table_ddl(), model.table_ddl()  # one expression: no local name of this frame changes between them
+        C = int  # noqa: F841 - read by the completion, from this frame's local names
+        with pytest.raises(ValueError, match=text):
+            model.table_ddl()
+        assert len(calls) == 2
+
     @pytest.mark.parametrize(
         ("value", "error", "rebind"),
         [("m3.Missing | None", AttributeError, ("Missing", int)), ("m3.Number | 3", TypeError, ("Number", str))],
@@ -2734,6 +2806,30 @@ class TestFailedRebuildHelpers:
         assert found == [("alias 0 Missing", model_base._UNBOUND)]
         module.Missing = int
         assert model_base._incomplete_dependencies(Plain, [module.BA]) == []
+
+    @pytest.mark.parametrize("value", ["'C | None'", "list['C'] | None"], ids=["string", "string-argument"])
+    def test_an_alias_whose_value_is_a_forward_reference(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        """``TypeAliasType("BA", "C | None")``: the names its value mentions, in the caller's local names (0) then in
+        the alias's module (1), under the alias's label; once ``C`` is bound there, the value it resolves to too."""
+        from typing_extensions import TypeAliasType
+
+        module = types.ModuleType("vec_fwd_alias_string")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(f"from typing_extensions import TypeAliasType\nBA = TypeAliasType('BA', {value})\n", module.__dict__)  # noqa: S102
+        assert isinstance(module.BA, TypeAliasType)
+
+        class Plain(BaseModel):
+            x: int = 0
+
+        unbound = model_base._UNBOUND
+        found = model_base._incomplete_dependencies(Plain, [module.BA], {"other": 1})
+        assert found == [("alias 0 0:C", unbound), ("alias 0 1:C", unbound)]
+        assert model_base._incomplete_dependencies(Plain, [module.BA], {"C": int}) == [
+            ("alias 0 0:C", int),
+            ("alias 0 1:C", unbound),
+        ]
+        module.C = str
+        assert model_base._incomplete_dependencies(Plain, [module.BA]) == [("alias 0 0:C", unbound), ("alias 0 1:C", str)]
 
     def test_the_text_of_an_alias_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``_alias_value_text()``: the value as written on Python 3.14+, ``None`` otherwise — before 3.14, for an
