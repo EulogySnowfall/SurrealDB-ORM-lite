@@ -564,7 +564,7 @@ class ModelFactory(Generic[M], metaclass=_FactoryMeta):
             by_name = bool(model.model_config.get("populate_by_name", False))
         if by_name:
             return model(**data)
-        model_fields = model.model_fields
+        fields = model.model_fields
         return model(**{(model.to_db_field(name) if name in fields else name): value for name, value in data.items()})
 
     @classmethod
