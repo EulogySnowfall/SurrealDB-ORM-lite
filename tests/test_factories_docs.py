@@ -88,6 +88,8 @@ _NEEDLES_41: dict[str, list[str]] = {
         "`create_batch(count, **overrides)` calls `create()` `count` times, one record after the other",
         "`Player.objects().bulk_create(PlayerFactory.build_batch(100))`",
         "a `Faker` passed as an override is generated",
+        "A class assigned to a field of the model, though, raises `TypeError` at the `class` statement",
+        "An override is used as is, not copied",
         "`count` is positional",
         "`build_batch(3, count=5)`",
         "A `count` that is not an `int` (or is a `bool`) raises `TypeError`, a negative one `ValueError`, and `0` returns `[]`",
@@ -96,6 +98,7 @@ _NEEDLES_41: dict[str, list[str]] = {
         '`Faker("nme")` raises `ValueError("Unknown Faker provider: \'nme\'")`',
         '`Faker("random_int", minimum=1)` raises `TypeError`',
         '`Faker("choice")` without `items` raises `ValueError`',
+        "returns a deep copy of the item it draws",
     ],
     "Server-generated values (`SurrealFunc`)": [
         "`create()` passes it to `save(server_values=…)`",
@@ -160,6 +163,8 @@ _NEEDLES_41: dict[str, list[str]] = {
         # early checks
         "with `TypeError` for a name that is no field, where the full ORM raises at the first value and passes "
         "unknown names to the model",
+        # choice deep copy
+        "**`choice` returns a deep copy** of the item it draws, where the full ORM returns the item itself",
         # seedable uuid
         "**`uuid` follows `random.seed()`**",
         # opt-in plugin

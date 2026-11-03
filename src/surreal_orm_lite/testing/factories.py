@@ -205,7 +205,7 @@ class Faker:
         - ``boolean`` — random bool
         - ``date`` — random date within the last year
         - ``datetime`` — random aware UTC datetime within the last year
-        - ``choice`` — random item of ``items`` (kwargs: ``items``, required and non-empty)
+        - ``choice`` — deep copy of a random item of ``items`` (kwargs: ``items``, required and non-empty)
 
     Raises:
         TypeError: ``provider`` is not a string, or a keyword the provider does not take is given.
@@ -292,7 +292,8 @@ class Faker:
         return datetime.now(tz=UTC) - timedelta(seconds=seconds_back)
 
     def _gen_choice(self) -> Any:
-        return random.choice(self.kwargs["items"])
+        # A deep copy, so a mutable item (list, dict, sub-model) is never shared between two instances (#399).
+        return copy.deepcopy(random.choice(self.kwargs["items"]))
 
     def __repr__(self) -> str:
         if self.kwargs:
@@ -315,18 +316,23 @@ def _describe_callable(value: Any) -> str:
     return kind.__qualname__ if kind.__module__ == "builtins" else f"{kind.__module__}.{kind.__qualname__}"
 
 
-def _collect_own(name: str, namespace: dict[str, Any]) -> dict[str, Any]:
-    """Collect one class body's declarations, in declaration order, names as written.
+def _collect_own(name: str, namespace: dict[str, Any]) -> tuple[dict[str, Any], dict[str, type]]:
+    """Collect one class body's declarations, in declaration order, names as written, and its classes.
 
-    Ignored: a ``_`` name, ``Meta``, a function (lambdas included), a ``classmethod``/``staticmethod``/``property``
-    and a class. Refused: any other callable (``datetime.now``, ``functools.partial(...)``, an instance with
-    ``__call__``), which F1 may later give a lazy meaning. Collected: everything else.
+    Ignored: a ``_`` name, ``Meta``, a function (lambdas included) and a ``classmethod``/``staticmethod``/``property``.
+    A class is returned apart: the metaclass refuses it once the model is known if its name is a model field (#399),
+    and ignores it otherwise. Refused: any other callable (``datetime.now``, ``functools.partial(...)``, an instance
+    with ``__call__``), which F1 may later give a lazy meaning. Collected: everything else.
     """
     own: dict[str, Any] = {}
+    classes: dict[str, type] = {}
     for key, value in namespace.items():
         if key.startswith("_") or key == "Meta":
             continue
-        if inspect.isfunction(value) or isinstance(value, (classmethod, staticmethod, property, type)):
+        if isinstance(value, type):
+            classes[key] = value
+            continue
+        if inspect.isfunction(value) or isinstance(value, (classmethod, staticmethod, property)):
             continue
         if callable(value):
             raise TypeError(
@@ -334,7 +340,7 @@ def _collect_own(name: str, namespace: dict[str, Any]) -> dict[str, Any]:
                 "a Faker or a SurrealFunc — lazy values are not supported yet"
             )
         own[key] = value
-    return own
+    return own, classes
 
 
 class _FactoryMeta(type):
@@ -345,12 +351,14 @@ class _FactoryMeta(type):
     """
 
     _own_defs: dict[str, Any]
+    _own_classes: dict[str, type]
     _field_defs: dict[str, Any]
 
     def __new__(mcs, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs: Any) -> "_FactoryMeta":
-        own = _collect_own(name, namespace)
+        own, classes = _collect_own(name, namespace)
         cls = super().__new__(mcs, name, bases, namespace, **kwargs)
         cls._own_defs = own
+        cls._own_classes = classes
         model = cls._find_model()
         if model is None:
             merged: dict[str, Any] = {}
@@ -377,6 +385,17 @@ class _FactoryMeta(type):
     @staticmethod
     def _normalized_defs(name: str, cls: "_FactoryMeta", model: type[BaseSurrealModel]) -> dict[str, Any]:
         """Merge the MRO's declarations keyed by the model's Python field names, then check them (D14, D15)."""
+        model_fields = model.model_fields
+        for klass in reversed(cls.__mro__):
+            own_classes: dict[str, type] = klass.__dict__.get("_own_classes", {})
+            for raw, value in own_classes.items():
+                py_name = model.to_py_field(raw)
+                if py_name in model_fields:
+                    raise TypeError(
+                        f"{name}.{raw} is a class ({value.__qualname__}) assigned to the field {py_name!r} of "
+                        f"{model.__name__}; a factory attribute is a static value, a Faker or a SurrealFunc — give an "
+                        "instance (an Enum member, for example), or pass the class as an override at the call"
+                    )
         per_class: list[list[tuple[str, str, Any]]] = []
         for klass in reversed(cls.__mro__):
             own: dict[str, Any] = klass.__dict__.get("_own_defs", {})
@@ -432,7 +451,7 @@ class ModelFactory(Generic[M], metaclass=_FactoryMeta):
 
     Raises (at the ``class`` statement):
         TypeError: ``Meta.model`` is not a ``BaseSurrealModel`` subclass; an attribute is a callable other than a
-            function, method or class; one class body declares a field under its Python name and its column; a
+            function, method or class; a class is assigned to a field of the model; one class body declares a field under its Python name and its column; a
             declared name is no field of the model (unless the model has ``extra="allow"``); a ``SurrealFunc`` is
             declared on (or inherited by) an edge factory.
     """
@@ -545,7 +564,7 @@ class ModelFactory(Generic[M], metaclass=_FactoryMeta):
             by_name = bool(model.model_config.get("populate_by_name", False))
         if by_name:
             return model(**data)
-        fields = model.model_fields
+        model_fields = model.model_fields
         return model(**{(model.to_db_field(name) if name in fields else name): value for name, value in data.items()})
 
     @classmethod
@@ -566,7 +585,8 @@ class ModelFactory(Generic[M], metaclass=_FactoryMeta):
     def build_batch(cls, count: int, /, **overrides: Any) -> list[M]:
         """Build *count* unsaved instances, each with fresh ``Faker`` values and fresh copies.
 
-        Every check runs before the first instance; ``count=0`` returns ``[]``.
+        Every check runs before the first instance; ``count=0`` returns ``[]``. An override is used as is, not
+        copied: ``build_batch(3, address=Address(city="Paris"))`` gives the three instances the same object (#399).
 
         Raises:
             ValueError: the factory has no model; *count* is negative.
@@ -610,7 +630,8 @@ class ModelFactory(Generic[M], metaclass=_FactoryMeta):
 
         Every check runs before the first ``save()``; ``count=0`` returns ``[]``. A failing ``save()`` stops the
         batch and propagates; the records already created stay. ``Model.objects().bulk_create(build_batch(n))`` is the
-        one-``INSERT`` path (no signals).
+        one-``INSERT`` path (no signals). An override is used as is, not copied: every record of the batch gets the
+        same object (#399).
 
         Raises:
             ValueError: the factory has no model; *count* is negative.
