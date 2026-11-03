@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.2] - 2026-11-03
+
+Follow-up of the review of the model factories (v0.40.0). No new public API.
+
+### Fixed
+
+- **`Faker("choice")` returns a deep copy of the item it draws** (#399). A mutable item (a list, a dict, a nested
+  model) is no longer shared by every instance that draws it: `build_batch(2)` with
+  `meta = Faker("choice", items=[Sub(x=[1])])` gives two distinct `meta` objects.
+- **A class assigned to a factory field raises `TypeError`** (#399). `role = Role` (meant as `Role.ADMIN`) used to
+  fall back to the model default without an error. The refusal applies at the `class` statement, only when the class
+  is the most-derived definition of the field: a subclass that sets a value over a base's class is accepted, and
+  `Meta` and classes named like no field are still ignored. The message names the factory that holds the class.
+
+### Notes
+
+- An override passed to `build()`, `build_batch()`, `create()` or `create_batch()` is used as is, not copied; the
+  docstrings and the testing guide now say so, and list the two departures from the full ORM.
+
 ## [0.40.1] - 2026-11-02
 
 The remembered forward-reference rebuild of v0.39.5 keys on the names a model's annotations mention, compares
