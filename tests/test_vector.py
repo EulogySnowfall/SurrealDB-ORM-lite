@@ -196,6 +196,7 @@ import pickle
 import re
 import sys
 import types
+import typing
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -235,6 +236,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     Vector,
     VectorField,
+    model_base,
     model_ddl,
     search,
     time_travel,
@@ -2207,6 +2209,12 @@ class TestForwardReferenceOrm:
         assert user_namespace() == {}
 
 
+def _table_ddl(model: type[BaseSurrealModel]) -> list[str]:
+    """``model.table_ddl()`` from a frame whose local names never change between calls: only the module's names, and
+    the models the fields reach, count for the completion's memory (issue #395)."""
+    return model.table_ddl()
+
+
 def _count_rebuilds(monkeypatch: pytest.MonkeyPatch, model: type[BaseModel]) -> list[dict[str, Any]]:
     """The keyword arguments of each ``model.model_rebuild()`` call from now on, the call still made."""
     calls: list[dict[str, Any]] = []
@@ -2277,10 +2285,93 @@ class TestFailedRebuildRemembered:
         assert first[1:] == second[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_once` TYPE any;"]
         assert len(calls) == 1
         assert calls[0]["raise_errors"] is False
-        another = 1  # noqa: F841 - a new local name: the names the completion could use have changed
+        another = 1  # noqa: F841 - a local name the annotations do not mention: still remembered (issue #395)
+        VecFwdOnce.table_ddl()
+        assert len(calls) == 1
+        Later = "Missing"  # noqa: F841 - the name the annotation mentions, bound: the completion tries again
         VecFwdOnce.table_ddl()
         assert len(calls) == 2
         assert VecFwdOnce.__pydantic_complete__ is False
+
+    def test_a_loop_rebuilds_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A loop rebinds its own local names at every turn, names no annotation of the model mentions: the failed
+        rebuild stays remembered across the turns (issue #395)."""
+
+        class VecFwdLoop(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="vec_fwd_loop")
+
+            id: str | None = None
+            e: "Later" = None  # noqa: F821 - never defined: the model stays incomplete
+
+        calls = _count_rebuilds(monkeypatch, VecFwdLoop)
+        for _turn in range(5):
+            ddl = VecFwdLoop.table_ddl()
+            indexes = VecFwdLoop.get_indexes()
+            queryset = VecFwdLoop.objects()
+        assert (ddl[1:], indexes, type(queryset).__name__) == (
+            ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_loop` TYPE any;"],
+            (),
+            "QuerySet",
+        )
+        assert len(calls) == 1
+        assert VecFwdLoop.__pydantic_complete__ is False
+
+    def test_only_the_names_the_annotations_mention(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The module's other names do not count; a mentioned name bound to another forward reference adds the names
+        that one mentions, in turn (issue #395)."""
+        module = types.ModuleType("vec_fwd_module_names")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            "class VecFwdModuleNames(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_module_names')\n"
+            "    id: str | None = None\n"
+            "    e: 'Later' = None\n"
+            "Later = 'Missing'\n",
+            module.__dict__,
+        )
+        model = module.VecFwdModuleNames
+        calls = _count_rebuilds(monkeypatch, model)
+        _table_ddl(model)
+        module.unrelated = object()
+        _table_ddl(model)
+        assert len(calls) == 1
+        module.Missing = typing.ForwardRef("Absent")  # named by Later's value, itself a forward reference
+        _table_ddl(model)
+        assert len(calls) == 2
+        _table_ddl(model)
+        assert len(calls) == 2
+        module.Absent = int | None
+        assert _table_ddl(model)[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_module_names` TYPE option<int>;"]
+        assert len(calls) == 3
+        assert model.__pydantic_complete__ is True
+
+    def test_a_value_freed_and_replaced_at_its_address(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The memory keeps the values it compares, by identity: a value freed after a failed rebuild cannot be
+        replaced by another object at the same address that would look unchanged (issue #395)."""
+        module = types.ModuleType("vec_fwd_module_address")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict\n"
+            "class VecFwdAddress(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_module_address')\n"
+            "    id: str | None = None\n"
+            "    e: 'Later | None' = None\n",
+            module.__dict__,
+        )
+        model = module.VecFwdAddress
+        calls = _count_rebuilds(monkeypatch, model)
+        module.Later = typing.ForwardRef("Missing")
+        address = id(module.Later)
+        _table_ddl(model)
+        assert len(calls) == 1
+        del module.Later  # the module's reference dropped: only the memory may keep the value alive
+        candidates = [typing.ForwardRef("int") for _ in range(200)]
+        module.Later = next((value for value in candidates if id(value) == address), candidates[0])
+        del candidates
+        assert _table_ddl(model)[1:] == ["DEFINE FIELD OVERWRITE `e` ON `vec_fwd_module_address` TYPE option<int>;"]
+        assert len(calls) == 2
+        assert model.__pydantic_complete__ is True
 
     def test_the_model_completes_once_the_name_is_defined(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class VecFwdLater(BaseSurrealModel):
@@ -2390,6 +2481,52 @@ class TestFailedRebuildRemembered:
             model.table_ddl()
         assert len(calls) == 3  # the second call remembered the failure; each refusal rebuilds again
 
+    @pytest.mark.parametrize("spelling", ["TypeAliasType", "type statement", "dataclass", "TypedDict"])
+    def test_a_dependency_through_an_alias(self, monkeypatch: pytest.MonkeyPatch, spelling: str) -> None:
+        """A dependency reached through a type alias (``typing_extensions.TypeAliasType``, PEP 695's ``type``
+        statement) or the field of a dataclass or a ``TypedDict``, in another module and completed later: the next
+        call on the dependent model rebuilds it and raises its refusal (issue #395)."""
+        if spelling == "type statement" and sys.version_info < (3, 12):
+            pytest.skip("the type statement (PEP 695) needs Python 3.12")
+        m2 = types.ModuleType("vec_fwd_alias_m2")
+        m1 = types.ModuleType("vec_fwd_alias_m1")
+        monkeypatch.setitem(sys.modules, m2.__name__, m2)
+        monkeypatch.setitem(sys.modules, m1.__name__, m1)
+        alias = {
+            "type statement": "type BA = B | None\n",
+            "TypeAliasType": "from typing_extensions import TypeAliasType\nBA = TypeAliasType('BA', B | None)\n",
+            "dataclass": "import dataclasses\n@dataclasses.dataclass\nclass D:\n    b: 'B | None' = None\nBA = D | None\n",
+            "TypedDict": "from typing_extensions import TypedDict\nclass T(TypedDict, total=False):\n    b: B | None\n"
+            "BA = T | None\n",
+        }[spelling]
+        exec(  # noqa: S102 - the test's own text
+            "from pydantic import BaseModel\nclass B(BaseModel):\n    x: 'C' = None\n" + alias,
+            m2.__dict__,
+        )
+        exec(  # noqa: S102 - the test's own text
+            "from surreal_orm_lite import BaseSurrealModel, Index, SurrealConfigDict, VectorField\n"
+            "from vec_fwd_alias_m2 import BA\n"
+            "class A3(BaseSurrealModel):\n"
+            "    model_config = SurrealConfigDict(table_name='vec_fwd_alias_a3',\n"
+            "        indexes=[Index('vec_fwd_e', 'e', hnsw=True, dimension=4)])\n"
+            "    id: str | None = None\n"
+            "    b: BA = None\n"
+            "    e: 'Vec' = None\n"
+            "Vec = VectorField[3]\n",
+            m1.__dict__,
+        )
+        model = m1.A3
+        assert model.__pydantic_complete__ is False
+        calls = _count_rebuilds(monkeypatch, model)
+        text = re.escape(_IC8.format("A3", "vec_fwd_e", 4, "F32", "e", 3, "F32"))
+        _table_ddl(model)
+        _table_ddl(model)
+        assert len(calls) == 1
+        m2.C = int
+        with pytest.raises(ValueError, match=text):
+            _table_ddl(model)
+        assert len(calls) == 2
+
     @pytest.mark.parametrize("base", ["BaseModel", "BaseSurrealModel"])
     def test_a_name_defined_later_in_a_dependency_module(self, monkeypatch: pytest.MonkeyPatch, base: str) -> None:
         """The missing name defined in the module of the dependency, which nothing completed yet: the next call on the
@@ -2423,6 +2560,99 @@ class TestFailedRebuildRemembered:
         VecFwdChild.table_ddl(), VecFwdChild.table_ddl()
         assert len(calls) == 1
         assert VecFwdChild.__pydantic_complete__ is False
+
+
+class TestFailedRebuildHelpers:
+    """The pieces of the completion's memory (issue #395): the names a forward reference mentions, their lookup, the
+    walk through aliases, and the comparison by identity."""
+
+    def test_the_names_a_forward_reference_mentions(self) -> None:
+        names = model_base._mentioned_names
+        assert names("mod.B | list['C'] | f().x | Literal['a b']") == ("Literal", "mod.B", "list", "C", "f")
+        assert names("B | B") == ("B",)
+        assert names("1 +") == ()
+        assert names("") == ()
+
+    def test_forward_references_that_name_each_other(self) -> None:
+        """``A = "B"``, ``B = "A"``: each name is looked up once, the walk ends."""
+        unbound = model_base._UNBOUND
+        found, values = model_base._bindings(({"A": "B", "B": "A"}, {}), ["A | C"], "x")
+        assert found == [
+            ("x0:A", "B"),
+            ("x1:A", unbound),
+            ("x0:C", unbound),
+            ("x1:C", unbound),
+            ("x0:B", "A"),
+            ("x1:B", unbound),
+        ]
+        assert values == ["B", "A"]
+
+    def test_the_lookup_of_a_name(self) -> None:
+        module = types.ModuleType("vec_fwd_lookup")
+        module.B = int
+        namespace = {"mod": module, "Cls": TestFailedRebuildHelpers, "value": 3}
+        lookup = model_base._lookup
+        assert lookup(namespace, "mod.B") is int
+        assert lookup(namespace, "mod.Missing") is model_base._UNBOUND
+        assert lookup(namespace, "Cls.test_the_lookup_of_a_name") is vars(TestFailedRebuildHelpers)["test_the_lookup_of_a_name"]
+        assert lookup(namespace, "value.real") == 3  # not a module nor a class: the value itself, no getattr()
+        assert lookup(namespace, "Missing") is model_base._UNBOUND
+
+    def test_the_comparison_is_by_identity(self) -> None:
+        same = model_base._same_bindings
+        value = [1]
+        assert same((("a", value),), (("a", value),)) is True
+        assert same((("a", value),), (("a", [1]),)) is False
+        assert same((("a", value),), (("b", value),)) is False
+        assert same((("a", value),), ()) is False
+        assert same(None, ()) is False
+
+    def test_an_annotate_function_that_raises(self) -> None:
+        if sys.version_info < (3, 14):
+            pytest.skip("``__annotate__`` (PEP 649) needs Python 3.14")
+
+        class Raising:
+            pass
+
+        def annotate(format: int) -> dict[str, Any]:
+            raise RuntimeError("not today")
+
+        Raising.__annotate__ = annotate  # type: ignore[attr-defined]
+        assert model_base._raw_annotations(Raising) == {}
+
+    def test_an_alias_waiting_for_a_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``type BA = Missing``: the alias is remembered with the name its value waits for, in its module."""
+        if sys.version_info < (3, 12):
+            pytest.skip("the type statement (PEP 695) needs Python 3.12")
+        module = types.ModuleType("vec_fwd_alias_waiting")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec("type BA = Missing | None\n", module.__dict__)  # noqa: S102 - the test's own text
+
+        class Plain(BaseModel):
+            x: int = 0
+
+        found = model_base._incomplete_dependencies(Plain, [module.BA])
+        assert found == [("alias 0 Missing", model_base._UNBOUND)]
+        module.Missing = int
+        assert model_base._incomplete_dependencies(Plain, [module.BA]) == []
+
+    def test_a_generic_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``BL[int]``: the alias behind the subscription is walked, and the model its value holds is found."""
+        from typing_extensions import TypeAliasType, TypeVar
+
+        module = types.ModuleType("vec_fwd_alias_generic")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec("from pydantic import BaseModel\nclass B(BaseModel):\n    x: 'C' = None\n", module.__dict__)  # noqa: S102
+        item = TypeVar("item")
+        alias = TypeAliasType("BL", list[item] | module.B, type_params=(item,))  # type: ignore[valid-type]
+
+        class Plain(BaseModel):
+            x: int = 0
+
+        found = model_base._incomplete_dependencies(Plain, [alias[int]])
+        assert found[0] == ("dependency 0", module.B)
+        assert found[1][0] == "dependency 0 module" and found[1][1] is module.__dict__
+        assert found[2:] == [("dependency 0 0:C", model_base._UNBOUND)]
 
 
 # === define_table(): the vector columns =============================================================================
