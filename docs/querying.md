@@ -393,9 +393,9 @@ lamp = Product(id="lamp", name="Lamp", price=40.0)
 desk = Product(id="desk", name="Desk", price=250.0)
 await lamp.save()
 await desk.save()
-opening = await client.query("RETURN time::now();")  # a moment, from the database's clock
+[opening] = await client.query("RETURN time::now();")  # a moment, from the database's clock
 await lamp.merge(price=30.0)
-sale = await client.query("RETURN time::now();")
+[sale] = await client.query("RETURN time::now();")  # client.query(): one result per statement
 await desk.delete()
 
 then = await Product.objects().as_of(opening).order_by("name").exec()
