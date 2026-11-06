@@ -2067,7 +2067,10 @@ class EvLog(BaseSurrealModel):
 
 
 #: An event the server cannot parse, whose excerpt of the statement quotes the secret (checked on every engine).
-_EV_HOOK = Event("ev_hook", then=f"RETURN <{_SECRET}> 1")
+#: A body the server's parser refuses on every line, its excerpt quoting the secret (4.x no longer refuses
+#: ``RETURN <secret> 1`` at parse time: it names the unknown type instead).
+_SECRET_BODY = f"LET $k = '{_SECRET}'; RETURN $k CREATE"
+_EV_HOOK = Event("ev_hook", then=_SECRET_BODY)
 
 
 class EvHookPerson(BaseSurrealModel):
@@ -2321,7 +2324,8 @@ class TestEventsE2E:
         assert type(raised.value) is SurrealDbError
         assert str(raised.value).startswith("Can't apply event definition: 'ev_broken' on table 'ev_person' -> ")
         assert str(raised.value).endswith(" of the statement)")  # the server's excerpt is left out, not its position
-        expected = RuntimeError if kind == "mem" else ValidationError if major >= 3 else InternalError
+        # The embedded engine's 4.0 core answers as a 4.x server does.
+        expected = ValidationError if major >= 3 else InternalError
         assert raised.value.__cause__ is None
         assert type(raised.value.__context__) is expected
 
@@ -2356,8 +2360,14 @@ class TestEventsE2E:
                 await client.query("CREATE ev_person:b SET k = 2;", {})
             assert await _client.query(client, "SELECT * FROM ev_person;", {}) == []
             major = await _major(client)
-        assert type(thrown.value).__name__ == type(failed.value).__name__ == "InternalError"
         cause = "Database record `ev_log:dup` already exists"
+        if major >= 4:
+            # SurrealDB 4.x names the event for a THROW only; any other error is the bare cause, as its own kind.
+            assert (type(thrown.value).__name__, type(failed.value).__name__) == ("InternalError", "AlreadyExistsError")
+            assert str(thrown.value) == "Error while processing event ev_throw: An error occurred: nope"
+            assert str(failed.value) == cause
+            return
+        assert type(thrown.value).__name__ == type(failed.value).__name__ == "InternalError"
         if major >= 3:
             assert str(thrown.value) == "Error while processing event ev_throw: An error occurred: nope"
             assert str(failed.value) == f"Error while processing event ev_dup: {cause}"
@@ -2378,7 +2388,8 @@ class TestEventsE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_unchanged_writes_differ_by_line(self, kind: str) -> None:
-        # AC-7 (M6): an unchanged merge() fires no event anywhere; an unchanged upsert() one UPDATE event on 3.x only.
+        # AC-7 (M6): an unchanged merge() fires no event anywhere; an unchanged upsert() one UPDATE event on 3.x only
+        # (not on 2.x nor 4.x).
         async with _evt(kind) as client:
             await EvPerson.define_events()
             person = EvPerson(id="ada", name="Ada", age=30)
@@ -2387,7 +2398,7 @@ class TestEventsE2E:
             await person.merge(name="Ada")
             assert await _log(client) == []
             await person.upsert()
-            expected = [("UPDATE", "ev_person:ada", None, None, None)] if await _major(client) >= 3 else []
+            expected = [("UPDATE", "ev_person:ada", None, None, None)] if await _major(client) == 3 else []
             assert await _log(client) == expected
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3053,7 +3064,7 @@ class TestFunctionsE2E:
         # Review of PR #273: the server's excerpt quotes the secret the body holds; the ORM's error does not.
         async with _evt(kind), SurrealDBConnectionManager.using("evt"):
             with pytest.raises(SurrealDbError) as raised:
-                await SurrealDBConnectionManager.define_function("fn::ev_hook", f"RETURN <{_SECRET}> 1")
+                await SurrealDBConnectionManager.define_function("fn::ev_hook", _SECRET_BODY)
         assert type(raised.value) is SurrealDbError
         assert str(raised.value).startswith("Can't apply function definition: 'fn::ev_hook' -> ")
         assert _SECRET in str(raised.value.__context__)
