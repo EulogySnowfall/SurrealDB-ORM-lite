@@ -16,6 +16,7 @@ from typing import Annotated, Any, Optional
 
 import pytest
 import surrealdb
+import surrealdb.data.types.constants as sdk_tags
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from surrealdb import RecordID
 from surrealdb.cbor import CBORTag
@@ -1439,7 +1440,7 @@ KEPT: dict[str, Callable[[], Any]] = {
     "decimal-nan": lambda: SdkPoint(Decimal("NaN"), 1.0),
     "decimal-positional-long": lambda: SdkPoint(Decimal("0.1234567890123456789012345678901"), 1.0),
     "decimal-2**96-1": lambda: SdkPoint(Decimal("7.9228162514264337593543950335E+28"), 1.0),
-    "cbor-tag": lambda: SdkPoint(CBORTag(surrealdb.TAG_DECIMAL_STRING, "1.5"), 1.0),
+    "cbor-tag": lambda: SdkPoint(CBORTag(sdk_tags.TAG_DECIMAL_STRING, "1.5"), 1.0),
     "sdk-subclass": lambda: _SdkPin(*A),
     "tuple-line": lambda: _with(SdkLine(*_square()[:2]), "geometry_points", tuple(_square()[:2])),
     "tuple-polygon": lambda: _with(_sdk("polygon"), "geometry_lines", tuple(_sdk("polygon").geometry_lines)),
@@ -1601,7 +1602,7 @@ class TestEncodeGeometry:
         out = encoding.encode(point)
         assert type(out) is SdkPoint and out is not point
         assert out.longitude == encoding._encode_decimal(d)
-        assert isinstance(out.longitude, CBORTag) and out.longitude.tag == surrealdb.TAG_DECIMAL_STRING
+        assert isinstance(out.longitude, CBORTag) and out.longitude.tag == sdk_tags.TAG_DECIMAL_STRING
         assert "E" not in out.longitude.value
         assert out.latitude == 1.0
         assert point.longitude is d  # the original is untouched
@@ -1903,8 +1904,8 @@ NO_LITERAL_COORDINATES: dict[str, Any] = {
     "decimal": Decimal("1.5"),
     "decimal-exponent": Decimal("1E-7"),
     "decimal-nan": Decimal("NaN"),
-    "cbor-tag": CBORTag(surrealdb.TAG_DECIMAL_STRING, "1.5"),
-    "cbor-tag-not-a-decimal": CBORTag(surrealdb.TAG_DURATION_COMPACT, [1, 0]),
+    "cbor-tag": CBORTag(sdk_tags.TAG_DECIMAL_STRING, "1.5"),
+    "cbor-tag-not-a-decimal": CBORTag(sdk_tags.TAG_DURATION_COMPACT, [1, 0]),
     "nan": math.nan,
     "inf": math.inf,
     "-inf": -math.inf,
@@ -2008,11 +2009,11 @@ class TestGeometryLiteral:
 
     def test_decimal_coordinate_message_names_the_decimal(self) -> None:
         # ``Decimal("1E-7")`` reaches the renderer as the boundary's decimal ``CBORTag``.
-        for coordinate in (Decimal("1.5"), Decimal("1E-7"), CBORTag(surrealdb.TAG_DECIMAL_STRING, "1.5")):
+        for coordinate in (Decimal("1.5"), Decimal("1E-7"), CBORTag(sdk_tags.TAG_DECIMAL_STRING, "1.5")):
             with pytest.raises(TypeError, match="not a decimal: a decimal coordinate has no verified text, use a float"):
                 to_surql_literal(SdkPoint(coordinate, 1.0))
         with pytest.raises(TypeError, match="finite int or float to be written as SurrealQL, not CBORTag.$"):
-            to_surql_literal(SdkPoint(CBORTag(surrealdb.TAG_DURATION_COMPACT, [1, 0]), 1.0))
+            to_surql_literal(SdkPoint(CBORTag(sdk_tags.TAG_DURATION_COMPACT, [1, 0]), 1.0))
         with pytest.raises(TypeError, match="this int is too large for a float"):
             to_surql_literal(_unchecked(lambda: SdkPoint(10**400, 1.0)))
 

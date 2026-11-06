@@ -517,18 +517,18 @@ class TestSdkLayout:
 
     def test_the_protocol_tags_match_the_sdks(self) -> None:
         sdk_tags = {
-            surrealdb.TAG_GEOMETRY_POINT: "Point",
-            surrealdb.TAG_GEOMETRY_LINE: "LineString",
-            surrealdb.TAG_GEOMETRY_POLYGON: "Polygon",
-            surrealdb.TAG_GEOMETRY_MULTI_POINT: "MultiPoint",
-            surrealdb.TAG_GEOMETRY_MULTI_LINE: "MultiLineString",
-            surrealdb.TAG_GEOMETRY_MULTI_POLYGON: "MultiPolygon",
-            surrealdb.TAG_GEOMETRY_COLLECTION: "GeometryCollection",
+            surrealdb.data.types.constants.TAG_GEOMETRY_POINT: "Point",
+            surrealdb.data.types.constants.TAG_GEOMETRY_LINE: "LineString",
+            surrealdb.data.types.constants.TAG_GEOMETRY_POLYGON: "Polygon",
+            surrealdb.data.types.constants.TAG_GEOMETRY_MULTI_POINT: "MultiPoint",
+            surrealdb.data.types.constants.TAG_GEOMETRY_MULTI_LINE: "MultiLineString",
+            surrealdb.data.types.constants.TAG_GEOMETRY_MULTI_POLYGON: "MultiPolygon",
+            surrealdb.data.types.constants.TAG_GEOMETRY_COLLECTION: "GeometryCollection",
         }
         assert sdk_tags == decoding._GEOMETRY_TYPES
         assert decoding.TAG_SET == 56
         assert decoding.TAG_SET not in vars(surrealdb.data.types.constants).values()  # SDK 2.0.0 has none
-        assert _sdk.TAG_DATETIME_COMPACT == surrealdb.TAG_DATETIME_COMPACT == 12
+        assert _sdk.TAG_DATETIME_COMPACT == surrealdb.data.types.constants.TAG_DATETIME_COMPACT == 12
 
 
 class TestInstall:
