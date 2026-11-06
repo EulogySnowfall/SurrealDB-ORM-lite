@@ -2554,7 +2554,7 @@ class TestGraphParityE2E:
         """A source whose own table was never created: the server diverges, the ORM does not.
 
         The graph-path ``DELETE`` raises ``NotFoundError`` ("The table … does not exist") on 3.x
-        and returns ``[]`` on 2.x. Outside a transaction the ORM keeps the v0.7.0 contract on both
+        and returns ``[]`` on 2.x and 4.x. Outside a transaction the ORM keeps the v0.7.0 contract on both
         lines: a silent no-op that removes nothing.
         """
         async with orm_client(*GRAPH_TABLES) as client:
@@ -2564,7 +2564,7 @@ class TestGraphParityE2E:
 
             statement = "DELETE $src->tr_follows WHERE out = $dst;"
             variables = {"src": RecordID("tr_ghost", "g"), "dst": BOB_P}
-            if (await _server_version())[0] >= 3:
+            if (await _server_version())[0] == 3:
                 with pytest.raises(NotFoundError, match="does not exist"):
                     await client.query(statement, variables)
             else:
@@ -2725,7 +2725,7 @@ class TestGraphParityTransactionsE2E:
 
     @pytest.mark.asyncio
     async def test_missing_source_table_in_buffered_tx(self) -> None:
-        """Under ``tx=`` the server's divergence stands: 3.x fails the commit, 2.x commits."""
+        """Under ``tx=`` the server's divergence stands: 3.x fails the commit, 2.x and 4.x commit."""
         async with http_orm_client(*GRAPH_TABLES) as client:
             alice, bob, _widget = await _nodes()
             carol = await TrPerson(id="carol", name="Carol").save()
@@ -2740,7 +2740,7 @@ class TestGraphParityTransactionsE2E:
                     await ghost.remove_relation("tr_follows", carol, tx=tx)
                     await ghost.remove_all_relations(["tr_follows"], direction="both", tx=tx)
 
-            if (await _server_version())[0] >= 3:
+            if (await _server_version())[0] == 3:
                 with pytest.raises(SurrealDbError, match="does not exist"):
                     await remove()
                 assert _people_pairs(await _stored(client, "tr_follows")) == [
@@ -2753,7 +2753,8 @@ class TestGraphParityTransactionsE2E:
 
     @pytest.mark.asyncio
     async def test_missing_source_table_in_interactive_tx(self) -> None:
-        """3.x over WebSocket: the statement fails at once, and the transaction with it."""
+        """3.x over WebSocket: the statement fails at once, and the transaction with it; 4.x reads the missing table as
+        empty and commits."""
         async with orm_client(*GRAPH_TABLES) as client:
             if not await _native_txn_supported():
                 pytest.skip("requires SurrealDB 3.x native transactions")
@@ -2762,6 +2763,13 @@ class TestGraphParityTransactionsE2E:
             ghost = TrGhost(id="g")
 
             reached = False
+            if (await _server_version())[0] >= 4:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    await alice.remove_relation("tr_follows", bob, tx=tx)
+                    await ghost.remove_relation("tr_follows", bob, tx=tx)
+                assert _people_pairs(await _stored(client, "tr_follows")) == []
+                return
             with pytest.raises(SurrealDbError, match="does not exist"):
                 async with SurrealDBConnectionManager.transaction() as tx:
                     assert tx.is_interactive
