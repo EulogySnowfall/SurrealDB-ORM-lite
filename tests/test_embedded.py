@@ -1211,7 +1211,7 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
     ``tests/test_subqueries.py`` (v0.27.0), ``tests/test_query_cache.py`` (v0.28.0),
     ``tests/test_introspection.py`` (v0.30.0), ``tests/test_table_ddl.py`` (v0.34.0), ``tests/test_vector.py``
     (v0.36.0), ``tests/test_factories.py``, ``tests/test_pytest_plugin.py`` and ``tests/test_factories_docs.py``
-    (v0.40.0), and ``tests/test_sdk3_values.py`` (v0.50.0), new too."""
+    (v0.40.0), and ``tests/test_sdk3_values.py`` and ``tests/test_query_order.py`` (v0.50.0), new too."""
     assert (
         frozenset(
             {
@@ -1232,6 +1232,7 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
                 "tests.test_pytest_plugin",
                 "tests.test_factories_docs",
                 "tests.test_sdk3_values",
+                "tests.test_query_order",
             }
         )
         == _REWRITE_MODULES

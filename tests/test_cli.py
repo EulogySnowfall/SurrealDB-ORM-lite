@@ -130,7 +130,7 @@ class TestParser:
         data = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         assert data["project"]["scripts"] == {"surreal-orm-lite": "surreal_orm_lite.cli.commands:main"}
         # No new runtime dependency (D1: argparse, no click).
-        assert data["project"]["dependencies"] == ["pydantic>=2.13.4", "surrealdb[pydantic]>=2.0.0,<3.0.0"]
+        assert data["project"]["dependencies"] == ["pydantic>=2.13.4", "surrealdb[pydantic]>=3.0.0,<4.0.0"]
 
     def test_exports(self) -> None:
         cli_package = importlib.import_module("surreal_orm_lite.cli")
