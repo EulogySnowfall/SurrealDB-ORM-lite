@@ -57,6 +57,7 @@ without going through ``surreal_orm_lite._client`` (mode from ``ORM_FRONTIER_SPY
 import asyncio
 import contextlib
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -146,6 +147,14 @@ def default_connection_class() -> type[SurrealDBConnectionManager]:
     so a test that reads or writes the default connection's private attributes does it here.
     """
     return SurrealDBConnectionManager._manager_for("default")
+
+
+async def line_major(client: Any) -> int:
+    """The major version of the engine *client* talks to (``"surrealdb-4.0.0"`` → 4; the embedded engine of SDK 3.0
+    answers 4), for the tests whose pins differ by line."""
+    match = re.search(r"(\d+)\.\d+", await client.version())
+    assert match is not None
+    return int(match.group(1))
 
 
 def _ws_url() -> str:

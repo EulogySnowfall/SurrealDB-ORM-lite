@@ -58,7 +58,7 @@ from surreal_orm_lite import (
     live,
 )
 from surreal_orm_lite.surql_literal import inline_variables, to_surql_literal
-from tests.conftest import orm_client
+from tests.conftest import line_major, orm_client
 from tests.test_encoding import _no_client
 from tests.test_rich_types import _http_client, _server_version
 
@@ -1793,6 +1793,12 @@ class TestRawGeometryE2E:
             assert await _client.query(client, "RETURN $v.is_geometry();", {"v": geojson}) is False
             assert await _client.query(client, "RETURN $v.is_geometry();", {"v": SdkPoint(*A)}) is True
             await _client.query(client, "DEFINE FIELD loc ON geo_raw TYPE option<geometry<point>>;", {})
+            if await line_major(client) >= 4:
+                # SurrealDB 4.x coerces the GeoJSON map into the geometry<point> column (measured on 4.0.0).
+                await _client.query(client, "CREATE geo_raw:x SET loc = $map;", {"map": geojson})
+                stored = await _client.query(client, "SELECT VALUE loc.is_geometry() FROM ONLY geo_raw:x;", {})
+                assert stored is True
+                return
             with pytest.raises(surrealdb.ServerError, match="geometry<point>"):
                 await _client.query(client, "CREATE geo_raw:x SET loc = $map;", {"map": geojson})
 

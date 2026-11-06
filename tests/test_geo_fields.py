@@ -72,7 +72,7 @@ from tests._readme_tables import (
 )
 from tests._readme_tables import doc_part as _doc_part
 from tests._retry import retry_write
-from tests.conftest import change_feed_database, orm_client
+from tests.conftest import change_feed_database, line_major, orm_client
 from tests.test_geo_types import (
     AB_METRES,
     HOLE,
@@ -1368,6 +1368,16 @@ CROSSING = [(-73.993, 40.70), (-73.993, 40.76)]
 #: The sets the spatial operators give on the mixed seed, measured on 2.7.0, 3.1.5 and 3.3.4 (spec §3.4).
 INSIDE_KEYS = {"near1", "near2", "poly"}
 OUTSIDE_KEYS = {"far", "none", "nullish", "obj", "text"}
+
+
+async def _spatial_keys(client: Any) -> tuple[set[str], set[str]]:
+    """``(INSIDE_KEYS, OUTSIDE_KEYS)`` on the line *client* talks to: SurrealDB 4.x reads ``obj``'s GeoJSON object at A
+    as the point it describes, so it lies inside the zone (measured on 4.0.0); 2.x and 3.x keep it a plain object."""
+    if await line_major(client) >= 4:
+        return INSIDE_KEYS | {"obj"}, OUTSIDE_KEYS - {"obj"}
+    return INSIDE_KEYS, OUTSIDE_KEYS
+
+
 #: ``LOOKUP_OPERATORS``: the infix operators only. The spatial lookups live in a mapping of their own (v0.24.0), and
 #: so do the text lookups, which compile to string functions (#251, ``TEXT_LOOKUP_FUNCTIONS``).
 INFIX_LOOKUP_OPERATORS = {
@@ -1536,21 +1546,24 @@ class TestSpatialLookupE2E:
     async def test_inside(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, _ = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(location__inside=zone).exec()) == INSIDE_KEYS
-            assert await GeoMixed.objects().filter(location__inside=ZONE).count() == len(INSIDE_KEYS)
+                assert _ids(await GeoMixed.objects().filter(location__inside=zone).exec()) == inside
+            assert await GeoMixed.objects().filter(location__inside=ZONE).count() == len(inside)
 
     async def test_outside_includes_the_rows_without_a_geometry(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            _, outside = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(location__outside=zone).exec()) == OUTSIDE_KEYS
+                assert _ids(await GeoMixed.objects().filter(location__outside=zone).exec()) == outside
 
     async def test_intersects(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, _ = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(location__intersects=zone).exec()) == INSIDE_KEYS
+                assert _ids(await GeoMixed.objects().filter(location__intersects=zone).exec()) == inside
             for line in _forms(GeometryLine.parse_coordinates(CROSSING)):
                 assert _ids(await GeoMixed.objects().filter(location__intersects=line).exec()) == {"poly"}
 
@@ -1563,24 +1576,27 @@ class TestSpatialLookupE2E:
     async def test_q_objects(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, outside = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(~Q(location__inside=zone)).exec()) == OUTSIDE_KEYS
+                assert _ids(await GeoMixed.objects().filter(~Q(location__inside=zone)).exec()) == outside
             either = Q(location__inside=ZONE) | Q(n=MIXED_KEYS.index("far") + 1)
-            assert _ids(await GeoMixed.objects().filter(either).exec()) == INSIDE_KEYS | {"far"}
+            assert _ids(await GeoMixed.objects().filter(either).exec()) == inside | {"far"}
             assert _ids(await GeoMixed.objects().filter(Q(location__inside=ZONE), n=1).exec()) == {"near1"}
 
     async def test_a_variable_reference(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, _ = await _spatial_keys(client)
             qs = GeoMixed.objects().filter(location__inside=Var("zone")).variables(zone=ZONE)
-            assert _ids(await qs.exec()) == INSIDE_KEYS
+            assert _ids(await qs.exec()) == inside
 
     async def test_combined_with_nearby_and_bulk_update(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
             assert _ids(await GeoMixed.objects().filter(location__inside=ZONE).nearby("location", B, 1000).exec()) == {"near2"}
-            assert await GeoMixed.objects().filter(location__intersects=ZONE).bulk_update(n=77) == len(INSIDE_KEYS)
-            assert _ids(await GeoMixed.objects().filter(n=77).exec()) == INSIDE_KEYS
+            inside, _ = await _spatial_keys(client)
+            assert await GeoMixed.objects().filter(location__intersects=ZONE).bulk_update(n=77) == len(inside)
+            assert _ids(await GeoMixed.objects().filter(n=77).exec()) == inside
 
     async def test_typed_model(self) -> None:
         async with orm_client("geo_place", "geo_zone"):
