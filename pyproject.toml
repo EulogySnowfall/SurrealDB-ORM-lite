@@ -27,8 +27,12 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.13.4",
-    "surrealdb[pydantic]>=2.0.0,<3.0.0",
+    "surrealdb[pydantic]>=3.0.0,<4.0.0",
 ]
+
+[project.optional-dependencies]
+# The SDK's in-process engine (mem://, file://, surrealkv://), SurrealDB core 4.x.
+embedded = ["surrealdb[embedded]>=3.0.0,<4.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite"
@@ -103,6 +107,7 @@ dev = [
     "python-dotenv>=1.2.1",
     "ruff>=0.15.16",
     "nbconvert>=7.16",
+    "surrealdb[embedded]>=3.0.0,<4.0.0",
 ]
 lint = [
     "ruff>=0.15.16",

@@ -56,20 +56,22 @@ def test_sdk_shim_rich_exports() -> None:
 
 
 def test_cbor_null_constant() -> None:
-    """AC-3 (spec §6.7): ``CBOR_NULL`` is the plain CBOR null, SurrealDB's open range bound."""
-    import surrealdb.cbor
+    """AC-3 (spec §6.7): ``CBOR_NULL`` is the plain CBOR null, SurrealDB's open range bound.
+
+    v0.50.0: on SDK 3.0 it is the SDK's ``Null`` singleton, which the SDK also returns for a CBOR null it reads.
+    """
+    import surrealdb
 
     from surreal_orm_lite import _sdk
 
-    assert type(_sdk.CBOR_NULL) is surrealdb.cbor.CBORSimpleValue
-    assert _sdk.CBOR_NULL.value == 22
-    assert _sdk.CBORSimpleValue is surrealdb.cbor.CBORSimpleValue
+    assert _sdk.CBOR_NULL is surrealdb.Null
     assert _sdk.cbor_encode is not None
     assert _sdk.cbor_decode is not None
     canary = "the SDK changed how it encodes a CBOR null or a Range: re-check spec §3.1/§3.9 (open range sides)"
     # f6, not c6 f6 (the tag-6 NONE that ``None`` gives).
     assert _sdk.cbor_encode(_sdk.CBOR_NULL) == b"\xf6", canary
-    assert _sdk.cbor_decode(b"\xf6") is None, canary
+    assert _sdk.cbor_encode(None) == b"\xc6\xf6", canary
+    assert _sdk.cbor_decode(b"\xf6") is _sdk.Null, canary
     open_begin = _sdk.SdkRange(_sdk.CBOR_NULL, _sdk.BoundExcluded(5))
     assert _sdk.cbor_encode(open_begin) == bytes.fromhex("d83182f6d83305"), canary
 
@@ -301,13 +303,14 @@ def test_sdk_shim_read_hook_exports() -> None:
     """#235: what the read hook (``decoding.py``) takes from the SDK enters through ``_sdk.py``."""
     import surrealdb
     import surrealdb.data.cbor
+    import surrealdb.data.types.constants
 
     from surreal_orm_lite import _sdk
 
     assert _sdk.cbor_tag_decoder is surrealdb.data.cbor.tag_decoder
     assert "cbor_tag_decoder" in _sdk.__all__
     # #279: the compact datetime tag, read when its value is outside years 1-9999.
-    assert _sdk.TAG_DATETIME_COMPACT == surrealdb.TAG_DATETIME_COMPACT == 12
+    assert _sdk.TAG_DATETIME_COMPACT == surrealdb.data.types.constants.TAG_DATETIME_COMPACT == 12
     assert "TAG_DATETIME_COMPACT" in _sdk.__all__
     for alias, name in _SDK_CONNECTION_CLASSES.items():
         assert getattr(_sdk, alias) is getattr(surrealdb, name), alias
@@ -323,10 +326,9 @@ def test_read_hook_without_the_sdk_symbols() -> None:
         del surrealdb.AsyncHttpSurrealConnection
         import surrealdb.connections.async_http as http
         del http.AsyncHttpSurrealConnection
-        from surreal_orm_lite import _sdk, decoding, encoding
+        from surreal_orm_lite import _sdk, decoding
         assert _sdk.cbor_tag_decoder is None and _sdk.SdkAsyncHttpConnection is None
         assert decoding.needed() and not decoding.available() and not decoding.active()
-        assert not encoding.reads_zero_duration()
         print("ok")
         """
     )
@@ -349,3 +351,126 @@ def test_sdk_shim_url_exports() -> None:
     assert _sdk.SdkUrlScheme is sdk_url.UrlScheme
     assert "SdkUrl" in _sdk.__all__
     assert "SdkUrlScheme" in _sdk.__all__
+
+
+# --- v0.50.0: the official SDK 3.0 import surface ------------------------------------------------
+
+_SDK3_ROOT_SYMBOLS = {
+    "Null": "Null",
+    "NullType": "NullType",
+    "SurrealSet": "SurrealSet",
+    "PreciseDatetime": "PreciseDatetime",
+    "Table": "Table",
+    "StringRecordId": "StringRecordId",
+    "Features": "Features",
+    "UnsupportedFeatureError": "UnsupportedFeatureError",
+    "UnsupportedVersionError": "UnsupportedVersionError",
+    "UnexpectedResponseError": "UnexpectedResponseError",
+    "ConnectionUnavailableError": "ConnectionUnavailableError",
+    "TransportError": "TransportError",
+    "TransportTimeoutError": "TransportTimeoutError",
+    "UnsupportedEngineError": "UnsupportedEngineError",
+}
+
+_SDK3_TAG_CONSTANTS = [
+    "TAG_DATETIME_COMPACT",
+    "TAG_DECIMAL_STRING",
+    "TAG_DURATION_COMPACT",
+    "TAG_GEOMETRY_POINT",
+    "TAG_GEOMETRY_LINE",
+    "TAG_GEOMETRY_POLYGON",
+    "TAG_GEOMETRY_MULTI_POINT",
+    "TAG_GEOMETRY_MULTI_LINE",
+    "TAG_GEOMETRY_MULTI_POLYGON",
+    "TAG_GEOMETRY_COLLECTION",
+]
+
+
+def test_sdk3_root_symbols() -> None:
+    """v0.50.0 AC-2: every SDK 3.0 symbol the ORM uses enters through ``_sdk.py``, from the SDK's top level."""
+    import surrealdb
+
+    from surreal_orm_lite import _sdk
+
+    for alias, name in _SDK3_ROOT_SYMBOLS.items():
+        assert getattr(_sdk, alias) is getattr(surrealdb, name), alias
+        assert alias in _sdk.__all__, alias
+    assert issubclass(_sdk.TransportTimeoutError, _sdk.TransportError)
+    assert issubclass(_sdk.ConnectionUnavailableError, _sdk.TransportError)
+
+
+def test_sdk3_tag_constants_come_from_the_constants_module() -> None:
+    """v0.50.0: SDK 3.0 no longer exports the CBOR tag numbers at its top level; they come from ``constants``."""
+    import surrealdb.data.types.constants as constants
+
+    from surreal_orm_lite import _sdk
+
+    for name in _SDK3_TAG_CONSTANTS:
+        assert getattr(_sdk, name) == getattr(constants, name), name
+        assert name in _sdk.__all__, name
+    assert _sdk.TAG_DATETIME_COMPACT == 12
+    assert [getattr(_sdk, f"TAG_GEOMETRY_{n}") for n in ("POINT", "COLLECTION")] == [88, 94]
+
+
+def test_sdk3_decoder_layout_exports() -> None:
+    """v0.50.0 (spec §5.6): the SDK's decoder class and its tag readers, ``None`` allowed for a later layout."""
+    import surrealdb.data._decoder as sdk_decoder
+
+    from surreal_orm_lite import _sdk
+
+    assert _sdk.SdkDecoder is sdk_decoder.Decoder
+    assert _sdk.SDK_TAG_READERS is sdk_decoder._TAGS
+    assert "SdkDecoder" in _sdk.__all__
+    assert "SDK_TAG_READERS" in _sdk.__all__
+
+
+def test_sdk3_null_is_the_cbor_null_alias() -> None:
+    """v0.50.0: ``CBOR_NULL`` (kept for internal callers until Task 7) is the SDK 3.0 ``Null`` sentinel."""
+    import surrealdb
+
+    from surreal_orm_lite import _sdk
+
+    assert _sdk.CBOR_NULL is surrealdb.Null
+    assert _sdk.cbor_encode is not None
+    assert _sdk.cbor_encode(_sdk.Null) == b"\xf6"
+
+
+def test_sdk3_connection_classes() -> None:
+    """v0.50.0: the WebSocket and HTTP classes are always there; the embedded one only with the extra."""
+    import surrealdb
+
+    from surreal_orm_lite import _sdk
+
+    assert _sdk.SdkAsyncWsConnection is surrealdb.AsyncWsSurrealConnection
+    assert _sdk.SdkAsyncHttpConnection is surrealdb.AsyncHttpSurrealConnection
+    assert _sdk.SdkAsyncEmbeddedConnection is getattr(surrealdb, "AsyncEmbeddedSurrealConnection", None)
+
+
+def test_import_without_the_embedded_engine() -> None:
+    """v0.50.0 (D11): without ``surrealdb_embedded`` the ORM and its testing helpers still import.
+
+    The embedded engine is an optional extra (``surreal-orm-lite[embedded]``): a missing engine is reported when an
+    embedded URL is opened, never at import.
+    """
+    result = _run_isolated(
+        """
+        import sys
+
+        class _Block:
+            def find_spec(self, name, path=None, target=None):
+                if name == "surrealdb_embedded" or name.startswith("surrealdb_embedded."):
+                    raise ImportError(f"blocked: {name}")
+                return None
+
+        sys.meta_path.insert(0, _Block())
+        import surreal_orm_lite
+        import surreal_orm_lite.testing
+        from surreal_orm_lite import _sdk
+        assert _sdk.SdkAsyncEmbeddedConnection is None, _sdk.SdkAsyncEmbeddedConnection
+        assert _sdk.SdkAsyncWsConnection is not None and _sdk.SdkAsyncHttpConnection is not None
+        assert "surrealdb_embedded" not in sys.modules
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok", result.stderr
