@@ -2610,8 +2610,7 @@ class BaseSurrealModel(BaseModel):
         declared, kept_mode = clauses.schema_mode, None if state is None else state.schema_mode
         mode = (declared or kept_mode) if overwrite else (kept_mode or declared)
         schemafull = mode == SchemaMode.SCHEMAFULL.value
-        # On a SCHEMAFULL table, SurrealDB 2.x and the embedded engine (whose version() answers the SDK's 2.x version)
-        # empty an object or an array held by an ``any`` column unless it is FLEXIBLE, which 3.x refuses there, and
+        # On a SCHEMAFULL table, SurrealDB 2.x (not the embedded engine, a 4.0 core since v0.50.0) empties an object or an array held by an ``any`` column unless it is FLEXIBLE, which 3.x refuses there, and
         # drop a FLEXIBLE column's value under an array of objects unless the array is FLEXIBLE too: the line is read
         # once, outside any transaction, and only when such a column or such a list of sub-models exists.
         before_3 = (

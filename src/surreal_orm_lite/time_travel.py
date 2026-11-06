@@ -199,7 +199,7 @@ def line_major(version: object) -> int:
 async def cached_major(client: Any) -> int:
     """The major of the server line *client* talks to (:func:`line_major` of ``client.version()``), read once per client.
 
-    For v0.36.0's vector search: below SurrealDB 3 (2.x, the embedded engine) a KNN next to other conditions is
+    For v0.36.0's vector search: below SurrealDB 3 (2.x; the embedded engine is a 4.0 core since v0.50.0) a KNN next to other conditions is
     compiled with those conditions selected first, in a ``LET``. The answer is kept per SDK client object, so a client
     is asked once, and forgotten with it: a reconnected WebSocket is a new client, read again. A client that cannot be
     weakly referenced is read every time. A version that cannot be read counts as 3 (:func:`line_major`).

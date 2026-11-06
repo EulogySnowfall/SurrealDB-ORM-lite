@@ -3389,19 +3389,19 @@ class TestGoldensE2E:
         )
         assert accepted is None, f"README row 'Full-text index': SurrealDB {line}.x takes {search.fulltext_keyword(line)}"
 
-    async def test_the_embedded_engine_takes_search(self) -> None:
-        """The keyword tripwire: an SDK whose embedded core changes line must change the keyword dispatch. The
-        embedded engine reports the SDK's version (major 2, its core's line) and takes ``SEARCH``, refusing
-        ``FULLTEXT``; the ORM writes the keyword of the major version the engine reports."""
+    async def test_the_embedded_engine_takes_fulltext(self) -> None:
+        """The keyword tripwire: an SDK whose embedded core changes line must change the keyword dispatch. Since
+        v0.50.0 (D23) the embedded engine is SDK 3.0's, a SurrealDB 4.0 core: it reports major 4, takes ``FULLTEXT``
+        and refuses ``SEARCH``; the ORM writes the keyword of the major version the engine reports."""
         async with _fts("mem") as client:
             major = await _major(client)
             await _apply_ddl(client, _A1)
             index = Index("fts_k", "k", search_analyzer="fts_english")
             fulltext = await _refusal(client, index.ddl("fts_t", line=3))
             keyword = await _refusal(client, index.ddl("fts_t", line=2))
-        assert major == 2, "the embedded engine's major version changed: check the full-text keyword it takes"
-        assert fulltext is not None and "Parse error" in fulltext, "the embedded engine now takes FULLTEXT"
-        assert keyword is None, "the embedded engine now refuses SEARCH"
+        assert major == 4, "the embedded engine's major version changed: check the full-text keyword it takes"
+        assert fulltext is None, "the embedded engine now refuses FULLTEXT"
+        assert keyword is not None, "the embedded engine now takes SEARCH"
 
 
 #: A record access on ``fts_db``: a user signed up through it is a record user, who may not read the schema.

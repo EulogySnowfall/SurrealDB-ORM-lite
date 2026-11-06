@@ -26,11 +26,15 @@ async def embedded_database(
             assert await User.objects().count() == 1
         # the in-memory database is gone; the previous settings, stored session and engine are back
 
-    Yields the SDK client of the block's engine (for raw SurrealQL and DDL), valid **inside the block only**:
-    with the surrealdb SDK 2.x, closing does not stop an in-process engine, so a client kept after the block
-    is still a running database — do not use it afterwards, and drop it before reopening the same
-    ``surrealkv://`` path. For an on-disk database pass ``surrealkv://<path>`` (with pytest, under
-    ``tmp_path``): its files stay after the block.
+    Yields the SDK client of the block's engine (for raw SurrealQL and DDL), valid **inside the block only**: the
+    block closes its engine when it ends (SDK 3.0's ``close()`` shuts it down), so do not use the client afterwards.
+    For an on-disk database pass ``surrealkv://<path>`` (with pytest, under ``tmp_path``): its files stay after the
+    block. SDK 3.0's engine locks its store: a block on the store the connection's own engine has open closes that
+    engine for the block (its data stays on disk) and connects it again afterwards, back to the stored session at
+    the next call.
+
+    The engine is the optional extra ``surreal-orm-lite[embedded]`` (v0.50.0), a SurrealDB 4.0 core: without it,
+    importing this module works and opening a block raises ``SurrealDbConnectionError`` naming the extra.
 
     The block points **one connection** at its engine (v0.29.0): *connection*, else the current one when the block
     opens — the name of the :meth:`~surreal_orm_lite.SurrealDBConnectionManager.using` block around it, else
@@ -46,8 +50,9 @@ async def embedded_database(
 
     :param connection: the connection to isolate (v0.29.0); ``None`` (the default) for the current one.
     :raises SurrealDbConnectionError: for a URL the installed SDK refuses (``rocksdb://`` today), quoting the
-        SDK's message — before anything changes; or if the engine cannot be opened, or another connection of the
-        process has that on-disk store open (the previous state is restored).
+        SDK's message — before anything changes; or if the engine cannot be opened (without the optional extension:
+        naming ``surreal-orm-lite[embedded]``), or another connection of the process has that on-disk store open (the
+        previous state is restored).
     :raises ValueError: for a server URL, or an empty namespace or database; an empty *connection*; a *connection*
         other than the active ``using()`` block's, whose models would reach their real database — all before anything
         changes.
@@ -80,8 +85,8 @@ async def embedded_database(
             client = await manager.get_client()
             yield client
         finally:
-            # This helper's own reference goes first: with the surrealdb SDK 2.x an in-process engine stops only
-            # once nothing refers to its client, and the same surrealkv:// path may be reopened right after.
+            # This helper's own reference goes first: the block's client is closed with it, and the same
+            # surrealkv:// path may be reopened right after.
             del client
             await manager._exit_embedded_block(state)
     finally:

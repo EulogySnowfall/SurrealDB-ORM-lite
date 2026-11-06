@@ -5,9 +5,11 @@ import functools
 import hashlib
 import inspect
 import logging
+import re
+import secrets
 import threading
 import weakref
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, ClassVar, Concatenate, Final, Literal, ParamSpec, TypeVar, cast
@@ -19,10 +21,24 @@ from . import _client
 from . import cache as _cache
 from . import decoding as _decoding
 from . import encoding as _encoding
-from ._sdk import AsyncSurreal, Features, NotFoundError, UnsupportedFeatureError, UnsupportedVersionError
+from ._sdk import (
+    AsyncSurreal,
+    Features,
+    NotFoundError,
+    UnsupportedEngineError,
+    UnsupportedFeatureError,
+    UnsupportedVersionError,
+)
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_config import ConnectionConfig
-from .embedded import ephemeral_unsupported, is_embedded_url, require_supported_url, store_key
+from .embedded import (
+    ENGINE_MISSING,
+    ephemeral_unsupported,
+    is_embedded_url,
+    is_memory_url,
+    require_supported_url,
+    store_key,
+)
 from .exceptions import (
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -147,6 +163,10 @@ class _ManagerState:
     embedded_client: Any
     embedded_url: str | None
     embedded_selection: tuple[str | None, str | None] | None
+    embedded_owner: bool = True
+    embedded_owner_user: bool = False
+    embedded_owner_secret: str | None = dataclasses.field(default=None, repr=False)
+    embedded_closed: bool = False
 
 
 #: A connection's state (v0.29.0): each name-mangled state attribute of :class:`SurrealDBConnectionManager`, with
@@ -168,6 +188,9 @@ _STATE: Final[tuple[tuple[str, Callable[[], Any]], ...]] = (
     ("embedded_client", lambda: None),
     ("embedded_url", lambda: None),
     ("embedded_selection", lambda: None),
+    ("embedded_owner", lambda: True),
+    ("embedded_owner_user", lambda: False),
+    ("embedded_owner_secret", lambda: None),
     ("embedded_lock", threading.Lock),
     ("generation", lambda: 0),
 )
@@ -355,7 +378,7 @@ class SurrealDBConnectionManager:
     # cooperatively (_embedded_guard), never by blocking a loop.
     #
     # A namespace/database change is a new *selection* on that one engine, and it resets the shared
-    # session — invalidate(), back to the in-process owner, then use() — instead of replaying the
+    # session — back to the in-process owner (below), then use() — instead of replaying the
     # stored token: a record session cannot write in another database and reads
     # nothing there, and replaying a token moves the session back to the database it was issued for,
     # silently undoing the selection. ``__embedded_selection`` is ``None`` while a client is in the
@@ -365,6 +388,17 @@ class SurrealDBConnectionManager:
     __embedded_url: str | None = None
     __embedded_selection: tuple[str | None, str | None] | None = None
     __embedded_lock: threading.Lock = threading.Lock()
+
+    # The owner session (v0.50.0, spec §5.7, D17). The engine's session starts as the in-process owner, and with SDK 3.0
+    # (SurrealDB core 4.0) invalidate() leaves it anonymous and denied — no way back by itself. So the slot tracks
+    # whether the shared session is still the owner: True at open, False once an identity exchange *succeeded* on it
+    # (a failed one leaves the session unchanged). Back to the owner, a file-backed engine is closed and connected
+    # again (its data kept); an in-memory one signs in as a temporary owner user the slot defined just before the first
+    # exchange (``__embedded_owner_user``: defined by this slot and not removed yet), then removes it. The secret lives
+    # here only, never in a log, a repr or an error.
+    __embedded_owner: bool = True
+    __embedded_owner_user: bool = False
+    __embedded_owner_secret: str | None = None
 
     # The settings generation (v0.29.0): "these settings are still the ones this connection serves". Bumped only by
     # _retire_server_clients() — add_connection() with other settings, remove_connection() of a named connection —
@@ -497,7 +531,7 @@ class SurrealDBConnectionManager:
         WebSocket it is closed and its next request raises ``SurrealDbConnectionError`` (it opens no socket); an HTTP
         client (it holds no socket) keeps the identity, namespace and database it was opened on — call :meth:`get_client` again; an embedded client is the
         connection's one in-process session: it follows a new namespace or database at the ORM's next call, but after a
-        new URL or :meth:`remove_connection` it is the previous engine (with SDK 2.x still running), so stop using it, as
+        new URL or :meth:`remove_connection` it is the previous engine, closed, so stop using it, as
         after :meth:`close_connection`. :meth:`remove_connection` does all of this too.
         :meth:`set_connection` keeps its v0.28 tolerance (its open clients keep serving until :meth:`close_connection`
         or :meth:`reconnect`).
@@ -536,8 +570,8 @@ class SurrealDBConnectionManager:
         committed. A call already under way on the name opens no new client on the old settings: one still waiting for
         the embedded engine while another thread held it raises ``ValueError("Connection not been set ('<name>').")``.
         A client the application obtained itself is its own, as after a re-registration: on WebSocket its next request
-        raises ``SurrealDbConnectionError``, an HTTP client keeps its namespace and database, and an embedded client is the previous engine (with
-        SDK 2.x still running), so stop using it, as after :meth:`close_connection`. A no-op for a name that is not
+        raises ``SurrealDbConnectionError``, an HTTP client keeps its namespace and database, and an embedded client is the previous engine,
+        closed, so stop using it, as after :meth:`close_connection`. A no-op for a name that is not
         registered (after the name's type check). ``remove_connection("default")`` is :meth:`unset_connection`,
         unchanged (the default is never unregistered). A model routed to a removed name raises ``ValueError`` at its next
         database call. The name is free again as soon as this is called: an ``add_connection()`` of it, even while the old one
@@ -843,7 +877,8 @@ class SurrealDBConnectionManager:
 
         On an **embedded** URL the SDK's constructor opens the in-process engine and ``connect()``
         takes no argument; nobody is signed in, whatever *signin_as_configured* says: the engine
-        has no system user on a fresh database, and its anonymous session is the in-process owner.
+        has no system user on a fresh database, and its session starts as the in-process owner. Without the optional
+        extension (``surreal-orm-lite[embedded]``) the error names it, not retryable.
 
         :param signin_as_configured: sign in as the configured user (server URLs). ``False`` yields
             an **anonymous** client, ready to be authenticated as somebody else.
@@ -884,6 +919,11 @@ class SurrealDBConnectionManager:
                 if client is not None:
                     with contextlib.suppress(Exception):
                         await client.close()
+                if isinstance(e, UnsupportedEngineError | ImportError):
+                    # SDK 3.0: the engine is the optional extra; its parser still routes the URL without it.
+                    missing = SurrealDbConnectionError(ENGINE_MISSING)
+                    missing.retryable = False  # type: ignore[attr-defined]
+                    raise missing from e
                 error = SurrealDbConnectionError(f"Can't open the embedded database {url!r}: {e}")
                 error.retryable = False  # type: ignore[attr-defined]
                 raise error from e
@@ -1121,7 +1161,13 @@ class SurrealDBConnectionManager:
     @classmethod
     @_routed("current")
     async def _replay_then_publish(
-        cls, client: Any, *, replayed: str, configured: str, publish: Callable[[Any, str], None]
+        cls,
+        client: Any,
+        *,
+        replayed: str,
+        configured: str,
+        publish: Callable[[Any, str], None],
+        replay: Callable[[Any], Awaitable[None]] | None = None,
     ) -> Any:
         """Replay the stored session on a freshly opened *client*, then publish it with the stamp of
         the identity it ended up with. Shared by the per-loop cache and the embedded slot.
@@ -1129,6 +1175,8 @@ class SurrealDBConnectionManager:
         :param replayed: the fingerprint of the configured identity *with* the stored token.
         :param configured: the same without it — what the client is when the token is refused.
         :param publish: stamps and caches the client under the given fingerprint.
+        :param replay: how the stored session is replayed, :meth:`_replay_session` by default (the embedded slot
+            tracks its owner session around it).
         """
         # Deliberately after the client is opened and OUTSIDE the except of the open. A dead token
         # is not a connection failure — the socket is up, the configured credentials worked,
@@ -1140,7 +1188,7 @@ class SurrealDBConnectionManager:
         # get_client() take the fast path and run statements as the configured root user while
         # the record identity is still being established.
         try:
-            await cls._replay_session(client)
+            await (cls._replay_session if replay is None else replay)(client)
         except SurrealDbConnectionError:
             # The connection itself failed during the replay: nothing is known about the client's
             # identity, and the stored session was kept for the next attempt.
@@ -1360,6 +1408,8 @@ class SurrealDBConnectionManager:
         """
         url, namespace, database = cls.__url, cls.__namespace, cls.__database
         claimed = _claim_store(url, cls)
+        # A new engine's session is the in-process owner (spec §5.7).
+        cls.__embedded_owner, cls.__embedded_owner_user, cls.__embedded_owner_secret = True, False, None
         try:
             # Fingerprinted from the settings _open_client() reads before its first await, as in
             # _connect_for_loop().
@@ -1373,7 +1423,9 @@ class SurrealDBConnectionManager:
                 cls.__embedded_selection = (namespace, database)
                 cls.__embedded_client = opened  # last: see the fast path of _acquire_embedded_client()
 
-            return await cls._replay_then_publish(client, replayed=replayed, configured=configured, publish=publish)
+            return await cls._replay_then_publish(
+                client, replayed=replayed, configured=configured, publish=publish, replay=cls._replay_embedded_session
+            )
         except BaseException:
             # A refused replay publishes the client, which keeps the store; any other failure leaves the slot empty.
             if cls.__embedded_client is None:
@@ -1385,7 +1437,8 @@ class SurrealDBConnectionManager:
     async def _reset_embedded_session(cls, client: Any) -> None:
         """Re-identify the shared embedded session on the configured selection. Caller holds the guard.
 
-        The one place that does it: back to the in-process owner (``invalidate()``), select the
+        The one place that does it: back to the in-process owner (:meth:`_back_to_embedded_owner`: nothing to do when
+        the session still is the owner, so no ``invalidate()``), select the
         configured namespace and database (``use()``), then replay the stored session, if any. Until
         that succeeds the slot's selection is stale, so nobody takes the fast path meanwhile and the
         next :meth:`get_client` resets again: the client is never handed out on a new selection with
@@ -1393,7 +1446,7 @@ class SurrealDBConnectionManager:
         it inside :meth:`_exclusive_embedded_client` to put the stored identity back after a failed
         ``bind=True``.
 
-        :raises SurrealDbConnectionError: ``invalidate()`` or ``use()`` failed (never retryable), or
+        :raises SurrealDbConnectionError: the return to the owner or ``use()`` failed (never retryable), or
             the replay hit a connection failure; the selection stays stale.
         :raises SurrealDbAuthenticationError: the stored session was refused; it is forgotten, and
             the session is the owner on the configured selection.
@@ -1404,8 +1457,8 @@ class SurrealDBConnectionManager:
         cls.__embedded_selection = None  # stale until done
         replayed = cls._fingerprint(url, namespace, database, cls.__user, cls.__session_token)
         configured = cls._fingerprint(url, namespace, database, cls.__user, None)
+        await cls._back_to_embedded_owner(client)
         try:
-            await client.invalidate()  # the in-process owner
             await client.use(namespace, database)
         except Exception as exc:
             error = SurrealDbConnectionError(
@@ -1414,7 +1467,7 @@ class SurrealDBConnectionManager:
             error.retryable = False  # type: ignore[attr-defined]
             raise error from exc
         try:
-            await cls._replay_session(client)
+            await cls._replay_embedded_session(client)
         except SurrealDbConnectionError:
             raise  # the selection stays stale
         except Exception:
@@ -1424,6 +1477,161 @@ class SurrealDBConnectionManager:
             raise
         cls._stamp_identity(client, fingerprint=replayed, replayable=True)
         cls.__embedded_selection = (namespace, database)
+
+    @classmethod
+    @_routed("current")
+    async def _replay_embedded_session(cls, client: Any) -> None:
+        """:meth:`_replay_session` on the embedded slot's session, as an identity exchange
+        (:meth:`_embedded_exchange`) when a session is stored. Caller holds the guard."""
+        if cls.__session_token is None:
+            await cls._replay_session(client)  # nothing to replay: no exchange
+            return
+        await cls._embedded_exchange(client, lambda: cls._replay_session(client))
+
+    @classmethod
+    @_routed("current")
+    async def _embedded_exchange(cls, client: Any, exchange: Callable[[], Awaitable[_R]]) -> _R:
+        """Run one identity exchange (``signin``, ``signup``, ``authenticate``, a replayed token) on the embedded
+        slot's shared session, tracking whether that session is still the in-process owner (spec §5.7, D17).
+        Caller holds the guard.
+
+        While the session is the owner of an **in-memory** engine (``mem://``, ``memory``), the temporary owner user
+        is defined first — the only way back to the owner afterwards (:meth:`_back_to_embedded_owner`). That
+        definition failing (a user of that name exists, or the engine refused it) raises before *exchange* runs. If
+        the exchange then fails, the session is unchanged — still the owner — and the user is removed at once. Once it
+        succeeded, the session is no longer the owner. File-backed engines define no user (they are reopened).
+
+        :raises SurrealDbConnectionError: the owner user could not be defined (fixed text, not retryable).
+        """
+        owner = cls.__embedded_owner
+        if owner and is_memory_url(cls._embedded_slot_url()):
+            await cls._define_embedded_owner_user(client)
+        try:
+            result = await exchange()
+        except BaseException:
+            if owner:
+                # The session is unchanged (SDK 3.0, M28): still the owner, so the user is not needed.
+                await cls._remove_embedded_owner_user(client, quiet=True)
+            raise
+        cls.__embedded_owner = False
+        return result
+
+    @classmethod
+    @_routed("current")
+    def _embedded_slot_url(cls) -> str | None:
+        """The URL of the engine in the slot, else (while it opens) the configured one."""
+        return cls.__embedded_url if cls.__embedded_client is not None else cls.__url
+
+    @classmethod
+    @_routed("current")
+    async def _define_embedded_owner_user(cls, client: Any) -> None:
+        """Define the temporary owner user of an in-memory engine (spec §5.7, M28-b), unless this slot still has one.
+        Caller holds the guard; the session is the owner.
+
+        The plain statement, never ``OVERWRITE`` or ``IF NOT EXISTS``: a user of that name the application defined is
+        refused, never replaced or later removed. The password is a literal (the engine takes no parameter there): a
+        fresh ``secrets.token_urlsafe(32)``, checked against its shape before it is inlined, kept in the slot only.
+
+        :raises SurrealDbConnectionError: the engine refused the statement — a fixed text, with neither ``__cause__``
+            nor ``__context__``: an engine error may quote the statement, so the secret.
+        """
+        if cls.__embedded_owner_user:
+            return
+        secret = secrets.token_urlsafe(32)
+        failed = not _OWNER_SECRET.fullmatch(secret)
+        if not failed:
+            try:
+                await _client.query(
+                    client,
+                    f"DEFINE USER {_OWNER_USER} ON ROOT PASSWORD '{secret}' ROLES OWNER DURATION FOR SESSION NONE",
+                )
+            except Exception:  # not bound: the fixed error below must not carry it as its context
+                failed = True
+        if failed:
+            raise _owner_error(_OWNER_DEFINE_FAILED) from None
+        cls.__embedded_owner_secret = secret
+        cls.__embedded_owner_user = True
+
+    @classmethod
+    @_routed("current")
+    async def _remove_embedded_owner_user(cls, client: Any, *, quiet: bool = False) -> None:
+        """Remove the temporary owner user this slot defined, if it has one; the session is the owner. Caller holds
+        the guard. A user this slot did not define is never removed.
+
+        :param quiet: a failure is not raised; the user is kept as this slot's, and removed by the next return to the
+            owner (:meth:`_back_to_embedded_owner`).
+        :raises SurrealDbConnectionError: the removal failed (fixed text, no ``__cause__``/``__context__``).
+        """
+        if not cls.__embedded_owner_user:
+            return
+        failed = False
+        try:
+            await _client.query(client, f"REMOVE USER {_OWNER_USER} ON ROOT")
+        except Exception:  # not bound: see _define_embedded_owner_user()
+            failed = True
+        if failed:
+            if quiet:
+                return
+            raise _owner_error(_OWNER_REMOVE_FAILED) from None
+        cls.__embedded_owner_user = False
+        cls.__embedded_owner_secret = None
+
+    @classmethod
+    @_routed("current")
+    async def _back_to_embedded_owner(cls, client: Any, *, ended: Callable[[], None] | None = None) -> None:
+        """Return the embedded slot's shared session to the in-process owner (spec §5.7, D17). Caller holds the guard.
+
+        - Still the owner (no exchange succeeded since the engine opened, or since the last return): nothing is sent —
+          no ``invalidate()``, which SDK 3.0 turns into an anonymous, denied session — except the removal of an owner
+          user a previous return could not remove.
+        - An in-memory engine (``mem://``, ``memory``): ``invalidate()``, ``signin`` as the temporary owner user,
+          then its removal. Its data stays (closing would lose it).
+        - A file-backed engine: ``close()`` then ``connect()`` on the same client: the engine reopens its store, data
+          kept, as the owner.
+
+        :param ended: called once the previous identity has ended (``invalidate()`` or ``close()`` succeeded).
+        :raises SurrealDbConnectionError: a step failed (not retryable). The session is then never left anonymous
+            silently: the slot still says it is not the owner, so the next reset runs the same path again.
+        """
+        if cls.__embedded_owner:
+            await cls._remove_embedded_owner_user(client, quiet=True)
+            return
+        if not is_memory_url(cls._embedded_slot_url()):
+            try:
+                await client.close()
+                if ended is not None:
+                    ended()
+                await client.connect()
+            except Exception as exc:
+                error = SurrealDbConnectionError(
+                    f"Can't reopen the embedded database {cls._embedded_slot_url()!r} to return to its owner session: {exc}"
+                )
+                error.retryable = False  # type: ignore[attr-defined]
+                raise error from exc
+            cls.__embedded_owner = True
+            return
+        try:
+            await client.invalidate()
+        except Exception as exc:
+            error = SurrealDbConnectionError(
+                f"Can't end the session of the embedded database {cls._embedded_slot_url()!r} to return to its owner "
+                f"session: {exc}"
+            )
+            error.retryable = False  # type: ignore[attr-defined]
+            raise error from exc
+        if ended is not None:
+            ended()
+        secret = cls.__embedded_owner_secret
+        failed = secret is None or not cls.__embedded_owner_user
+        if not failed:
+            try:
+                await client.signin({"username": _OWNER_USER, "password": secret})
+            except Exception:  # not bound: an error of the sign-in may quote the secret
+                failed = True
+        if failed:
+            raise _owner_error(_OWNER_SIGNIN_FAILED) from None
+        cls.__embedded_owner = True
+        await cls._remove_embedded_owner_user(client)
 
     @classmethod
     @_routed("current")
@@ -1462,6 +1670,8 @@ class SurrealDBConnectionManager:
         cls.__embedded_client = None
         cls.__embedded_url = None
         cls.__embedded_selection = None
+        # Closed: whatever was signed in, and an in-memory engine's owner user, end with it.
+        cls.__embedded_owner, cls.__embedded_owner_user, cls.__embedded_owner_secret = True, False, None
         _cache.retire_client(client)
         try:
             with contextlib.suppress(Exception):
@@ -1491,7 +1701,9 @@ class SurrealDBConnectionManager:
         means a concurrent first :meth:`get_client` on another thread either completes before the block — its
         client is detached with the rest — or waits and then opens the block's engine: it can never publish an
         engine for the outer settings into the block's slot. Per-loop server clients are neither closed nor used,
-        even by a :meth:`close_connection` or :meth:`reconnect` inside the block (they close the engine only).
+        even by a :meth:`close_connection` or :meth:`reconnect` inside the block (they close the engine only). An
+        outer engine on the block's own on-disk store is closed for the block (SDK 3.0's engine locks its store;
+        the data stays on disk), and connected again by :meth:`_exit_embedded_block`.
 
         Private, for :mod:`surreal_orm_lite.testing`; the caller validates the URL, namespace and database.
         """
@@ -1508,10 +1720,21 @@ class SurrealDBConnectionManager:
                 embedded_client=cls.__embedded_client,
                 embedded_url=cls.__embedded_url,
                 embedded_selection=cls.__embedded_selection,
+                embedded_owner=cls.__embedded_owner,
+                embedded_owner_user=cls.__embedded_owner_user,
+                embedded_owner_secret=cls.__embedded_owner_secret,
             )
+            outer, outer_key = cls.__embedded_client, store_key(cls.__embedded_url)
             cls.__embedded_client = None  # first: see the fast path of _acquire_embedded_client()
             cls.__embedded_url = None
             cls.__embedded_selection = None
+            cls.__embedded_owner, cls.__embedded_owner_user, cls.__embedded_owner_secret = True, False, None
+            if outer is not None and outer_key is not None and outer_key == store_key(url):
+                # SDK 3.0's engine locks its store: the block cannot open the store the outer engine has open. The
+                # outer engine is closed for the block (its data stays on disk) and connected again after it.
+                with contextlib.suppress(Exception):
+                    await outer.close()
+                state = dataclasses.replace(state, embedded_closed=True)
             cls.set_connection(url=url, namespace=namespace, database=database)
         return state
 
@@ -1524,7 +1747,10 @@ class SurrealDBConnectionManager:
         it (unless closed since): the block's :meth:`set_connection` must not silently lift that guard. The
         stored-function signatures are forgotten (the block's belong to its discarded database). Everything is
         restored before the block's client is closed, so even an interrupted close leaves the previous state in
-        place; with the surrealdb SDK 2.x the engine itself stops once nothing refers to that client.
+        place. An outer engine closed for the block because it has the block's store open (SDK 3.0's engine locks its
+        store) is connected again once the block's engine is closed: back to the owner, its selection stale, so the
+        next call selects and replays the stored session; if it cannot be reopened, the slot is left empty and the
+        next call opens the store again.
 
         Store claims (v0.29.0): the block's on-disk store is released, unless it is the restored engine's — that
         engine, detached for the block, still has it open, and holds it again even if a close inside the block
@@ -1544,12 +1770,34 @@ class SurrealDBConnectionManager:
             for loop in state.lost_identity:
                 if not loop.is_closed():
                     cls.__lost_identity.add(loop)
-            cls.__embedded_url = state.embedded_url
+            restored = state.embedded_client
+            if state.embedded_closed and restored is not None:
+                # Closed for the block (same store): the block's engine releases the store's lock first, then the
+                # outer engine reopens it as the owner, its selection stale so that the next call selects and replays.
+                if block_client is not None and block_client is not restored:
+                    _cache.retire_client(block_client)
+                    with contextlib.suppress(Exception):
+                        await block_client.close()
+                    block_client = None
+                try:
+                    await restored.connect()
+                except Exception:
+                    restored = None  # nothing to come back to: the next call opens the store again
+                state = dataclasses.replace(
+                    state, embedded_selection=None, embedded_owner=True, embedded_owner_user=False, embedded_owner_secret=None
+                )
+            cls.__embedded_url = state.embedded_url if restored is not None else None
             cls.__embedded_selection = state.embedded_selection
-            cls.__embedded_client = state.embedded_client  # last: see the fast path of _acquire_embedded_client()
+            cls.__embedded_owner = state.embedded_owner
+            cls.__embedded_owner_user = state.embedded_owner_user
+            cls.__embedded_owner_secret = state.embedded_owner_secret
+            cls.__embedded_client = restored  # last: see the fast path of _acquire_embedded_client()
             cls.clear_function_signature_cache()
-            restored_key = None if state.embedded_client is None else store_key(state.embedded_url)
+            restored_key = None if restored is None else store_key(state.embedded_url)
             _reclaim_store(restored_key, cls)
+            if restored is None and state.embedded_client is not None:
+                _cache.retire_client(state.embedded_client)
+                _release_store(store_key(state.embedded_url), cls)
             if block_client is not None and block_client is not state.embedded_client:
                 _cache.retire_client(block_client)
                 try:
@@ -1580,10 +1828,8 @@ class SurrealDBConnectionManager:
         The embedded engine's client — one for the whole process (:meth:`get_client`) — is closed
         too, from whichever loop or thread calls this: a ``mem://`` database is discarded with it
         and the next call opens a new, empty one; a file-backed one (``surrealkv://``, ``file://``)
-        reopens with its data. With the surrealdb SDK 2.x, closing does not stop an in-process
-        engine: a client obtained before the close is still a running database. Do not use it after
-        the close, and drop it (``del client``) before reopening the same ``surrealkv://`` path —
-        two engines on one path miss each other's writes.
+        reopens with its data. A client obtained before the close is closed with it (SDK 3.0 shuts the
+        engine down): do not use it afterwards.
 
         While an embedded URL is configured, **only the engine** is closed: the running loop's
         server client, its live queries and its identity (even one set with ``store=False``) are
@@ -1888,10 +2134,14 @@ class SurrealDBConnectionManager:
             )
         )
         async with cls._identity_client() as (client, embedded):
-            try:
-                tokens = await client.signin(payload)
-            except Exception as exc:
-                raise wrap_auth_error(exc, "signin") from exc
+
+            async def exchange() -> Any:
+                try:
+                    return await client.signin(payload)
+                except Exception as exc:
+                    raise wrap_auth_error(exc, "signin") from exc
+
+            tokens = await (cls._embedded_exchange(client, exchange) if embedded else exchange())
             return cls._adopt_tokens(tokens, store=store, operation="signin", client=client, embedded=embedded)
 
     @classmethod
@@ -1937,10 +2187,14 @@ class SurrealDBConnectionManager:
             )
         )
         async with cls._identity_client() as (client, embedded):
-            try:
-                tokens = await client.signup(payload)
-            except Exception as exc:
-                raise wrap_auth_error(exc, "signup") from exc
+
+            async def exchange() -> Any:
+                try:
+                    return await client.signup(payload)
+                except Exception as exc:
+                    raise wrap_auth_error(exc, "signup") from exc
+
+            tokens = await (cls._embedded_exchange(client, exchange) if embedded else exchange())
             return cls._adopt_tokens(tokens, store=store, operation="signup", client=client, embedded=embedded)
 
     @classmethod
@@ -2034,12 +2288,16 @@ class SurrealDBConnectionManager:
             # back 401 — and since the manager caches that client for the life of the event loop,
             # one bad JWT would break the application permanently. Restore what was there.
             previous = getattr(client, "token", None)
-            try:
-                await client.authenticate(token)
-            except Exception as exc:
-                with contextlib.suppress(Exception):
-                    client.token = previous
-                raise wrap_auth_error(exc, "authenticate") from exc
+
+            async def exchange() -> None:
+                try:
+                    await client.authenticate(token)
+                except Exception as exc:
+                    with contextlib.suppress(Exception):
+                        client.token = previous
+                    raise wrap_auth_error(exc, "authenticate") from exc
+
+            await (cls._embedded_exchange(client, exchange) if embedded else exchange())
 
             if store:
                 cls.__session_token = token
@@ -2090,17 +2348,16 @@ class SurrealDBConnectionManager:
         """
         # The kind of session to restore is the one of the connection the client came from.
         async with cls._identity_client() as (client, embedded):
+            if embedded:
+                # Still holding the session: nobody signs in between the owner and the selection.
+                await cls._reselect_after_invalidate(client)
+                return
             try:
                 await client.invalidate()
             except Exception as exc:
                 raise wrap_auth_error(exc, "invalidate") from exc
 
             cls.clear_session()
-
-            if embedded:
-                # Still holding the session: nobody signs in between the owner and the selection.
-                await cls._reselect_after_invalidate(client)
-                return
 
         credentials = _encoding.encode({"username": cls.__user, "password": cls.__password})
         try:
@@ -2121,20 +2378,25 @@ class SurrealDBConnectionManager:
     @classmethod
     @_routed("current")
     async def _reselect_after_invalidate(cls, client: Any) -> None:
-        """The embedded half of :meth:`invalidate`, once the SDK's ``invalidate()`` succeeded: the
-        session is the in-process owner, and only the selection is left to restore. Caller holds
-        the guard (:meth:`_identity_client`), from the ``invalidate()`` on: the guard is not
-        re-entrant.
+        """The embedded half of :meth:`invalidate`: back to the in-process owner
+        (:meth:`_back_to_embedded_owner`, v0.50.0), the stored session forgotten once the previous identity ended,
+        then the selection restored. Caller holds the guard (:meth:`_identity_client`): the guard is not re-entrant.
 
         No configured sign-in (the engine has no system user on a fresh database, and the owner is
         what a reconnect restores). The slot's selection is stale until ``use()`` succeeds, so
         nobody takes the fast path meanwhile; on failure it stays stale — the next
         :meth:`get_client` selects again — and nothing is closed: :meth:`close_connection` would
         discard a ``mem://`` database.
+
+        :raises SurrealDbConnectionError: the return to the owner failed (the stored session is kept when the previous
+            identity did not end).
+        :raises SurrealDbAuthenticationError: ``use()`` failed.
         """
         held = cls.__embedded_client is client
         if held:
             cls.__embedded_selection = None
+        await cls._back_to_embedded_owner(client, ended=cls.clear_session)
+        cls.clear_session()  # also when the session already was the owner
         namespace, database = cls.__namespace, cls.__database
         try:
             if namespace is not None and database is not None:
@@ -3279,6 +3541,22 @@ _CLOSED_LOOP_TEXT = (
     "This SurrealDB connection belonged to an event loop that is closed. Get a new client with "
     "SurrealDBConnectionManager.get_client()."
 )
+#: The temporary owner user of an in-memory embedded engine (v0.50.0, spec §5.7): SDK 3.0's ``invalidate()`` leaves the
+#: engine's session anonymous and denied, and no root user exists to sign back in, so before the first identity
+#: exchange on the owner session the ORM defines this user, signs back in with it to return to the owner, then removes
+#: it. The name is reserved on in-memory embedded engines.
+_OWNER_USER: Final = "__surreal_orm_lite_owner"
+#: The shape of its secret (``secrets.token_urlsafe(32)``), checked before the secret is inlined: the statement takes a
+#: literal password only (a ``$param`` is a parse error).
+_OWNER_SECRET: Final = re.compile(r"[A-Za-z0-9_-]{43}")
+#: The fixed texts of the owner user's errors: they never quote a statement, an SDK error or the secret.
+_OWNER_DEFINE_FAILED: Final = (
+    "The embedded engine could not define its temporary owner user (a user named __surreal_orm_lite_owner already "
+    "exists, or the engine refused it); the session was not changed."
+)
+_OWNER_SIGNIN_FAILED: Final = "The embedded engine could not sign back in as its temporary owner user."
+_OWNER_REMOVE_FAILED: Final = "The embedded engine could not remove its temporary owner user."
+
 #: Why the client of ``ephemeral_client()`` refuses its requests once its block ended.
 _EPHEMERAL_CLOSED_TEXT = "This SurrealDB client was closed when its ephemeral_client() block ended."
 
@@ -3294,6 +3572,14 @@ def _settings_retired_text(name: str | None) -> str:
         f"Connection {name!r} was removed or registered again with other settings; this client of the old settings "
         "was closed. Get a new client with SurrealDBConnectionManager.get_client()."
     )
+
+
+def _owner_error(text: str) -> SurrealDbConnectionError:
+    """A not-retryable ``SurrealDbConnectionError`` with one of the owner user's fixed texts (spec §5.7, C6). The caller
+    raises it ``from None`` outside any ``except`` block, so it has neither ``__cause__`` nor ``__context__``."""
+    error = SurrealDbConnectionError(text)
+    error.retryable = False  # type: ignore[attr-defined]
+    return error
 
 
 def _new_sdk_client(url: str, *, embedded: bool) -> Any:

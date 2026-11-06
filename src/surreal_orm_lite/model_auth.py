@@ -833,12 +833,22 @@ class AuthenticatedUserMixin:
         """
         payload = _encoding.encode(payload)
         tokens: AuthTokens | None = None
-        try:
+
+        async def exchange() -> Any:
             try:
                 if token is not None:
-                    await client.authenticate(token)  # the raw SDK call: nothing stored yet
-                else:
-                    raw = await getattr(client, action)(payload)
+                    return await client.authenticate(token)  # the raw SDK call: nothing stored yet
+                return await getattr(client, action)(payload)
+            except Exception as exc:
+                raise wrap_auth_error(exc, label) from exc
+
+        try:
+            # The engine's owner session is tracked around the exchange (v0.50.0, spec §5.7): a failure leaves the
+            # session the owner, and the owner user of an in-memory engine is defined first — a refusal of that
+            # raises its own SurrealDbConnectionError before the exchange.
+            raw = await manager._embedded_exchange(client, exchange)
+            try:
+                if token is None:
                     access = getattr(raw, "access", None)
                     if not access:
                         raise SurrealDbAuthenticationError(f"The server returned no access token for {label}.")

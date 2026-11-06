@@ -709,9 +709,16 @@ async def _root_rows(database: str, table: str, url: str | None = None) -> list[
 
 
 async def _engine_rows(client: Any, database: str, table: str) -> list[Any]:
-    """The rows of *table* in *database* of an embedded engine, through a request-scoped ``USE DB`` (spec M5)."""
+    """The rows of *table* in *database* of an embedded engine, through a request-scoped ``USE DB`` (spec M5).
+
+    SurrealDB core 4.0 (the SDK 3.0 engine) answers a ``SELECT`` on a table nobody wrote with an error, "The table
+    '<table>' does not exist": no rows (v0.50.0)."""
     raw = await client.query_raw(f"USE DB {database}; SELECT * FROM {table};", {})
-    return list(raw["result"][-1]["result"])
+    answer = raw["result"][-1]
+    if answer.get("status") == "ERR":
+        assert f"The table '{table}' does not exist" in str(answer["result"]), answer
+        return []
+    return list(answer["result"])
 
 
 def _values(rows: list[Any]) -> list[Any]:

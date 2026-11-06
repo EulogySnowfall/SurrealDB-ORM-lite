@@ -2,8 +2,10 @@
 
 The official SDK routes a URL with its own parser (``surrealdb.connections.url``): ``AsyncSurreal(url)``
 opens a server transport for ``http``, ``https``, ``ws`` and ``wss``, and its in-process engine
-(``AsyncEmbeddedSurrealConnection``) for every other scheme the parser recognises — ``mem``, ``memory``,
-``file``, ``surrealkv`` and ``surrealkv+versioned`` with SDK 2.0.0. This module asks that same parser
+(``AsyncEmbeddedSurrealConnection``) for every other scheme the parser recognises — ``mem``, ``memory`` (also bare),
+``file``, ``surrealkv`` and ``surrealkv+versioned`` with SDK 3.0. Since v0.50.0 that engine is the optional extra
+``surreal-orm-lite[embedded]`` (``surrealdb[embedded]``, SurrealDB core 4.0): the parser still classifies the URL
+without it, and opening one raises :data:`ENGINE_MISSING`. This module asks that same parser
 (through ``_sdk``) and keeps **no list of embedded schemes**, so a scheme a later SDK release adds
 (#233) needs no change here. A URL the parser refuses gets one clear ORM error quoting the
 SDK's own message (:func:`require_supported_url`) before anything is opened.
@@ -51,8 +53,8 @@ def url_kind(url: str) -> UrlKind:
 
     Classified by the SDK's own parser (``SdkUrl``): ``"refused"`` when it raises (any ``Exception``: 2.0.0
     raises ``ValueError``, the 3.0 line ``UnsupportedEngineError``/``InvalidUrlError``); ``"server"`` for
-    http, https, ws and wss; ``"embedded"`` for every other scheme it recognises — on SDK 2.0.0 ``mem``,
-    ``memory``, ``file``, ``surrealkv``, ``surrealkv+versioned`` — so a scheme a later SDK adds (#233)
+    http, https, ws and wss; ``"embedded"`` for every other scheme it recognises — on SDK 3.0 ``mem``,
+    ``memory`` (also the bare ``memory``), ``file``, ``surrealkv``, ``surrealkv+versioned`` — so a scheme a later SDK adds (#233)
     needs no change here.
     """
     try:
@@ -69,6 +71,19 @@ def is_embedded_url(url: str | None) -> bool:
     if not url:  # an explicit test: mypy does not narrow ``str | None`` through ``bool(url) and …``
         return False
     return url_kind(url) == "embedded"
+
+
+def is_memory_url(url: str | None) -> bool:
+    """Whether *url* opens an **in-memory** database of the SDK's engine (v0.50.0): the ``mem`` or ``memory`` scheme
+    (``mem://``, ``memory://``) or the bare ``memory`` the SDK 3.0 parser accepts, as the SDK's parser reads it.
+
+    Closing such an engine loses its data, so it is the only kind on which the ORM defines a temporary owner user to
+    return to the owner session (spec §5.7). False for a file-backed engine (``surrealkv://``, ``file://`` …), a
+    server URL, a URL the SDK refuses, and ``None``/``""``.
+    """
+    if not url or url_kind(url) != "embedded":
+        return False
+    return SdkUrl(url).scheme in _IN_MEMORY_SCHEMES
 
 
 def store_key(url: str | None) -> str | None:
@@ -134,6 +149,10 @@ def unsupported_url_message(url: str, exc: BaseException) -> str:
                 "see https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/233."
             )
     return f"The installed surrealdb SDK cannot open {url!r}: {exc}. The URL schemes it accepts are: {schemes}.{hint}"
+
+
+#: The error opening an embedded URL raises when the SDK's engine is not installed (v0.50.0): it is an optional extra.
+ENGINE_MISSING: Final = "The embedded engine needs the optional extension: pip install 'surreal-orm-lite[embedded]'"
 
 
 def live_unsupported(url: str | None) -> str:

@@ -304,9 +304,9 @@ class ChangeModelStream(Generic[T]):
 
         A stream stopped while starting returns without sending anything more; iterating it ends.
 
-        :raises SurrealDbError: if the table does not exist or has no change feed, or for a
-            datetime ``since`` on the embedded engine of the surrealdb SDK 2.x (it keeps no
-            timestamps for change-feed positions: pass a cursor or ``since=None``).
+        :raises SurrealDbError: if the table does not exist or has no change feed. (A datetime ``since`` is read
+            on the embedded engine too since v0.50.0: SDK 3.0's engine is a SurrealDB 4.0 core, which stamps its
+            feed positions; the refusal below is kept for an engine that answers a version below 3.)
         """
         if self._major is not None:
             return self

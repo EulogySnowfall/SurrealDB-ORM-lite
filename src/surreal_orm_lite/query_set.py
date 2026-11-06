@@ -3716,13 +3716,13 @@ class QuerySet:
 
         :param since: a cursor from :attr:`ChangeModelStream.cursor`; a ``datetime`` or ISO-8601
             string (naive means UTC; exact on 3.x, at-least-once on 2.x, whose server also returns
-            some earlier changes; refused on the embedded engine of the surrealdb SDK 2.x, which
-            keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
+            some earlier changes; exact on the embedded engine too, a SurrealDB 4.0 core since v0.50.0); or
+            ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
         :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()``, ``search()`` and ``similar_to()``
             included), here; on start, for a table that does not exist or has no change feed (on the table or on its
-            database), or for a datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
+            database).
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
         self._reject_time_travel("changes()")
