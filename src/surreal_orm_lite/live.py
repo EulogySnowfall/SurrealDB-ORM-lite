@@ -7,16 +7,19 @@ pieces of plumbing the official SDK does not provide. :class:`LiveModelStream` t
 each envelope into a :class:`ModelChangeEvent` carrying a model instance — the full
 SurrealDB-ORM's API, so code written against it migrates with an import change.
 
-**Why the ORM does not call the SDK's ``subscribe_live()``.** The SDK's generator body is
-``yield ret["result"]``: it hands back the record payload and discards the envelope around
-it, so ``CREATE``, ``UPDATE`` and ``DELETE`` all arrive looking identical. The action is the
-whole point of a live query, so the ORM registers its own queue in the connection's public
+**Why the ORM does not call the SDK's ``subscribe_live()``.** With SDK 2.0 its generator body
+was ``yield ret["result"]``: it handed back the record payload and discarded the envelope around
+it, so ``CREATE``, ``UPDATE`` and ``DELETE`` all arrived looking identical. The action is the
+whole point of a live query, so the ORM registers its own reader in the connection's public
 ``live_queues`` registry — the same mechanism the SDK's own ``subscribe_live()`` uses — and
-yields the complete envelope. Since v0.50.0 (SDK 3.0) the entry is a :class:`_LiveFeed` around
-the queue: the SDK also puts its own end markers there (on a drop, a ``kill()``, a ``close()``),
-and the feed passes notifications only, so a reader never sees anything but an envelope. An SDK build without that attribute is refused outright rather
-than degraded to the SDK generator: action-less envelopes would silently break every
-``notif["action"] == …`` comparison, and a wrong answer is worse than a clear failure.
+yields the complete envelope. SDK 3.0's generator yields the whole envelope, but on a drop it raises
+the SDK's own error and never resubscribes a live query started by ``LIVE SELECT``; the ORM keeps its
+own rules (end-of-stream, resubscription under the same identity, below) and so its own reader.
+Moving onto the SDK generator and replay is a later step (#422). Since v0.50.0 that reader is a :class:`_LiveFeed`
+around the queue: the SDK also puts its own end markers there (on a drop, a ``kill()``, a
+``close()``), and the feed passes notifications only, so a reader never sees anything but an
+envelope. An SDK build without that attribute is refused outright rather than degraded to the
+SDK generator: the ORM's end-of-stream and resubscription rules would be lost with it.
 ``tests/test_live_queries.py`` guards the attribute, so an SDK bump that removes it fails in
 CI rather than in production.
 
@@ -514,9 +517,8 @@ def open_stream(
     if queues is None:
         raise SurrealDbError(
             "This SurrealDB SDK connection does not expose a `live_queues` registry, which the "
-            "ORM needs to read the `action` of each notification — the SDK's own "
-            "`subscribe_live()` discards it. Live queries cannot be served correctly against "
-            "this SDK build; pin a `surrealdb` release that provides it."
+            "ORM reads every live notification from. Live queries cannot be served correctly "
+            "against this SDK build; pin a `surrealdb` release that provides it."
         )
     if _key(query_uuid) in _killed():
         return LiveIterator(client, query_uuid, None)

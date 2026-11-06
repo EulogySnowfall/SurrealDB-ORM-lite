@@ -629,18 +629,18 @@ class TestWatchE2E:
 class TestSdkCouplingE2E:
     @pytest.mark.asyncio
     async def test_connection_still_exposes_live_queues(self) -> None:
-        """The ORM reads the envelope out of this registry because the SDK's own
-        ``subscribe_live()`` discards the action. If a future SDK drops the attribute, the
-        ORM degrades silently — this test makes that change loud instead."""
+        """The ORM reads every envelope out of this registry (through its own feed, ``live._LiveFeed``). If a future
+        SDK drops the attribute, the ORM degrades silently — this test makes that change loud instead."""
         from surreal_orm_lite.live import _sdk_queues
 
         async with orm_client(TABLE) as client:
             assert _sdk_queues(client) is not None
 
     @pytest.mark.asyncio
-    async def test_sdk_subscribe_live_still_discards_the_action(self) -> None:
-        """Documents *why* the tap exists: if the SDK ever starts yielding the envelope, this
-        test fails and the ORM can drop its own registry."""
+    async def test_sdk_subscribe_live_yields_the_whole_envelope(self) -> None:
+        """SDK 2.0's ``subscribe_live()`` yielded ``ret["result"]`` only, which is why the ORM read the registry
+        itself. SDK 3.0 yields the whole envelope, action included: moving the ORM onto it (and onto the SDK's own
+        replay) is the connection-resilience epic (#422). Until then this pins the SDK behaviour that move relies on."""
         async with orm_client(TABLE) as client:
             await _define_table(client)
             live_id = await Watched.objects().live()
@@ -650,8 +650,8 @@ class TestSdkCouplingE2E:
                 payload = await asyncio.wait_for(generator.__anext__(), timeout=10)
             finally:
                 await SurrealDBConnectionManager.kill(live_id)
-        assert "action" not in payload
-        assert payload["name"] == "sdk"
+        assert payload["action"] == "CREATE", payload
+        assert payload["result"]["name"] == "sdk", payload
 
 
 class TestSdkLayout:
