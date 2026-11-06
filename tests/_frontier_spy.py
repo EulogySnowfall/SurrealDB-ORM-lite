@@ -12,7 +12,7 @@ The mode comes from the ``ORM_FRONTIER_SPY`` environment variable:
 - ``report``: the violations are listed in the terminal summary, the session outcome is unchanged;
 - ``off``: nothing is wrapped.
 
-The default is ``report`` while the ORM's call sites are being moved to the frontier.
+The default is ``enforce``: every call site of the ORM goes through the frontier.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ METHODS = ("query", "query_raw", "select", "create", "update", "upsert", "insert
 PACKAGE = "surreal_orm_lite"
 FRONTIER = "surreal_orm_lite._client"
 MODES = ("enforce", "report", "off")
-DEFAULT_MODE = "report"
+DEFAULT_MODE = "enforce"
 ENV = "ORM_FRONTIER_SPY"
 
 

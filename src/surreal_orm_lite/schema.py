@@ -106,6 +106,7 @@ from dataclasses import KW_ONLY, dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Literal
 
+from . import _client
 from ._sdk import ServerError
 from .define_parser import (
     _DURATION,
@@ -1080,7 +1081,7 @@ async def read_table_definitions(client: Any, table: str, *, kind: str, what: st
     :raises SurrealDbError: any other refusal of the ``INFO``.
     """
     try:
-        info = await client.query(_INFO_FOR_DB, {})
+        info = await _client.query(client, _INFO_FOR_DB, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _guard_read_refused(_INFO_FOR_DB, error, kind=kind, table=table, what=what) from error
     tables = info.get("tables") if isinstance(info, dict) else None
@@ -1115,7 +1116,7 @@ async def table_holds_records(client: Any, table: str, *, kind: str) -> bool:
     """
     statement = f"SELECT id FROM {_identifier(_identifier_name(table, what='Table'))} LIMIT 1;"
     try:
-        rows = await client.query(statement, {})
+        rows = await _client.query(client, statement, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _guard_read_refused("SELECT", error, kind=kind, table=table) from error
     return isinstance(rows, list) and len(rows) > 0
@@ -1949,7 +1950,7 @@ async def read_table_fields(client: Any, table: str, *, kind: str) -> dict[tuple
     """
     statement = f"INFO FOR TABLE {_identifier(_identifier_name(table, what='Table'))};"
     try:
-        info = await client.query(statement, {})
+        info = await _client.query(client, statement, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _guard_read_refused(statement, error, kind=kind, table=table, what="table") from error
     fields = info.get("fields") if isinstance(info, dict) else None

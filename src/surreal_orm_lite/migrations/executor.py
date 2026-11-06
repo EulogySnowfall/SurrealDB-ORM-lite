@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .. import _sdk
+from .. import _client, _sdk
 from .. import cache as _cache
 from .. import encoding as _encoding
 from ..concurrency import is_conflict_error
@@ -308,7 +308,7 @@ async def _send(client: Any, batch: _Batch, line: int, name: str | None) -> _Fai
     variables = _encoding.encode({} if name is None else {"surreal_orm_migration": name})
     async with _cache.writing(None):
         try:
-            answer = await client.query_raw(batch.text(), variables)
+            answer = await _client.query_raw(client, batch.text(), variables)
         except RuntimeError as error:
             embedded = _sdk.SdkAsyncEmbeddedConnection
             if embedded is None or not isinstance(client, embedded):
@@ -766,7 +766,7 @@ class MigrationExecutor:
         """
         await self.ensure_migrations_table()
         client = await self._client()
-        rows = await client.query(_APPLIED, {})
+        rows = await _client.query(client, _APPLIED, {})
         if not isinstance(rows, list):
             raise SurrealDbError(f"The tracking table {MIGRATIONS_TABLE} could not be read: unexpected answer.")
         return [row["name"] for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)]

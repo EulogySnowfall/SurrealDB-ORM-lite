@@ -528,7 +528,6 @@ class TestFactoryCompleteness:
 # --- (c) the real tree ------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="the ORM's call sites are not yet routed through surreal_orm_lite._client")
 def test_the_orm_calls_the_sdk_only_through_the_frontier() -> None:
     violations: list[str] = []
     for path in sorted(SRC.rglob("*.py")):
@@ -593,7 +592,7 @@ class TestRuntimeSpy:
 
     @pytest.mark.parametrize(
         ("value", "mode"),
-        [("", "report"), ("enforce", "enforce"), (" Report ", "report"), ("off", "off"), ("bogus", "report")],
+        [("", "enforce"), ("enforce", "enforce"), (" Report ", "report"), ("off", "off"), ("bogus", "enforce")],
     )
     def test_mode_from_env(self, value: str, mode: str) -> None:
         assert _frontier_spy.mode_from_env({_frontier_spy.ENV: value}) == mode

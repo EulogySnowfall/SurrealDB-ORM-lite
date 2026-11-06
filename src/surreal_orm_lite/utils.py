@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, SupportsIndex, TypeAlias, cast
 
 import pydantic
 
+from . import _client
 from . import geo as _geo
 from ._sdk import NotFoundError, RecordID, SdkRange, ServerError
 from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARAMETERS, TEXT_LOOKUP_FUNCTIONS
@@ -1272,7 +1273,7 @@ async def apply_ddl_statements(
             if tx is not None:
                 await tx.add(statement, None)
             else:
-                await client.query(statement, {})
+                await _client.query(client, statement, {})
         except (ServerError, SurrealDbError, RuntimeError) as e:
             if classify and isinstance(e, SurrealDbConflictError):
                 raise

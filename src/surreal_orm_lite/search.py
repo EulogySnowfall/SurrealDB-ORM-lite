@@ -91,6 +91,7 @@ from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
 
+from . import _client
 from ._sdk import ServerError
 from .define_parser import DefineParseError, parse_define_analyzer, parse_define_index, unquote
 from .exceptions import SurrealDbError
@@ -1092,7 +1093,7 @@ async def read_database_info(
     :raises SurrealDbError: any other refusal of the ``INFO``.
     """
     try:
-        info = await client.query(_INFO_FOR_DB, {})
+        info = await _client.query(client, _INFO_FOR_DB, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _read_refused(_INFO_FOR_DB, error, what=what, kind=kind, subject=subject) from error
     analyzers = info.get("analyzers") if isinstance(info, dict) else None
@@ -1128,7 +1129,7 @@ async def _table_indexes(client: Any, table: str, *, what: str, kind: str) -> di
     SurrealDB may store in backticks (``fts-t``) —, written in backticks, escaped."""
     statement = f"INFO FOR TABLE {_identifier(table)};"
     try:
-        info = await client.query(statement, {})
+        info = await _client.query(client, statement, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _read_refused(statement, error, what=what, kind=kind, subject=f"table {table!r}") from error
     indexes = info.get("indexes") if isinstance(info, dict) else None

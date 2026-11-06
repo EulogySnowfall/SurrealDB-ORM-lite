@@ -50,7 +50,7 @@ module to that set.
 
 **The SDK call frontier (v0.50.0) is watched at run time.** ``pytest_configure`` below registers
 ``tests/_frontier_spy.py`` for the whole session: it records every SDK data call a ``surreal_orm_lite`` module makes
-without going through ``surreal_orm_lite._client`` (mode from ``ORM_FRONTIER_SPY``: ``enforce``, ``report``, ``off``).
+without going through ``surreal_orm_lite._client`` (mode from ``ORM_FRONTIER_SPY``: ``enforce``, the default, ``report``, ``off``).
 """
 
 import asyncio

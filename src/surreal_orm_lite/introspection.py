@@ -64,6 +64,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
+from . import _client
 from ._sdk import ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .define_parser import (
@@ -191,7 +192,7 @@ async def _info_for_db(client: Any, name: str) -> dict[str, Any]:
     """``INFO FOR DB`` on *client*: ``SurrealDbAuthenticationError`` when the session may not run it, ``SurrealDbError``
     when it fails otherwise or answers something other than an object; an ORM error propagates unchanged."""
     try:
-        info = await client.query("INFO FOR DB;", {})
+        info = await _client.query(client, "INFO FOR DB;", {})
     except SurrealORMError:
         raise
     except Exception as exc:
@@ -280,7 +281,7 @@ class _Reader:
             self.issue("table", name, name, f"INFO FOR TABLE failed: {exc}")
             return state
         try:
-            info = await self.client.query(info_for_table, {})
+            info = await _client.query(self.client, info_for_table, {})
         except (ServerError, RuntimeError) as exc:  # the server's answer (the embedded engine's: a RuntimeError)
             if _refused(exc):  # INFO FOR DB passed: the session lost its rights meanwhile, the table is not at fault
                 raise SurrealDbAuthenticationError(
@@ -317,7 +318,7 @@ class _Reader:
         raises ``SurrealDbAuthenticationError``; any other answer of the server that is not a list of records is an
         issue (``kind="table"``, the table's name) and ``()``; an error that is not the server's answer propagates."""
         try:
-            rows = await self.client.query(_APPLIED, {})
+            rows = await _client.query(self.client, _APPLIED, {})
         except SurrealORMError:
             raise
         except (ServerError, RuntimeError) as exc:  # the server's answer (the embedded engine's: a RuntimeError)
