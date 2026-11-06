@@ -1624,8 +1624,9 @@ class SurrealDBConnectionManager:
         secret = cls.__embedded_owner_secret
         failed = secret is None or not cls.__embedded_owner_user
         if not failed:
+            credentials = _encoding.encode({"username": _OWNER_USER, "password": secret})
             try:
-                await client.signin({"username": _OWNER_USER, "password": secret})
+                await client.signin(credentials)
             except Exception:  # not bound: an error of the sign-in may quote the secret
                 failed = True
         if failed:

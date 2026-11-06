@@ -898,7 +898,8 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
        ``_client.<m>(client, …)``, the payload is one argument further (v0.50.0).
     2. Each payload is **bare** (absent, or ``{}``), **inline** (``_encoding.encode(…)``) or an
        **encoded name** (a name whose last binding before the call, in the same function, is
-       ``name = _encoding.encode(…)``).
+       ``name = _encoding.encode(…)``; for a name a nested function never binds, its enclosing function's last
+       binding before the nested ``def``, with none after it).
     3. No ``_encoding.encode(…)`` sits in the body of a ``try`` catching ``ValueError`` (bare
        ``except:``, ``Exception``, ``BaseException``, ``ValueError``) or of a ``with suppress(…)``
        naming one of them: the refusal would be re-wrapped.
@@ -924,7 +925,20 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
         if not isinstance(arg, ast.Name):
             return False
         at = (call.lineno, call.col_offset)
-        before = [binding for binding in _bindings(scope_of(call), arg.id) if binding[0] <= at]
+        scope = scope_of(call)
+        bindings = _bindings(scope, arg.id)
+        # A closure (v0.50.0): a name the nested function never binds is its enclosing function's, read when the call
+        # runs. It counts only when the enclosing function binds it last before the nested ``def`` and never after.
+        while not bindings and isinstance(scope, _SCOPES):
+            outer = scope_of(scope)
+            if not isinstance(outer, _SCOPES):
+                return False
+            at = (scope.lineno, scope.col_offset)
+            bindings = _bindings(outer, arg.id)
+            if any(position > at for position, _ in bindings):
+                return False
+            scope = outer
+        before = [binding for binding in bindings if binding[0] <= at]
         if not before:
             return False
         last = max(before, key=lambda binding: binding[0])[1]
@@ -1132,6 +1146,34 @@ _REJECTED = {
         """,
         "transaction",
     ),
+    "a closure over an unencoded name": (
+        """
+        async def f(client, payload):
+            async def exchange():
+                return await client.signin(payload)
+            return await exchange()
+        """,
+        "payload",
+    ),
+    "a closure over a name rebound after its def": (
+        """
+        async def f(client, v, w):
+            payload = _encoding.encode(v)
+            async def exchange():
+                return await client.signin(payload)
+            payload = w
+            return await exchange()
+        """,
+        "payload",
+    ),
+    "a closure over a module-level name": (
+        """
+        payload = _encoding.encode(V)
+        async def f(client):
+            return await client.signin(payload)
+        """,
+        "payload",
+    ),
 }
 
 _ACCEPTED = {
@@ -1226,6 +1268,20 @@ _ACCEPTED = {
             collected.update(x)
         """,
         (0, 0, 0),
+    ),
+    "a closure over an encoded name (v0.50.0)": (
+        """
+        async def f(client, action, payload):
+            payload = _encoding.encode(payload)
+            async with lock():
+                async def exchange():
+                    try:
+                        return await getattr(client, action)(payload)
+                    except Exception as exc:
+                        raise RuntimeError() from exc
+                return await exchange()
+        """,
+        (0, 1, 0),
     ),
 }
 
