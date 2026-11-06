@@ -73,7 +73,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, NoReturn
 
-from . import _sdk
+from . import _client, _sdk
 from . import cache as _cache
 from . import encoding as _encoding
 from .exceptions import SurrealDbConflictError, SurrealDbError
@@ -618,7 +618,7 @@ class BufferedTransaction(Transaction):
                 variables = _encoding.encode(self.variables)
                 _cache.reaching()  # issue #325: from here, the commit's outcome is unknown
                 try:
-                    raw = await self._client.query_raw(query, variables)
+                    raw = await _client.query_raw(self._client, query, variables)
                 except RuntimeError as exc:
                     # The embedded engine raises a bare RuntimeError for a query it refuses as a whole (issue
                     # #278): the same error as a server's envelope, the engine's error kept as the suppressed
@@ -673,7 +673,7 @@ class InteractiveTransaction(Transaction):
         _cache.reaching()  # issue #325: the statement is sent
         try:
             try:
-                raw = await self._client.query_raw(statement, payload, txn_id=self._txn_id)
+                raw = await _client.query_raw(self._client, statement, payload, txn_id=self._txn_id)
             except Exception as exc:
                 raise _as_conflict(exc) from exc
             self.raise_for_status(raw)
@@ -693,7 +693,7 @@ class InteractiveTransaction(Transaction):
         _cache.reaching()  # issue #325: the statement is sent
         try:
             try:
-                return await self._client.query(statement, payload, txn_id=self._txn_id)
+                return await _client.query(self._client, statement, payload, txn_id=self._txn_id)
             except Exception as exc:
                 raise _as_conflict(exc) from exc
         except BaseException as failure:

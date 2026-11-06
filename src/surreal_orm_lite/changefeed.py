@@ -39,6 +39,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from . import _client
 from .embedded import changes_since_datetime_unsupported
 from .enum import LiveAction
 from .exceptions import SurrealDbConnectionError, SurrealDbError
@@ -419,12 +420,12 @@ class ChangeModelStream(Generic[T]):
 
     async def _show(self, position: str | None, limit: int) -> list[dict[str, Any]]:
         sql = f"SHOW CHANGES FOR TABLE {self._table} SINCE {position} LIMIT {limit};"
-        result = await self._with_retry(lambda client: client.query(sql, {}))
+        result = await self._with_retry(lambda client: _client.query(client, sql, {}))
         return [entry for entry in result if isinstance(entry, dict)] if isinstance(result, list) else []
 
     async def _server_now(self) -> datetime:
         """The server's clock, not ours: versionstamps are stamped by the server."""
-        now = await self._with_retry(lambda client: client.query("RETURN time::now();", {}))
+        now = await self._with_retry(lambda client: _client.query(client, "RETURN time::now();", {}))
         if not isinstance(now, datetime):
             now = datetime.fromisoformat(str(now))
         return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
@@ -520,7 +521,7 @@ class ChangeModelStream(Generic[T]):
     async def _info(self, statement: str, key: str) -> dict[str, Any] | None:
         """One section of an ``INFO`` statement, or ``None`` when it cannot be read."""
         try:
-            info = await self._with_retry(lambda client: client.query(statement, {}))
+            info = await self._with_retry(lambda client: _client.query(client, statement, {}))
         except (SurrealDbConnectionError, _StreamStopped):
             raise
         except Exception as exc:

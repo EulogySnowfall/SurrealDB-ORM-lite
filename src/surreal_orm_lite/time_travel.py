@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
+from . import _client
 from . import encoding as _encoding
 from ._sdk import SdkDuration, ServerError
 from .exceptions import SurrealDbError
@@ -178,7 +179,7 @@ async def resolve(as_of: AsOf, client: Any, variables: Mapping[str, Any]) -> dat
     else:  # pragma: no cover - normalise_as_of always sets one of the three
         raise RuntimeError("internal: an as_of() moment with nothing to resolve")
     try:
-        value = await client.query(statement, _encoding.encode(bound))
+        value = await _client.query(client, statement, _encoding.encode(bound))
     except (ServerError, RuntimeError) as exc:
         raise SurrealDbError(evaluation_failed(spec, exc)) from exc
     if not isinstance(value, datetime):

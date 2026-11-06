@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
+from . import _client
 from . import cache as _cache
 from . import decoding as _decoding
 from . import encoding as _encoding
@@ -114,7 +115,7 @@ async def _read_function_signature(client: Any, function: str) -> tuple[str, ...
     :raises SurrealDbNotFoundError: the database has no such function.
     """
     try:
-        info = await client.query("INFO FOR DB;", {})
+        info = await _client.query(client, "INFO FOR DB;", {})
     except Exception as exc:
         raise SurrealDbError(f"Could not read the signature of {function!r}: {exc}") from exc
 
@@ -1101,7 +1102,7 @@ class SurrealDBConnectionManager:
 
         # Establish the connection
         try:
-            _client = await cls._open_client(signin_as_configured=True)
+            opened = await cls._open_client(signin_as_configured=True)
         except SurrealDbConnectionError:
             stale = cls.__clients.pop(loop, None)
             if stale is not None:
@@ -1111,7 +1112,7 @@ class SurrealDBConnectionManager:
             raise
 
         return await cls._replay_then_publish(
-            _client,
+            opened,
             replayed=replayed,
             configured=configured,
             publish=lambda client, fingerprint: cls._publish(loop, client, fingerprint, still_wanted, generation),
@@ -2347,7 +2348,7 @@ class SurrealDBConnectionManager:
             # SurrealDbError, so catching it here would silently downgrade it.
             return cls._coerce_result(raw, return_type, repr(name))
         try:
-            value = await client.query(statement, variables)
+            value = await _client.query(client, statement, variables)
         except Exception as exc:
             raise cls._wrap_call_error(exc, name) from exc
 
