@@ -380,7 +380,12 @@ class TestLiveReadersByOwner:
         b = live.register_subscriber(client, "u-b", owner="md_b")
         d = live.register_subscriber(client, "u-d")
         assert live._bucket() == {"u-a": [a], "u-b": [b], "u-d": [d]}
-        assert client.live_queues == {"u-a": [a], "u-b": [b], "u-d": [d]}
+        # SDK side: a feed per reader, wrapping its queue (v0.50.0).
+        assert {key: [feed.queue for feed in feeds] for key, feeds in client.live_queues.items()} == {
+            "u-a": [a],
+            "u-b": [b],
+            "u-d": [d],
+        }
         assert live.owner_of("u-a") == "md_a"
         assert live.owner_of("u-b") == "md_b"
         assert live.owner_of("u-d") == "default"

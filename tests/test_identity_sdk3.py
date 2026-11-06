@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import contextlib
 import inspect
+import json
 import os
 import textwrap
 from typing import Any
@@ -29,11 +31,23 @@ import pytest
 
 from surreal_orm_lite import SurrealDBConnectionManager, _client
 from surreal_orm_lite._sdk import AsyncSurreal, Features, SdkAsyncWsConnection
-from surreal_orm_lite.exceptions import SurrealDbConnectionError
+from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
 from surreal_orm_lite.live import is_dead
-from tests._proxy import CuttableProxy
+from tests._proxy import CuttableProxy, _RequestLog
 from tests.test_auth import AUTH_TABLE, PASSWORD, REFRESH_ACCESS, _unique_email, auth_client
-from tests.test_reconnect import Reconnected, _wait_dead, proxied
+from tests.test_reconnect import (
+    TABLE,
+    Reconnected,
+    _direct_lives,
+    _direct_query,
+    _next_within,
+    _plain_id,
+    _resubscribed,
+    _wait_dead,
+    fast_backoff,  # noqa: F401 - the fixture, used by name below
+    proxied,
+    record_user,
+)
 
 # ==================== The SDK layout retire() relies on (C7) ====================
 
@@ -256,6 +270,112 @@ class TestRetiredClientsE2E:
 
             assert proxy.connections == opened
             assert not stream.is_active
+
+
+# ==================== Resubscription identity (AC-17) ====================
+
+#: Requests that read or write no data: the handshake, and the identity calls themselves. A connection the ORM opens
+#: signs in as the configured user, then replays the stored session token (v0.21.0) — before any other request.
+_NO_DATA = frozenset({"version", "ping", "use", "signin", "authenticate"})
+
+
+def _token_id(token: str) -> str:
+    """The ``ID`` claim (the record user) of a SurrealDB access token."""
+    payload = token.split(".")[1]
+    return str(json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["ID"])
+
+
+def _identity_before_data(connection: _RequestLog) -> list[tuple[str, Any]]:
+    """The identity calls *connection* sent before its first request that reads or writes data."""
+    calls: list[tuple[str, Any]] = []
+    for method, params in connection.requests:
+        if method not in _NO_DATA:
+            break
+        if method in {"signin", "authenticate"}:
+            calls.append((method, params))
+    return calls
+
+
+def _sent_live(connections: list[_RequestLog]) -> bool:
+    return any(
+        method == "query" and "LIVE SELECT" in str(params[0]).upper()
+        for connection in connections
+        for method, params in connection.requests
+    )
+
+
+@pytest.mark.usefixtures("fast_backoff")
+class TestResubscriptionIdentityE2E:
+    """After a drop, the ORM opens connections for a live stream only under the identity the stream ran as: the stored
+    record user's token, sent before anything else; and none at all for an identity it may not replay. Read off the
+    proxy's request log, connection by connection."""
+
+    @pytest.mark.asyncio
+    async def test_a_stored_record_identity_reconnects_as_itself_before_anything_else(self) -> None:
+        async with proxied() as proxy, record_user(store=True) as user_id, Reconnected.objects().watch() as stream:
+            old = stream.live_id
+            before = proxy.connections
+            proxy.cut()
+            await _resubscribed(stream, old)
+            await _direct_query(f"CREATE {TABLE}:mine SET owner = <record> '{user_id}';")
+            envelope = await _next_within(stream)
+
+            assert isinstance(envelope, dict)
+            assert str(envelope["record"].id) == "mine"
+            opened = proxy.log[before:]
+            assert opened and _sent_live(opened)
+            for connection in opened:
+                # The last identity set before any data request is the record user's token, and nothing replaces it.
+                method, params = _identity_before_data(connection)[-1]
+                assert method == "authenticate", connection.requests
+                assert _plain_id(_token_id(params[0])) == _plain_id(user_id)
+                assert len(_identity_before_data(connection)) == sum(
+                    method in {"signin", "authenticate"} for method in connection.methods()
+                ), connection.requests
+
+    @pytest.mark.asyncio
+    async def test_an_unstored_record_identity_opens_no_connection_and_leaves_no_live_query(self) -> None:
+        async with proxied() as proxy, record_user(store=False):
+            async with Reconnected.objects().watch() as stream:
+                before = proxy.connections
+                proxy.cut()
+                with pytest.raises(SurrealDbAuthenticationError):
+                    await _next_within(stream)
+            await asyncio.sleep(0.2)
+
+            assert proxy.connections == before
+            assert await _direct_lives() == {}
+
+    @pytest.mark.asyncio
+    async def test_a_stream_of_another_database_opens_no_connection_and_leaves_no_live_query(self) -> None:
+        async with proxied() as proxy:
+            async with Reconnected.objects().watch() as stream:
+                SurrealDBConnectionManager.set_connection(
+                    url=proxy.url(), user="root", password="root", namespace="ns", database="elsewhere"
+                )
+                before = proxy.connections
+                proxy.cut()
+                with pytest.raises(SurrealDbAuthenticationError):
+                    await _next_within(stream)
+            await asyncio.sleep(0.2)
+
+            assert proxy.connections == before
+            assert await _direct_lives() == {}
+
+    @pytest.mark.asyncio
+    async def test_a_stream_yields_only_notifications_across_a_resubscribe(self) -> None:
+        async with proxied() as proxy, Reconnected.objects().watch() as stream:
+            old = stream.live_id
+            await Reconnected(id="before", name="a").save()
+            seen = [await _next_within(stream)]
+            proxy.cut()
+            await _resubscribed(stream, old)
+            await Reconnected(id="after", name="b").save()
+            seen.append(await _next_within(stream))
+
+            assert all(isinstance(envelope, dict) for envelope in seen), seen
+            assert [envelope["action"] for envelope in seen] == ["CREATE", "CREATE"]
+            assert [str(envelope["record"].id) for envelope in seen] == ["before", "after"]
 
 
 def _http_url() -> str:

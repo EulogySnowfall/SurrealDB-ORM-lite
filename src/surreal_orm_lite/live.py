@@ -12,7 +12,9 @@ SurrealDB-ORM's API, so code written against it migrates with an import change.
 it, so ``CREATE``, ``UPDATE`` and ``DELETE`` all arrive looking identical. The action is the
 whole point of a live query, so the ORM registers its own queue in the connection's public
 ``live_queues`` registry — the same mechanism the SDK's own ``subscribe_live()`` uses — and
-yields the complete envelope. An SDK build without that attribute is refused outright rather
+yields the complete envelope. Since v0.50.0 (SDK 3.0) the entry is a :class:`_LiveFeed` around
+the queue: the SDK also puts its own end markers there (on a drop, a ``kill()``, a ``close()``),
+and the feed passes notifications only, so a reader never sees anything but an envelope. An SDK build without that attribute is refused outright rather
 than degraded to the SDK generator: action-less envelopes would silently break every
 ``notif["action"] == …`` comparison, and a wrong answer is worse than a clear failure.
 ``tests/test_live_queries.py`` guards the attribute, so an SDK bump that removes it fails in
@@ -21,8 +23,8 @@ CI rather than in production.
 **Why the ORM owns end-of-stream.** A reader parked on ``queue.get()`` only ever wakes if
 something wakes it, and the server cannot be relied on to do so. After ``kill()``, SurrealDB
 3.x sends a final envelope with ``action="KILLED"`` and 2.6.x sends nothing at all; when the
-WebSocket drops, the SDK's receive task swallows the close and never touches ``live_queues``,
-so nothing arrives on either line. ``close_subscribers()`` (one live query) and
+WebSocket drops, no notification arrives on either line (SDK 3.0 only puts its own end marker,
+which the feed drops). ``close_subscribers()`` (one live query) and
 ``close_all_subscribers()`` (connection teardown) push a private sentinel onto every queue
 this module handed out, which makes termination identical everywhere. It has to be a separate
 registry because the SDK's ``kill()`` pops its own ``live_queues`` entry, orphaning the queue
@@ -127,6 +129,29 @@ def _key(query_uuid: str | UUID) -> str:
     return str(query_uuid)
 
 
+class _LiveFeed:
+    """What the ORM puts in the SDK's ``live_queues`` for one reader (v0.50.0): it wraps the reader's queue.
+
+    SDK 3.0 calls ``put_nowait()`` — and nothing else — on every entry of that registry, with a notification ``dict``
+    or with one of its own end markers. The feed forwards a notification, normalised once (:func:`_client.normalize`),
+    and drops anything else: each marker follows an event the ORM itself initiated or already watches — its own
+    ``kill()`` or ``close()`` (it releases the reader then), or a drop (it watches the receive task, and resubscribes or
+    ends the stream under its own rules). Delivering a marker would hand the reader a value that is not a notification,
+    ahead of the error the ORM raises for an identity it may not replay.
+    """
+
+    __slots__ = ("queue",)
+
+    def __init__(self, queue: asyncio.Queue[Any]) -> None:
+        self.queue = queue
+
+    def put_nowait(self, item: Any) -> None:
+        if isinstance(item, dict):
+            self.queue.put_nowait(_client.normalize(item))
+        else:
+            logger.debug("Dropped a non-notification item from the SDK's live queue: %r", item)
+
+
 def _prune_dead_loops() -> None:
     """Forget the registries of loops that have been closed, so they cannot accumulate.
 
@@ -177,8 +202,9 @@ def owner_of(query_uuid: str | UUID) -> str | None:
     return _OWNERS.get(loop, {}).get(key, "default")
 
 
-def _sdk_queues(client: Any) -> dict[str, list[asyncio.Queue[Any]]] | None:
-    """The SDK connection's live-notification registry, or ``None`` if it has none.
+def _sdk_queues(client: Any) -> dict[str, list[Any]] | None:
+    """The SDK connection's live-notification registry, or ``None`` if it has none. The ORM's entries in it are
+    :class:`_LiveFeed` objects; the SDK's own ``subscribe_live()`` puts queues there.
 
     ``AsyncSurreal`` returns the connection directly today, but a session wrapper keeps the
     real connection on ``_connection``, so both shapes are tried before giving up.
@@ -233,7 +259,7 @@ def register_subscriber(
         queue = asyncio.Queue()
     queues = _sdk_queues(client)
     if queues is not None:
-        queues.setdefault(key, []).append(queue)
+        queues.setdefault(key, []).append(_LiveFeed(queue))
     _bucket().setdefault(key, []).append(queue)
     _owners()[key] = owner
     return queue
@@ -248,16 +274,17 @@ def unregister_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Qu
     """Drop one subscriber, leaving any other reader of the same live query untouched."""
     key = _key(query_uuid)
     sdk = _sdk_queues(client)
+    if sdk is not None and (feeds := sdk.get(key)) is not None:
+        feeds[:] = [feed for feed in feeds if not (isinstance(feed, _LiveFeed) and feed.queue is queue)]
+        if not feeds:
+            sdk.pop(key, None)
     bucket = _bucket()
-    registries = [bucket] if sdk is None else [sdk, bucket]
-    for registry in registries:
-        holders = registry.get(key)
-        if holders is None:
-            continue
+    holders = bucket.get(key)
+    if holders is not None:
         if queue in holders:
             holders.remove(queue)
         if not holders:
-            registry.pop(key, None)
+            bucket.pop(key, None)
     if key not in bucket:  # the uuid's last reader on this loop is gone, and its owner with it
         _owners().pop(key, None)
 
@@ -446,7 +473,8 @@ class LiveIterator:
         self._detach()
 
     def rebind(self, client: Any, query_uuid: str | UUID) -> None:
-        """Move this reader, buffer and all, onto a resubscribed live query on *client*."""
+        """Move this reader, buffer and all, onto a resubscribed live query on *client*: the same queue, in a new
+        feed (:class:`_LiveFeed`) in *client*'s registry; the old client's feed is removed."""
         queue = self._queue
         if queue is None:
             return

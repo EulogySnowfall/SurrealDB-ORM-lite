@@ -848,6 +848,12 @@ async def record_user(*, store: bool) -> AsyncIterator[str]:
                 await cleanup.query(statement, {})
 
 
+def _plain_id(record_id: Any) -> str:
+    """*record_id* as text without the ``⟨…⟩``/backtick escaping: SDK 3.0 escapes a key that starts with a digit,
+    SurrealDB 2.x's ``<string>`` does not, so the same record may print either way."""
+    return str(record_id).translate({ord(c): None for c in "⟨⟩`"})
+
+
 async def _direct_query(sql: str) -> Any:
     from surrealdb import AsyncSurreal
 
@@ -1266,7 +1272,7 @@ class TestLostIdentityE2E:
             await _wait_dead(client)
 
             info = await SurrealDBConnectionManager.info()
-            assert info is not None and str(info["id"]) == user_id
+            assert info is not None and _plain_id(info["id"]) == _plain_id(user_id)
 
     @pytest.mark.asyncio
     async def test_a_store_false_signin_on_a_streams_connection_ends_the_stream_on_a_drop(self) -> None:

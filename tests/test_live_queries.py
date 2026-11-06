@@ -31,7 +31,12 @@ class _FakeClient:
     """Stand-in for the SDK connection: only ``live_queues`` matters to the registry."""
 
     def __init__(self) -> None:
-        self.live_queues: dict[str, list[asyncio.Queue[Any]]] = {}
+        self.live_queues: dict[str, list[Any]] = {}
+
+
+def _fed(client: Any, key: str) -> list[Any]:
+    """The ORM queues *client*'s ``live_queues`` feeds for *key*: each entry is a feed wrapping one (v0.50.0)."""
+    return [feed.queue for feed in client.live_queues.get(key, [])]
 
 
 class Watched(BaseSurrealModel):
@@ -67,7 +72,7 @@ class TestSubscriberRegistry:
 
         client = _FakeClient()
         queue = live.register_subscriber(client, "abc")
-        assert queue in client.live_queues["abc"]
+        assert queue in _fed(client, "abc")
         assert queue in live._bucket()["abc"]
         live.close_subscribers("abc")
 
@@ -101,7 +106,7 @@ class TestSubscriberRegistry:
         second = live.register_subscriber(client, "abc")
         live.unregister_subscriber(client, "abc", first)
         assert live._bucket()["abc"] == [second]
-        assert client.live_queues["abc"] == [second]
+        assert _fed(client, "abc") == [second]
         live.close_subscribers("abc")
 
     @pytest.mark.asyncio
@@ -122,7 +127,7 @@ class TestSubscriberRegistry:
         client = _FakeClient()
         key = uuid4()
         queue = live.register_subscriber(client, key)
-        assert queue in client.live_queues[str(key)]
+        assert queue in _fed(client, str(key))
         live.close_subscribers(key)
         assert str(key) not in live._bucket()
 
@@ -198,6 +203,94 @@ async def _register_and_leave() -> None:
     from surreal_orm_lite import live
 
     live.register_subscriber(_FakeClient(), "left-behind")
+
+
+# ==================== v0.50.0 — the feed between the SDK and the ORM's queues (D18) ====================
+
+
+class _OtherClient(_FakeClient):
+    """A second connection, to move a reader onto (``rebind()``)."""
+
+
+class TestLiveFeedUnit:
+    """SDK 3.0 puts its own end markers in every queue it finds in ``live_queues``; the ORM registers a feed there,
+    which forwards notifications (normalised) and drops everything else."""
+
+    @pytest.mark.asyncio
+    async def test_a_notification_is_forwarded_normalised(self) -> None:
+        from surreal_orm_lite import live
+        from surreal_orm_lite._sdk import Null
+
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        live._LiveFeed(queue).put_nowait({"action": "CREATE", "result": {"name": Null}})
+        assert queue.get_nowait() == {"action": "CREATE", "result": {"name": None}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("item", [object(), None, "CLOSED", ["x"]])
+    async def test_anything_but_a_notification_is_dropped(self, item: Any) -> None:
+        from surreal_orm_lite import live
+
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        live._LiveFeed(queue).put_nowait(item)
+        assert queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_register_puts_a_feed_in_the_sdk_registry_and_the_queue_in_the_orm_s(self) -> None:
+        from surreal_orm_lite import live
+
+        client = _FakeClient()
+        queue = live.register_subscriber(client, "abc")
+        (feed,) = client.live_queues["abc"]
+        assert isinstance(feed, live._LiveFeed)
+        assert feed.queue is queue
+        assert live._bucket()["abc"] == [queue]
+        live.close_subscribers("abc")
+
+    @pytest.mark.asyncio
+    async def test_unregister_removes_the_feed(self) -> None:
+        from surreal_orm_lite import live
+
+        client = _FakeClient()
+        kept = live.register_subscriber(client, "abc")
+        gone = live.register_subscriber(client, "abc")
+        live.unregister_subscriber(client, "abc", gone)
+        assert _fed(client, "abc") == [kept]
+        live.unregister_subscriber(client, "abc", kept)
+        assert "abc" not in client.live_queues
+        assert "abc" not in live._bucket()
+
+    @pytest.mark.asyncio
+    async def test_an_sdk_end_marker_never_reaches_the_reader(self) -> None:
+        from surreal_orm_lite import live
+
+        client = _FakeClient()
+        reader = live.open_stream(client, "abc")
+        for feed in client.live_queues["abc"]:
+            feed.put_nowait(object())  # what SDK 3.0 puts on a drop or a close
+            feed.put_nowait({"action": "CREATE", "result": {"id": 1}})
+        assert await asyncio.wait_for(anext(reader), timeout=1) == {"action": "CREATE", "result": {"id": 1}}
+        await reader.aclose()
+
+    @pytest.mark.asyncio
+    async def test_rebind_moves_the_buffer_into_a_new_feed_on_the_new_client(self) -> None:
+        from surreal_orm_lite import live
+
+        old, new = _FakeClient(), _OtherClient()
+        reader = live.open_stream(old, "before")
+        old.live_queues["before"][0].put_nowait({"action": "CREATE", "result": {"n": 1}})
+
+        reader.rebind(new, "after")
+
+        assert "before" not in old.live_queues
+        assert "before" not in live._bucket()
+        (feed,) = new.live_queues["after"]
+        assert isinstance(feed, live._LiveFeed)
+        feed.put_nowait(object())
+        feed.put_nowait({"action": "UPDATE", "result": {"n": 2}})
+        assert await asyncio.wait_for(anext(reader), timeout=1) == {"action": "CREATE", "result": {"n": 1}}
+        assert await asyncio.wait_for(anext(reader), timeout=1) == {"action": "UPDATE", "result": {"n": 2}}
+        await reader.aclose()
+        assert "after" not in new.live_queues
 
 
 class TestOpenStreamGuards:
@@ -559,6 +652,48 @@ class TestSdkCouplingE2E:
                 await SurrealDBConnectionManager.kill(live_id)
         assert "action" not in payload
         assert payload["name"] == "sdk"
+
+
+class TestSdkLayout:
+    """What the feed relies on in SDK 3.0's WebSocket connection (spec §5.8): a ``live_queues`` dict attribute, on
+    whose entries the SDK only ever calls ``put_nowait``, and a ``recv_task`` that is an ``asyncio.Task``."""
+
+    def test_the_sdk_only_puts_into_the_live_queues(self) -> None:
+        import ast
+        import inspect
+        import textwrap
+
+        from surreal_orm_lite._sdk import SdkAsyncWsConnection
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(inspect.getmodule(SdkAsyncWsConnection))))  # type: ignore[arg-type]
+        bound: set[str] = set()  # names a ``for`` binds to live_queues values, or to items of those
+        called: set[str] = set()
+        for loop in ast.walk(tree):
+            if not isinstance(loop, (ast.For, ast.AsyncFor)):
+                continue
+            source = ast.unparse(loop.iter)
+            if "live_queues" not in source and not (isinstance(loop.iter, ast.Name) and loop.iter.id in bound):
+                continue
+            targets = {node.id for node in ast.walk(loop.target) if isinstance(node, ast.Name)}
+            bound |= targets
+            for node in ast.walk(loop):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in targets
+                ):
+                    called.add(node.func.attr)
+        assert called == {"put_nowait"}, (
+            f"SDK 3.0 now calls {sorted(called - {'put_nowait'})} on the queues in live_queues: "
+            "the ORM's _LiveFeed only implements put_nowait"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_queues_is_a_dict_and_recv_task_a_task(self) -> None:
+        async with orm_client(TABLE) as client:
+            assert isinstance(client.live_queues, dict)
+            assert isinstance(client.recv_task, asyncio.Task)
 
 
 class TestExports:
