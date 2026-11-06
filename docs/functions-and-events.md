@@ -167,7 +167,8 @@ account = Account(id="ada", email="ada@old.example", balance=10)
 await account.save()
 await account.merge(email="ada@new.example")
 client = await SurrealDBConnectionManager.get_client()
-print(await client.query("SELECT old, new FROM audit_log;", {}))
+[rows] = await client.query("SELECT old, new FROM audit_log;", {})  # one result per statement
+print(rows)
 # [{'new': 'ada@new.example', 'old': 'ada@old.example'}]
 
 try:
