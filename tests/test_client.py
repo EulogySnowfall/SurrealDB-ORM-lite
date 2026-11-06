@@ -19,6 +19,7 @@ import pytest
 
 from surreal_orm_lite import _client, _sdk
 from surreal_orm_lite._sdk import BoundIncluded, Null, PreciseDatetime, RecordID, SdkRange, SurrealSet, Table
+from tests.conftest import orm_client
 
 
 class _Builder:
@@ -344,3 +345,19 @@ class TestNormalize:
         value = {"a": [Null]}
         _client.normalize(value)
         assert value["a"][0] is Null
+
+
+class TestUpdateReplacesE2E:
+    """M31: ``update(RecordID, data)`` replaces the record on SDK 3.0, as ``client.update()`` did on SDK 2.0.
+
+    ``Model.save()`` with plain content relies on it (``UPDATE … CONTENT`` semantics): a field missing from *data* is
+    removed. Measured on SurrealDB 2.x, 3.x and 4.x.
+    """
+
+    async def test_fields_missing_from_data_are_removed(self) -> None:
+        async with orm_client("frontier_m31") as client:
+            rid = RecordID("frontier_m31", "a")
+            await _client.create(client, rid, {"name": "Ada", "nick": "ada"})
+            updated = await _client.update(client, rid, {"name": "Grace"})
+            assert updated == {"id": rid, "name": "Grace"}
+            assert await _client.select(client, rid) == {"id": rid, "name": "Grace"}

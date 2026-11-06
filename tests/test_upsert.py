@@ -10,6 +10,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    _client,
     post_save,
     post_update,
 )
@@ -43,9 +44,9 @@ async def _setup():
     _connect()
     client = await SurrealDBConnectionManager.get_client()
     for table in TABLES:
-        await client.query(f"DEFINE TABLE IF NOT EXISTS {table};", {})
+        await _client.query(client, f"DEFINE TABLE IF NOT EXISTS {table};", {})
         with contextlib.suppress(Exception):
-            await client.query(f"DELETE {table};", {})
+            await _client.query(client, f"DELETE {table};", {})
     return client
 
 
@@ -122,13 +123,13 @@ async def _http_orm_client(*tables: str) -> AsyncIterator[Any]:
     client = await SurrealDBConnectionManager.get_client()
     for table in tables:
         with contextlib.suppress(Exception):
-            await client.query(f"REMOVE TABLE {table};", {})
+            await _client.query(client, f"REMOVE TABLE {table};", {})
     try:
         yield client
     finally:
         for table in tables:
             with contextlib.suppress(Exception):
-                await client.query(f"REMOVE TABLE {table};", {})
+                await _client.query(client, f"REMOVE TABLE {table};", {})
         await SurrealDBConnectionManager.close_connection()
 
 
@@ -197,14 +198,14 @@ class TestUpsertE2E:
         client = await _setup()
         u = UpUser(id="alice", name="Alice", age=30)
         await u.upsert()
-        rows = await client.query("SELECT * FROM UpUser;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser;", {})
         assert len(rows) == 1
         assert rows[0]["name"] == "Alice"
         assert rows[0]["age"] == 30
         # replace (age omitted from the new model defaults to 0 → REPLACE drops the old 30)
         u2 = UpUser(id="alice", name="Alice2")
         await u2.upsert()
-        rows = await client.query("SELECT * FROM UpUser;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser;", {})
         assert len(rows) == 1  # still one record (no duplicate)
         assert rows[0]["name"] == "Alice2"
         assert rows[0]["age"] == 0  # REPLACE semantics
@@ -222,7 +223,7 @@ class TestUpsertE2E:
         client = await _setup()
         async with SurrealDBConnectionManager.transaction() as tx:
             await UpUser(id="txu", name="Tx").upsert(tx=tx)
-        rows = await client.query("SELECT * FROM UpUser WHERE id = UpUser:txu;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser WHERE id = UpUser:txu;", {})
         assert len(rows) == 1
         assert rows[0]["name"] == "Tx"
         await SurrealDBConnectionManager.close_connection()
@@ -234,7 +235,7 @@ class TestUpsertE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await UpUser(id="txr", name="TxR").upsert(tx=tx)
                 raise RuntimeError("boom")
-        rows = await client.query("SELECT * FROM UpUser WHERE id = UpUser:txr;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser WHERE id = UpUser:txr;", {})
         assert not rows
         await SurrealDBConnectionManager.close_connection()
 
@@ -247,7 +248,7 @@ class TestUpdateOrCreateE2E:
         assert created is True
         assert obj.name == "Alice"
         assert obj.age == 30
-        rows = await client.query("SELECT * FROM UpUser;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser;", {})
         assert len(rows) == 1
         await SurrealDBConnectionManager.close_connection()
 
@@ -259,7 +260,7 @@ class TestUpdateOrCreateE2E:
         second, c2 = await UpUser.objects().update_or_create(name="Bob", defaults={"age": 2})
         assert c2 is False
         assert second.age == 2
-        rows = await client.query("SELECT * FROM UpUser;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser;", {})
         assert len(rows) == 1  # no duplicate
         assert rows[0]["age"] == 2
         await SurrealDBConnectionManager.close_connection()
@@ -271,7 +272,7 @@ class TestUpdateOrCreateE2E:
         await UpAccount(id="acc1", name="Bob", email="b@x.io", role="admin", age=5).save()
         obj, created = await UpAccount.objects().update_or_create(name="Bob", defaults={"age": 9})
         assert created is False
-        rows = await client.query("SELECT * FROM UpAccount WHERE id = UpAccount:acc1;", {})
+        rows = await _client.query(client, "SELECT * FROM UpAccount WHERE id = UpAccount:acc1;", {})
         assert len(rows) == 1
         assert rows[0]["age"] == 9
         assert rows[0]["email"] == "b@x.io"  # NOT dropped
@@ -287,7 +288,7 @@ class TestUpdateOrCreateE2E:
         await UpUser(id="carol", name="Carol", age=1).save()
         _obj, created = await UpUser.objects().update_or_create(name__exact="Carol", defaults={"age": 7})
         assert created is False
-        rows = await client.query("SELECT * FROM UpUser WHERE id = UpUser:carol;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser WHERE id = UpUser:carol;", {})
         assert rows[0]["age"] == 7
         assert rows[0]["name"] == "Carol"
         assert "name__exact" not in rows[0]  # no corrupt column written
@@ -301,7 +302,7 @@ class TestUpdateOrCreateE2E:
         assert created is True
         # upsert() the SAME logical entity by PK; must hit the SAME physical record.
         await UpEmailUser(email="z@x.io", name="Z2").upsert()
-        rows = await client.query("SELECT * FROM UpEmailUser;", {})
+        rows = await _client.query(client, "SELECT * FROM UpEmailUser;", {})
         assert len(rows) == 1  # not two (auto-id record + PK record)
         assert rows[0]["name"] == "Z2"
         await SurrealDBConnectionManager.close_connection()
@@ -365,7 +366,7 @@ class TestGetOrCreateE2E:
         second, c2 = await UpUser.objects().get_or_create(name="Yan", defaults={"age": 99})
         assert c2 is False
         assert second.age == 7  # unchanged
-        rows = await client.query("SELECT * FROM UpUser;", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser;", {})
         assert len(rows) == 1
         assert rows[0]["age"] == 7
         await SurrealDBConnectionManager.close_connection()
@@ -400,7 +401,7 @@ class TestUpsertTxParticipationE2E:
                 _obj, created = await UpUser.objects(tx=tx).update_or_create(name="TxC", defaults={"age": 1})
                 assert created is True
                 raise RuntimeError("rollback")
-        rows = await client.query("SELECT * FROM UpUser WHERE name = 'TxC';", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser WHERE name = 'TxC';", {})
         assert not rows  # rolled back → never persisted
         await SurrealDBConnectionManager.close_connection()
 
@@ -417,7 +418,7 @@ class TestUpsertTxParticipationE2E:
             _o2, c2 = await UpUser.objects(tx=tx).get_or_create(name="Seen", defaults={"age": 2})
         assert c1 is True
         assert c2 is False  # the second call saw the first's uncommitted write
-        rows = await client.query("SELECT * FROM UpUser WHERE name = 'Seen';", {})
+        rows = await _client.query(client, "SELECT * FROM UpUser WHERE name = 'Seen';", {})
         assert len(rows) == 1
         await SurrealDBConnectionManager.close_connection()
 

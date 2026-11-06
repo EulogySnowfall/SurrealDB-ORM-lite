@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 from surrealdb import ServerError
 
-from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, _client
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.utils import validate_json_pointer, validate_patch_operations
 
@@ -33,9 +33,9 @@ async def _setup():
     _connect()
     client = await SurrealDBConnectionManager.get_client()
     for table in TABLES:
-        await client.query(f"DEFINE TABLE IF NOT EXISTS {table};", {})
+        await _client.query(client, f"DEFINE TABLE IF NOT EXISTS {table};", {})
         with contextlib.suppress(Exception):
-            await client.query(f"DELETE {table};", {})
+            await _client.query(client, f"DELETE {table};", {})
     return client
 
 
@@ -132,7 +132,7 @@ class TestPatchE2E:
         )
         assert u.age == 26  # non-tx applies the returned row to self
         assert u.tags == ["a", "premium"]
-        rows = await client.query("SELECT * FROM PatchUser:p1;", {})
+        rows = await _client.query(client, "SELECT * FROM PatchUser:p1;", {})
         assert rows[0]["age"] == 26
         assert rows[0]["tags"] == ["a", "premium"]
         await SurrealDBConnectionManager.close_connection()
@@ -164,7 +164,7 @@ class TestPatchE2E:
             ]
         )
         assert p.name == "ok"
-        rows = await client.query("SELECT name FROM PatchUser:te1;", {})
+        rows = await _client.query(client, "SELECT name FROM PatchUser:te1;", {})
         assert rows[0]["name"] == "ok"
         await SurrealDBConnectionManager.close_connection()
 
@@ -185,7 +185,7 @@ class TestPatchE2E:
                     {"op": "replace", "path": "/name", "value": "CHANGED"},
                 ]
             )
-        rows = await client.query("SELECT name FROM PatchUser:te2;", {})
+        rows = await _client.query(client, "SELECT name FROM PatchUser:te2;", {})
         assert rows[0]["name"] == "x"  # untouched: the replace never applied
         await SurrealDBConnectionManager.close_connection()
 
@@ -199,7 +199,7 @@ class TestAtomicArrayE2E:
         await p.atomic_append("tags", "x")  # duplicate allowed
         await p.atomic_append("tags", "y")
         assert p.tags == ["x", "x", "y"]
-        rows = await client.query("SELECT tags FROM PatchUser:a1;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:a1;", {})
         assert rows[0]["tags"] == ["x", "x", "y"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -211,7 +211,7 @@ class TestAtomicArrayE2E:
         await p.save()
         await p.atomic_remove("tags", "x")
         assert p.tags == ["y"]  # every x gone, identical on both DB lines
-        rows = await client.query("SELECT tags FROM PatchUser:a2;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:a2;", {})
         assert rows[0]["tags"] == ["y"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -233,7 +233,7 @@ class TestAtomicSetAddIncrementE2E:
         assert p.tags == ["x"]
         await p.atomic_set_add("tags", "z")  # absent → added
         assert p.tags == ["x", "z"]
-        rows = await client.query("SELECT tags FROM PatchUser:s1;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:s1;", {})
         assert rows[0]["tags"] == ["x", "z"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -248,7 +248,7 @@ class TestAtomicSetAddIncrementE2E:
         assert p.views == 16
         await p.atomic_increment("views", -6)  # decrement
         assert p.views == 10
-        rows = await client.query("SELECT views FROM PatchUser:i1;", {})
+        rows = await _client.query(client, "SELECT views FROM PatchUser:i1;", {})
         assert rows[0]["views"] == 10
         await SurrealDBConnectionManager.close_connection()
 
@@ -259,7 +259,7 @@ class TestAtomicSetAddIncrementE2E:
         await p.save()
         await p.atomic_increment("counters.views", 5)  # dotted nested path
         assert p.counters["views"] == 15
-        rows = await client.query("SELECT counters FROM PatchUser:n1;", {})
+        rows = await _client.query(client, "SELECT counters FROM PatchUser:n1;", {})
         assert rows[0]["counters"]["views"] == 15
         await SurrealDBConnectionManager.close_connection()
 
@@ -271,7 +271,7 @@ class TestAtomicSetAddIncrementE2E:
         await p.save()
         await p.atomic_increment("meta.stats.hits", 4)
         assert p.meta["stats"]["hits"] == 5
-        rows = await client.query("SELECT meta FROM PatchUser:n2;", {})
+        rows = await _client.query(client, "SELECT meta FROM PatchUser:n2;", {})
         assert rows[0]["meta"]["stats"]["hits"] == 5
         await SurrealDBConnectionManager.close_connection()
 
@@ -283,7 +283,7 @@ class TestAtomicSetAddIncrementE2E:
         await p.save()
         await p.atomic_increment("balance", Decimal("2.25"))
         assert p.balance == Decimal("12.75")
-        rows = await client.query("SELECT balance FROM PatchUser:d1;", {})
+        rows = await _client.query(client, "SELECT balance FROM PatchUser:d1;", {})
         assert rows[0]["balance"] == Decimal("12.75")
         await SurrealDBConnectionManager.close_connection()
 
@@ -296,7 +296,7 @@ class TestAtomicManyE2E:
         await p.save()
         await p.atomic_append_many("tags", ["c", "d", "a"])  # all appended, dup 'a' kept
         assert p.tags == ["a", "b", "c", "d", "a"]
-        rows = await client.query("SELECT tags FROM PatchUser:m1;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:m1;", {})
         assert rows[0]["tags"] == ["a", "b", "c", "d", "a"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -307,7 +307,7 @@ class TestAtomicManyE2E:
         await p.save()
         await p.atomic_set_add_many("tags", ["x", "z", "z"])  # 'x' present, 'z' deduped
         assert p.tags == ["x", "z"]
-        rows = await client.query("SELECT tags FROM PatchUser:m2;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:m2;", {})
         assert rows[0]["tags"] == ["x", "z"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -319,7 +319,7 @@ class TestAtomicManyE2E:
         await p.save()
         await p.atomic_remove_many("tags", ["x", "z"])
         assert p.tags == ["y", "y"]  # both x and z gone, both y kept; identical on both lines
-        rows = await client.query("SELECT tags FROM PatchUser:m3;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:m3;", {})
         assert rows[0]["tags"] == ["y", "y"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -332,7 +332,7 @@ class TestAtomicManyE2E:
         await p.atomic_set_add_many("tags", [])
         await p.atomic_remove_many("tags", [])
         assert p.tags == ["a", "b"]
-        rows = await client.query("SELECT tags FROM PatchUser:m4;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:m4;", {})
         assert rows[0]["tags"] == ["a", "b"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -350,7 +350,7 @@ class TestAtomicManyE2E:
         await p.save()
         async with SurrealDBConnectionManager.transaction() as tx:
             await p.atomic_append_many("tags", ["b", "c"], tx=tx)
-        rows = await client.query("SELECT tags FROM PatchUser:m6;", {})
+        rows = await _client.query(client, "SELECT tags FROM PatchUser:m6;", {})
         assert rows[0]["tags"] == ["a", "b", "c"]
         await SurrealDBConnectionManager.close_connection()
 
@@ -374,7 +374,7 @@ class TestAtomicManyE2E:
         ghost = PatchUser(id="ghost", views=5)
         await ghost.atomic_increment("views", 3)  # no raise
         assert ghost.views == 5  # untouched: nothing came back to apply
-        rows = await client.query("SELECT id FROM PatchUser;", {})
+        rows = await _client.query(client, "SELECT id FROM PatchUser;", {})
         assert {str(r["id"].id) for r in rows} == {"real"}  # ghost was NOT created
         await SurrealDBConnectionManager.close_connection()
 
@@ -388,7 +388,7 @@ class TestQuerySetPatchE2E:
         await PatchUser(id="q3", name="B", age=1).save()
         n = await PatchUser.objects().filter(name="A").patch([{"op": "replace", "path": "/age", "value": 99}])
         assert n == 2
-        rows = await client.query("SELECT id, age FROM PatchUser ORDER BY id;", {})
+        rows = await _client.query(client, "SELECT id, age FROM PatchUser ORDER BY id;", {})
         by_age = {str(r["id"].id): r["age"] for r in rows}
         assert by_age == {"q1": 99, "q2": 99, "q3": 1}
         await SurrealDBConnectionManager.close_connection()
@@ -400,7 +400,7 @@ class TestQuerySetPatchE2E:
         await PatchUser(id="w2", age=2).save()
         n = await PatchUser.objects().patch([{"op": "replace", "path": "/age", "value": 0}])
         assert n == 2
-        rows = await client.query("SELECT age FROM PatchUser;", {})
+        rows = await _client.query(client, "SELECT age FROM PatchUser;", {})
         assert all(r["age"] == 0 for r in rows)
         await SurrealDBConnectionManager.close_connection()
 
@@ -424,7 +424,7 @@ class TestQuerySetPatchTxE2E:
             # Real affected count on the interactive (3.x) strategy; the buffered (2.6.x / HTTP)
             # strategy cannot know it before commit and reports 0 — same contract as bulk_update.
             assert n == 2 if interactive else n == 0
-        rows = await client.query("SELECT age FROM PatchUser WHERE name = 'A';", {})
+        rows = await _client.query(client, "SELECT age FROM PatchUser WHERE name = 'A';", {})
         assert all(r["age"] == 5 for r in rows)  # persisted on both lines
         await SurrealDBConnectionManager.close_connection()
 
@@ -436,7 +436,7 @@ class TestQuerySetPatchTxE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await PatchUser.objects(tx=tx).filter(name="B").patch([{"op": "replace", "path": "/age", "value": 9}])
                 raise RuntimeError("boom")
-        rows = await client.query("SELECT age FROM PatchUser WHERE name = 'B';", {})
+        rows = await _client.query(client, "SELECT age FROM PatchUser WHERE name = 'B';", {})
         assert rows[0]["age"] == 1  # rolled back
         await SurrealDBConnectionManager.close_connection()
 
@@ -450,7 +450,7 @@ class TestPatchTxE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             await p.patch([{"op": "replace", "path": "/age", "value": 7}], tx=tx)
             await p.atomic_increment("score", 2.0, tx=tx)
-        rows = await client.query("SELECT age, score FROM PatchUser:t1;", {})
+        rows = await _client.query(client, "SELECT age, score FROM PatchUser:t1;", {})
         assert rows[0]["age"] == 7
         assert rows[0]["score"] == 2.0
         await SurrealDBConnectionManager.close_connection()
@@ -464,7 +464,7 @@ class TestPatchTxE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await p.patch([{"op": "replace", "path": "/age", "value": 99}], tx=tx)
                 raise RuntimeError("boom")
-        rows = await client.query("SELECT age FROM PatchUser:t2;", {})
+        rows = await _client.query(client, "SELECT age FROM PatchUser:t2;", {})
         assert rows[0]["age"] == 1  # rolled back
         await SurrealDBConnectionManager.close_connection()
 
@@ -479,7 +479,7 @@ class TestPatchTxE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             await p.patch([{"op": "replace", "path": "/age", "value": 42}], tx=tx)
             assert p.age == 42  # interactive tx applies the returned row to self
-        rows = await client.query("SELECT age FROM PatchUser:t3;", {})
+        rows = await _client.query(client, "SELECT age FROM PatchUser:t3;", {})
         assert rows[0]["age"] == 42
         await SurrealDBConnectionManager.close_connection()
 
@@ -494,7 +494,7 @@ class TestPatchTxE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             await p.atomic_increment("views", 5, tx=tx)
             assert p.views == 15  # interactive tx applies the server-computed row to self
-        rows = await client.query("SELECT views FROM PatchUser:t4;", {})
+        rows = await _client.query(client, "SELECT views FROM PatchUser:t4;", {})
         assert rows[0]["views"] == 15
         await SurrealDBConnectionManager.close_connection()
 

@@ -103,7 +103,10 @@ async def create(client: Any, target: Target, data: Any, *, txn_id: UUID | None 
 
 
 async def update(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
-    """``UPDATE … CONTENT``: replaces the record(s) with *data*."""
+    """``UPDATE … CONTENT``: replaces the record(s) with *data*.
+
+    A field missing from *data* is removed, as with SDK 2.0's ``update()`` (measured on SurrealDB 2.x, 3.x and 4.x).
+    """
     return normalize(await client.update(_target(target), data, **_txn(txn_id)))
 
 

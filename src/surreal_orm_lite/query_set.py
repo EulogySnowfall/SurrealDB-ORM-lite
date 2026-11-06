@@ -11,7 +11,7 @@ from uuid import UUID
 from pydantic import BaseModel
 from pydantic_core import ValidationError
 
-from . import BaseSurrealModel, SurrealDBConnectionManager
+from . import BaseSurrealModel, SurrealDBConnectionManager, _client
 from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
@@ -1790,7 +1790,7 @@ class QuerySet:
         encoded = _encoding.encode(vars_)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
         try:
-            return await client.query(query, encoded)  # type: ignore
+            return await _client.query(client, query, encoded)  # type: ignore
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
@@ -1863,7 +1863,7 @@ class QuerySet:
                 await self._tx.run_read(_subquery.TABLE_PROBE, variables)
             else:
                 client = await self._manager().get_client()
-                await client.query(_subquery.TABLE_PROBE, _encoding.encode(variables))
+                await _client.query(client, _subquery.TABLE_PROBE, _encoding.encode(variables))
         except NotFoundError as exc:
             # The check's answer, never a failed statement of the transaction (issue #268).
             if self._tx is not None:
@@ -2370,7 +2370,7 @@ class QuerySet:
 
             client = await self._manager().get_client()
             try:
-                data = await client.select(record_id)
+                data = await _client.select(client, record_id)
             except NotFoundError:
                 raise SurrealDbNotFoundError("No result found.") from None
             if isinstance(data, list):
@@ -2419,7 +2419,7 @@ class QuerySet:
 
         client = await self._manager().get_client()
         try:
-            results = await client.select(self._model_table)
+            results = await _client.select(client, self._model_table)
         except NotFoundError:
             return self.model.from_db([])
         return self.model.from_db(results)
@@ -2447,7 +2447,7 @@ class QuerySet:
         async def run() -> Any:
             client = await self._manager().get_client()
             try:
-                return await client.select(target)
+                return await _client.select(client, target)
             except NotFoundError:
                 return missing
 
@@ -2470,7 +2470,7 @@ class QuerySet:
         """
         client = await self._manager().get_client()
         with contextlib.suppress(NotFoundError):
-            await client.delete(self._model_table)
+            await _client.delete(client, self._model_table)
         return True
 
     # ==================== Aggregation Methods ====================
@@ -2866,7 +2866,7 @@ class QuerySet:
 
         encoded = _encoding.encode(data_list)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
-        results = await client.insert(self._model_table, encoded)
+        results = await _client.insert(client, self._model_table, encoded)
 
         if isinstance(results, list):
             return self.model.from_db(results)  # type: ignore
@@ -3541,7 +3541,7 @@ class QuerySet:
         async def start(client: Any) -> UUID:
             if items:
                 try:
-                    await client.query(check)
+                    await _client.query(client, check)
                 except ServerError as exc:
                     refusal = _search.missing_index_refusal(exc, fields)
                     if refusal is not None:
@@ -3551,7 +3551,7 @@ class QuerySet:
                         raise
                     raise SurrealDbNotFoundError(_subquery.live_table_missing(missing, exc)) from exc
             try:
-                live_id = await client.query(query)
+                live_id = await _client.query(client, query)
             except NotFoundError as exc:
                 raise missing_table_error(exc, table) from exc
             return live_id if isinstance(live_id, UUID) else UUID(str(live_id))
@@ -3765,7 +3765,7 @@ class QuerySet:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it
             # would corrupt their string literals (issue #156).
-            results = await client.query(query, _encoding.encode(variables or {}))
+            results = await _client.query(client, query, _encoding.encode(variables or {}))
         except NotFoundError:
             # SurrealDB 3.x raises for a never-created table; the ORM contract
             # treats a missing table as empty.

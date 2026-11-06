@@ -19,6 +19,7 @@ from typing import Any, ClassVar, Literal, Self
 
 from pydantic import AliasChoices, Field, field_validator
 
+from . import _client
 from . import cache as _cache
 from . import encoding as _encoding
 from . import routing as _routing
@@ -143,9 +144,9 @@ async def insert_edges(
         client = await manager.get_client()
         try:
             if guarded:
-                result = await client.query(_GUARDED_INSERT.format(table=table), encoded)
+                result = await _client.query(client, _GUARDED_INSERT.format(table=table), encoded)
             else:
-                result = await client.insert_relation(table, encoded)
+                result = await _client.insert_relation(client, table, encoded)
         except ServerError as exc:
             raise edge_write_error(exc) from exc
     returned = _as_rows(result)
