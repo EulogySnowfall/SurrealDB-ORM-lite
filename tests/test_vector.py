@@ -6524,6 +6524,19 @@ _COMPACTING = {"building": {"compacting": True, "initial": 0, "pending": 0, "sta
 _COMPACTED = {"building": {"compacting": False, "initial": 0, "pending": 0, "status": "ready", "updated": 0}}
 _NO_COMPACTION = {"building": {"initial": 0, "pending": 0, "status": "ready", "updated": 0}}
 _EMBEDDED_READY = {"building": {"status": "ready"}}
+#: The embedded engine's answer from its 4.0 core: a compaction queued after the seed, never started.
+_EMBEDDED_QUEUED = {
+    "building": {
+        "active": False,
+        "armed_shards": 2,
+        "compacting": True,
+        "initial": 0,
+        "pending": 0,
+        "queued": True,
+        "status": "ready",
+        "updated": 0,
+    }
+}
 
 
 @pytest.fixture
@@ -6541,13 +6554,25 @@ def recorded_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 class TestCompactionWait:
     """``tests/_compaction.py``, the wait every seed of a vector index makes before the test writes to its table (issue
     #344): it reads ``INFO FOR INDEX`` until ``building.compacting`` is no longer true, returns after one read when
-    the engine reports no such key (SurrealDB 2.x, 3.1, the embedded engine), and fails with a clear message — never
-    passes silently — when the compaction outlasts its timeout or the answer holds no ``building`` state. A model's
-    wait reads its vector indexes from ``get_indexes()``; hand-written statements give theirs."""
+    the engine reports no such key (SurrealDB 2.x, 3.1) or never runs the compaction (the embedded engine), and fails
+    with a clear message — never passes silently — when the compaction outlasts its timeout or the answer holds no
+    ``building`` state. A model's wait reads its vector indexes from ``get_indexes()``; hand-written statements give
+    theirs."""
 
     @pytest.mark.parametrize("answer", [_NO_COMPACTION, _EMBEDDED_READY, _COMPACTED], ids=["2x-31", "embedded", "33-idle"])
     async def test_no_compaction_running_returns_after_one_read(self, answer: Any, recorded_sleeps: list[float]) -> None:
         client = _InfoClient(answer)
+        await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc")
+        assert client.sent == ["INFO FOR INDEX vec_doc_embedding ON vec_doc;"]
+        assert recorded_sleeps == []
+
+    async def test_the_embedded_engine_is_read_once(
+        self, recorded_sleeps: list[float], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The embedded engine (4.0 core) reports ``compacting = true`` after a seed and never runs the compaction (no
+        background task, measured on SDK 3.0.0): the wait reads once and returns, as there is nothing to wait for."""
+        client = _InfoClient(_EMBEDDED_QUEUED)
+        monkeypatch.setattr(_compaction, "EMBEDDED_CLIENTS", (_InfoClient,))
         await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc")
         assert client.sent == ["INFO FOR INDEX vec_doc_embedding ON vec_doc;"]
         assert recorded_sleeps == []
@@ -6620,9 +6645,9 @@ class TestCompactionWait:
 
 class TestCompactionWaitE2E:
     """The wait after a seed on every engine (the line under test over WebSocket and HTTP, and the embedded engine):
-    SurrealDB 3.3 reports ``building.compacting`` and the wait returns once it is false; SurrealDB 2.x, 3.1 and the
-    embedded engine report no such key and the wait sends one ``INFO FOR INDEX`` per vector index, no other query, and
-    fails none."""
+    SurrealDB 3.3 and 4.0 report ``building.compacting`` and the wait returns once it is false; SurrealDB 2.x and 3.1
+    report no such key, and the embedded engine (4.0 core) queues the compaction without ever running it: there the
+    wait sends one ``INFO FOR INDEX`` per vector index, no other query, and fails none."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_the_wait_returns_once_the_compaction_is_over(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6636,7 +6661,11 @@ class TestCompactionWaitE2E:
             sent = _calls(calls)
             monkeypatch.undo()
             states = [(await _client.query(client, read, {}))["building"] for read in reads]
-        if line >= (3, 3):
+        if kind == "mem":
+            # The embedded engine (4.0 core) queues the compaction and never runs it: one read, no wait.
+            assert [(state["compacting"], state["active"]) for state in states] == [(True, False), (True, False)]
+            assert sent == _sent(reads), "one read per vector index"
+        elif line >= (3, 3):
             assert [state["compacting"] for state in states] == [False, False]
             assert sent[:2] == _query(reads[0]) and sent[-2:] == _query(reads[1])
             assert set(sent) == {*_query(reads[0]), *_query(reads[1])}, "INFO FOR INDEX only"

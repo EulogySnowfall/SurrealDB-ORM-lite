@@ -5,8 +5,10 @@ starts right after them. While it runs, ``INFO FOR INDEX <index> ON <table>`` re
 and a write to the table can fail with "Transaction conflict: Write conflict, retry the transaction" (issue #344).
 Measured on 3.3.4: about 0.25 s after a seed of six records, over WebSocket and HTTP alike.
 
-SurrealDB 2.7.0, 3.1.5 and the embedded engine report no ``compacting`` key, so the wait returns after one read and
-adds no delay there. The wait is a read, never a write, and never retries a test's own write (``tests/_retry.py`` does):
+SurrealDB 2.7.0 and 3.1.5 report no ``compacting`` key, so the wait returns after one read and adds no delay there.
+SurrealDB 4.0.0 reports it as 3.3 does. The embedded engine (its 4.0 core, SDK 3.0) reports ``compacting = true`` after
+a seed and never runs the compaction — it stays queued, reads and writes work —, so for an embedded client the wait
+also returns after one read. The wait is a read, never a write, and never retries a test's own write (``tests/_retry.py`` does):
 a test calls it right after its seed, before any spy records the queries it sends.
 """
 
@@ -16,10 +18,13 @@ import asyncio
 import re
 from typing import Any
 
-from surreal_orm_lite import BaseSurrealModel, _client
+from surreal_orm_lite import BaseSurrealModel, _client, _sdk
 
 #: How long the wait gives a compaction before it fails the test: forty times the longest one measured.
 COMPACTION_TIMEOUT = 10.0
+
+#: The client classes of the embedded engine, which never runs the compaction it reports as queued.
+EMBEDDED_CLIENTS: tuple[type, ...] = (_sdk.SdkAsyncEmbeddedConnection,) if _sdk.SdkAsyncEmbeddedConnection is not None else ()
 
 #: The pause between two reads of the index's state.
 _POLL_INTERVAL = 0.02
@@ -36,7 +41,8 @@ async def wait_for_compaction(client: Any, index: str, table: str, *, timeout: f
     """Return once ``INFO FOR INDEX`` *index* ``ON`` *table* no longer reports ``building.compacting = true``.
 
     *client* is the SDK client the test seeded through; *index* and *table* are constant names of the test. An engine
-    that reports no ``compacting`` key (SurrealDB 2.x, 3.1, the embedded engine) returns after the first read. A
+    that reports no ``compacting`` key (SurrealDB 2.x, 3.1) or never runs the compaction (the embedded engine) returns
+    after the first read. A
     compaction still running after *timeout* seconds fails the test with ``AssertionError``, and so does an answer
     without a ``building`` state or an index that does not exist (the server's own error): the wait never passes
     silently.
@@ -48,7 +54,7 @@ async def wait_for_compaction(client: Any, index: str, table: str, *, timeout: f
         building = info.get("building") if isinstance(info, dict) else None
         if not isinstance(building, dict):
             raise AssertionError(f"{statement} answered no building state: {info!r}")
-        if building.get("compacting") is not True:
+        if building.get("compacting") is not True or isinstance(client, EMBEDDED_CLIENTS):
             return
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError(
