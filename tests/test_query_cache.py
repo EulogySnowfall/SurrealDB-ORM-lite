@@ -2613,7 +2613,14 @@ class TestTags:
         expected = QcItem.objects().filter(category="book")._compile_query()
         assert reads == [_Read("query", *expected, frozenset({"qc_item"}), False)]
 
-    async def test_every_compiled_read_goes_through_the_cache(self, reads: list[_Read]) -> None:
+    async def test_every_compiled_read_goes_through_the_cache(
+        self, reads: list[_Read], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # first() reads the line for its implicit ORDER BY id (v0.50.0): SurrealDB 3 or later here, without a client.
+        async def line_3_or_later(self: QuerySet, compiler: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(QuerySet, "_below_3", line_3_or_later)
         qs = QcItem.objects().filter(price__gt=1).cache()
         assert await qs.exec() == []
         with pytest.raises(SurrealDbNotFoundError):
@@ -2630,8 +2637,9 @@ class TestTags:
         assert [read.kind for read in reads] == ["query"] * 10
         assert {read.tables for read in reads} == {frozenset({"qc_item"})}
         assert not any(read.any_table for read in reads)
-        # exec() and get() send the same statement, as first() and exists() do (LIMIT 1).
-        assert len({read.statement for read in reads}) == 8
+        # exec() and get() send the same statement; first() and exists() both LIMIT 1, first() also ORDER BY id (v0.50.0).
+        assert len({read.statement for read in reads}) == 9
+        assert reads[1].statement.endswith(" ORDER BY id LIMIT 1;")
         assert qs._limit is None  # first() and exists() leave the queryset untouched
 
     async def test_an_edge_read(self, reads: list[_Read]) -> None:

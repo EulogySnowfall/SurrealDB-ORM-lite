@@ -158,6 +158,8 @@ class QuerySet:
         self._limit: int | None = None
         self._offset: int | None = None
         self._order_by: str | None = None
+        # first()'s implicit ORDER BY id (v0.50.0): set for the duration of its own call only, as its LIMIT 1.
+        self._first_order: bool = False
         self._model_table: str = model.get_table_name()
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
@@ -1430,6 +1432,12 @@ class QuerySet:
             # column the projection does not read.
             if compiler.knn_prefilter and self._similar.dist is not None and self._reads_id():
                 query += ", id"
+        elif self._first_order:
+            # first() without an order of its own (v0.50.0, D22): the smallest matching id from SurrealDB 3 on, where
+            # 4.x promises no order and an indexed filter comes in index order; below 3 the statement is unchanged.
+            compiler.implicit_order = True
+            if not compiler.knn_prefilter:
+                query += " ORDER BY id"
 
         if self._limit is not None:
             query += f" LIMIT {self._limit}"
@@ -1918,9 +1926,10 @@ class QuerySet:
         subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them, and so are the
         fields their ``similar_to()`` searches (v0.36.0, ``knn_fields=``), so a dimension error names them.
 
-        A KNN next to other conditions (v0.36.0), or an exact scan (``compiler.knn_conditions``), is compiled for the
-        line: *knn_prefilter* ``None`` decides it once, right after the first compilation — the line read once per
-        client (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is checked,
+        A KNN next to other conditions (v0.36.0), or an exact scan (``compiler.knn_conditions``), and ``first()``'s
+        implicit ``ORDER BY id`` (v0.50.0, ``compiler.implicit_order``) are compiled for the line: *knn_prefilter*
+        ``None`` decides it once, right after the first compilation and its link check — the line read once per
+        client (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is keyed,
         queued or sent — and every later compilation of this read or write (a re-send for a missing subquery table
         included) uses that decision; :meth:`_run_cached` passes the one it took."""
         empty: frozenset[str] = frozenset()
@@ -1928,11 +1937,12 @@ class QuerySet:
             compiler = self._subquery_compiler(empty, warn=warn, knn_prefilter=bool(knn_prefilter))
             warn = False
             query, variables = compile_statement(compiler)
+            # A link to another connection is refused before the line is read (v0.50.0: first() reads it too).
+            self._check_links()
             if knn_prefilter is None:
                 knn_prefilter = await self._below_3(compiler)
                 if knn_prefilter:
                     continue
-            self._check_links()
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
             read = frozenset(compiler.tables) - empty
@@ -1961,17 +1971,18 @@ class QuerySet:
         (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
         compilation gives the filter values' warnings, once per read.
 
-        A KNN next to other conditions (v0.36.0), or an exact scan, is keyed in its line's form: the line is read after
-        the first compilation and, below SurrealDB 3, the statement compiled again for the key; the decision is passed
+        A KNN next to other conditions (v0.36.0), or an exact scan, and ``first()``'s implicit ``ORDER BY id`` (v0.50.0)
+        are keyed in their line's form: the line is read after the first compilation and its link check and, below
+        SurrealDB 3, the statement compiled again for the key — the two forms never share a key; the decision is passed
         on to :meth:`_run_uncached`, so a read the compilation refuses stores nothing.
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
+        self._check_links()
         knn_prefilter = await self._below_3(compiler)
         if knn_prefilter:
             compiler = self._subquery_compiler(warn=False, knn_prefilter=True)
             query, variables = compile_statement(compiler)
-        self._check_links()
         tables = {self._model_table, *compiler.tables}
         if self.model.__surreal_edge__ or compiler.edge_tables:
             tables.add(EDGES)
@@ -1993,11 +2004,12 @@ class QuerySet:
 
     async def _below_3(self, compiler: SubqueryCompiler) -> bool:
         """Whether the statement *compiler* compiled is for a line below SurrealDB 3 and needs the form with the
-        conditions next to its KNN selected first (v0.36.0), or an exact scan's nearest ranked by distance then id: only
-        when it has such conditions or such a scan (``compiler.knn_conditions``) is the line read, once per client
+        conditions next to its KNN selected first (v0.36.0), or an exact scan's nearest ranked by distance then id, or
+        ``first()``'s statement without its implicit ``ORDER BY id`` (v0.50.0): only when it has such conditions or such
+        a scan (``compiler.knn_conditions``) or that clause (``compiler.implicit_order``) is the line read, once per client
         (``time_travel.cached_major()``) — on the connection's client, an interactive transaction's included. A version
         that cannot be read counts as 3."""
-        if not compiler.knn_conditions:
+        if not (compiler.knn_conditions or compiler.implicit_order):
             return False
         return await _time_travel.cached_major(await self._manager().get_client()) < 3
 
@@ -2306,15 +2318,24 @@ class QuerySet:
         same queryset can be reused (or re-executed) afterwards and still yields every
         matching row.
 
+        Which row (v0.50.0): on SurrealDB 3.x, 4.x and the embedded engine, a statement without an order of its own
+        ends ``ORDER BY id``, so ``first()`` returns the matching record with the smallest id — on a range filter over
+        an indexed field this costs a sort of the matching records; ``order_by()`` on that field avoids it when its
+        order is the one wanted. ``order_by()``, ``similar_to()`` (nearest first) and a ``values()``/``annotate()``
+        aggregation keep their own order. On SurrealDB 2.x the statement is unchanged: the server's order, id order
+        for a plain table scan and index order for an indexed filter. The line is read once per client.
+
         Returns:
             The first model instance, or raises SurrealDbNotFoundError if no results.
         """
         original_limit = self._limit
         try:
             self._limit = 1
+            self._first_order = True
             results = await self.exec()
         finally:
             self._limit = original_limit
+            self._first_order = False
 
         if results:
             return results[0]

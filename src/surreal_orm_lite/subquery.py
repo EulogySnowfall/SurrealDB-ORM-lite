@@ -231,6 +231,9 @@ class SubqueryCompiler:
             holds its nearest ranked by distance then id, every condition applied first.
         knn_conditions: a KNN of the statement shares its ``WHERE`` with a condition that is not an id subquery
             (v0.36.0), or is an exact scan (``dist=``): the caller reads the line.
+        implicit_order: the statement is ``first()``'s without an order of its own (v0.50.0): in the form for SurrealDB
+            3 and later it ends ``ORDER BY id``, below 3 (``knn_prefilter``) it has no ``ORDER BY``: the caller reads
+            the line.
         warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
             ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
             re-send for a missing subquery table), so each read warns once (v0.28.1).
@@ -255,6 +258,7 @@ class SubqueryCompiler:
     knn_fields: dict[tuple[str, str], str] = field(default_factory=dict)
     knn_prefilter: bool = False
     knn_conditions: bool = False
+    implicit_order: bool = False
     warn: bool = True
     variable_like: list[str] = field(default_factory=list)
     _stack: list[int] = field(default_factory=list)
