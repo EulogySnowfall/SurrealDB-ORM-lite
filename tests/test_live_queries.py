@@ -812,6 +812,10 @@ class _DroppingClient:
         self._dropped = asyncio.Event()
         self.recv_task: asyncio.Task[Any] = asyncio.get_running_loop().create_task(self._dropped.wait())
 
+    async def close(self) -> None:
+        """SDK 3.0's ``close()`` tears the transport down (the ORM retires a dropped client with it)."""
+        await self.socket.close()
+
     async def kill(self, query_uuid: Any) -> None:
         cancellation: BaseException = asyncio.CancelledError()
         if self._cancelled:

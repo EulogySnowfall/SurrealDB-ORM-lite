@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
 from surreal_orm_lite.exceptions import SurrealDbConnectionError
 from surreal_orm_lite.live import is_dead, recv_task_of
 from tests._proxy import CuttableProxy
@@ -205,7 +205,7 @@ class TestDeadClientReplacementE2E:
 
         async with proxied() as proxy:
             client = await SurrealDBConnectionManager.get_client()
-            live_id = await client.query(f"LIVE SELECT * FROM {TABLE};", {})
+            live_id = await _client.query(client, f"LIVE SELECT * FROM {TABLE};", {})
             proxy.cut()
             await _wait_dead(client)
 
@@ -353,7 +353,7 @@ async def _direct_lives(table: str = TABLE) -> dict[str, Any]:
     try:
         await client.signin({"username": "root", "password": "root"})
         await client.use("ns", "db")
-        info = await client.query(f"INFO FOR TABLE {table};", {})
+        info = await _client.query(client, f"INFO FOR TABLE {table};", {})
         return dict(info.get("lives") or {})
     finally:
         await client.close()
@@ -837,7 +837,7 @@ async def record_user(*, store: bool) -> AsyncIterator[str]:
         await SurrealDBConnectionManager.signup(
             access=OWNED_ACCESS, variables={"email": f"{uuid4().hex}@example.test"}, store=store
         )
-        user_id = await root.query("RETURN <string> $auth.id;", {})
+        user_id = await _client.query(root, "RETURN <string> $auth.id;", {})
         yield str(user_id)
     finally:
         SurrealDBConnectionManager.clear_session()
@@ -856,7 +856,7 @@ async def _direct_query(sql: str) -> Any:
     try:
         await client.signin({"username": "root", "password": "root"})
         await client.use("ns", "db")
-        return await client.query(sql, {})
+        return await _client.query(client, sql, {})
     finally:
         await client.close()
 
@@ -1068,7 +1068,7 @@ class TestOpenClientFailuresE2E:
         closed: list[bool] = []
 
         class _SlowSurreal:
-            def __init__(self, url: str) -> None:
+            def __init__(self, url: str, **options: Any) -> None:
                 pass
 
             async def connect(self, url: str) -> None:

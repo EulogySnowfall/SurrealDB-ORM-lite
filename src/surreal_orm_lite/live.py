@@ -54,6 +54,8 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from . import _client
+from ._sdk import TransportError, UnexpectedResponseError
 from .embedded import is_embedded_url, live_unsupported
 from .enum import LiveAction
 from .exceptions import (
@@ -203,7 +205,10 @@ def recv_task_of(client: Any) -> asyncio.Task[Any] | None:
 
 
 def is_dead(client: Any) -> bool:
-    """Whether *client*'s WebSocket has dropped. An HTTP client never is: it holds no socket."""
+    """Whether *client*'s WebSocket has dropped, or the ORM retired it (v0.50.0: it refuses every request, and its
+    reader is gone once it is closed). An HTTP client never is: it holds no socket."""
+    if _client.is_retired(client):
+        return True
     task = recv_task_of(client)
     return task is not None and task.done()
 
@@ -518,6 +523,9 @@ def is_connection_failure(exc: BaseException, client: Any) -> bool:
     """
     if isinstance(exc, SurrealDbConnectionError):
         return bool(getattr(exc, "retryable", True))
+    if isinstance(exc, (TransportError, UnexpectedResponseError)):
+        # SDK 3.0 errors raised by a call outside the frontier (signin, use, begin…): classified as the frontier does.
+        return bool(getattr(_client.connection_error(exc), "retryable", False))
     if isinstance(exc, OSError) or _is_transport_error(exc):
         return True
     return client is not None and is_dead(client)

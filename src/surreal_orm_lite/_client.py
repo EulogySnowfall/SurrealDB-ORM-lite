@@ -18,6 +18,17 @@ What changed with the official SDK 3.0, and how this module keeps the ORM's sema
 - ``txn_id`` (an interactive transaction's id) is passed only when given: the SDK's HTTP methods have no such keyword,
   and no ORM path gives one to an HTTP client (transactions over HTTP are buffered).
 
+Errors (v0.50.0): the SDK's transport and response errors reach the ORM's callers as ``SurrealDbConnectionError``,
+chained to the SDK's error (``__cause__``). ``ConnectionUnavailableError`` (the connection is gone or could not be
+reached) and any other ``TransportError`` are retryable; ``TransportTimeoutError`` (a deadline set with
+``get_client().timeout(…)``) and ``UnexpectedResponseError`` (a response the SDK cannot read) are not. Server errors
+(``ServerError`` and its subclasses) pass through unchanged.
+
+Retired clients (v0.50.0): SDK 3.0's WebSocket client opens a new socket on any request made once its socket is gone,
+and that socket is anonymous (the ORM signs in itself, it never hands the SDK credentials). ``retire()`` makes a client
+the ORM no longer serves refuse every request instead (``SurrealDbConnectionError``, not retryable), then closes it;
+``refuse_on_drop()`` does the refusing part as soon as a client's connection drops, before the ORM has replaced it.
+
 ``normalize()`` maps the SDK 3.0 values the ORM reads differently: SurrealDB's ``NULL`` (the SDK's ``Null``) is
 ``None``, a native set (``SurrealSet``) is a ``set`` — a ``list`` when a ``set`` would lose an item — and an open range
 bound is ``None``. Everything else, ``PreciseDatetime`` included, is returned as the SDK gives it.
@@ -26,13 +37,29 @@ Internal: not exported, not part of the public API. ``SurrealDBConnectionManager
 client; code that calls it directly gets the SDK's own semantics.
 """
 
+import asyncio
+import contextlib
 import copy
+import weakref
+from collections.abc import Iterator
 from typing import Any
 from uuid import UUID
 
-from ._sdk import Null, RecordID, SdkRange, SurrealSet, Table
+from ._sdk import (
+    Null,
+    RecordID,
+    SdkAsyncWsConnection,
+    SdkRange,
+    SurrealSet,
+    Table,
+    TransportError,
+    TransportTimeoutError,
+    UnexpectedResponseError,
+)
+from .exceptions import SurrealDbConnectionError
 
 __all__ = [
+    "connection_error",
     "create",
     "delete",
     "insert",
@@ -43,6 +70,9 @@ __all__ = [
     "query",
     "query_all",
     "query_raw",
+    "is_retired",
+    "refuse",
+    "refuse_on_drop",
     "retire",
     "select",
     "update",
@@ -63,6 +93,28 @@ def _txn(txn_id: UUID | None) -> dict[str, Any]:
     return {} if txn_id is None else {"txn_id": txn_id}
 
 
+@contextlib.contextmanager
+def _sdk_errors() -> Iterator[None]:
+    """Re-raise the SDK's transport and response errors as ``SurrealDbConnectionError`` (see the module docstring)."""
+    try:
+        yield
+    except (TransportError, UnexpectedResponseError) as exc:
+        raise connection_error(exc) from exc
+
+
+def connection_error(exc: BaseException) -> SurrealDbConnectionError:
+    """The ``SurrealDbConnectionError`` an SDK transport or response error becomes, ``retryable`` set.
+
+    Retryable: a connection that is gone or could not be reached (``ConnectionUnavailableError`` and the other
+    ``TransportError``s). Not retryable: a deadline that passed (``TransportTimeoutError``) or a response the SDK cannot
+    read (``UnexpectedResponseError``) — the same request would meet the same answer.
+    """
+    error = SurrealDbConnectionError(str(exc))
+    retryable = isinstance(exc, TransportError) and not isinstance(exc, TransportTimeoutError)
+    error.retryable = retryable  # type: ignore[attr-defined]
+    return error
+
+
 # --- queries --------------------------------------------------------------------------------------
 
 
@@ -71,13 +123,15 @@ async def query(client: Any, sql: str, variables: dict[str, Any] | None = None, 
 
     A failing statement raises, even when it is not the first (SDK 3.0).
     """
-    results = await client.query(sql, variables, **_txn(txn_id))
+    with _sdk_errors():
+        results = await client.query(sql, variables, **_txn(txn_id))
     return normalize(results[0]) if results else None
 
 
 async def query_all(client: Any, sql: str, variables: dict[str, Any] | None = None, *, txn_id: UUID | None = None) -> list[Any]:
     """One normalised result per statement."""
-    results = await client.query(sql, variables, **_txn(txn_id))
+    with _sdk_errors():
+        results = await client.query(sql, variables, **_txn(txn_id))
     return [normalize(result) for result in results]
 
 
@@ -85,7 +139,9 @@ async def query_raw(
     client: Any, sql: str, variables: dict[str, Any] | None = None, *, txn_id: UUID | None = None
 ) -> dict[str, Any]:
     """The server's response envelope (``{"result": [{"status", "result", "time", …}]}`` or ``{"error": …}``), normalised."""
-    raw: dict[str, Any] = normalize(await client.query_raw(sql, variables, **_txn(txn_id)))
+    with _sdk_errors():
+        response = await client.query_raw(sql, variables, **_txn(txn_id))
+    raw: dict[str, Any] = normalize(response)
     return raw
 
 
@@ -94,12 +150,16 @@ async def query_raw(
 
 async def select(client: Any, target: Target, *, txn_id: UUID | None = None) -> Any:
     """A record (``dict``, or ``None`` when it does not exist) or a table's records (``list``)."""
-    return normalize(await client.select(_target(target), **_txn(txn_id)))
+    with _sdk_errors():
+        result = await client.select(_target(target), **_txn(txn_id))
+    return normalize(result)
 
 
 async def create(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
     """``CREATE``: the new record, or a list of records for a table target."""
-    return normalize(await client.create(_target(target), data, **_txn(txn_id)))
+    with _sdk_errors():
+        result = await client.create(_target(target), data, **_txn(txn_id))
+    return normalize(result)
 
 
 async def update(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
@@ -107,50 +167,120 @@ async def update(client: Any, target: Target, data: Any, *, txn_id: UUID | None 
 
     A field missing from *data* is removed, as with SDK 2.0's ``update()`` (measured on SurrealDB 2.x, 3.x and 4.x).
     """
-    return normalize(await client.update(_target(target), data, **_txn(txn_id)))
+    with _sdk_errors():
+        result = await client.update(_target(target), data, **_txn(txn_id))
+    return normalize(result)
 
 
 async def upsert(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
     """``UPSERT … CONTENT``: creates or replaces the record(s)."""
-    return normalize(await client.upsert(_target(target), data, **_txn(txn_id)))
+    with _sdk_errors():
+        result = await client.upsert(_target(target), data, **_txn(txn_id))
+    return normalize(result)
 
 
 async def merge(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
     """``UPDATE … MERGE``: SDK 3.0's ``update(target).merge(data)``; ``None`` for a missing record."""
-    return normalize(await client.update(_target(target), **_txn(txn_id)).merge(data))
+    with _sdk_errors():
+        result = await client.update(_target(target), **_txn(txn_id)).merge(data)
+    return normalize(result)
 
 
 async def patch(client: Any, target: Target, ops: list[Any], *, txn_id: UUID | None = None) -> Any:
     """``UPDATE … PATCH`` (JSON Patch *ops*): SDK 3.0's ``update(target).patch(ops)``; ``None`` for a missing record."""
-    return normalize(await client.update(_target(target), **_txn(txn_id)).patch(ops))
+    with _sdk_errors():
+        result = await client.update(_target(target), **_txn(txn_id)).patch(ops)
+    return normalize(result)
 
 
 async def insert(client: Any, table: str | Table, data: Any, *, txn_id: UUID | None = None) -> list[Any]:
     """``INSERT INTO``: the inserted records, always a list."""
-    rows: list[Any] = normalize(await client.insert(_target(table), data, **_txn(txn_id)))
+    with _sdk_errors():
+        result = await client.insert(_target(table), data, **_txn(txn_id))
+    rows: list[Any] = normalize(result)
     return rows
 
 
 async def insert_relation(client: Any, table: str | Table, data: Any, *, txn_id: UUID | None = None) -> list[Any]:
     """``INSERT RELATION INTO``: SDK 3.0's ``insert(table, data, relation=True)``; the edges, always a list."""
-    rows: list[Any] = normalize(await client.insert(_target(table), data, relation=True, **_txn(txn_id)))
+    with _sdk_errors():
+        result = await client.insert(_target(table), data, relation=True, **_txn(txn_id))
+    rows: list[Any] = normalize(result)
     return rows
 
 
 async def delete(client: Any, target: Target, *, txn_id: UUID | None = None) -> Any:
     """``DELETE``: the deleted record(s)."""
-    return normalize(await client.delete(_target(target), **_txn(txn_id)))
+    with _sdk_errors():
+        result = await client.delete(_target(target), **_txn(txn_id))
+    return normalize(result)
 
 
 # --- retired clients ------------------------------------------------------------------------------
 
 
-async def retire(client: Any, reason: str) -> None:
-    """Make *client* refuse every further request with ``reason``, then close it.
+#: How long ``retire()`` waits for the SDK's ``close()``.
+_CLOSE_TIMEOUT = 2.0
 
-    Not implemented yet: the ORM's clients are retired once their construction moves to SDK 3.0.
+
+def is_retired(client: Any) -> bool:
+    """Whether *client* refuses every request (:func:`refuse`)."""
+    connect = getattr(client, "__dict__", {}).get("connect")
+    return getattr(connect, "_orm_refusal", None) is not None
+
+
+def refuse(client: Any, reason: str) -> None:
+    """Make every further request on the WebSocket *client* raise ``SurrealDbConnectionError(reason)``, not retryable.
+
+    Every request path of SDK 3.0's WebSocket client starts with ``connect()``, which opens a new, anonymous socket
+    when the old one is gone. The instance's ``connect`` is replaced by one that raises instead, so the client can
+    never open a socket again. Idempotent: the first reason stays. Not for HTTP clients: they hold no socket, their
+    requests never call ``connect()``, and a kept one sends the token it had (measured, SDK 3.0.0), as with SDK 2.0;
+    nor for the embedded engine, which has no socket either.
     """
-    raise NotImplementedError("retire() is not implemented yet")
+    if is_retired(client) or SdkAsyncWsConnection is None or not isinstance(client, SdkAsyncWsConnection):
+        return
+
+    async def _refuse(*args: Any, **kwargs: Any) -> None:
+        error = SurrealDbConnectionError(reason)
+        error.retryable = False  # type: ignore[attr-defined]
+        raise error
+
+    # The closure holds the reason, never the client: no reference cycle.
+    _refuse._orm_refusal = reason  # type: ignore[attr-defined]
+    client.connect = _refuse  # type: ignore[method-assign]
+
+
+def refuse_on_drop(client: Any, reason: str) -> None:
+    """:func:`refuse` *client* as soon as its WebSocket's reader stops (a drop, or a close).
+
+    A request made on the client between the drop and the ORM replacing it (a reference kept by the application, an
+    open interactive transaction) then fails instead of reconnecting anonymously. A no-op for a client with no reader.
+    """
+    task = getattr(client, "recv_task", None)
+    if not isinstance(task, asyncio.Task):
+        return
+    # A weak reference: the reader's callback must not keep a client the ORM let go of alive.
+    held = weakref.ref(client)
+
+    def _on_done(_task: asyncio.Task[Any]) -> None:
+        dropped = held()
+        if dropped is not None:
+            refuse(dropped, reason)
+
+    task.add_done_callback(_on_done)
+
+
+async def retire(client: Any, reason: str) -> None:
+    """Make *client* refuse every further request with ``reason`` (:func:`refuse`), then close it.
+
+    The refusal is installed **before** ``close()``: SDK 3.0's ``close()`` never reaches ``connect()``
+    (``tests/test_identity_sdk3.py::TestSdkLayout`` pins it), so the close cannot meet the refusal. The close waits at
+    most two seconds, and what it raises is suppressed: the client is being given up either way.
+    """
+    refuse(client, reason)
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(client.close(), _CLOSE_TIMEOUT)
 
 
 # --- values ---------------------------------------------------------------------------------------

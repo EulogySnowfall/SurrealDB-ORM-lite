@@ -10,6 +10,7 @@ call mapping (``merge`` and ``patch`` are ``update(target).merge()``/``.patch()`
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Generator
 from datetime import UTC, datetime
@@ -263,9 +264,35 @@ class TestCrud:
 
 
 class TestRetire:
-    async def test_retire_is_not_implemented_yet(self) -> None:
-        with pytest.raises(NotImplementedError):
-            await _client.retire(_FakeClient(), "closed")
+    """``retire()`` refuses requests on SDK WebSocket clients only (``tests/test_identity_sdk3.py`` covers them): any
+    other client is closed and left as it is."""
+
+    async def test_a_client_without_a_socket_is_closed_but_not_refused(self) -> None:
+        closed: list[bool] = []
+
+        class _Closable:
+            async def close(self) -> None:
+                closed.append(True)
+
+        client = _Closable()
+        await _client.retire(client, "closed")
+
+        assert closed == [True]
+        assert not _client.is_retired(client)
+
+    async def test_a_close_that_raises_or_hangs_is_given_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_client, "_CLOSE_TIMEOUT", 0.01)
+
+        class _Broken:
+            async def close(self) -> None:
+                raise RuntimeError("already gone")
+
+        class _Hanging:
+            async def close(self) -> None:
+                await asyncio.sleep(10)
+
+        await _client.retire(_Broken(), "closed")
+        await _client.retire(_Hanging(), "closed")
 
 
 # --- normalize() ----------------------------------------------------------------------------------

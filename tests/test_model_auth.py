@@ -101,8 +101,8 @@ class TestEphemeralClient:
                 async with SurrealDBConnectionManager.ephemeral_client() as client:
                     captured.append(client)
                     raise RuntimeError("boom")
-            # A closed client refuses further use.
-            with pytest.raises(SurrealError):
+            # A closed client refuses further use, without opening a socket (v0.50.0: it is retired).
+            with pytest.raises(SurrealDbConnectionError, match=r"ephemeral_client\(\) block ended"):
                 await captured[0].info()
         finally:
             await SurrealDBConnectionManager.unset_connection()

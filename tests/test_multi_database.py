@@ -46,6 +46,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     Transaction,
+    _client,
     cache,
     connection_manager,
     embedded,
@@ -689,10 +690,10 @@ async def _root(database: str, url: str | None = None) -> AsyncIterator[Any]:
 
 async def _rows_of(client: Any, table: str) -> list[Any]:
     """The rows of *table* — none when it does not exist (SurrealDB 3.x refuses to select a missing table)."""
-    info = await client.query("INFO FOR DB;", {})
+    info = await _client.query(client, "INFO FOR DB;", {})
     if table not in (info.get("tables") or {}):
         return []
-    return list(await client.query(f"SELECT * FROM {table};", {}))
+    return list(await _client.query(client, f"SELECT * FROM {table};", {}))
 
 
 async def _root_rows(database: str, table: str, url: str | None = None) -> list[Any]:
@@ -769,7 +770,8 @@ class _FakeSocket:
 
 
 class _FakeServerClient:
-    """A WebSocket-like server client: a transport, a live-query table and a ``close()`` that counts its calls."""
+    """A WebSocket-like server client: a transport, a live-query table and a ``close()`` that counts its calls and,
+    as SDK 3.0's does, closes the transport."""
 
     def __init__(self) -> None:
         self.socket = _FakeSocket()
@@ -778,6 +780,7 @@ class _FakeServerClient:
 
     async def close(self) -> None:
         self.close_calls += 1
+        await self.socket.close()
 
 
 class _HttpLikeClient:
@@ -1080,8 +1083,10 @@ class TestReRegistration:
         assert result["closed"] is True
         assert there.socket.closed_on == [result["loop"]]
         assert gone.socket.closed_on == []
-        # The transport only: a client the application kept fails on its next request instead of reopening.
-        assert here.close_calls == there.close_calls == gone.close_calls == 0
+        # v0.50.0: each client is retired — closed on its own loop (an SDK WebSocket client also refuses every further
+        # request, tests/test_identity_sdk3.py); a closed loop's client is only dropped.
+        assert here.close_calls == there.close_calls == 1
+        assert gone.close_calls == 0
 
     async def test_from_a_thread_with_no_running_loop(self) -> None:
         loop = asyncio.get_running_loop()
