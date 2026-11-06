@@ -258,11 +258,11 @@ class TestPagingE2E:
             assert _ranks(await PgItem.objects().order_by("rank").limit(1).cache().exec()) == [1]
 
     async def test_above_2_32(self, kind: str) -> None:
-        """SurrealDB 3.x reads it; 2.x and the embedded engine (2.x core) refuse a ``LIMIT``/``START`` above
-        ``2**32 - 1`` when the read runs."""
+        """SurrealDB 3.x reads it; 2.x and 4.x (the embedded engine's 4.0 core too) refuse a ``LIMIT``/``START``
+        above ``2**32 - 1`` when the read runs."""
         async with paging_db(kind) as client:
             reads = [PgItem.objects().order_by("rank").limit(2**32).offset(3), PgItem.objects().offset(2**32)]
-            if kind == "mem" or line_major(await client.version()) == 2:
+            if kind == "mem" or line_major(await client.version()) != 3:
                 for qs in reads:
                     with pytest.raises(ServerError, match="must evaluate to a positive integer"):
                         await qs.exec()
