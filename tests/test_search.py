@@ -3874,17 +3874,20 @@ class TestDefineIndexesE2E:
     async def test_an_analyzer_and_its_index_in_one_transaction(self, kind: str) -> None:
         """README row "Full-text index" and section 36, Transactions: on a table holding records, a transaction that
         defines an analyzer and then an index using it fails on every SurrealDB server — the server builds the index
-        with the analyzers committed before the transaction began — and succeeds on the embedded engine. Hence
+        with the analyzers committed before the transaction began — and succeeds on SurrealDB 4.x (server and embedded
+        engine). Hence
         ``define_indexes(tx=…)`` defines no analyzer, on every engine."""
         async with _fts(kind) as client:
             keyword_line = await _keyword_line(client)
+            major = await _major(client)
             await _apply_ddl(client, "CREATE fts_note:n1 SET title = 'Physics rocks';")
             index = Index("fts_note_title", "title", search_analyzer=FTS_ENGLISH).ddl("fts_note", line=keyword_line)
             refusals = await _refusals(client, f"BEGIN TRANSACTION; {_A1} {index} COMMIT TRANSACTION;")
             analyzers, _ = await search.read_database_info(client, what="index", kind="definition", subject="table 'fts_note'")
             indexes = await _indexes(client, "fts_note")
-        if kind == "mem":
-            assert refusals == [], "README row 'Full-text index': the embedded engine sees the analyzer"
+        if major >= 4:
+            # SurrealDB 4.x (server and embedded engine) builds the index with the analyzer the transaction defined.
+            assert refusals == [], "README row 'Full-text index': SurrealDB 4.x sees the analyzer"
             assert sorted(analyzers) == ["fts_english"]
             assert sorted(indexes) == ["fts_note_title"]
         else:
@@ -3909,13 +3912,16 @@ class TestDefineIndexesE2E:
         save ``a7`` (or not), define the title index, save ``a8`` (or not). A SurrealDB server commits and leaves ``a7``
         out of the index — on 2.x a write after the index, to a table that held records, fails the commit instead, with
         a retryable conflict that a retry meets again, while on an empty table it commits as on 3.x; the embedded
-        engine indexes every record."""
+        engine's 2.x core indexed every record. SurrealDB 4.x (server and embedded engine) refuses an index defined
+        after a write to its table in the same transaction ("a build without CONCURRENTLY cannot see" those writes):
+        nothing commits; defined before the writes, it commits and indexes every record."""
         async with _fts_models(kind) as client:
             await _apply_ddl(client, _A1)
             if held:
                 await FtsArticle(id="a1", title="Physics a1", slug="a1").save()
             index = FtsArticle.index_ddl(line=await _keyword_line(client))[1]
-            server = None if kind == "mem" else await _major(client)
+            major = await _major(client)
+            server = None if kind == "mem" else major
 
             async def block() -> SurrealDbError | None:
                 try:
@@ -3936,6 +3942,15 @@ class TestDefineIndexesE2E:
             found = _ids(await FtsArticle.objects().search(title="physics").exec()) if indexes else None
         committed = ["a1"] if held else []
         written = sorted([*committed, *before, *after])
+        if major >= 4:
+            if before:
+                assert type(failed) is SurrealDbError and type(retried) is SurrealDbError, "4.x refuses the index"
+                assert "a build without CONCURRENTLY cannot see" in str(failed)
+                assert (rows, indexes) == (committed, {}), "4.x: nothing committed"
+            else:
+                assert failed is None, "4.x commits an index defined before the transaction's writes"
+                assert (rows, sorted(indexes), found) == (written, ["fts_article_title"], written)
+            return
         if server == 2 and after and held:
             assert type(failed) is SurrealDbConflictError, "README section 36, Transactions: 2.x fails the commit"
             assert type(retried) is SurrealDbConflictError, "README section 36, Transactions: a retry meets it again"
@@ -4287,7 +4302,9 @@ class TestViewIndexPinE2E:
             found = await _client.query(client, "SELECT VALUE title FROM fts_view WHERE title @0@ 'physics';", {})
         both = ["Cooking with physics", "Quantum physics for beginners"]
         assert sorted(held) == both
-        if major >= 3:
+        if major >= 4:
+            assert sorted(found) == both, "README section 36, Not supported: SurrealDB 4.x indexes them (#7377 fixed)"
+        elif major >= 3:
             assert found == ["Quantum physics for beginners"], _VIEW_PIN_3X
         else:
             assert sorted(found) == both, "README section 36, Not supported: 2.x and the embedded engine index them"
@@ -5289,11 +5306,11 @@ class TestIndexesDefinedInTheBlockE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_index_defined_then_removed_in_the_block(self, kind: str, table: str) -> None:
         """The v0.37.5 row of the 2.x/3.x table: ``define_indexes(tx=…)``, then ``remove_index(tx=…)`` of that index,
-        not stored before the block. SurrealDB 2.x and the embedded engine commit the block: the index is absent
-        after the commit. SurrealDB 3.x fails the commit with a retryable conflict, whatever the table holds: nothing
-        committed. Either way no index is left, and the table takes writes."""
+        not stored before the block. SurrealDB 2.x commits the block: the index is absent after the commit. SurrealDB
+        3.x and 4.x (the embedded engine's 4.0 core too) fail the commit with a retryable conflict, whatever the table
+        holds: nothing committed. Either way no index is left, and the table takes writes."""
         async with _fts_models(kind) as client:
-            server = None if kind == "mem" else await _major(client)
+            server = await _major(client)
             await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
             if table == "empty-table":
                 await _apply_ddl(client, "DEFINE TABLE `fts_post` SCHEMALESS;")
@@ -5309,14 +5326,12 @@ class TestIndexesDefinedInTheBlockE2E:
             indexes = await _indexes(client, "fts_post")
             created = await _refusals(client, "CREATE fts_post:p2 SET title = 'Physics';")
             kept = await FtsPost.objects().count()
-        assert defined == FtsPost.index_ddl(line=2 if server != 3 else 3)[1:]
+        assert defined == FtsPost.index_ddl(line=2 if server < 3 else 3)[1:]
         assert removed == "REMOVE INDEX IF EXISTS `fts_post_title` ON `fts_post`;"
-        if server == 3:
+        if server >= 3:
             assert type(failed) is SurrealDbConflictError, _DEFINED_REMOVED_PIN_3X
         else:
-            assert failed is None, (
-                "README row 'define_indexes(tx=) then remove_index(tx=)': 2.x and the embedded engine commit it"
-            )
+            assert failed is None, "README row 'define_indexes(tx=) then remove_index(tx=)': 2.x commits it"
         assert indexes == {}
         assert created == []
         assert kept == (2 if table == "table-holding-a-record" else 1)
@@ -5325,13 +5340,13 @@ class TestIndexesDefinedInTheBlockE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_index_stored_before_the_block_redefined_then_removed_in_it(self, kind: str, table: str) -> None:
         """README section 36, Transactions: ``fts_post_title`` stored before the block with ``fts_plain``;
-        ``FtsPostP.define_indexes(tx=…)`` redefines it with ``fts_p``, then ``remove_index(tx=…)`` removes it. The
-        embedded engine commits the block, whatever the table holds, and so does SurrealDB 2.x on an empty table: the
-        index is absent after the commit. SurrealDB 2.x on a table that held records, and 3.x whatever the table holds,
+        ``FtsPostP.define_indexes(tx=…)`` redefines it with ``fts_p``, then ``remove_index(tx=…)`` removes it.
+        SurrealDB 2.x on an empty table commits the block: the index is absent after the commit. SurrealDB 2.x on a
+        table that held records, and 3.x and 4.x (the embedded engine's 4.0 core too) whatever the table holds,
         fail the commit with a retryable conflict that a retry meets again: nothing committed, the index stands as
         before and serves the records committed before the block. Either way the table takes writes."""
         async with _fts_models(kind) as client:
-            server = None if kind == "mem" else await _major(client)
+            server = await _major(client)
             line = await _keyword_line(client)
             held = table == "table-holding-a-record"
             await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
@@ -5358,15 +5373,15 @@ class TestIndexesDefinedInTheBlockE2E:
             kept = await FtsPost.objects().count()
         assert seen["defined"] == FtsPostP.index_ddl(line=line)[1:]
         assert seen["removed"] == "REMOVE INDEX IF EXISTS `fts_post_title` ON `fts_post`;"
-        if server == 3 or (server == 2 and held):
-            pin = _DEFINED_REMOVED_PIN_3X if server == 3 else _STORED_REDEFINED_REMOVED_PIN_2X
+        if server >= 3 or (server == 2 and held):
+            pin = _DEFINED_REMOVED_PIN_3X if server >= 3 else _STORED_REDEFINED_REMOVED_PIN_2X
             assert type(failed) is SurrealDbConflictError, pin
             assert type(retried) is SurrealDbConflictError, pin
             state = indexes["fts_post_title"]
             assert state is not None and state.search_analyzer == "fts_plain"
             assert found == (1 if held else 0)
         else:
-            assert failed is None, "README section 36, Transactions: 2.x on an empty table and the embedded engine commit it"
+            assert failed is None, "README section 36, Transactions: 2.x on an empty table commits it"
             assert indexes == {}
         assert created == []
         assert kept == (2 if held else 1)
@@ -5837,8 +5852,15 @@ class TestLiveIndexCheckE2E:
 # --- the search annotations on the engines --------------------------------------------------------------------------
 
 #: The BM25 scores of ``search(title="physics")`` on the corpus, its index built once in a fresh database: the same on
-#: every engine.
+#: every engine of a line — SurrealDB 2.x and 3.x, then 4.x (server and embedded engine), whose BM25 formula changed.
 _PHYSICS_SCORES = {"a1": 0.543332, "a2": 0.612858}
+_PHYSICS_SCORES_4X = {"a1": 0.951749, "a2": 1.073537}
+
+
+def _physics_scores(major: int) -> dict[str, float]:
+    """:data:`_PHYSICS_SCORES` of the line *major*."""
+    return _PHYSICS_SCORES_4X if major >= 4 else _PHYSICS_SCORES
+
 
 #: The README rows the line pins back.
 _ROW_AND = "README row 'Two search() fields AND-ed'"
@@ -5867,11 +5889,12 @@ class TestAnnotateE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_q3_score_highlight_and_offsets(self, kind: str) -> None:
-        async with _corpus(kind):
+        async with _corpus(kind) as client:
+            scores = _physics_scores(await _major(client))
             articles = await _q3("physics").exec()
         assert [article.id for article in articles] == ["a2", "a1"]
         assert all(isinstance(article, FtsArticle) for article in articles)
-        assert [article.relevance for article in articles] == [_approx(0.612858), _approx(0.543332)]
+        assert [article.relevance for article in articles] == [_approx(scores["a2"]), _approx(scores["a1"])]
         assert articles[0].relevance > articles[1].relevance > 0
         assert [article.snippet for article in articles] == [
             "Cooking with <b>physics</b>",
@@ -5956,7 +5979,8 @@ class TestAnnotateE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_first_and_get_without_an_id(self, kind: str) -> None:
-        async with _corpus(kind):
+        async with _corpus(kind) as client:
+            scores = _physics_scores(await _major(client))
             first = await _q3("physics").first()
             got = (
                 await FtsArticle.objects()
@@ -5964,7 +5988,7 @@ class TestAnnotateE2E:
                 .annotate(relevance=SearchScore(0), snippet=SearchHighlight())
                 .get()
             )
-        assert (first.id, first.relevance, first.snippet) == ("a2", _approx(0.612858), "Cooking with <b>physics</b>")
+        assert (first.id, first.relevance, first.snippet) == ("a2", _approx(scores["a2"]), "Cooking with <b>physics</b>")
         assert first.spans == {"0": [{"s": 13, "e": 20}]}
         assert (got.id, got.snippet) == ("a2", "<b>Cooking</b> with physics")
         assert got.relevance > 0
@@ -5998,8 +6022,9 @@ class TestSearchLinesE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_term_in_more_than_half_the_documents(self, kind: str) -> None:
         """README row "BM25 score of a term in more than half the documents (``SearchScore``)": SurrealDB 3.x gives
-        it no weight (``0.0``); 2.x and the embedded engine score it below zero, so a text holding it scores lower
-        than without it. The records matched are the same."""
+        it no weight (``0.0``); 2.x scores it below zero, so a text holding it scores lower than without it; 4.x
+        (server and embedded engine) gives it a positive weight, so a text holding it scores higher. The records
+        matched are the same."""
         async with _corpus(kind) as client:
             major = await _major(client)
             common = await _scores(body="and")
@@ -6007,7 +6032,10 @@ class TestSearchLinesE2E:
             alone = await _scores(body="physics")
         assert sorted(common) == ["a2", "a3", "a4", "a6"]
         assert sorted(mixed) == sorted(alone) == ["a2"]
-        if major >= 3:
+        if major >= 4:
+            assert all(score > 0 for score in common.values()), f"{_ROW_COMMON}: 4.x gives it a positive weight"
+            assert mixed["a2"] > alone["a2"], f"{_ROW_COMMON}: on 4.x a text holding the term scores higher"
+        elif major >= 3:
             assert all(score == 0.0 for score in common.values()), f"{_ROW_COMMON}: 3.x scores 0.0"
             assert mixed["a2"] == _approx(alone["a2"]), f"{_ROW_COMMON}: on 3.x the term adds nothing"
         else:
@@ -6024,7 +6052,7 @@ class TestSearchLinesE2E:
             fresh = await _scores(title="physics")
             await _apply_ddl(client, _REBUILD_TITLE)
             rebuilt = await _scores(title="physics")
-        assert fresh == {key: _approx(value) for key, value in _PHYSICS_SCORES.items()}, "an index built once"
+        assert fresh == {key: _approx(value) for key, value in _physics_scores(major).items()}, "an index built once"
         assert sorted(rebuilt) == ["a1", "a2"], f"{_ROW_STATISTICS}: the matches are unaffected"
         if major >= 3:
             assert rebuilt == {key: _approx(value) for key, value in fresh.items()}, (
@@ -6048,7 +6076,7 @@ class TestSearchLinesE2E:
             await knitting.delete()
             after = await _scores(title="physics")
             stored = _ids(await FtsArticle.objects().all())
-        assert fresh == {key: _approx(value) for key, value in _PHYSICS_SCORES.items()}, "an index built once"
+        assert fresh == {key: _approx(value) for key, value in _physics_scores(major).items()}, "an index built once"
         assert stored == ["a1", "a2", "a3", "a4", "a5", "a6"]
         assert sorted(after) == ["a1", "a2"], f"{_ROW_STATISTICS}: the matches are unaffected"
         if major >= 3:
@@ -6321,11 +6349,23 @@ class TestSearchTransactionsE2E:
         holding records. Interactive (SurrealDB 3.x over WebSocket): the indexes serve at once the search of a record
         the transaction then writes. Buffered (HTTP, SurrealDB 2.x, the embedded engine): they are applied at the
         commit. After the commit the search finds the records written before the transaction (and the one written in
-        it)."""
+        it). SurrealDB 4.x, interactive: an index defined in the transaction serves no search in it — the search is
+        refused as on a field without a full-text index, the block rolls back and no index is left."""
         async with _fts_models(kind) as client:
             interactive = await _native_transactions(kind, client)
             await _apply_ddl(client, _A1)
             await _seed()
+            if interactive and await _major(client) >= 4:
+                with pytest.raises(SurrealDbError) as refused:
+                    async with SurrealDBConnectionManager.transaction("fts") as tx:
+                        await FtsArticle.define_indexes(tx=tx)
+                        await FtsArticle(id="a7", title="Physics of knitting", slug="a7").save(tx=tx)
+                        await FtsArticle.objects(tx=tx).search(title="knitting").exec()
+                assert type(refused.value) is SurrealDbError
+                assert str(refused.value) == search.search_index_refused(["title"])
+                assert await _indexes(client) == {}
+                assert _ids(await FtsArticle.objects().exec()) == ["a1", "a2", "a3", "a4", "a5", "a6"]
+                return
             inside: list[str] | None = None
             async with SurrealDBConnectionManager.transaction("fts") as tx:
                 assert await FtsArticle.define_indexes(tx=tx) == FtsArticle.index_ddl(line=await _keyword_line(client))[1:]
