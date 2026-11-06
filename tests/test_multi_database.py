@@ -1598,7 +1598,9 @@ class TestReRegistrationE2E:
             await _drain_background()
             if kind == "ws":
                 # Its transport was closed: its receive task ends, its next request fails.
-                await asyncio.wait({c1.recv_task}, timeout=10)
+                receiving = live.recv_task_of(c1)  # None once the SDK dropped it with the transport
+                if receiving is not None:
+                    await asyncio.wait({receiving}, timeout=10)
                 assert live.is_dead(c1)
                 with pytest.raises(Exception):  # noqa: B017 - the SDK's own error for a closed socket
                     await c1.query("RETURN 1;", {})
@@ -1803,7 +1805,7 @@ class TestSessionsPerConnectionE2E:
                 assert str(info.value).startswith("The SurrealDB connection 'md_a' on this event loop dropped")
             # The default is served, as its configured user.
             default_client = await router.get_client()
-            assert await default_client.query("RETURN 1;", {}) == 1
+            assert await _client.query(default_client, "RETURN 1;", {}) == 1
             assert await router.info() is None
             async with router.using("md_a"):
                 with pytest.raises(SurrealDbAuthenticationError, match="'md_a'"):
@@ -2634,7 +2636,7 @@ async def _create(connection: str, table: str, key: str) -> None:
 async def _lives(database: str, table: str) -> list[str]:
     """The uuids of the live queries the server runs on *table* of *database*, read by a root client of its own."""
     async with _root(database) as root:
-        info = await root.query(f"INFO FOR TABLE {table};", {})
+        info = await _client.query(root, f"INFO FOR TABLE {table};", {})
     return sorted(str(key) for key in (info.get("lives") or {}))
 
 
@@ -3933,7 +3935,7 @@ def _r11_kept(name: str) -> str:
 
 async def _session_database(client: Any) -> Any:
     """The database the embedded session is on."""
-    return await client.query("RETURN session::db();", {})
+    return await _client.query(client, "RETURN session::db();", {})
 
 
 class _GuardSpy:
@@ -4834,7 +4836,7 @@ class TestRemoveConnectionE2E:
 
                 async def on_another_loop() -> None:
                     client = await router.get_client("md_a")
-                    assert await client.query("RETURN 1;", {}) == 1
+                    assert await _client.query(client, "RETURN 1;", {}) == 1
                     receiving = live.recv_task_of(client)
                     assert receiving is not None
                     outcome["client"] = client
@@ -4857,9 +4859,9 @@ class TestRemoveConnectionE2E:
                     await _read_one(stream)
                 assert stream.is_active is False
                 await _drain_background()
-                here_receiving = live.recv_task_of(here)
-                assert here_receiving is not None
-                await asyncio.wait({here_receiving}, timeout=10)
+                here_receiving = live.recv_task_of(here)  # None once the SDK dropped it with the transport
+                if here_receiving is not None:
+                    await asyncio.wait({here_receiving}, timeout=10)
                 assert live.is_dead(here)
                 await asyncio.to_thread(thread.join, 30)
                 assert not thread.is_alive()

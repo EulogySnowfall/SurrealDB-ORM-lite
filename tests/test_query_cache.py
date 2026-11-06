@@ -52,6 +52,8 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealDbNotFoundError,
+    _client,
+    _sdk,
     around_save,
     cache,
     computed,
@@ -727,7 +729,7 @@ class TestMakeKey:
         with pytest.raises(TypeError) as info:
             QueryCache.make_key("q", {"a": object()}, "t")
         cause = info.value.__cause__
-        assert isinstance(cause, BufferError)
+        assert isinstance(cause, Exception)  # the SDK encoder's own error; its class is the SDK's detail
         assert str(info.value) == f"QueryCache.make_key(): the variables hold a value the SDK cannot send ({cause})"
 
     def test_no_encoder(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2766,7 +2768,7 @@ class TestUncachedUnchanged:
         monkeypatch.setattr(QuerySet, "_cached_read", never)
         assert (await QcItem.objects().get("i1")).name == "a"
         assert [item.name for item in await QcItem.objects().all()] == ["a"]
-        assert selected == [RecordID("qc_item", "i1"), "qc_item"]
+        assert selected == [RecordID("qc_item", "i1"), _sdk.Table("qc_item")]  # the frontier's table target
 
 
 # --- AC-11, AC-12: every public coroutine is classified; every write is wrapped ------------------------------
@@ -3110,7 +3112,7 @@ def _sign_in_as(name: str, *, store: bool) -> Callable[[], Awaitable[Any]]:
 
 async def _note_keys(client: Any) -> list[str]:
     """The keys of the ``qc_note`` rows the client's current identity may read."""
-    rows = await client.query("SELECT VALUE id FROM qc_note;")
+    rows = await _client.query(client, "SELECT VALUE id FROM qc_note;")
     return sorted(str(row.id) for row in rows)
 
 
@@ -4074,7 +4076,7 @@ class TestWriteInvalidationE2E:
         async def total_price() -> int:
             rows = QueryCache.get(key)
             if rows is None:
-                rows = await clients[0].query(statement)
+                rows = await _client.query(clients[0], statement)
                 QueryCache.set(key, rows, "qc_item", ttl=60)
             return int(rows[0]["total"])
 

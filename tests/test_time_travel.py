@@ -50,6 +50,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     SurrealFunc,
+    _client,
     _sdk,
     pre_delete,
     pre_save,
@@ -787,7 +788,7 @@ async def history_db(tmp_path: Path) -> AsyncIterator[Any]:
 
 async def _now(client: Any) -> datetime:
     """The database's clock, never the host's (spec §9)."""
-    moment = await client.query("RETURN time::now();")
+    moment = await _client.query(client, "RETURN time::now();")
     assert isinstance(moment, datetime)
     return moment
 
@@ -1942,8 +1943,8 @@ class TestRefusedBulkCreateInTransactionE2E:
                     await SnapIndexed.objects(tx=tx).bulk_create([SnapIndexed(id="b", name="Bob"), snapshot])
                 written = (tx._records_written(), tx._cache_written())
                 applied = await SnapIndexed.define_indexes(tx=tx)
-            info = await client.query("INFO FOR TABLE snap_indexed;", {})
-            rows = await client.query("SELECT * FROM snap_indexed;", {})
+            info = await _client.query(client, "INFO FOR TABLE snap_indexed;", {})
+            rows = await _client.query(client, "SELECT * FROM snap_indexed;", {})
         assert type(raised.value) is SurrealDbError
         assert str(raised.value) == time_travel.snapshot_write_refused("SnapIndexed", "bulk_create()", M2021)
         assert written == (frozenset(), frozenset())
