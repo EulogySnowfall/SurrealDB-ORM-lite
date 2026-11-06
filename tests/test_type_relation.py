@@ -1231,7 +1231,11 @@ class _GuardClient:
         self.queries: list[str] = []
         self.version_calls = 0
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if statement == _INFO:
@@ -1927,12 +1931,17 @@ class _RefusingClient:
         self.error = error
         self.calls: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         self.calls.append(statement)
         raise self.error
 
-    async def insert_relation(self, table: str, data: object) -> object:
-        self.calls.append(f"insert_relation({table!r})")
+    async def insert(self, table: object, data: object, *, relation: bool = False) -> object:
+        """SDK 3.0's ``insert()``; ``relation=True`` is ``INSERT RELATION``."""
+        self.calls.append(f"insert_relation({str(table)!r})" if relation else f"insert({str(table)!r})")
         raise self.error
 
 

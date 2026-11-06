@@ -1384,7 +1384,11 @@ class _InfoClient:
         self.error = error
         self.queries: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if self.error is not None:
@@ -1750,7 +1754,11 @@ class _TablesClient:
         self.error = error
         self.queries: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if self.error is not None:
@@ -2734,7 +2742,11 @@ class _LiveClient:
         self.check = check
         self.calls: list[str] = []
 
-    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         self.calls.append(query)
         if not query.startswith("RETURN "):
             return _LIVE_ID

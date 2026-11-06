@@ -1712,7 +1712,11 @@ class _RaisingClient:
         self.probe = probe
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         self.calls.append((query, dict(variables or {})))
         if query != TABLE_PROBE:
             raise self.error
@@ -2289,7 +2293,11 @@ class _LiveClient:
         self.check = check
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         self.calls.append((query, dict(variables or {})))
         if not query.startswith("RETURN "):
             return _LIVE_ID

@@ -130,6 +130,7 @@ from surreal_orm_lite.schema import (
 from surreal_orm_lite.subquery import SubqueryCompiler
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import apply_ddl_statements
+from tests import _sdk_calls
 from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
 from tests._readme_tables import SERVER_BEHAVIOUR as _SERVER_BEHAVIOUR
 from tests._readme_tables import (
@@ -1714,7 +1715,11 @@ class _RefusingClient:
         self.error = error
         self.queries: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         self.queries.append(statement)
         raise self.error
 
@@ -1872,7 +1877,11 @@ class _GuardClient:
         self.queries: list[str] = []
         self.version_calls = 0
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if statement == _INFO:
@@ -3122,19 +3131,8 @@ _M6 = (
 )
 
 #: The SDK methods a refused write must reach none of (AC-6).
-_SDK_METHODS = (
-    "query",
-    "query_raw",
-    "create",
-    "insert",
-    "insert_relation",
-    "update",
-    "merge",
-    "patch",
-    "upsert",
-    "delete",
-    "select",
-)
+#: Every request function of the SDK 3.0 frontier (``surreal_orm_lite._client``).
+_SDK_METHODS = (*_sdk_calls.QUERIES, *_sdk_calls.CRUD)
 
 
 class MvOrder(BaseSurrealModel):
@@ -3216,21 +3214,8 @@ async def _rows(client: Any, table: str) -> list[dict[str, Any]]:
 
 
 def _spy_sdk(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
-    """Record the name of every SDK method of :data:`_SDK_METHODS` *client* is called with (and let it through)."""
-    calls: list[str] = []
-
-    def recording(method: str) -> Any:
-        real = getattr(client, method)
-
-        async def call(*args: object, **kwargs: object) -> object:
-            calls.append(method)
-            return await real(*args, **kwargs)
-
-        return call
-
-    for method in _SDK_METHODS:
-        monkeypatch.setattr(client, method, recording(method))
-    return calls
+    """Record the name of every frontier request of :data:`_SDK_METHODS` made for *client* (and let it through)."""
+    return _sdk_calls.record(monkeypatch, client, *_SDK_METHODS, entry=lambda call: call.name)
 
 
 class TestViewWritesE2E:

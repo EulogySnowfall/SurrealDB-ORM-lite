@@ -211,7 +211,11 @@ class _FakeClient:
         self.errors = dict(errors or {})
         self.calls: list[tuple[str, object, tuple[object, ...], dict[str, object]]] = []
 
-    async def query(self, sql: str, vars: object = None, *args: object, **kwargs: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, sql: str, vars: object = None, *args: object, **kwargs: object) -> object:
         self.calls.append((sql, vars, args, kwargs))
         if sql in self.errors:
             raise self.errors[sql]

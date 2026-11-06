@@ -834,20 +834,23 @@ async def _native_txn_supported() -> bool:
 
 
 class _InsertRelationSpy:
-    """Stands in for the connected SDK client's ``insert_relation()``: records each call, then forwards it."""
+    """Stands in for the frontier's ``_client.insert_relation()`` (SDK 3.0's ``insert(..., relation=True)``): records
+    each call made for *client*, then forwards it."""
 
     def __init__(self, client: Any) -> None:
         self.calls: list[tuple[Any, Any]] = []
-        self._forward = client.insert_relation
+        self._owner = id(client)
+        self._forward = _client.insert_relation
 
-    async def __call__(self, table: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
-        self.calls.append((table, data))
-        return await self._forward(table, data, *args, **kwargs)
+    async def __call__(self, client: Any, table: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
+        if id(client) == self._owner:
+            self.calls.append((table, data))
+        return await self._forward(client, table, data, *args, **kwargs)
 
 
 def _spy_insert_relation(monkeypatch: pytest.MonkeyPatch, client: Any) -> _InsertRelationSpy:
     spy = _InsertRelationSpy(client)
-    monkeypatch.setattr(client, "insert_relation", spy)
+    monkeypatch.setattr(_client, "insert_relation", spy)
     return spy
 
 
@@ -1988,14 +1991,20 @@ class _RecordingClient:
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
 
-    async def query(self, q: str, v: dict[str, Any] | None = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, q: str, v: dict[str, Any] | None = None) -> Any:
         self.calls.append((q, v))
         return []
 
-    async def insert_relation(self, table: str, data: Any) -> Any:
-        self.calls.append(("insert_relation", table, data))
+    async def insert(self, table: Any, data: Any, *, relation: bool = False) -> Any:
+        """SDK 3.0's ``insert()``; ``relation=True`` is ``INSERT RELATION``."""
+        assert relation, "an edge write is an INSERT RELATION"
+        self.calls.append(("insert_relation", str(table), data))
         rows = data if isinstance(data, list) else [data]
-        return [{**r, "id": RecordID(table, f"stub{i}")} for i, r in enumerate(rows)]
+        return [{**r, "id": RecordID(str(table), f"stub{i}")} for i, r in enumerate(rows)]
 
 
 @pytest.fixture

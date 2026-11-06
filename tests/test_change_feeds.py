@@ -709,7 +709,11 @@ class _FakeServer3x:
     async def version(self) -> str:
         return "surrealdb-3.3.3"
 
-    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, sql: str, variables: dict[str, Any]) -> Any:
         await asyncio.sleep(0)
         if sql.startswith("INFO FOR DB"):
             return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}
@@ -841,7 +845,11 @@ class _CancelRaceClient:
     async def version(self) -> str:
         return "surrealdb-2.7.0"
 
-    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, sql: str, variables: dict[str, Any]) -> Any:
         await asyncio.sleep(0)
         if sql.startswith("INFO FOR DB"):
             return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}

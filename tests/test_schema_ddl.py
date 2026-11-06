@@ -1351,7 +1351,11 @@ class _FakeClient:
         self.queries: list[tuple[str, object]] = []
         self.version_calls = 0
 
-    async def query(self, statement: str, variables: object) -> list[object]:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> list[object]:
         self.queries.append((statement, variables))
         if self.error is not None:
             raise self.error
@@ -1759,7 +1763,11 @@ class _OvertakenReads:
         self.drop = drop
         self.reads = 0
 
-    async def query(self, statement: str, variables: Mapping[str, Any]) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: Mapping[str, Any]) -> Any:
         assert (statement, variables) == ("INFO FOR DB;", {})
         self.reads += 1
         if self.reads <= self.drops:

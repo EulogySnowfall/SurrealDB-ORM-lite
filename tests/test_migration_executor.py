@@ -374,7 +374,11 @@ class _FakeClient:
             raise answer
         return answer
 
-    async def query(self, query: str, variables: Any = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, query: str, variables: Any = None) -> Any:
         if self.read_error is not None:
             raise self.read_error
         if self.rows is not None:

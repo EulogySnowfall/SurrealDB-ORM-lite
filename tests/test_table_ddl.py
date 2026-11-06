@@ -3210,7 +3210,11 @@ class _InfoClient:
         self.error = error
         self.queries: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if self.error is not None:
@@ -3571,7 +3575,11 @@ class _TableClient:
         self.version_calls = 0
         self.version_at: int | None = None
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if statement == _INFO:
