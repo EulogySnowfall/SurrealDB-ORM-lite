@@ -3581,7 +3581,7 @@ class TestDefineViewE2E:
         """AC-10 (M10, D14): ``define_view()`` then ``define_events()`` puts the event on the view; the next
         ``define_view()`` (``OVERWRITE``) drops it, the next ``define_events()`` restores it, and it fires on a source
         write. Measured with orders saved (``filled``), over WebSocket and HTTP: on 3.3 the event fires once per group
-        the ``OVERWRITE`` recomputes, then is dropped; 2.x and the embedded engine drop it first; 3.1 refuses
+        the ``OVERWRITE`` recomputes, then is dropped; 2.x and 4.x (the embedded engine too) drop it first; 3.1 refuses
         ``OVERWRITE`` on a view that holds records (S3: the view and its event are kept) and drops the event of an
         empty view as every line does."""
         async with _mv(kind) as client:
@@ -3606,7 +3606,7 @@ class TestDefineViewE2E:
             else:
                 assert await MvStatsEvents.define_view() == MvStatsEvents.view_ddl()
                 assert await _events_info(client, "mv_order_stats") == {}
-                fired = 2 if filled and line[0] >= 3 else 0
+                fired = 2 if filled and line[0] == 3 else 0
             assert len(await _rows(client, "mv_log")) == fired
             assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
             assert await _groups() == ({"new": (1, 1.0), "paid": (2, 15.5)} if filled else {})
@@ -3660,9 +3660,15 @@ class TestViewGuardE2E:
             assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
             assert "mv_seen" not in await _events_info(client, "mv_order_stats")
             # Measured: on 3.x the event, defined before the OVERWRITE, fired once per group the view was filled
-            # with, and was dropped after; 2.x and the embedded engine dropped it first.
-            assert len(await _rows(client, "mv_log")) == (2 if await _major(client) >= 3 else 0)
-            logged = len(await _rows(client, "mv_log"))
+            # with, and was dropped after; 2.x and 4.x (the embedded engine too) dropped it first. 4.x reads the
+            # table the event never created as missing.
+            major = await _major(client)
+            if major >= 4:
+                assert "mv_log" not in await _tables(client)
+                logged = 0
+            else:
+                assert len(await _rows(client, "mv_log")) == (2 if major == 3 else 0)
+                logged = len(await _rows(client, "mv_log"))
             await MvStatsEvents.define_events()
             assert list(await _events_info(client, "mv_order_stats")) == ["mv_seen"]
             await MvOrder(id="o4", status="paid", amount=1.0).save()
@@ -3896,7 +3902,8 @@ class TestViewLinesE2E:
             await MvStats.define_view()
             major = await _major(client)
             [raw] = await _client.query(client, "SELECT revenue FROM mv_order_stats:['paid'];", {})
-            assert (type(raw["revenue"]), raw["revenue"]) == ((float, 20.0) if major >= 3 else (int, 20))
+            # ``math::sum()`` of integers: an int on 2.x and 4.x, a float on 3.x (M5, measured on 4.0.0).
+            assert (type(raw["revenue"]), raw["revenue"]) == ((float, 20.0) if major == 3 else (int, 20))
             stats = await MvStats.objects().get(RecordID("mv_order_stats", ["paid"]))
             assert (type(stats.revenue), stats.revenue) == (float, 20.0)
             await _apply_ddl(
@@ -3964,10 +3971,16 @@ class TestViewLinesE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_m8_a_source_write_without_the_aggregated_field(self, kind: str) -> None:
-        """M8 (surrealdb#7447), every line: with ``math::sum(amount)`` in a view, a source write without ``amount`` is
-        refused by the server, unchanged by the ORM; ``math::sum(amount ?? 0)`` lets it through."""
+        """M8 (surrealdb#7447), 2.x and 3.x: with ``math::sum(amount)`` in a view, a source write without ``amount``
+        is refused by the server, unchanged by the ORM; ``math::sum(amount ?? 0)`` lets it through. SurrealDB 4.x
+        accepts the write and sums the missing field as ``0``."""
         async with _mv(kind) as client:
             await MvStats.define_view()
+            if await _major(client) >= 4:
+                await MvOrder(id="x", status="paid").save()
+                stats = await _client.query(client, "SELECT revenue, total FROM mv_order_stats:['paid'];", {})
+                assert stats == [{"revenue": 0, "total": 1}], "4.x sums a missing field as 0"
+                return
             with pytest.raises(InternalError) as raised:
                 await MvOrder(id="x", status="paid").save()
             assert "math::sum()" in str(raised.value)
@@ -4489,12 +4502,13 @@ class TestViewReadsE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_raw_id_in_on_a_view_per_line(self, kind: str) -> None:
         """The raw ``id IN`` the ORM avoids on a view table: no record on SurrealDB 3.x (3.1 and 3.3 measured), both
-        on 2.x and the embedded engine. Fails on purpose when a 3.x release answers it again."""
+        on 2.x and 4.x (surrealdb/surrealdb#7608 fixed there; the embedded engine's 4.0 core too). Fails on purpose
+        when a 3.x release answers it again."""
         async with _mv(kind) as client:
             await _save_orders()
             await MvStats.define_view()
             answer = await _client.query(client, "SELECT VALUE id FROM mv_order_stats WHERE id IN $ids", {"ids": [_PAID, _NEW]})
-            if await _major(client) >= 3:
+            if await _major(client) == 3:
                 if answer != []:
                     pytest.fail(_ID_IN_FIXED)
             else:
