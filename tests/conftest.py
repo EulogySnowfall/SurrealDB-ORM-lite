@@ -47,6 +47,10 @@ vector search, ``tests/test_factories.py`` (v0.40.0), whose factories build and 
 Faker values, and ``tests/test_pytest_plugin.py`` (v0.40.0), whose pytester inner sessions run in the same
 process under the outer test's guard and may write any value. A new test that needs rich values goes into one of them — never add a pre-existing
 module to that set.
+
+**The SDK call frontier (v0.50.0) is watched at run time.** ``pytest_configure`` below registers
+``tests/_frontier_spy.py`` for the whole session: it records every SDK data call a ``surreal_orm_lite`` module makes
+without going through ``surreal_orm_lite._client`` (mode from ``ORM_FRONTIER_SPY``: ``enforce``, ``report``, ``off``).
 """
 
 import asyncio
@@ -61,7 +65,14 @@ import pytest_asyncio
 
 from surreal_orm_lite import SurrealDBConnectionManager, connection_manager, encoding
 from surreal_orm_lite.testing import embedded_database
+from tests import _frontier_spy
 from tests._retry import apply_reset
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the runtime frontier check for the session (``tests/_frontier_spy.py``)."""
+    _frontier_spy.register(config)
+
 
 #: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
 #: hook, v0.25.0's embedded engine, v0.26.0's time travel, v0.27.0's subqueries, v0.28.0's query cache,
