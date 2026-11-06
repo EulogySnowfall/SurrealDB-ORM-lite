@@ -94,6 +94,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     Var,
     VectorField,
+    _client,
     hybrid,
     search,
     vector,
@@ -2625,7 +2626,7 @@ async def _setup_sl(client: Any) -> None:
     compaction (measured on 3.3.4)."""
     await _setup(client, HySl)
     await _apply_ddl(client, _SL_UPDATE)
-    stored = await client.query("SELECT * FROM hy_sl;", {})
+    stored = await _client.query(client, "SELECT * FROM hy_sl;", {})
     assert len(stored) == 8
     for row in stored:
         assert {column: row.get(column) for column in _SL_STORED} == _SL_STORED, row
@@ -2932,7 +2933,7 @@ class TestHybridTransactionsE2E:
                     with pytest.raises(SurrealDbError) as read:
                         await HyDoc.objects(tx=tx).hybrid_search(**{**_ARGS, "text_field": "category"})
                     await HyDoc(id="d9", title="Go programming", embedding=[0.95, 0.05, 0.0]).save(tx=tx)
-            stored = await client.query("SELECT VALUE id FROM hy_doc;", {})
+            stored = await _client.query(client, "SELECT VALUE id FROM hy_doc;", {})
         assert read is not None
         assert type(read.value) is SurrealDbError
         assert str(read.value) == _HS1_CATEGORY
@@ -2981,7 +2982,7 @@ class TestHybridLinePinsE2E:
             rows: list[dict[str, Any]] | None = None
             refused: pytest.ExceptionInfo[Exception] | None = None
             if major >= 3:
-                rows = await client.query(_PIN_RRF, {})
+                rows = await _client.query(client, _PIN_RRF, {})
             else:
                 with pytest.raises((InternalError, RuntimeError)) as refused:
                     await client.query(_PIN_RRF, {})
@@ -3006,7 +3007,7 @@ class TestHybridLinePinsE2E:
             rows: list[dict[str, Any]] | None = None
             refused: pytest.ExceptionInfo[Exception] | None = None
             if major >= 3:
-                rows = await client.query(_PIN_RRF_FORMULA, {})
+                rows = await _client.query(client, _PIN_RRF_FORMULA, {})
             else:
                 with pytest.raises((InternalError, RuntimeError)) as refused:
                     await client.query(_PIN_RRF_FORMULA, {})

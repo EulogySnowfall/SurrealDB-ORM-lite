@@ -16,7 +16,7 @@ import asyncio
 import re
 from typing import Any
 
-from surreal_orm_lite import BaseSurrealModel
+from surreal_orm_lite import BaseSurrealModel, _client
 
 #: How long the wait gives a compaction before it fails the test: forty times the longest one measured.
 COMPACTION_TIMEOUT = 10.0
@@ -44,7 +44,7 @@ async def wait_for_compaction(client: Any, index: str, table: str, *, timeout: f
     statement = f"INFO FOR INDEX {index} ON {table};"
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
-        info = await client.query(statement, {})
+        info = await _client.query(client, statement, {})
         building = info.get("building") if isinstance(info, dict) else None
         if not isinstance(building, dict):
             raise AssertionError(f"{statement} answered no building state: {info!r}")

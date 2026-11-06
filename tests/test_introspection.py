@@ -62,6 +62,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     TableState,
+    _client,
     generate_models_from_db,
 )
 from surreal_orm_lite import introspection as introspection_module
@@ -2076,7 +2077,7 @@ _TOKEN = uuid.UUID("0190d3b4-0000-7000-8000-000000000000")
 
 async def _row(client: Any, record: str) -> object:
     """The stored row of *record* without ``id`` and ``created`` (the column the model does not hold)."""
-    rows = await client.query(f"SELECT * OMIT id, created FROM {record};", {})
+    rows = await _client.query(client, f"SELECT * OMIT id, created FROM {record};", {})
     assert isinstance(rows, list) and len(rows) == 1, rows
     return rows[0]
 
@@ -2150,7 +2151,7 @@ DEFINE FIELD prefs.seen ON isp_sfo TYPE option<datetime> DEFAULT time::now();
 async def _stored_at(client: Any, record: RecordID, column: str) -> list[object]:
     """``prefs.<column>`` of *record* as the SDK reads it, then as the server writes it (nanoseconds included)."""
     query = f"SELECT VALUE [prefs.{column}, <string> prefs.{column}] FROM ONLY $rid;"  # column: a constant of the test
-    values = await client.query(query, {"rid": record})
+    values = await _client.query(client, query, {"rid": record})
     assert isinstance(values, list) and len(values) == 2, values
     return values
 

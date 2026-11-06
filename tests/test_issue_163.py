@@ -17,7 +17,7 @@ import threading
 import pytest
 
 import surreal_orm_lite
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
 from tests.conftest import default_connection_class
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
@@ -75,7 +75,7 @@ def test_two_successive_asyncio_run_calls(url: str) -> None:
 
     async def work() -> int:
         client = await SurrealDBConnectionManager.get_client()
-        rows = await client.query("RETURN 1;")
+        rows = await _client.query(client, "RETURN 1;")
         await SurrealDBConnectionManager.close_connection()
         return rows
 
@@ -93,7 +93,7 @@ def test_second_run_without_an_explicit_close() -> None:
 
     async def work() -> int:
         client = await SurrealDBConnectionManager.get_client()
-        return await client.query("RETURN 1;")
+        return await _client.query(client, "RETURN 1;")
 
     assert _run(work()) == 1
     assert _run(work()) == 1
@@ -140,7 +140,7 @@ def test_two_live_loops_keep_their_own_client() -> None:
     async def second_loop() -> None:
         client = await SurrealDBConnectionManager.get_client()
         results["second_client"] = id(client)
-        results["second_query"] = await client.query("RETURN 2;")
+        results["second_query"] = await _client.query(client, "RETURN 2;")
         await SurrealDBConnectionManager.close_connection()
 
     _run(second_loop())
@@ -216,7 +216,7 @@ async def test_context_manager_still_works() -> None:
     _connect(HTTP_URL)
 
     async with SurrealDBConnectionManager() as client:
-        assert await client.query("RETURN 1;") == 1
+        assert await _client.query(client, "RETURN 1;") == 1
     assert len(_cache()) == 0
 
 

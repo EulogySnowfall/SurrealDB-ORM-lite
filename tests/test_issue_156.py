@@ -310,7 +310,7 @@ class TestIssue156E2E:
             await Issue156Model.objects().update_or_create(defaults={"age": 2, "nope": "x"}, name="bob")
 
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        rows = await client.query("SELECT * FROM Issue156Model WHERE name = 'bob';")
+        rows = await _client.query(client, "SELECT * FROM Issue156Model WHERE name = 'bob';")
         assert "nope" not in rows[0], "an undeclared key must never be written to the row"
 
     async def test_get_or_create_rejects_undeclared_keys(self) -> None:

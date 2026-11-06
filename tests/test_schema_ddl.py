@@ -54,6 +54,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     Transaction,
+    _client,
     schema,
 )
 from surreal_orm_lite._sdk import ServerError
@@ -2167,14 +2168,14 @@ async def _wait_rows(queryset: Any, n: int, timeout: float = 5.0) -> list[Any]:
 
 async def _events_info(client: Any, table: str) -> dict[str, str]:
     """The ``events`` of ``INFO FOR TABLE`` *table* (a constant name of these tests): name → definition."""
-    info = await client.query(f"INFO FOR TABLE {table};", {})
+    info = await _client.query(client, f"INFO FOR TABLE {table};", {})
     return dict(info["events"])
 
 
 async def _log(client: Any) -> list[tuple[Any, ...]]:
     """Every ``ev_log`` row as ``(kind, rid, old, new, name)`` — ``rid`` as text, an absent column ``None`` —,
     sorted (row ids are random)."""
-    rows = await client.query("SELECT * FROM ev_log;", {})
+    rows = await _client.query(client, "SELECT * FROM ev_log;", {})
     return _sorted(
         (
             row.get("kind"),
@@ -2345,7 +2346,7 @@ class TestEventsE2E:
                 await client.query("CREATE ev_person:a SET k = 1;", {})
             with pytest.raises(ServerError) as failed:
                 await client.query("CREATE ev_person:b SET k = 2;", {})
-            assert await client.query("SELECT * FROM ev_person;", {}) == []
+            assert await _client.query(client, "SELECT * FROM ev_person;", {}) == []
             major = await _major(client)
         assert type(thrown.value).__name__ == type(failed.value).__name__ == "InternalError"
         cause = "Database record `ev_log:dup` already exists"
@@ -2363,7 +2364,7 @@ class TestEventsE2E:
         async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
             await SurrealDBConnectionManager.define_event(recorder, "ev_person")
             await client.query("CREATE ev_person:i SET name = 'x';", {})
-            rows = await client.query("SELECT * FROM ev_log WHERE kind = 'input';", {})
+            rows = await _client.query(client, "SELECT * FROM ev_log WHERE kind = 'input';", {})
             expected = {"name": "x"} if await _major(client) >= 3 else None
         assert [row.get("inp") for row in rows] == [expected]
 
@@ -2586,7 +2587,7 @@ class TestEventTransactionsE2E:
                         await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_product", tx=tx)
                     raise _Abort
             assert await _events_info(client, "ev_person") == {}
-            assert "ev_product" not in (await client.query("INFO FOR DB;", {}))["tables"]
+            assert "ev_product" not in (await _client.query(client, "INFO FOR DB;", {}))["tables"]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_write_the_guard_refuses_cancels_the_block(self, kind: str) -> None:
@@ -2637,7 +2638,7 @@ async def _default(kind: str) -> AsyncIterator[Any]:
 
 async def _tables(client: Any) -> dict[str, Any]:
     """The tables of *client*'s database."""
-    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+    return dict((await _client.query(client, "INFO FOR DB;", {}))["tables"])
 
 
 class TestEventConnectionsE2E:
@@ -2743,7 +2744,7 @@ class TestDdlPermissionsE2E:
                     await SurrealDBConnectionManager.remove_function(_GREET)
             finally:
                 await SurrealDBConnectionManager.invalidate()
-            assert "ev_greet" not in (await client.query("INFO FOR DB;", {}))["functions"]
+            assert "ev_greet" not in (await _client.query(client, "INFO FOR DB;", {}))["functions"]
         refusals = [
             (
                 define_function,
@@ -2866,7 +2867,7 @@ class TestFunctionsE2E:
         async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
             statement = await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
             assert statement == function_ddl(*_GREET_ARGS, **_GREET_KWARGS)
-            assert sorted((await client.query("INFO FOR DB;", {}))["functions"]) == ["ev_greet"]
+            assert sorted((await _client.query(client, "INFO FOR DB;", {}))["functions"]) == ["ev_greet"]
             # A trailing option<…> parameter may be left out (M20).
             assert await SurrealDBConnectionManager.call_function(_GREET, ["Ada"]) == "Hello Ada"
             assert await SurrealDBConnectionManager.call_function("ev_greet", ["Bea", 2]) == "Hello Bea"
@@ -3007,7 +3008,7 @@ class TestFunctionsE2E:
 
             assert await SurrealDBConnectionManager.remove_function(_GREET) == _GREET_REMOVAL
             assert SurrealDBConnectionManager.function_signature_cache_size() == 0
-            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+            assert (await _client.query(client, "INFO FOR DB;", {}))["functions"] == {}
             with pytest.raises(SurrealDbNotFoundError):
                 await SurrealDBConnectionManager.call_function(_GREET, ["Ada"])
             with pytest.raises(SurrealDbNotFoundError):
@@ -3035,7 +3036,7 @@ class TestFunctionsE2E:
         async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
             with pytest.raises(SurrealDbError) as raised:
                 await SurrealDBConnectionManager.define_function("fn::ev_broken", "RETURN")
-            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+            assert (await _client.query(client, "INFO FOR DB;", {}))["functions"] == {}
         assert type(raised.value) is SurrealDbError
         assert str(raised.value).startswith("Can't apply function definition: 'fn::ev_broken' -> ")
 
@@ -3079,7 +3080,7 @@ class TestFunctionsE2E:
                 assert await SurrealDBConnectionManager.call_function(_GREET, params=both) == "Hello Ada"
                 assert SurrealDBConnectionManager.function_signature_cache_size() == 1
             assert SurrealDBConnectionManager.function_signature_cache_size() == 0
-            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+            assert (await _client.query(client, "INFO FOR DB;", {}))["functions"] == {}
             with pytest.raises(SurrealDbNotFoundError):
                 await SurrealDBConnectionManager.call_function(_GREET, params=both)
 
@@ -3109,7 +3110,7 @@ class TestFunctionsE2E:
                 async with SurrealDBConnectionManager.transaction() as tx:
                     await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS, tx=tx)
                     raise _Abort
-            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+            assert (await _client.query(client, "INFO FOR DB;", {}))["functions"] == {}
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_x1m_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3125,7 +3126,7 @@ class TestFunctionsE2E:
                 assert evt_calls == []
                 assert default_calls == []
                 assert getattr(tx, "statements", []) == []
-            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+            assert (await _client.query(client, "INFO FOR DB;", {}))["functions"] == {}
         assert str(define_function.value) == _x1m("define_function()")
         assert str(remove_function.value) == _x1m("remove_function()")
 
@@ -3229,7 +3230,7 @@ class TestRoundTripE2E:
                 await EvAsyncPerson.define_events()
             for args, kwargs in _FUNCTIONS:
                 await SurrealDBConnectionManager.define_function(*args, **kwargs)
-            info = await client.query("INFO FOR DB;", {})
+            info = await _client.query(client, "INFO FOR DB;", {})
             schema = await DatabaseIntrospector("evt", tables=["ev_person"]).introspect()
         assert schema.issues == ()
         then = _THEN_3X if major >= 3 else _THEN_2X
@@ -3355,7 +3356,8 @@ account = Account(id="ada", email="ada@old.example", balance=10)
 await account.save()
 await account.merge(email="ada@new.example")
 client = await SurrealDBConnectionManager.get_client()
-print(await client.query("SELECT old, new FROM audit_log;", {}))
+[rows] = await client.query("SELECT old, new FROM audit_log;", {})  # one result per statement
+print(rows)
 # [{'new': 'ada@new.example', 'old': 'ada@old.example'}]
 
 try:
@@ -3861,7 +3863,7 @@ class TestReadmeSection32:
                 client = await SurrealDBConnectionManager.get_client()
                 await client.query("CREATE product:widget SET stock = 1;", {})
                 await client.query("DELETE product:widget;", {})
-                assert await client.query("SELECT * FROM account;", {}) == []
-                assert await client.query("SELECT * FROM product;", {}) == []
+                assert await _client.query(client, "SELECT * FROM account;", {}) == []
+                assert await _client.query(client, "SELECT * FROM product;", {}) == []
         finally:
             namespace.clear()

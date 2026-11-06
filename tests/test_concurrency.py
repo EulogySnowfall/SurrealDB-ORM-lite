@@ -13,6 +13,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    _client,
 )
 from surreal_orm_lite._sdk import AsyncSurreal
 from surreal_orm_lite.concurrency import is_conflict_error, retry_on_conflict
@@ -394,6 +395,6 @@ class TestConflictE2E:
             return "done"
 
         assert await create_user() == "done"
-        rows = await client.query("SELECT * FROM OccUser;", {})
+        rows = await _client.query(client, "SELECT * FROM OccUser;", {})
         assert len(rows) == 1
         await SurrealDBConnectionManager.close_connection()

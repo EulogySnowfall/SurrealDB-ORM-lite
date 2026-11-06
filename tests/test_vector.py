@@ -236,6 +236,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     Vector,
     VectorField,
+    _client,
     model_base,
     model_ddl,
     search,
@@ -3185,7 +3186,7 @@ async def _keyword_line(client: Any) -> Literal[2, 3]:
 
 async def _table_info(client: Any, table: str) -> dict[str, Any]:
     """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
-    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    info: dict[str, Any] = await _client.query(client, f"INFO FOR TABLE {table};", {})
     return info
 
 
@@ -3337,7 +3338,7 @@ class TestDefineTableE2E:
             await _apply_ddl(
                 client, "CREATE vec_doc:d1 SET title = 'Cats and dogs', embedding = [1, 0, 0], summary = [0, 1, 0];"
             )
-            rows = await client.query("SELECT embedding, summary FROM vec_doc:d1;", {})
+            rows = await _client.query(client, "SELECT embedding, summary FROM vec_doc:d1;", {})
             assert rows == [{"embedding": [1.0, 0.0, 0.0], "summary": [0.0, 1.0, 0.0]}]
             assert {type(item) for row in rows for value in row.values() for item in value} == {float}
             doc = await VecDoc.objects().get("d1")
@@ -3349,7 +3350,7 @@ class TestDefineTableE2E:
                 await _apply_ddl(client, statement)
             assert await _refused(client, "CREATE vec_doc:d4 SET title = 'Short', embedding = [1.0, 0.0];")
             assert await _refused(client, "CREATE vec_doc:d5 SET title = 'Short', summary = [1.0, 0.0];")
-            assert await client.query("SELECT VALUE record::id(id) FROM vec_doc;", {}) == ["d1"]
+            assert await _client.query(client, "SELECT VALUE record::id(id) FROM vec_doc;", {}) == ["d1"]
 
 
 # === define_indexes() and remove_index(): the vector indexes on every engine ========================================
@@ -4545,11 +4546,11 @@ class TestSimilarToE2E:
             doc.loc = None
             doc.n = 20
             await doc.update()
-            updated = await client.query("SELECT * FROM vec_doc:d2;", {})
+            updated = await _client.query(client, "SELECT * FROM vec_doc:d2;", {})
             await doc.delete()
             await _compaction.wait_for_model_indexes(client, VecDoc)
             await doc.save()
-            saved = await client.query("SELECT * FROM vec_doc:d2;", {})
+            saved = await _client.query(client, "SELECT * FROM vec_doc:d2;", {})
         for stored in (updated, saved):
             assert (stored[0]["n"], stored[0]["embedding"]) == (20, [0.9, 0.1, 0.0])
             assert "_knn_distance" not in stored[0]
@@ -4570,11 +4571,11 @@ class TestSimilarToE2E:
             first = docs[0]
             first.title = "Cats and dogs, again"
             await first.update()
-            updated = await client.query("SELECT * FROM vec_extra:d1;", {})
+            updated = await _client.query(client, "SELECT * FROM vec_extra:d1;", {})
             await first.delete()
             await _compaction.wait_for_model_indexes(client, VecExtra)
             await first.save()
-            saved = await client.query("SELECT * FROM vec_extra:d1;", {})
+            saved = await _client.query(client, "SELECT * FROM vec_extra:d1;", {})
         for stored in (updated, saved):
             assert stored[0]["title"] == "Cats and dogs, again"
             assert sorted(stored[0]) == ["category", "embedding", "id", "title"]
@@ -5794,13 +5795,13 @@ def _ranged(dist: str | None = None) -> Any:
 
 async def _hits(client: Any) -> list[str]:
     """The keys of the ``vec_ranked`` records whose ``hit`` is true, sorted."""
-    rows = await client.query("SELECT VALUE id FROM vec_ranked WHERE hit = true;", {})
+    rows = await _client.query(client, "SELECT VALUE id FROM vec_ranked WHERE hit = true;", {})
     return sorted(str(row.id) for row in rows)
 
 
 async def _ranked_left(client: Any) -> list[str]:
     """The keys of the ``vec_ranked`` records, sorted."""
-    rows = await client.query("SELECT VALUE id FROM vec_ranked;", {})
+    rows = await _client.query(client, "SELECT VALUE id FROM vec_ranked;", {})
     return sorted(str(row.id) for row in rows)
 
 
@@ -6126,7 +6127,7 @@ def _tied_nearest(dist: str = "cosine", limit: int = 3) -> Any:
 
 async def _tied_keys(client: Any, condition: str = "true") -> list[str]:
     """The keys of the ``vec_tied`` records matching *condition* (a constant of these tests), sorted."""
-    rows = await client.query(f"SELECT VALUE id FROM vec_tied WHERE {condition};", {})
+    rows = await _client.query(client, f"SELECT VALUE id FROM vec_tied WHERE {condition};", {})
     return sorted(str(row.id) for row in rows)
 
 
@@ -6144,7 +6145,7 @@ class TestExactScanRankingE2E:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _TIE_CORPUS)
             major = await _major(client)
-            every = await client.query(_PIN_EVERY_DISTANCE.format(dist=dist), {"q": _Q})
+            every = await _client.query(client, _PIN_EVERY_DISTANCE.format(dist=dist), {"q": _Q})
             answers = [await _tied_nearest(dist).exec() for _ in range(_TIE_CALLS)]
         own = {str(row["id"].id): row["d"] for row in every}
         orders = {tuple(_ids(records)) for records in answers}
@@ -6165,7 +6166,7 @@ class TestExactScanRankingE2E:
     async def test_without_a_tie_the_answer_is_the_exact_scan_s(self, kind: str, dist: str) -> None:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _SPREAD_CORPUS)
-            raw = await client.query(_PIN_TWO_NEAREST.format(dist=dist), {"q": _Q})
+            raw = await _client.query(client, _PIN_TWO_NEAREST.format(dist=dist), {"q": _Q})
             records = await _tied_nearest(dist, 2).exec()
         assert [str(row["id"].id) for row in raw] == (["s4", "s1"] if dist == "HAMMING" else ["s1", "s4"])
         assert list(zip(_ids(records), _distances(records), strict=True)) == [(str(row["id"].id), row["d"]) for row in raw]
@@ -6175,7 +6176,7 @@ class TestExactScanRankingE2E:
     async def test_a_zero_vector_under_cosine(self, kind: str) -> None:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _ZERO_CORPUS)
-            raw = await client.query(_PIN_TWO_NEAREST.format(dist="COSINE"), {"q": _Q})
+            raw = await _client.query(client, _PIN_TWO_NEAREST.format(dist="COSINE"), {"q": _Q})
             records = await _tied_nearest("cosine", 2).exec()
         assert [str(row["id"].id) for row in raw] == _ids(records) == ["z0", "z1"]
         assert math.isnan(records[0]._knn_distance) and math.isnan(raw[0]["d"])
@@ -6405,7 +6406,7 @@ class TestDimensionE2E:
             line = await _line(client)
             with pytest.raises((SurrealDbError, ServerError)) as raised:
                 await VecLoose.objects().similar_to("embedding", _SHORT).bulk_update(hit=True)
-            hits = await client.query("SELECT VALUE id FROM vec_loose WHERE hit = true;", {})
+            hits = await _client.query(client, "SELECT VALUE id FROM vec_loose WHERE hit = true;", {})
         assert hits == []
         if line == (3, 1):
             assert isinstance(raised.value, ServerError)
@@ -6505,16 +6506,16 @@ class TestTransactionsE2E:
 
 class _InfoClient:
     """A client whose ``query()`` answers each ``INFO FOR INDEX`` with the next of *answers* (the last one again once
-    they run out): records what it was sent."""
+    they run out), as SDK 3.0 does: one result per statement: records what it was sent."""
 
     def __init__(self, *answers: Any) -> None:
         self.answers = answers
         self.sent: list[str] = []
 
-    async def query(self, statement: str, variables: dict[str, Any]) -> Any:
+    async def query(self, statement: str, variables: dict[str, Any] | None) -> Any:
         assert variables == {}
         self.sent.append(statement)
-        return self.answers[min(len(self.sent), len(self.answers)) - 1]
+        return [self.answers[min(len(self.sent), len(self.answers)) - 1]]
 
 
 #: ``INFO FOR INDEX``'s answer for an HNSW index of six records, measured on each engine: SurrealDB 3.3.4 while its
@@ -6634,7 +6635,7 @@ class TestCompactionWaitE2E:
             await _compaction.wait_for_model_indexes(client, VecDoc)
             sent = _calls(calls)
             monkeypatch.undo()
-            states = [(await client.query(read, {}))["building"] for read in reads]
+            states = [(await _client.query(client, read, {}))["building"] for read in reads]
         if line >= (3, 3):
             assert [state["compacting"] for state in states] == [False, False]
             assert sent[:2] == _query(reads[0]) and sent[-2:] == _query(reads[1])
@@ -6711,7 +6712,7 @@ _SIX = ["d1", "d2", "d3", "d4", "d5", "d6"]
 
 async def _keys(client: Any, statement: str, **variables: Any) -> list[str]:
     """The keys of the record ids *statement* (a ``SELECT VALUE id`` constant of these pins) answers, sorted."""
-    rows = await client.query(statement, variables)
+    rows = await _client.query(client, statement, variables)
     return sorted(str(row.id) for row in rows)
 
 
@@ -6819,7 +6820,7 @@ class TestLinePinsE2E:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _seed_statements("vec_loose"))
             line = await _line(client)
-            raw = await client.query(_PIN_NO_INDEX, {"q": _Q})
+            raw = await _client.query(client, _PIN_NO_INDEX, {"q": _Q})
             docs = await VecLoose.objects().similar_to("embedding", _Q, 2).exec()
             exact = await VecLoose.objects().similar_to("embedding", _Q, 2, dist="cosine").exec()
         if line == (3, 1):
@@ -6861,10 +6862,10 @@ class TestLinePinsE2E:
             await _seed_ranked(client)
             major = await _major(client)
             ranged = await _keys(client, _PIN_RANGE, a=2, q=_Q)
-            counted = await client.query(_PIN_RANGE_COUNT, {"a": 2, "q": _Q})
+            counted = await _client.query(client, _PIN_RANGE_COUNT, {"a": 2, "q": _Q})
             exact = await _keys(client, _PIN_EQUAL_EXACT, c="tech", q=_Q)
             ranged_first = await _keys(client, _PIN_RANGE_LET, a=2, q=_Q)
-            counted_first = await client.query(_PIN_RANGE_COUNT_LET, {"a": 2, "q": _Q})
+            counted_first = await _client.query(client, _PIN_RANGE_COUNT_LET, {"a": 2, "q": _Q})
             exact_first = await _keys(client, _PIN_EQUAL_EXACT_LET, c="tech", q=_Q)
         if major >= 3:
             assert (ranged, counted, exact) == (["d4", "d6"], [{"count": 2}], ["d3", "d4"]), (
@@ -6905,9 +6906,9 @@ class TestLinePinsE2E:
             await _apply_ddl(client, _seed_statements("vec_pin_r", numbered=True))
             await _compaction.wait_for_defined_indexes(client, _PIN_WRITE_DDL)
             major = await _major(client)
-            returned = await client.query(_PIN_W_UPDATE, {"q": _Q})
+            returned = await _client.query(client, _PIN_W_UPDATE, {"q": _Q})
             written = await _keys(client, _PIN_W_HITS)
-            ranged = await client.query(_PIN_R_UPDATE, {"a": 2, "q": _Q})
+            ranged = await _client.query(client, _PIN_R_UPDATE, {"a": 2, "q": _Q})
             ranged_written = await _keys(client, _PIN_R_HITS)
             selected = await _keys(client, _PIN_R_SELECT, a=2, q=_Q)
         assert sorted(str(row["id"].id) for row in returned) == ["d1", "d2"], f"{_ROW_WRITES}: the K nearest returned"
@@ -6931,7 +6932,7 @@ class TestLinePinsE2E:
         async with _vec_models(kind) as client:
             await _seed(client)
             line = await _line(client)
-            indexed = await client.query(_PIN_MATCH, {"t": "cats", "q": _Q2})
+            indexed = await _client.query(client, _PIN_MATCH, {"t": "cats", "q": _Q2})
             exact = await _keys(client, _PIN_MATCH_EXACT, t="cats", q=_Q2)
             matched_first = await _keys(client, _PIN_MATCH_LET, t="cats", q=_Q2)
         found = {str(row["id"].id): row["d"] for row in indexed}
@@ -6965,7 +6966,7 @@ class TestLinePinsE2E:
                 with pytest.raises(ServerError) as refused:
                     await client.query(_PIN_SCORE_LET, {"t": "programming", "q": _Q2})
             else:
-                scores = await client.query(_PIN_SCORE_LET, {"t": "programming", "q": _Q2})
+                scores = await _client.query(client, _PIN_SCORE_LET, {"t": "programming", "q": _Q2})
         if major >= 3:
             assert refused is not None
             assert "no MATCHES clause found in WHERE condition" in str(refused.value), (
@@ -6982,8 +6983,8 @@ class TestLinePinsE2E:
         WebSocket, on every server line (the embedded engine has no live queries)."""
         async with _vec_models("ws") as client:
             await _seed(client)
-            nearest_id = await client.query(_LIVE_KNN, {})
-            every_id = await client.query(_LIVE_ALL, {})
+            nearest_id = await _client.query(client, _LIVE_KNN, {})
+            every_id = await _client.query(client, _LIVE_ALL, {})
             try:
                 nearest = SurrealDBConnectionManager.subscribe_live(nearest_id)
                 every = SurrealDBConnectionManager.subscribe_live(every_id)

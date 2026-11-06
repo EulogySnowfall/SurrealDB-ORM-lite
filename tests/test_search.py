@@ -201,6 +201,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     Transaction,
+    _client,
     search,
     transaction,
 )
@@ -3622,7 +3623,7 @@ _ARTICLE_READS = [*_query(_INFO_DB), ("version", None), *_query(_INFO_ARTICLE)]
 
 async def _tables(client: Any) -> dict[str, Any]:
     """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
-    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+    return dict((await _client.query(client, "INFO FOR DB;", {}))["tables"])
 
 
 async def _indexes(client: Any, table: str = "fts_article") -> dict[str, IndexState | None]:
@@ -4270,8 +4271,8 @@ class TestViewIndexPinE2E:
                 "CREATE fts_src:b2 SET title = 'Cooking with physics';",
             ):
                 await _apply_ddl(client, statement)
-            held = await client.query("SELECT VALUE title FROM fts_view;", {})
-            found = await client.query("SELECT VALUE title FROM fts_view WHERE title @0@ 'physics';", {})
+            held = await _client.query(client, "SELECT VALUE title FROM fts_view;", {})
+            found = await _client.query(client, "SELECT VALUE title FROM fts_view WHERE title @0@ 'physics';", {})
         both = ["Cooking with physics", "Quantum physics for beginners"]
         assert sorted(held) == both
         if major >= 3:
@@ -4422,7 +4423,7 @@ def _sent(statements: Sequence[str]) -> list[tuple[str, object]]:
 
 async def _found(client: Any, table: str, field: str = "title") -> list[str]:
     """The ids of *table*'s records a raw search for ``physics`` in *field* finds, sorted."""
-    found = await client.query(f"SELECT VALUE id FROM {table} WHERE {field} @0@ 'physics';", {})
+    found = await _client.query(client, f"SELECT VALUE id FROM {table} WHERE {field} @0@ 'physics';", {})
     return sorted(str(record_id) for record_id in found)
 
 
@@ -5921,7 +5922,7 @@ class TestAnnotateE2E:
             article.views = 20
             await article.update()
             await article.upsert()
-            stored = await client.query("SELECT * FROM fts_article;", {})
+            stored = await _client.query(client, "SELECT * FROM fts_article;", {})
         assert read[0] == "a2" and read[1] > 0
         assert not {"relevance", "snippet", "spans"} & set(dumped)
         assert all(not {"relevance", "snippet", "spans"} & set(row) for row in stored)

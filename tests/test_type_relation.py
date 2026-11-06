@@ -112,6 +112,7 @@ from surreal_orm_lite import (
     SurrealORMError,
     TableType,
     Transaction,
+    _client,
     generate_models_from_db,
     is_conflict_error,
     model_generator,
@@ -1477,7 +1478,7 @@ async def _rel(kind: str) -> AsyncIterator[Any]:
 
 async def _tables(client: Any) -> dict[str, Any]:
     """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
-    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+    return dict((await _client.query(client, "INFO FOR DB;", {}))["tables"])
 
 
 class TestRelationDdlE2E:
@@ -1651,18 +1652,18 @@ def _sent_per_attempt(calls: list[tuple[str, tuple[object, ...]]], expected: lis
 
 async def _table_info(client: Any, table: str) -> dict[str, Any]:
     """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
-    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    info: dict[str, Any] = await _client.query(client, f"INFO FOR TABLE {table};", {})
     return info
 
 
 async def _edge_ids(client: Any) -> list[str]:
     """The ids of ``rel_likes``' edges, ordered, as ``table:id`` texts."""
-    return [str(edge) for edge in await client.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {})]
+    return [str(edge) for edge in await _client.query(client, "SELECT VALUE id FROM rel_likes ORDER BY id;", {})]
 
 
 async def _like_counts(client: Any) -> dict[str, int]:
     """The view ``rel_like_counts``: ``out`` (as a ``table:id`` text) → ``n``."""
-    return {str(row["out"]): row["n"] for row in await client.query("SELECT n, out FROM rel_like_counts;", {})}
+    return {str(row["out"]): row["n"] for row in await _client.query(client, "SELECT n, out FROM rel_like_counts;", {})}
 
 
 def _without_feed(text: str) -> str:
@@ -1731,7 +1732,7 @@ class TestDefineRelationE2E:
                 if kind != "mem":
                     # The second connection's session is open before the define (M9).
                     second = await SurrealDBConnectionManager.get_client("rel2")
-                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                    assert await _client.query(second, "SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
                         RecordID("rel_likes", "e1"),
                         RecordID("rel_likes", "e2"),
                     ]
@@ -1803,7 +1804,7 @@ class TestDefineRelationE2E:
             after = (await _tables(client))["rel_stats"]
             assert after == before
             assert parse_define_table(after).view_query is not None
-            assert await client.query("SELECT VALUE n FROM rel_stats;", {}) == [1]
+            assert await _client.query(client, "SELECT VALUE n FROM rel_stats;", {}) == [1]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_rg3_a_type_any_table_holding_an_edge(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2163,7 +2164,7 @@ class TestEnforcementE2E:
         async with _rel(kind) as client:
             await _enforced(client)
             await _create_edge(path, _ADA, RecordID("rel_book", "b1"))
-            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            ends = await _client.query(client, "SELECT VALUE [in, out] FROM rel_likes;", {})
             expected = [[_ADA, RecordID("rel_book", "b1")]]
             if path == "bulk_create":
                 expected.append([_ADA, _P1])
@@ -2178,7 +2179,7 @@ class TestEnforcementE2E:
                 eve = await RelPerson(id="eve").save(tx=tx)
                 await eve.relate(RelLikes, _P1, tx=tx)
                 await eve.relate("rel_likes", RecordID("rel_book", "b1"), tx=tx)
-            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            ends = await _client.query(client, "SELECT VALUE [in, out] FROM rel_likes;", {})
             eve_id = RecordID("rel_person", "eve")
             assert sorted(ends, key=str) == sorted([[eve_id, _P1], [eve_id, RecordID("rel_book", "b1")]], key=str)
 
@@ -2207,7 +2208,7 @@ class TestEnforcementE2E:
                 await ada.relate("rel_follows", bob)
             _assert_refusal(raised, SurrealDbError)
             assert "rel_follows_pair" in str(raised.value)
-            assert len(await client.query("SELECT VALUE id FROM rel_follows;", {})) == 1
+            assert len(await _client.query(client, "SELECT VALUE id FROM rel_follows;", {})) == 1
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_by_name_a_type_normal_table(self, kind: str) -> None:
@@ -2217,7 +2218,7 @@ class TestEnforcementE2E:
             with pytest.raises(SurrealDbError) as raised:
                 await RelPerson(id="ada").relate("rel_normal", _P1)
             _assert_refusal(raised, SurrealDbError)
-            assert await client.query("SELECT VALUE id FROM rel_normal;", {}) == []
+            assert await _client.query(client, "SELECT VALUE id FROM rel_normal;", {}) == []
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_by_name_in_a_transaction(self, kind: str) -> None:
@@ -2282,7 +2283,7 @@ def _field_type(info: dict[str, Any], name: str) -> str:
 
 async def _ends(client: Any) -> list[list[RecordID]]:
     """``[in, out]`` of every ``rel_likes`` edge, sorted."""
-    return sorted(await client.query("SELECT VALUE [in, out] FROM rel_likes;", {}), key=str)
+    return sorted(await _client.query(client, "SELECT VALUE [in, out] FROM rel_likes;", {}), key=str)
 
 
 #: K6, its read-back and K7 on AC-6's table without its change feed (issue #406): AC-20's E2E tests do not need it,
@@ -2366,7 +2367,7 @@ class TestRemoveConstraintE2E:
                 if kind != "mem":
                     # The second connection's session is open before the removal (M9).
                     second = await SurrealDBConnectionManager.get_client("rel2")
-                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                    assert await _client.query(second, "SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
                         RecordID("rel_likes", "e1"),
                         RecordID("rel_likes", "e2"),
                     ]
@@ -2728,7 +2729,7 @@ class TestRelationLineFactsE2E:
             refused = await _refusal(client, _alter_edge("a4", "rel_company:c"))
             assert refused is not None
             assert "rel_person" in refused
-            written = await client.query("SELECT VALUE id FROM rel_alter;", {})
+            written = await _client.query(client, "SELECT VALUE id FROM rel_alter;", {})
             expected = ["a1", "a2", "a3"] if await _major(client) >= 3 else ["a1", "a3"]
             assert sorted(str(record.id) for record in written) == expected
 
@@ -2764,17 +2765,17 @@ class TestExistingRecordsE2E:
             assert await _edge_ids(client) == ["rel_likes:dangling", "rel_likes:odd"]
 
             odd = await RelLikes.objects().get("odd")
-            stored = await client.query("SELECT * FROM rel_likes:odd;", {})
+            stored = await _client.query(client, "SELECT * FROM rel_likes:odd;", {})
             with pytest.raises(ServerError) as raised:
                 await odd.merge(stars=5)
             assert not isinstance(raised.value, SurrealORMError)
             assert "`in`" in str(raised.value)
             assert "rel_person" in str(raised.value)
-            assert await client.query("SELECT * FROM rel_likes:odd;", {}) == stored
+            assert await _client.query(client, "SELECT * FROM rel_likes:odd;", {}) == stored
 
             dangling = await RelLikes.objects().get("dangling")
             await dangling.merge(stars=4)
-            assert await client.query("SELECT VALUE stars FROM rel_likes:dangling;", {}) == [4]
+            assert await _client.query(client, "SELECT VALUE stars FROM rel_likes:dangling;", {}) == [4]
 
             assert await RelLikes.raw_query(_NONCONFORMING_EDGES) == [RecordID("rel_likes", "odd")]
             assert await RelLikes.raw_query(_DANGLING_EDGES) == [RecordID("rel_likes", "dangling")]
@@ -2836,7 +2837,7 @@ class TestChangeFeedAndLiveE2E:
             assert [event.record_id for event in events] == ["rel_likes:e1", "rel_likes:e2", str(e3.id)]
             assert all(isinstance(event.instance, RelLikes) for event in events)
 
-            entries = await client.query("SHOW CHANGES FOR TABLE rel_likes SINCE 0 LIMIT 100;", {})
+            entries = await _client.query(client, "SHOW CHANGES FOR TABLE rel_likes SINCE 0 LIMIT 100;", {})
             kinds = [change_kind for entry in entries for change in entry["changes"] for change_kind in change]
             assert kinds == ["define_table", "update", "update", "define_table", "update"]
 

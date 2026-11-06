@@ -42,6 +42,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     Var,
+    _client,
 )
 from surreal_orm_lite._sdk import NotFoundError, ServerError
 from surreal_orm_lite.query_set import QuerySet
@@ -1483,7 +1484,7 @@ class TestOrderedLimitedE2E:
         """
         async with subquery_db("ws") as client:
             await _seed_ordered()
-            counts = [len(await client.query(_PIN)) for _ in range(_RUNS)]
+            counts = [len(await _client.query(client, _PIN)) for _ in range(_RUNS)]
             if _7470_FIRST <= await _server_version(client) < _7470_FIXED:
                 if min(counts) >= 10:
                     pytest.fail(_PIN_FIXED)
@@ -2097,7 +2098,7 @@ class TestSubqueryWritesE2E:
             post, created = await SqPost.objects().get_or_create(author__in=Subquery(_nobody()), title="new")
             assert created is True
             assert (post.title, post.author) == ("new", None)
-            rows = await client.query("SELECT * FROM sq_post WHERE title = 'new';")
+            rows = await _client.query(client, "SELECT * FROM sq_post WHERE title = 'new';")
             assert len(rows) == 1
             assert "author" not in rows[0], rows
 

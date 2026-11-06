@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 from tests.conftest import orm_client
@@ -351,7 +351,7 @@ async def _collect(stream: Any, count: int, timeout: float = 10.0) -> list[dict[
 
 async def _churn(client: Any, table: str = TABLE) -> None:
     """One create, one update and one delete — the three actions a live query reports."""
-    created = await client.query(f"CREATE {table}:one SET name = 'a';", {})
+    created = await _client.query(client, f"CREATE {table}:one SET name = 'a';", {})
     assert created
     await client.query(f"UPDATE {table}:one SET name = 'b';", {})
     await client.query(f"DELETE {table}:one;", {})

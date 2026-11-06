@@ -53,6 +53,7 @@ from surreal_orm_lite import (
     SchemaMode,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    _client,
     _sdk,
 )
 from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
@@ -1240,7 +1241,7 @@ async def _run(client: Any, statements: str) -> None:
 
 
 async def _info_db(client: Any) -> dict[str, Any]:
-    info = await client.query("INFO FOR DB;", {})
+    info = await _client.query(client, "INFO FOR DB;", {})
     assert isinstance(info, dict)
     return info
 
@@ -1250,7 +1251,7 @@ async def _tables(client: Any) -> set[str]:
 
 
 async def _fields(client: Any, table: str) -> dict[str, str]:
-    info = await client.query(f"INFO FOR TABLE `{table}`;", {})
+    info = await _client.query(client, f"INFO FOR TABLE `{table}`;", {})
     assert isinstance(info, dict)
     return dict(info["fields"])
 
@@ -1319,8 +1320,8 @@ class TestMigrateE2E:
             ]
             for instance in saved:
                 await instance.save()
-            assert await client.query("SELECT n FROM mig_stats;", {}) == [{"n": 2}]
-            assert len(await client.query("SELECT * FROM mig_likes;", {})) == 1
+            assert await _client.query(client, "SELECT n FROM mig_stats;", {}) == [{"n": 2}]
+            assert len(await _client.query(client, "SELECT * FROM mig_likes;", {})) == 1
             # A SIGNUP through the accesses migrate() defined — the primary-key form (#338) included. On the embedded
             # engine the exchange runs on the shared session (bind=True), so last. (AdPlain, MiSchemaless and AdRefresh
             # declare no id: no record of theirs can be read into an instance; the diff above checks their tables and
@@ -2035,7 +2036,7 @@ class TestRollbackStatesE2E:
                 assert "FLEXIBLE" not in fields["bag"]
             assert "SCHEMAFULL" in (await _info_db(client))["tables"]["rs_t"]
             await _run(client, "UPSERT rs_t:one SET bag = { a: { b: 1 } };")
-            assert await client.query("SELECT VALUE bag FROM rs_t:one;", {}) == [{"a": {"b": 1}}]
+            assert await _client.query(client, "SELECT VALUE bag FROM rs_t:one;", {}) == [{"a": {"b": 1}}]
 
 
 class RvDoc(BaseSurrealModel):
@@ -2274,7 +2275,7 @@ class TestEventsAndFunctionsE2E:
                 assert expected.diff(now) == []
                 assert now.functions == expected.functions
                 if target:
-                    assert await client.query("RETURN fn::ef_greet('x');", {}) == greetings[target]
+                    assert await _client.query(client, "RETURN fn::ef_greet('x');", {}) == greetings[target]
 
 
 #: A hand-written migration file: ``AddField`` then a ``DataMigration`` whose functions (which a generated file cannot
@@ -2321,7 +2322,7 @@ def _data_files(directory: Path, *, forwards_sql: str = "UPDATE dm_item SET a = 
 
 
 async def _item(client: Any) -> dict[str, Any]:
-    rows = await client.query("SELECT * OMIT id FROM dm_item:one;", {})
+    rows = await _client.query(client, "SELECT * OMIT id FROM dm_item:one;", {})
     assert isinstance(rows, list) and len(rows) == 1, rows
     return dict(rows[0])
 
@@ -2964,7 +2965,7 @@ class TestLineDispatchE2E:
             ]
             name = _write(tmp_path, "docs", operations)
             assert await MigrationExecutor(tmp_path).migrate() == [name]
-            info = await client.query("INFO FOR TABLE ld_doc;", {})
+            info = await _client.query(client, "INFO FOR TABLE ld_doc;", {})
             stored = info["indexes"]["ld_title"]
             keyword, other = ("FULLTEXT", "SEARCH") if await _line(client) >= 3 else ("SEARCH", "FULLTEXT")
             assert keyword in stored
@@ -3056,7 +3057,7 @@ class TestLineDispatchE2E:
             assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
             result = await MigUser.signup(email="pk@x.io", password="p", bind=kind == "mem")
             assert result.user.email == "pk@x.io"
-            assert await client.query("SELECT VALUE id FROM mig_user;", {}) == [_sdk.RecordID("mig_user", "pk@x.io")]
+            assert await _client.query(client, "SELECT VALUE id FROM mig_user;", {}) == [_sdk.RecordID("mig_user", "pk@x.io")]
 
 
 #: The columns ``table_ddl()`` writes for ``Any``, ``list`` and ``list[Sub]`` (spec M27), on a SCHEMALESS table.
@@ -3080,7 +3081,7 @@ async def _af_kept(client: Any, *records: str) -> None:
     """After one more write, each of *records* still holds the objects of ``_AF_OBJECTS``."""
     for record in records:
         await _run(client, f"UPDATE af_t:{record} SET name = 'again';")
-        (row,) = await client.query(f"SELECT bag, tags, subs FROM af_t:{record};", {})
+        (row,) = await _client.query(client, f"SELECT bag, tags, subs FROM af_t:{record};", {})
         assert {key: row[key] for key in _AF_VALUES} == _AF_VALUES, record
 
 
@@ -3176,8 +3177,8 @@ class TestAlterTableFlexibleE2E:
             assert ("FLEXIBLE" in (await _fields(client, "af_l"))["bag"]) is (line == 2)
             await AfLoose(id="two", bag={"x": {"y": 2}}).save()
             await _run(client, "UPDATE af_l:one SET name = 'again';")
-            assert await client.query("SELECT VALUE bag FROM af_l:one;", {}) == [{"x": {"y": 1}}]
-            assert await client.query("SELECT VALUE bag FROM af_l:two;", {}) == [{"x": {"y": 2}}]
+            assert await _client.query(client, "SELECT VALUE bag FROM af_l:one;", {}) == [{"x": {"y": 1}}]
+            assert await _client.query(client, "SELECT VALUE bag FROM af_l:two;", {}) == [{"x": {"y": 2}}]
 
 
 _GD_ANALYZER = Analyzer("gd_x", ["blank"], ["lowercase"])

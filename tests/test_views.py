@@ -104,6 +104,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     Transaction,
+    _client,
     computed,
     define_parser,
     generate_models_from_db,
@@ -3210,7 +3211,7 @@ async def _line(client: Any) -> tuple[int, int]:
 
 async def _rows(client: Any, table: str) -> list[dict[str, Any]]:
     """Every record of *table* (a constant name of these tests), ordered by id, read raw."""
-    rows: list[dict[str, Any]] = await client.query(f"SELECT * FROM {table} ORDER BY id;", {})
+    rows: list[dict[str, Any]] = await _client.query(client, f"SELECT * FROM {table} ORDER BY id;", {})
     return rows
 
 
@@ -3273,10 +3274,10 @@ class TestViewWritesE2E:
             ends = (order_id, view_id) if reverse else (view_id, order_id)
             rows = await stats.relate("mv_watches", order, reverse=reverse)
             assert [(row["in"], row["out"]) for row in rows] == [ends]
-            edges = await client.query("SELECT in, out FROM mv_watches;", {})
+            edges = await _client.query(client, "SELECT in, out FROM mv_watches;", {})
             assert [(edge["in"], edge["out"]) for edge in edges] == [ends]
             await stats.remove_relation("mv_watches", order, reverse=reverse)
-            assert await client.query("SELECT * FROM mv_watches;", {}) == []
+            assert await _client.query(client, "SELECT * FROM mv_watches;", {}) == []
             assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3433,12 +3434,12 @@ def _sent(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
 
 async def _tables(client: Any) -> dict[str, Any]:
     """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
-    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+    return dict((await _client.query(client, "INFO FOR DB;", {}))["tables"])
 
 
 async def _events_info(client: Any, table: str) -> dict[str, Any]:
     """The ``events`` of ``INFO FOR TABLE`` *table* (a constant name of these tests)."""
-    return dict((await client.query(f"INFO FOR TABLE {table};", {}))["events"])
+    return dict((await _client.query(client, f"INFO FOR TABLE {table};", {}))["events"])
 
 
 @contextlib.asynccontextmanager
@@ -3909,14 +3910,14 @@ class TestViewLinesE2E:
             await _apply_ddl(client, _MV_INTEGER_ORDERS)
             await MvStats.define_view()
             major = await _major(client)
-            [raw] = await client.query("SELECT revenue FROM mv_order_stats:['paid'];", {})
+            [raw] = await _client.query(client, "SELECT revenue FROM mv_order_stats:['paid'];", {})
             assert (type(raw["revenue"]), raw["revenue"]) == ((float, 20.0) if major >= 3 else (int, 20))
             stats = await MvStats.objects().get(RecordID("mv_order_stats", ["paid"]))
             assert (type(stats.revenue), stats.revenue) == (float, 20.0)
             await _apply_ddl(
                 client, "DEFINE TABLE mv_means AS SELECT status, math::mean(amount) AS mean FROM mv_orders GROUP BY status;"
             )
-            [mean] = await client.query("SELECT mean FROM mv_means:['paid'];", {})
+            [mean] = await _client.query(client, "SELECT mean FROM mv_means:['paid'];", {})
             assert (type(mean["mean"]), mean["mean"]) == ((float, 10.0) if major >= 3 else (Decimal, Decimal("10")))
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -4507,7 +4508,7 @@ class TestViewReadsE2E:
         async with _mv(kind) as client:
             await _save_orders()
             await MvStats.define_view()
-            answer = await client.query("SELECT VALUE id FROM mv_order_stats WHERE id IN $ids", {"ids": [_PAID, _NEW]})
+            answer = await _client.query(client, "SELECT VALUE id FROM mv_order_stats WHERE id IN $ids", {"ids": [_PAID, _NEW]})
             if await _major(client) >= 3:
                 if answer != []:
                     pytest.fail(_ID_IN_FIXED)

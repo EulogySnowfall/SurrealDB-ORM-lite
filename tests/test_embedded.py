@@ -844,7 +844,7 @@ class TestSelectionResetE2E:
             SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
             assert await SurrealDBConnectionManager.get_client() is client
             assert await SurrealDBConnectionManager.info() is None
-            rows = await client.query("SELECT email FROM user;")
+            rows = await _client.query(client, "SELECT email FROM user;")
             assert [row["email"] for row in rows] == ["a@x"]
 
     @pytest.mark.parametrize("setter", ["set_database", "set_namespace"])
@@ -976,7 +976,7 @@ class TestServerClientsUntouchedE2E:
 
             SurrealDBConnectionManager.set_connection(**settings)
             assert await SurrealDBConnectionManager.get_client() is server
-            assert await server.query("RETURN 1;") == 1
+            assert await _client.query(server, "RETURN 1;") == 1
             assert _slot_client() is engine
 
             SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
@@ -1580,7 +1580,7 @@ class TestEngineLineGuardE2E:
 
     async def test_the_bundled_engine_is_the_2x_line(self) -> None:
         async with embedded() as client:
-            assert await client.query("RETURN type::is::string('');") is True
+            assert await _client.query(client, "RETURN type::is::string('');") is True
             match = re.search(r"(\d+)\.", str(await client.version()))
             assert match is not None
             assert int(match.group(1)) == 2, (
@@ -1871,7 +1871,7 @@ class TestKillAfterSwitchE2E:
                 # The block put the server settings back, and the server client was neither closed nor replaced.
                 assert SurrealDBConnectionManager.get_connection_string() == _ws_url()
                 assert await SurrealDBConnectionManager.get_client() is server
-                assert await server.query("RETURN 1;") == 1
+                assert await _client.query(server, "RETURN 1;") == 1
         finally:
             await SurrealDBConnectionManager.unset_connection()
 
@@ -1984,7 +1984,7 @@ class TestAuthEmbeddedE2E:
             assert SurrealDBConnectionManager.get_session_token() is None
             assert await SurrealDBConnectionManager.info() is None
             assert await _is_owner(client)
-            rows = await client.query("SELECT email FROM user;")
+            rows = await _client.query(client, "SELECT email FROM user;")
             assert [row["email"] for row in rows] == ["a@x"]
             # Selected and stamped: the next call takes the fast path, no second reset.
             assert await SurrealDBConnectionManager.get_client() is client
@@ -2114,7 +2114,7 @@ class TestModelAuthEmbeddedE2E:
             assert "SIGNUP ( CREATE emb_keyed SET id = $email, email = $email, " in applied[-1]
             result = await EmbKeyed.signup(email="k:x", password="p", bind=True)
             assert result.user.email == "k:x"
-            assert await client.query("SELECT VALUE id FROM emb_keyed;") == [RecordID("emb_keyed", "k:x")]
+            assert await _client.query(client, "SELECT VALUE id FROM emb_keyed;") == [RecordID("emb_keyed", "k:x")]
             signed_in = await EmbKeyed.signin(email="k:x", password="p", bind=True)
             assert signed_in.user.email == "k:x"
 
@@ -2208,7 +2208,7 @@ class TestFailedBindEmbeddedE2E:
             assert SurrealDBConnectionManager.get_session_token() is None
             assert await SurrealDBConnectionManager.info() is None
             assert await _is_owner(client)
-            rows = await client.query("SELECT email FROM emb_locked;")
+            rows = await _client.query(client, "SELECT email FROM emb_locked;")
             assert [row["email"] for row in rows] == ["l@x"]  # the signup ran: only the bind was undone
 
     async def test_a_stored_record_session_is_put_back(self) -> None:
