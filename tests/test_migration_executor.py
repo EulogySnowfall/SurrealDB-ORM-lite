@@ -1753,7 +1753,8 @@ class TestCompensationE2E:
 class TestConcurrencyE2E:
     """AC-14 (spec §9.3): four executors on four connections to one database run ``migrate()`` at once: one record
     per migration, every definition once; each call returns the names it applied (maybe none) or raises the
-    retryable ``SurrealDbConflictError`` — never a ``MigrationStatementError``."""
+    retryable ``SurrealDbConflictError`` — never a ``MigrationStatementError``. Under load all four can meet a conflict
+    (seen on SurrealDB 4.0.0): those run again, as the error tells a caller to."""
 
     async def test_four_executors_at_once(self, tmp_path: Path) -> None:
         database = _database_name()
@@ -1773,15 +1774,21 @@ class TestConcurrencyE2E:
                 SurrealDBConnectionManager.add_connection(
                     name, url=_url("ws"), user="root", password="root", namespace="ns", database=database
                 )
-            outcomes = await asyncio.gather(
-                *(MigrationExecutor(tmp_path, connection=name).migrate() for name in names), return_exceptions=True
-            )
-            for outcome in outcomes:
-                if isinstance(outcome, BaseException):
-                    assert isinstance(outcome, SurrealDbConflictError), repr(outcome)
-                    assert not isinstance(outcome, MigrationStatementError)
-                else:
-                    assert outcome in ([], [first], [second], [first, second]), outcome
+            pending = names
+            for _ in range(5):  # a conflict is retryable: the executors that met one run again, as a caller would
+                outcomes = await asyncio.gather(
+                    *(MigrationExecutor(tmp_path, connection=name).migrate() for name in pending), return_exceptions=True
+                )
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException):
+                        assert isinstance(outcome, SurrealDbConflictError), repr(outcome)
+                        assert not isinstance(outcome, MigrationStatementError)
+                    else:
+                        assert outcome in ([], [first], [second], [first, second]), outcome
+                pending = [name for name, outcome in zip(pending, outcomes, strict=True) if isinstance(outcome, BaseException)]
+                if not pending:
+                    break
+            assert pending == [], "every executor ends applying its migrations or finding them applied"
             applied = await MigrationExecutor(tmp_path).get_applied_migrations()
             assert applied == [first, second]
             fields = await _fields(client, "cc_t")
