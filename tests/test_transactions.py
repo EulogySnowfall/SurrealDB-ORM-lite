@@ -21,8 +21,10 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
+    _client,
     computed,
 )
+from surreal_orm_lite._sdk import Features, UnsupportedFeatureError
 from surreal_orm_lite.concurrency import is_conflict_error
 from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
@@ -322,7 +324,8 @@ class _FakeTxnClient:
 
     async def query(self, sql: str, vars: Any = None, session_id: Any = None, txn_id: Any = None) -> Any:
         self.calls.append(("query", txn_id))
-        return self.read_rows
+        # SDK 3.0: one result per statement.
+        return [self.read_rows]
 
     async def commit(self, txn_id: Any, session_id: Any = None) -> None:
         self.calls.append(("commit", txn_id))
@@ -392,9 +395,9 @@ async def _clear(client) -> None:
     hence the suppression.
     """
     with contextlib.suppress(Exception):
-        await client.query("DEFINE TABLE IF NOT EXISTS TxUser;", {})
+        await _client.query(client, "DEFINE TABLE IF NOT EXISTS TxUser;", {})
     with contextlib.suppress(Exception):
-        await client.query("DELETE TxUser;", {})
+        await _client.query(client, "DELETE TxUser;", {})
 
 
 class TxUser(BaseSurrealModel):
@@ -419,7 +422,7 @@ class TestTransactionE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             await TxUser(id="alice", name="Alice").save(tx=tx)
             await TxUser(id="bob", name="Bob").save(tx=tx)
-        rows = await client.query("SELECT * FROM TxUser;", {})
+        rows = await _client.query(client, "SELECT * FROM TxUser;", {})
         assert len(rows) == 2
         await SurrealDBConnectionManager.close_connection()
 
@@ -432,7 +435,7 @@ class TestTransactionE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await TxUser(id="carol", name="Carol").save(tx=tx)
                 raise RuntimeError("boom")
-        rows = await client.query("SELECT * FROM TxUser;", {})
+        rows = await _client.query(client, "SELECT * FROM TxUser;", {})
         assert len(rows) == 0  # nothing persisted
         await SurrealDBConnectionManager.close_connection()
 
@@ -446,7 +449,7 @@ class TestTransactionE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await TxUser(id="dup", name="A").save(tx=tx)
                 await TxUser(id="dup", name="B").save(tx=tx)
-        rows = await client.query("SELECT * FROM TxUser WHERE id = TxUser:dup;", {})
+        rows = await _client.query(client, "SELECT * FROM TxUser WHERE id = TxUser:dup;", {})
         assert not rows  # nothing persisted
         await SurrealDBConnectionManager.close_connection()
 
@@ -461,7 +464,7 @@ class TestTransactionE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             await u.update(tx=tx)
 
-        rows = await client.query("SELECT name FROM TxUser:dave;", {})
+        rows = await _client.query(client, "SELECT name FROM TxUser:dave;", {})
         assert rows[0]["name"] == "David"
         await SurrealDBConnectionManager.close_connection()
 
@@ -476,7 +479,7 @@ class TestTransactionE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             await erin.merge(tx=tx, name="Erin Updated")
 
-        rows = await client.query("SELECT name FROM TxUser:erin;", {})
+        rows = await _client.query(client, "SELECT name FROM TxUser:erin;", {})
         assert rows[0]["name"] == "Erin Updated"
         await SurrealDBConnectionManager.close_connection()
 
@@ -491,7 +494,7 @@ class TestTransactionE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             await frank.delete(tx=tx)
 
-        rows = await client.query("SELECT * FROM TxUser:frank;", {})
+        rows = await _client.query(client, "SELECT * FROM TxUser:frank;", {})
         assert len(rows) == 0
         await SurrealDBConnectionManager.close_connection()
 
@@ -508,7 +511,7 @@ class TestTransactionE2E:
                 await TxUser(id="gina", name="Gina").delete(tx=tx)
                 raise RuntimeError("rollback everything")
 
-        rows = await client.query("SELECT id FROM TxUser;", {})
+        rows = await _client.query(client, "SELECT id FROM TxUser;", {})
         ids = {str(r["id"]) for r in rows}
         assert "TxUser:gina" in ids  # delete rolled back
         assert "TxUser:hank" not in ids  # create rolled back
@@ -548,7 +551,7 @@ async def test_refresh_tx_works_in_interactive() -> None:
     client = await SurrealDBConnectionManager.get_client()
     await _clear(client)
     await TxUser(id="ref1", name="Before").save()
-    await client.query("UPDATE TxUser:ref1 SET name = 'After';", {})
+    await _client.query(client, "UPDATE TxUser:ref1 SET name = 'After';", {})
     u = TxUser(id="ref1", name="Before")
     async with SurrealDBConnectionManager.transaction() as tx:
         await u.refresh(tx=tx)
@@ -595,7 +598,7 @@ class TestTransactionSignalsE2E:
         _connect()
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(Exception):
-            await client.query("DELETE TxSignalUser;", {})
+            await _client.query(client, "DELETE TxSignalUser;", {})
 
         seen: list[tuple[str, bool]] = []
 
@@ -622,7 +625,7 @@ class TestTransactionSignalsE2E:
         _connect()
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(Exception):
-            await client.query("DELETE TxSignalUser;", {})
+            await _client.query(client, "DELETE TxSignalUser;", {})
 
         seen: list[str] = []
 
@@ -646,7 +649,7 @@ class TestTransactionSignalsE2E:
         _connect()
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(Exception):
-            await client.query("DELETE TxSignalUser;", {})
+            await _client.query(client, "DELETE TxSignalUser;", {})
 
         seen: list[str] = []
 
@@ -671,7 +674,7 @@ class TestTransactionSignalsE2E:
         _connect()
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(Exception):
-            await client.query("DELETE TxSignalUser;", {})
+            await _client.query(client, "DELETE TxSignalUser;", {})
         await TxSignalUser(id="killme", name="X").save()
 
         seen: list[str] = []
@@ -708,7 +711,7 @@ class TestMergeTxSync:
             assert u.name == "NewName"
         # After commit, instance and DB agree.
         assert u.name == "NewName"
-        rows = await client.query("SELECT name FROM TxUser:sync;", {})
+        rows = await _client.query(client, "SELECT name FROM TxUser:sync;", {})
         assert rows[0]["name"] == "NewName"
         await SurrealDBConnectionManager.close_connection()
 
@@ -742,7 +745,7 @@ class TestTransactionDispatchE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             assert tx.is_interactive is False
             await TxUser(id="http1", name="H").save(tx=tx)
-        rows = await client.query("SELECT * FROM TxUser;", {})
+        rows = await _client.query(client, "SELECT * FROM TxUser;", {})
         assert len(rows) == 1
         await SurrealDBConnectionManager.close_connection()
 
@@ -756,28 +759,90 @@ class TestTransactionDispatchE2E:
         await _clear(client)
         async with SurrealDBConnectionManager.transaction() as tx:
             await TxUser(id="w1", name="W").save(tx=tx)
-        assert len(await client.query("SELECT * FROM TxUser;", {})) == 1
+        assert len(await _client.query(client, "SELECT * FROM TxUser;", {})) == 1
         await _clear(client)
         with pytest.raises(RuntimeError):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await TxUser(id="w2", name="W2").save(tx=tx)
                 raise RuntimeError("boom")
-        assert len(await client.query("SELECT * FROM TxUser;", {})) == 0
+        assert len(await _client.query(client, "SELECT * FROM TxUser;", {})) == 0
         await SurrealDBConnectionManager.close_connection()
 
 
 async def _native_txn_supported() -> bool:
-    """True if the server exposes the SDK's native transaction RPC (SurrealDB 3.x)."""
-    import contextlib
-
+    """True if the configured connection runs native interactive transactions: a WebSocket URL and a server with
+    ``Features.TRANSACTIONS`` (SurrealDB 3.x and 4.x; never 2.x, whose ``begin()`` SDK 3.0 refuses before sending)."""
     client = await SurrealDBConnectionManager.get_client()
-    try:
-        txn = await client.begin()
-    except Exception:
-        return False
-    with contextlib.suppress(Exception):
-        await client.cancel(txn)
-    return True
+    url = SurrealDBConnectionManager.get_connection_string() or ""
+    return url.startswith(("ws://", "wss://")) and bool(client.is_feature_supported(Features.TRANSACTIONS))
+
+
+class _ProbedClient:
+    """A WebSocket client double for ``transaction()``'s strategy probe."""
+
+    def __init__(self, *, supported: bool, begin_error: BaseException | None = None) -> None:
+        self.supported = supported
+        self.begin_error = begin_error
+        self.begun = 0
+
+    def is_feature_supported(self, feature: Any) -> bool:
+        assert feature is Features.TRANSACTIONS
+        return self.supported
+
+    async def begin(self) -> str:
+        self.begun += 1
+        if self.begin_error is not None:
+            raise self.begin_error
+        return "TXN"
+
+    async def commit(self, txn_id: Any) -> None:
+        pass
+
+    async def cancel(self, txn_id: Any) -> None:
+        pass
+
+
+class TestTransactionStrategyProbeUnit:
+    """AC-8: ``transaction()`` picks the strategy from ``Features.TRANSACTIONS``; nothing leaks from the probe."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("client", "interactive", "begun"),
+        [
+            (_ProbedClient(supported=True), True, 1),
+            (_ProbedClient(supported=False), False, 0),
+            (_ProbedClient(supported=True, begin_error=UnsupportedFeatureError("transactions need 3.0.0")), False, 1),
+        ],
+        ids=["supported", "2.x", "begin-refused"],
+    )
+    async def test_the_strategy_follows_the_capability(
+        self, monkeypatch: pytest.MonkeyPatch, client: _ProbedClient, interactive: bool, begun: int
+    ) -> None:
+        _connect()
+
+        async def _get_client(cls: Any, name: str | None = None) -> _ProbedClient:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+
+        async with SurrealDBConnectionManager.transaction() as tx:
+            assert tx.is_interactive is interactive
+            assert isinstance(tx, InteractiveTransaction if interactive else BufferedTransaction)
+        assert client.begun == begun
+
+
+class TestTransactionStrategyE2E:
+    @pytest.mark.asyncio
+    async def test_a_websocket_transaction_follows_the_server_line(self) -> None:
+        """AC-8: interactive on 3.x/4.x, buffered on 2.x — without any exception reaching the block."""
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            assert tx.is_interactive is client.is_feature_supported(Features.TRANSACTIONS)
+            await TxUser(id="probe", name="P").save(tx=tx)
+        assert [row["name"] for row in await _client.query(client, "SELECT name FROM TxUser;", {})] == ["P"]
+        await SurrealDBConnectionManager.close_connection()
 
 
 class TestQuerySetTxE2E:
@@ -794,7 +859,7 @@ class TestQuerySetTxE2E:
         async with SurrealDBConnectionManager.transaction() as tx:
             n = await TxUser.objects(tx=tx).filter(name="guest").bulk_update(name="member")
             assert n == 2
-        rows = await client.query("SELECT name FROM TxUser;", {})
+        rows = await _client.query(client, "SELECT name FROM TxUser;", {})
         assert all(r["name"] == "member" for r in rows)
         await SurrealDBConnectionManager.close_connection()
 
@@ -811,7 +876,7 @@ class TestQuerySetTxE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await TxUser.objects(tx=tx).filter(name="x").bulk_delete()
                 raise RuntimeError("rollback")
-        assert len(await client.query("SELECT * FROM TxUser;", {})) == 1
+        assert len(await _client.query(client, "SELECT * FROM TxUser;", {})) == 1
         await SurrealDBConnectionManager.close_connection()
 
     @pytest.mark.asyncio
@@ -822,7 +887,7 @@ class TestQuerySetTxE2E:
         await TxUser(id="h1", name="guest").save()
         async with SurrealDBConnectionManager.transaction() as tx:
             await TxUser.objects(tx=tx).filter(name="guest").bulk_update(name="member")
-        rows = await client.query("SELECT name FROM TxUser;", {})
+        rows = await _client.query(client, "SELECT name FROM TxUser;", {})
         assert rows[0]["name"] == "member"
         await SurrealDBConnectionManager.close_connection()
 
@@ -856,19 +921,19 @@ class TestNativeTxSpikeE2E:
             pytest.skip("native interactive transactions require SurrealDB 3.x")
 
         with contextlib.suppress(Exception):
-            await client.query("DELETE TxSpike;", {})
+            await _client.query(client, "DELETE TxSpike;", {})
 
         async def _select_outside() -> list:
             # SurrealDB 3.x raises NotFoundError for a SELECT on a never-materialized
             # table; the isolation contract treats that as "0 rows visible".
             try:
-                return await client.query("SELECT * FROM TxSpike;", {})
+                return await _client.query(client, "SELECT * FROM TxSpike;", {})
             except NotFoundError:
                 return []
 
         txn = await client.begin()
-        await client.query("CREATE TxSpike:s1 CONTENT { name: 'x' };", {}, txn_id=txn)
-        inside = await client.query("SELECT * FROM TxSpike;", {}, txn_id=txn)
+        await _client.query(client, "CREATE TxSpike:s1 CONTENT { name: 'x' };", {}, txn_id=txn)
+        inside = await _client.query(client, "SELECT * FROM TxSpike;", {}, txn_id=txn)
         outside = await _select_outside()
         assert len(inside) == 1  # voit l'écriture non-committée
         assert len(outside) == 0  # isolation : invisible hors txn
@@ -877,11 +942,11 @@ class TestNativeTxSpikeE2E:
         assert len(after) == 0  # rollback effectif
 
         txn2 = await client.begin()
-        await client.query("CREATE TxSpike:s2 CONTENT { name: 'y' };", {}, txn_id=txn2)
+        await _client.query(client, "CREATE TxSpike:s2 CONTENT { name: 'y' };", {}, txn_id=txn2)
         await client.commit(txn2)
-        final = await client.query("SELECT * FROM TxSpike;", {})
+        final = await _client.query(client, "SELECT * FROM TxSpike;", {})
         assert len(final) == 1  # commit persiste
-        await client.query("DELETE TxSpike;", {})
+        await _client.query(client, "DELETE TxSpike;", {})
         await SurrealDBConnectionManager.close_connection()
 
 
@@ -1327,18 +1392,18 @@ async def _tx_fail_db(transport: str) -> Any:
     SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database="db")
     client = await SurrealDBConnectionManager.get_client()
     with contextlib.suppress(Exception):
-        await client.query("REMOVE TABLE tx_fail_row;", {})
-    await client.query(_TX_FAIL_SCHEMA, {})
+        await _client.query(client, "REMOVE TABLE tx_fail_row;", {})
+    await _client.query(client, _TX_FAIL_SCHEMA, {})
     try:
         yield client
     finally:
         with contextlib.suppress(Exception):
-            await client.query("REMOVE TABLE tx_fail_row;", {})
+            await _client.query(client, "REMOVE TABLE tx_fail_row;", {})
         await SurrealDBConnectionManager.close_connection()
 
 
 async def _stored_ages(client: Any) -> dict[str, Any]:
-    rows = await client.query("SELECT * FROM tx_fail_row;", {})
+    rows = await _client.query(client, "SELECT * FROM tx_fail_row;", {})
     return {str(row["id"].id): row["age"] for row in rows or []}
 
 
@@ -1454,7 +1519,7 @@ class TestInteractiveFailedStatementE2E:
             if not await _native_txn_supported():
                 pytest.skip("requires SurrealDB 3.x")
             with contextlib.suppress(Exception):
-                await client.query("REMOVE TABLE tx_never_written;", {})
+                await _client.query(client, "REMOVE TABLE tx_never_written;", {})
             async with SurrealDBConnectionManager.transaction() as tx:
                 assert await TxNeverWritten.objects(tx=tx).filter(name="x").exec() == []
                 assert await TxNeverWritten.objects(tx=tx).all() == []
@@ -1877,7 +1942,7 @@ async def _embedded_tx_db() -> Any:
     SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
     try:
         client = await SurrealDBConnectionManager.get_client()
-        await client.query(_TX_FAIL_SCHEMA, {})
+        await _client.query(client, _TX_FAIL_SCHEMA, {})
         yield client
     finally:
         await SurrealDBConnectionManager.unset_connection()
@@ -2694,8 +2759,8 @@ class TestBodyRefusalInTransactionE2E:
                     await TxBodyIndexed(id="a").relate("bad edge!", TxBodyIndexed(id="b"), tx=tx)
                 written = (tx._records_written(), tx._cache_written())
                 applied = await TxBodyIndexed.define_indexes(tx=tx)
-            info = await client.query("INFO FOR TABLE tx_body_indexed;", {})
-            rows = await client.query("SELECT * FROM tx_body_indexed;", {})
+            info = await _client.query(client, "INFO FOR TABLE tx_body_indexed;", {})
+            rows = await _client.query(client, "SELECT * FROM tx_body_indexed;", {})
         assert written == (frozenset(), frozenset())
         assert applied == TxBodyIndexed.index_ddl()
         assert list(info["indexes"]) == ["tx_body_indexed_name"]

@@ -19,7 +19,7 @@ from . import _client
 from . import cache as _cache
 from . import decoding as _decoding
 from . import encoding as _encoding
-from ._sdk import AsyncSurreal, NotFoundError
+from ._sdk import AsyncSurreal, Features, NotFoundError, UnsupportedFeatureError, UnsupportedVersionError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_config import ConnectionConfig
 from .embedded import ephemeral_unsupported, is_embedded_url, require_supported_url, store_key
@@ -494,8 +494,8 @@ class SurrealDBConnectionManager:
           ``SurrealDbConnectionError`` (open it again).
 
         A client the application obtained itself (:meth:`get_client`) before the call belongs to the application: on
-        WebSocket its transport is closed and its next request fails; an HTTP client (no socket with the SDK 2.0) keeps
-        the namespace and database it was opened on — call :meth:`get_client` again; an embedded client is the
+        WebSocket it is closed and its next request raises ``SurrealDbConnectionError`` (it opens no socket); an HTTP
+        client (it holds no socket) keeps the identity, namespace and database it was opened on — call :meth:`get_client` again; an embedded client is the
         connection's one in-process session: it follows a new namespace or database at the ORM's next call, but after a
         new URL or :meth:`remove_connection` it is the previous engine (with SDK 2.x still running), so stop using it, as
         after :meth:`close_connection`. :meth:`remove_connection` does all of this too.
@@ -536,7 +536,7 @@ class SurrealDBConnectionManager:
         committed. A call already under way on the name opens no new client on the old settings: one still waiting for
         the embedded engine while another thread held it raises ``ValueError("Connection not been set ('<name>').")``.
         A client the application obtained itself is its own, as after a re-registration: on WebSocket its next request
-        fails, an HTTP client keeps its namespace and database, and an embedded client is the previous engine (with
+        raises ``SurrealDbConnectionError``, an HTTP client keeps its namespace and database, and an embedded client is the previous engine (with
         SDK 2.x still running), so stop using it, as after :meth:`close_connection`. A no-op for a name that is not
         registered (after the name's type check). ``remove_connection("default")`` is :meth:`unset_connection`,
         unchanged (the default is never unregistered). A model routed to a removed name raises ``ValueError`` at its next
@@ -649,11 +649,11 @@ class SurrealDBConnectionManager:
         event loop and retire its server clients on every loop.
 
         Synchronous, with or without a running event loop (``add_connection()`` may run at import time). Each loop's
-        client is taken out of the cache, its query-cache scope retired, and its **transport** closed on its own loop —
-        the transport only, as :meth:`_discard_dead_client` does, so a WebSocket client the application kept fails on
-        its next request instead of reopening an anonymous socket (an HTTP client has no transport: it is only dropped,
-        and the ORM's own holders are stopped by the generation). A closed loop's client is just dropped. The embedded
-        slot is not touched: it follows the new settings at the next call.
+        client is taken out of the cache, its query-cache scope retired, and the client **retired**
+        (``_client.retire``, closed on its own loop), as :meth:`_discard_dead_client` does, so a WebSocket client the
+        application kept fails on its next request instead of reopening an anonymous socket (an HTTP client holds no
+        socket: it is only dropped, and the ORM's own holders are stopped by the generation). A closed loop's client is
+        just dropped. The embedded slot is not touched: it follows the new settings at the next call.
         """
         cls.__generation += 1
         close_all_subscribers(owner=cls._connection_name, every_loop=True)
@@ -664,12 +664,15 @@ class SurrealDBConnectionManager:
         for loop, client in list(cls.__clients.items()):
             cls.__clients.pop(loop, None)
             _cache.retire_client(client)
+            reason = _settings_retired_text(cls._connection_name)
+            # At once, from any thread: whatever request it is asked next, it refuses.
+            _client.refuse(client, reason)
             if loop is running:
-                _spawn_socket_close(client)
+                _spawn_retire(client, reason)
             elif not loop.is_closed():
                 # Closed meanwhile: the socket goes with that loop.
                 with contextlib.suppress(RuntimeError):
-                    loop.call_soon_threadsafe(_spawn_socket_close, client)
+                    loop.call_soon_threadsafe(_spawn_retire, client, reason)
 
     @classmethod
     @_routed("default")
@@ -785,6 +788,7 @@ class SurrealDBConnectionManager:
             client = cls.__clients.pop(loop, None)
             if client is not None:
                 _cache.retire_client(client)
+                _client.refuse(client, _CLOSED_LOOP_TEXT)
             logger.debug("Dropped the cached SurrealDB client of a closed event loop.")
 
     @classmethod
@@ -833,6 +837,11 @@ class SurrealDBConnectionManager:
         Like every way the ORM gets a client, it marks the ORM writes in progress as having reached the database
         (``cache.reaching()``, issue #325).
 
+        SDK 3.0 (v0.50.0): a server client is built without the SDK's own reconnect, query streaming and token renewal
+        (:func:`_new_sdk_client`); a WebSocket client refuses every request once its connection drops
+        (``_client.refuse_on_drop``). A server outside the versions the SDK supports raises a
+        ``SurrealDbConnectionError`` naming its version, not retryable, chained to the SDK's ``UnsupportedVersionError``.
+
         On an **embedded** URL the SDK's constructor opens the in-process engine and ``connect()``
         takes no argument; nobody is signed in, whatever *signin_as_configured* says: the engine
         has no system user on a fresh database, and its anonymous session is the in-process owner.
@@ -855,7 +864,7 @@ class SurrealDBConnectionManager:
         client: Any = None
         credentials = _encoding.encode({"username": user, "password": password})
         try:
-            client = AsyncSurreal(url)
+            client = _new_sdk_client(url, embedded=embedded)
             # SDK 3.0 (#205): the read hook is a workaround for SDK 2.0.0's decoder; ``install`` is a
             # no-op once the SDK reads every value itself (capability probes), or has another layout.
             _decoding.install(client)
@@ -864,6 +873,8 @@ class SurrealDBConnectionManager:
             # WebSocket connections require explicit connect()
             elif url.startswith(("ws://", "wss://")):
                 await client.connect(url)
+                # From here, a drop makes every request on this client fail, never reopen an anonymous socket.
+                _client.refuse_on_drop(client, _DROPPED_TEXT)
             if signin_as_configured and not embedded:
                 assert user is not None
                 assert password is not None
@@ -878,14 +889,23 @@ class SurrealDBConnectionManager:
                 error.retryable = False  # type: ignore[attr-defined]
                 raise error from e
             logger.warning(f"Can't get connection: {e}")
+            # Before the close: a closed client reads as dead (its reader is gone), whatever failed.
+            retryable = is_connection_failure(e, client)
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.close()
+            if isinstance(e, UnsupportedVersionError):
+                # SDK 3.0 checks the server's version when it connects: the server lines the ORM supports are the SDK's.
+                unsupported = SurrealDbConnectionError(
+                    f"SurrealDB {e.version} is not supported by surrealdb SDK 3.x ({e.minimum} to {e.maximum} excluded)."
+                )
+                unsupported.retryable = False  # type: ignore[attr-defined]
+                raise unsupported from e
             error = SurrealDbConnectionError("Can't connect to the database.")
             # Kept as SurrealDbConnectionError for every caller, but a server that *answered*
             # — the configured credentials rejected, the namespace refused — will answer the same
             # on the next attempt, so the reconnect loops (v0.21.0) must not retry it.
-            error.retryable = is_connection_failure(e, client)  # type: ignore[attr-defined]
+            error.retryable = retryable  # type: ignore[attr-defined]
             raise error from None
         except BaseException:
             # A cancellation (a stream stopped mid-reconnect) must not leave a socket behind.
@@ -1032,37 +1052,19 @@ class SurrealDBConnectionManager:
         uuids are recorded as dead, so a late ``subscribe_live()`` on one ends at once instead of
         waiting on the new connection for a subscription that no longer exists.
 
-        The SDK client is deliberately **not** closed: its ``close()`` would reset it to "never
-        connected", after which any stale reference to it (an open transaction, say) would
-        silently open a fresh, anonymous, uncached socket on its next call. Only its transport is
-        closed (:meth:`_close_dead_socket`), so such a call fails loudly instead.
+        The client is **retired** (``_client.retire``): SDK 3.0 would open a fresh, anonymous socket for any request
+        made on it once its socket is gone, so a stale reference to it (an open transaction, a client the application
+        kept) refuses every request with a ``SurrealDbConnectionError`` instead, and its transport is closed — the
+        server then drops the session and its live queries, even when the receive loop ended with the socket open.
         """
         if cls.__clients.get(loop) is client:
             cls.__clients.pop(loop, None)
         _cache.retire_client(client)
         logger.info("The SurrealDB WebSocket connection dropped; opening a new one.")
-        await cls._close_dead_socket(client)
-        for candidate in (client, getattr(client, "_connection", None)):
-            queues = getattr(candidate, "live_queues", None)
-            if isinstance(queues, dict):
-                for key in list(queues):
-                    mark_killed(key)
-
-    @staticmethod
-    async def _close_dead_socket(client: Any) -> None:
-        """Close the transport of a client whose receive task ended, if it is still open.
-
-        The SDK's receive loop also ends — leaving the socket **open** — on a frame it cannot
-        decode or an error frame with no request id. The server then keeps the session, and its
-        live queries, running on a socket nobody reads; each resubscribe would add a duplicate.
-        Closing the transport makes the server drop them. A no-op on a socket that is already gone.
-        """
-        for candidate in (client, getattr(client, "_connection", None)):
-            socket = getattr(candidate, "socket", None)
-            if socket is not None and hasattr(socket, "close"):
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(socket.close(), 2.0)
-                return
+        uuids = [key for candidate in (client, getattr(client, "_connection", None)) for key in _live_keys(candidate)]
+        await _client.retire(client, _DROPPED_TEXT)
+        for key in uuids:
+            mark_killed(key)
 
     @staticmethod
     def _fingerprint(url: str | None, namespace: str | None, database: str | None, user: str | None, token: str | None) -> str:
@@ -1107,8 +1109,7 @@ class SurrealDBConnectionManager:
             stale = cls.__clients.pop(loop, None)
             if stale is not None:
                 _cache.retire_client(stale)
-                with contextlib.suppress(NotImplementedError):
-                    await stale.close()
+                await _client.retire(stale, _DROPPED_TEXT)
             raise
 
         return await cls._replay_then_publish(
@@ -1183,7 +1184,7 @@ class SurrealDBConnectionManager:
             raise error
         if generation is not None and generation != cls.__generation:
             # Built on settings the connection no longer serves: never cached, closed in the background, quietly
-            # (the SDK 2.0 HTTP client's close() raises NotImplementedError).
+            # (a close() that raises must not end a background task with an exception nobody retrieves).
             closing = asyncio.get_running_loop().create_task(_close_quietly(client))
             _BACKGROUND.add(closing)
             closing.add_done_callback(_BACKGROUND.discard)
@@ -1612,9 +1613,7 @@ class SurrealDBConnectionManager:
         if client is None:
             return
         _cache.retire_client(client)
-
-        with contextlib.suppress(NotImplementedError):
-            await client.close()
+        await _client.retire(client, _closed_text("close_connection()"))
 
     @classmethod
     @_routed("every")
@@ -1622,9 +1621,8 @@ class SurrealDBConnectionManager:
         """
         Close every cached connection, whatever loop created it.
 
-        A client belonging to another *live* loop cannot be closed from here, so it is
-        dropped rather than awaited — the socket is released when that loop is finalised.
-        Only the running loop's client is closed properly.
+        Every client is retired: a reference to one kept by the application refuses its next request. The running
+        loop's client is closed here; another live loop's is closed on that loop, in the background.
 
         The embedded engine's client is closed too, as by :meth:`close_connection` (a ``mem://``
         database is discarded with it).
@@ -1635,13 +1633,17 @@ class SurrealDBConnectionManager:
         close_all_subscribers(owner=cls._connection_name, every_loop=True)
         cls.__lost_identity.clear()
         await cls._close_embedded()
+        reason = _closed_text("close_all_connections()")
         client = cls.__clients.pop(loop, None)
         if client is not None:
             _cache.retire_client(client)
-            with contextlib.suppress(NotImplementedError):
-                await client.close()
-        for other in list(cls.__clients.values()):
+            await _client.retire(client, reason)
+        for other_loop, other in list(cls.__clients.items()):
             _cache.retire_client(other)
+            _client.refuse(other, reason)
+            if not other_loop.is_closed():
+                with contextlib.suppress(RuntimeError):
+                    other_loop.call_soon_threadsafe(_spawn_retire, other, reason)
         cls.__clients.clear()
 
     @classmethod
@@ -1674,8 +1676,7 @@ class SurrealDBConnectionManager:
         try:
             yield client
         finally:
-            with contextlib.suppress(Exception):
-                await client.close()
+            await _client.retire(client, _EPHEMERAL_CLOSED_TEXT)
 
     @classmethod
     @_routed("current")
@@ -1683,7 +1684,7 @@ class SurrealDBConnectionManager:
     async def transaction(cls, name: str | None = None) -> Any:
         """Atomic transaction. Strategy depends on server capability:
 
-        - WebSocket + SurrealDB 3.x (native ``begin()`` available) →
+        - WebSocket + SurrealDB 3.x or 4.x (native ``begin()`` available, ``Features.TRANSACTIONS``) →
           ``InteractiveTransaction``: operations run immediately inside the server-side
           transaction (tagged by ``txn_id``); reads inside the transaction see
           uncommitted writes.
@@ -1742,10 +1743,10 @@ class SurrealDBConnectionManager:
         client = await cls.get_client()
         url = cls.__url or ""
         tx: Transaction
-        if url.startswith(("ws://", "wss://")):
+        if url.startswith(("ws://", "wss://")) and client.is_feature_supported(Features.TRANSACTIONS):
             try:
                 txn_id = await client.begin()
-            except NotFoundError:
+            except (UnsupportedFeatureError, NotFoundError):
                 txn_id = None
             tx = InteractiveTransaction(client, txn_id) if txn_id is not None else BufferedTransaction(client)
         else:
@@ -2955,7 +2956,7 @@ class SurrealDBConnectionManager:
                 # Before any await: a resubscribe woken by the same drop must find the reader gone.
                 release_subscribers(query_uuid)
                 if client is not None:
-                    await cls._close_dead_socket(client)
+                    await _client.retire(client, _DROPPED_TEXT)
                 mark_killed(query_uuid)
                 return
             if not is_embedded_url(cls.__url):
@@ -2971,7 +2972,7 @@ class SurrealDBConnectionManager:
                     raise asyncio.CancelledError from exc  # the SDK raised over the caller's cancellation
                 if await cls._dropped_under_request(client, exc):
                     # The server never answered: the connection went down with the request in flight.
-                    await cls._close_dead_socket(client)
+                    await _client.retire(client, _DROPPED_TEXT)
                 elif not cls._is_unknown_live_query(exc):
                     raise SurrealDbError(f"Failed to kill live query {query_uuid}: {exc}") from exc
             mark_killed(query_uuid)
@@ -3269,17 +3270,74 @@ def _new_connection_class(name: str) -> type[SurrealDBConnectionManager]:
     )
 
 
-def _spawn_socket_close(client: Any) -> None:
-    """Close *client*'s transport in the background on the running loop — the loop the client belongs to — kept in
-    ``_BACKGROUND`` until done (:meth:`SurrealDBConnectionManager._retire_server_clients`)."""
-    closing = asyncio.get_running_loop().create_task(SurrealDBConnectionManager._close_dead_socket(client))
+#: Why a client whose connection dropped refuses its requests (v0.50.0, ``_client.refuse``).
+_DROPPED_TEXT = (
+    "This SurrealDB connection dropped; the ORM does not reopen it. Get a new client with "
+    "SurrealDBConnectionManager.get_client()."
+)
+#: Why the client of an event loop that is closed refuses its requests.
+_CLOSED_LOOP_TEXT = (
+    "This SurrealDB connection belonged to an event loop that is closed. Get a new client with "
+    "SurrealDBConnectionManager.get_client()."
+)
+#: Why the client of ``ephemeral_client()`` refuses its requests once its block ended.
+_EPHEMERAL_CLOSED_TEXT = "This SurrealDB client was closed when its ephemeral_client() block ended."
+
+
+def _closed_text(by: str) -> str:
+    """Why a client closed by *by* (``close_connection()`` …) refuses its requests."""
+    return f"This SurrealDB connection was closed by {by}. Get a new client with SurrealDBConnectionManager.get_client()."
+
+
+def _settings_retired_text(name: str | None) -> str:
+    """Why a client of connection *name*'s previous settings refuses its requests."""
+    return (
+        f"Connection {name!r} was removed or registered again with other settings; this client of the old settings "
+        "was closed. Get a new client with SurrealDBConnectionManager.get_client()."
+    )
+
+
+def _new_sdk_client(url: str, *, embedded: bool) -> Any:
+    """A new SDK 3.0 client for *url*, not connected (v0.50.0).
+
+    The embedded engine takes the URL only. A server client is built with:
+
+    - ``reconnect=False``: the ORM replaces a dropped client itself and replays its session (v0.21.0); two reconnect
+      mechanisms on one socket would race.
+    - ``streaming=False``: one buffered answer per request on every server line (2.x and 3.1 never stream).
+    - ``renew_access=False``: the SDK never spends a refresh token the ORM stored (they are single use) — the
+      application's ``signin(refresh=…)`` and the reconnect replay keep working.
+    - ``timeout=None`` on WebSocket: no client deadline, as with SDK 2.0 (a long migration, index build or query is not
+      cut); a dead peer is still detected by the SDK's pings. HTTP keeps SDK 2.0's 30-second deadline per request
+      (measured, SDK 2.0.0): ``_HTTP_TIMEOUT``.
+    """
+    if embedded:
+        return AsyncSurreal(url)
+    timeout = _HTTP_TIMEOUT if url.startswith(("http://", "https://")) else None
+    return AsyncSurreal(url, reconnect=False, streaming=False, renew_access=False, timeout=timeout)
+
+
+#: The deadline of one HTTP request, in seconds: SDK 2.0.0's (``aiohttp.ClientTimeout(total=30)``), kept.
+_HTTP_TIMEOUT: Final = 30.0
+
+
+def _live_keys(candidate: Any) -> list[str]:
+    """The live-query uuids *candidate* (an SDK client, or ``None``) has queues for."""
+    queues = getattr(candidate, "live_queues", None)
+    return list(queues) if isinstance(queues, dict) else []
+
+
+def _spawn_retire(client: Any, reason: str) -> None:
+    """Retire *client* (``_client.retire``) in the background on the running loop — the loop the client belongs to —
+    kept in ``_BACKGROUND`` until done (:meth:`SurrealDBConnectionManager._retire_server_clients`)."""
+    closing = asyncio.get_running_loop().create_task(_client.retire(client, reason))
     _BACKGROUND.add(closing)
     closing.add_done_callback(_BACKGROUND.discard)
 
 
 async def _close_quietly(client: Any) -> None:
-    """Close a client nobody will use, whatever its ``close()`` raises (the SDK 2.0 HTTP client's raises
-    ``NotImplementedError``): a background task must not end with an exception nobody retrieves."""
+    """Close a client nobody will use, whatever its ``close()`` raises: a background task must not end with an
+    exception nobody retrieves."""
     with contextlib.suppress(Exception):
         await client.close()
 
