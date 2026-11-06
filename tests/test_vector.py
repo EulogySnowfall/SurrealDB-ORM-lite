@@ -4882,7 +4882,7 @@ _MISSING_FIRST = (
     "$_sq1 AND embedding <|2,100|> $_f2 ORDER BY _knn_distance) };"
 )
 _MISSING_AGAIN = (
-    "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, "
+    "{ LET $_sq0 = <array> []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, "
     "vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND id IN $_sq1 AND embedding <|2,100|> "
     "$_f1 ORDER BY _knn_distance) };"
 )
@@ -5691,14 +5691,14 @@ _K12C = (
     "id IN $_sq0 AND embedding <|1,100|> $_f1); (UPDATE vec_doc PATCH $_ops WHERE id IN $_sq1) };"
 )
 #: K12d: K12's write once SurrealDB 3.x confirmed that the table does not exist.
-_K12D = "{ LET $_sq0 = []; (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq0) };"
+_K12D = "{ LET $_sq0 = <array> []; (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq0) };"
 #: An id subquery next to the KNN: its ``LET`` first, then the ids of the nearest; with its table missing, ``[]``.
 _K12_BY_SUBQUERY = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id "
     "IN $_sq0 AND embedding <|2,100|> $_f1); (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq1) };"
 )
 _K12_BY_EMPTY_SUBQUERY = (
-    "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f0); "
+    "{ LET $_sq0 = <array> []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f0); "
     "(UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq1) };"
 )
 
@@ -5746,7 +5746,7 @@ _UPDATE_NEAREST = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE embedding <|2,100|> $_f0); (UPDATE vec_ranked SET hit = $_v0 "
     "WHERE id IN $_sq0) };"
 )
-_UPDATE_NONE = "{ LET $_sq0 = []; (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq0) };"
+_UPDATE_NONE = "{ LET $_sq0 = <array> []; (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq0) };"
 
 #: The variables of ``VecRanked``'s range writes.
 _RANGE_VARIABLES = {"_f0": 2, "_f1": [1.0, 0.0, 0.0], "_v0": True}

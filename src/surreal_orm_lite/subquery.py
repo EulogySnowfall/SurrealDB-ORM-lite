@@ -32,8 +32,9 @@ value is read as ``Subquery(qs)`` — sends **one** statement, inside which the 
   "The table '<t>' does not exist"; :func:`missing_table` recognises only the server's own forms of that error
   (never the sentence inside another error, which may quote a value the statement read). The ORM then asks the
   server whether ``<t>`` exists (:data:`TABLE_PROBE`, the name bound) and, only when the server confirms it does
-  not, sends the statement once more with every subquery of that table bound to ``[]`` (``LET $_sq0 = [];``), so
-  a missing table reads as empty on every line, as the ORM reads any missing table. Any other error is the
+  not, sends the statement once more with every subquery of that table bound to an empty array
+  (``LET $_sq0 = <array> [];``, :data:`EMPTY`), so a missing table reads as empty on every line, as the ORM reads any
+  missing table. Any other error is the
   server's, relayed unchanged: a subquery is never read as empty because an error mentions its table.
 
 :class:`SubqueryCompiler` is what one statement's subqueries share: the ``LET`` s, the tables they read, the
@@ -66,6 +67,10 @@ if TYPE_CHECKING:
 VALUE_ALIAS: Final = "_sqv"
 #: The prefix of the block-scoped ``LET`` that binds each subquery: ``$_sq0``, ``$_sq1``… (reserved).
 LET_PREFIX: Final = "_sq"
+#: The value a subquery of a missing table is bound to: an empty array written as a cast, not the literal ``[]``, which
+#: SurrealDB 4.x folds next to a KNN operator (``id IN [] AND <|k|>``) and then refuses the statement ("no KNN operator
+#: found in WHERE condition"). Every line reads it as ``[]``.
+EMPTY: Final = "<array> []"
 #: The lookups that compare a field with all the values of a subquery.
 COLLECTION_LOOKUPS: Final = frozenset({"in", "not_in", "containsall", "containsany"})
 #: The lookups that compare a field with the first value of a subquery (no record when it is empty).

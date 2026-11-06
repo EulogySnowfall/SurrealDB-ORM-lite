@@ -376,7 +376,7 @@ class TestCompilerBookkeeping:
     def test_mutable_fields_are_not_shared(self) -> None:
         one, two = SubqueryCompiler(), SubqueryCompiler()
         one.variables["a"] = 1
-        one.lets.append("LET $_sq0 = [];")
+        one.lets.append("LET $_sq0 = <array> [];")
         one.tables.add("t")
         one._stack.append(1)
         assert (two.variables, two.lets, two.tables, two._stack) == ({}, [], set(), [])
@@ -393,9 +393,9 @@ class TestCompilerBookkeeping:
         )
 
     def test_wrap_with_two_lets_keeps_their_order(self) -> None:
-        compiler = SubqueryCompiler(lets=["LET $_sq0 = (SELECT VALUE a FROM t);", "LET $_sq1 = [];"])
+        compiler = SubqueryCompiler(lets=["LET $_sq0 = (SELECT VALUE a FROM t);", "LET $_sq1 = <array> [];"])
         assert compiler.wrap("SELECT * FROM u WHERE x IN $_sq1;") == (
-            "{ LET $_sq0 = (SELECT VALUE a FROM t); LET $_sq1 = []; (SELECT * FROM u WHERE x IN $_sq1) };"
+            "{ LET $_sq0 = (SELECT VALUE a FROM t); LET $_sq1 = <array> []; (SELECT * FROM u WHERE x IN $_sq1) };"
         )
 
     @pytest.mark.parametrize(("a", "b"), _DIFFERENT, ids=_DIFFERENT_IDS)
@@ -716,7 +716,7 @@ class TestCompileSubquery:
     def test_c14_retry_form(self) -> None:
         qs = _with_inner(_active())
         assert qs._compile_query(subqueries=qs._subquery_compiler(frozenset({"sq_person"}))) == (
-            "{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
+            "{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
             {},
         )
 
@@ -725,7 +725,7 @@ class TestCompileSubquery:
         qs = _with_inner(SqPerson.objects().filter(id__in=Subquery(writers)))
         compiler = qs._subquery_compiler(frozenset({"sq_person"}))
         assert qs._compile_query(subqueries=compiler) == (
-            "{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
+            "{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
             {},
         )
         assert compiler.tables == {"sq_person"}
@@ -1504,7 +1504,7 @@ def _nested_ghost() -> Any:
     return SqPost.objects().filter(author__in=Subquery(SqPerson.objects().filter(id__not_in=_ghost())))
 
 
-_EMPTY_LET = "LET $_sq0 = [];"
+_EMPTY_LET = "LET $_sq0 = <array> [];"
 
 
 _PROBE_SQ_GHOST = (TABLE_PROBE, {"table": "sq_ghost"})
@@ -1926,13 +1926,13 @@ class TestRunCompiled:
         assert calls[0][1] == {"subquery_tables": frozenset({"sq_person", "sq_post"})}
         assert calls[1] == (
             (
-                "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM sq_person WHERE id IN $_sq0); "
+                "{ LET $_sq0 = <array> []; LET $_sq1 = (SELECT VALUE id FROM sq_person WHERE id IN $_sq0); "
                 "(SELECT * FROM sq_post WHERE author IN $_sq1) };",
                 {},
             ),
             {"subquery_tables": frozenset({"sq_person"})},
         )
-        assert calls[2] == (("{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0) };", {}), {})
+        assert calls[2] == (("{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0) };", {}), {})
 
     @pytest.mark.parametrize(
         ("read", "statement"),
@@ -1984,7 +1984,7 @@ class TestRunCompiled:
         await read(qs)
         assert [(args[0], kwargs) for args, kwargs in calls] == [
             (f"{{ {_C1_LET} ({statement}) }};", {"subquery_tables": _READS_SQ_PERSON}),
-            (f"{{ LET $_sq0 = []; ({statement}) }};", {}),
+            (f"{{ LET $_sq0 = <array> []; ({statement}) }};", {}),
         ]
 
     async def test_the_limit_of_exists_is_restored(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2247,7 +2247,10 @@ class TestMissingSubqueryTableWritesE2E:
                     {"_f0": "g"},
                 ),
                 _PROBE_SQ_GHOST,
-                ("{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0 AND title = $_f0 LIMIT 2) };", {"_f0": "g"}),
+                (
+                    "{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0 AND title = $_f0 LIMIT 2) };",
+                    {"_f0": "g"},
+                ),
             ]
             await _assert_every_post_scored_one_and_one_created()
 

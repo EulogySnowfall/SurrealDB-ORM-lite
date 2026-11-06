@@ -1238,7 +1238,7 @@ class QuerySet:
         engine, and a range on an indexed column next to the KNN writes nothing on every engine.
 
         The ``LET`` reads the model's own table, registered in ``compiler.tables`` as a subquery's: when SurrealDB 3.x
-        confirms that table missing (``compiler.empty_tables``), the ids are bound to ``[]`` and nothing else is
+        confirms that table missing (``compiler.empty_tables``), the ids are bound to an empty array and nothing else is
         compiled, so the write reads it as empty, as it does without ``similar_to()``. A view model never gets here
         (its writes are refused first), so the write always says ``id IN``. ``limit()``, ``offset()`` and
         ``order_by()`` are not written, as for every bulk write.
@@ -1249,7 +1249,7 @@ class QuerySet:
         compiler.tables.add(table)
         if table in compiler.empty_tables:
             values: dict[str, Any] = {}
-            select = "[]"
+            select = _subquery.EMPTY
         else:
             where, values = self._build_where(subqueries=compiler)
             select = f"(SELECT VALUE id FROM {table}{where})"
@@ -1267,7 +1267,7 @@ class QuerySet:
         values are bound from *counter* on, its ``variables()`` merged into the statement's, its own subqueries
         rendered first (their ``LET`` s precede its own). Under the outer ``as_of()`` (``compiler.moment``) it
         carries the per-record guard and ``VERSION $_as_of``: the server never applies the outer ``VERSION`` to a
-        ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. Each of its ``search()`` conditions is
+        ``LET``. A table in ``compiler.empty_tables`` compiles to an empty array (``subquery.EMPTY``). Each of its ``search()`` conditions is
         recorded in ``compiler.searched`` (v0.35.0), its ``similar_to()`` in ``compiler.knn_fields`` (v0.36.0).
         ``fetch()`` is ignored, as in the full SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
 
@@ -1317,7 +1317,7 @@ class QuerySet:
             compiler.view_tables.add(table)
         compiler.merge_variables(self._variables)
         if table in compiler.empty_tables:
-            return "[]", {}, counter
+            return _subquery.EMPTY, {}, counter
         for field, search_column, _ in self._search:
             compiler.searched[(table, search_column)] = field
         if self._similar is not None:
