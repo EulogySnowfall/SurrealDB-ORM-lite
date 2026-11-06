@@ -3438,11 +3438,11 @@ async def _indexes(client: Any, table: str) -> dict[str, IndexState | None]:
     return await search.read_table_indexes(client, table, what="index", kind="definition")
 
 
-async def _refusals(client: Any, query: str) -> list[str]:
-    """Run *query* raw: the text of every statement SurrealDB refused, ``[]`` when it accepts them all (a parse error
-    refuses the whole query; the embedded engine raises it)."""
+async def _refusals(client: Any, query: str, **variables: Any) -> list[str]:
+    """Run *query* raw, with *variables*: the text of every statement SurrealDB refused, ``[]`` when it accepts them all
+    (a parse error refuses the whole query; the embedded engine raises it)."""
     try:
-        response = await client.query_raw(query, {})
+        response = await client.query_raw(query, variables)
     except RuntimeError as error:
         return [str(error)]
     if "error" in response:
@@ -3733,10 +3733,6 @@ _PIN_BARE_SERVER = (
     "DEFINE INDEX vec_pin_t ON vec_pin FIELDS embedding HNSW DIMENSION 3 DIST EUCLIDEAN TYPE F32 EFC 150 M 12 M0 24 "
     "LM 0.40242960438184466f"
 )
-_PIN_BARE_EMBEDDED = (
-    "DEFINE INDEX vec_pin_t ON vec_pin FIELDS embedding HNSW DIMENSION 3 DIST EUCLIDEAN TYPE F64 EFC 150 M 12 M0 24 "
-    "LM 0.40242960438184466f"
-)
 
 _PIN_MTREE = "DEFINE INDEX vec_pin_m ON vec_pin FIELDS embedding MTREE DIMENSION 3;"
 _PIN_MTREE_STORED = (
@@ -3764,14 +3760,10 @@ class TestVectorDdlPinsE2E:
             await _apply_ddl(client, _PIN_ORM.ddl("vec_pin"))
             info = await _table_info(client, "vec_pin")
         stored = info["indexes"]
-        if kind == "mem":
-            assert stored["vec_pin_t"] == _PIN_BARE_EMBEDDED, (
-                "README section 37, _S37_TYPE: the embedded engine stores F64 vectors for an index without TYPE"
-            )
-        else:
-            assert stored["vec_pin_t"] == _PIN_BARE_SERVER, (
-                "README section 37, _S37_TYPE: a SurrealDB server stores F32 vectors for an index without TYPE"
-            )
+        # The embedded engine's 4.0 core (SDK 3.0) stores F32 as the servers do; its 2.x core stored F64.
+        assert stored["vec_pin_t"] == _PIN_BARE_SERVER, (
+            "README section 37, _S37_TYPE: SurrealDB stores F32 vectors for an index without TYPE"
+        )
         written = parse_define_index(stored["vec_pin_o"])
         assert written.vector_type == "F32", "README section 37, _S37_TYPE: the ORM writes TYPE on every engine"
         assert search.index_matches(_PIN_ORM, ["embedding"], written)
@@ -3793,7 +3785,16 @@ class TestVectorDdlPinsE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_hnsw_unique_stores_a_plain_unique_index(self, kind: str) -> None:
+        """Below 4 SurrealDB keeps a plain ``UNIQUE`` index and drops ``HNSW``; 4.x refuses the statement ("Cannot
+        combine UNIQUE with HNSW", a parse error). The ORM refuses ``Index(hnsw=True, unique=True)`` on every line."""
         async with _vec(kind) as client:
+            major = await _major(client)
+            if major >= 4:
+                refusals = await _refusals(client, _PIN_UNIQUE)
+                info = await _table_info(client, "vec_pin")
+                assert len(refusals) == 1 and "Cannot combine UNIQUE with HNSW" in refusals[0], "4.x refuses it"
+                assert info["indexes"] == {}
+                return
             await _apply_ddl(client, _PIN_UNIQUE)
             info = await _table_info(client, "vec_pin")
         message = "Index(hnsw=True, unique=True) is refused: SurrealDB keeps a plain UNIQUE index and drops HNSW"
@@ -6176,8 +6177,15 @@ class TestExactScanRankingE2E:
     async def test_a_zero_vector_under_cosine(self, kind: str) -> None:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _ZERO_CORPUS)
+            major = await _major(client)
             raw = await _client.query(client, _PIN_TWO_NEAREST.format(dist="COSINE"), {"q": _Q})
             records = await _tied_nearest("cosine", 2).exec()
+        if major >= 4:
+            # SurrealDB 4.x ranks the zero vector's NaN distance after every number: the two nearest are z1 and z2.
+            assert [str(row["id"].id) for row in raw] == _ids(records) == ["z1", "z2"]
+            assert records[0]._knn_distance == raw[0]["d"] == 0.0
+            assert records[1]._knn_distance == raw[1]["d"] == pytest.approx(0.4)
+            return
         assert [str(row["id"].id) for row in raw] == _ids(records) == ["z0", "z1"]
         assert math.isnan(records[0]._knn_distance) and math.isnan(raw[0]["d"])
         assert records[1]._knn_distance == raw[1]["d"] == 0.0
@@ -6835,6 +6843,12 @@ class TestLinePinsE2E:
         async with _vec_models(kind) as client:
             await _seed(client)
             major = await _major(client)
+            if major >= 4:
+                refusals = await _refusals(client, _PIN_TWO_KNN, q=_Q, p=_Q2)
+                assert len(refusals) == 1 and "supports a single KNN operator" in refusals[0], (
+                    f"{_ROW_CONDITIONS}: SurrealDB 4.x refuses a second KNN operator"
+                )
+                return
             keys = await _keys(client, _PIN_TWO_KNN, q=_Q, p=_Q2)
         if major >= 3:
             assert keys == ["d1", "d2"], f"{_ROW_CONDITIONS}: SurrealDB 3.x returns the first operator's neighbours"
@@ -6904,6 +6918,13 @@ class TestLinePinsE2E:
             assert ranged == [], f"{_ROW_CONDITIONS}: 2.x answers no record next to a range on an indexed field"
             assert counted == [{"count": 4}], f"{_ROW_CONDITIONS}: 2.x counts more records than K there"
             assert exact == [], f"{_ROW_CONDITIONS}: 2.x's exact scan answers no record next to an indexed field"
+        if major >= 4:
+            # SurrealDB 4.0.0: inside a block, an HNSW search next to `id IN $s`, $s a LET of the block holding a
+            # SELECT, answers no record (the exact scan is right).
+            assert (ranged_first, counted_first, exact_first) == ([], [{"count": 0}], ["d3", "d4"]), (
+                f"{_ROW_CONDITIONS}: 4.0.0 answers no record for an HNSW search next to a LET's ids"
+            )
+            return
         assert (ranged_first, counted_first, exact_first) == (["d4", "d6"], [{"count": 2}], ["d3", "d4"]), (
             f"{_ROW_CONDITIONS}: the records selected first in a LET, right on every engine"
         )
@@ -6935,6 +6956,20 @@ class TestLinePinsE2E:
             await _apply_ddl(client, _seed_statements("vec_pin_r", numbered=True))
             await _compaction.wait_for_defined_indexes(client, _PIN_WRITE_DDL)
             major = await _major(client)
+            if major >= 4:
+                refused = [
+                    await _refusals(client, _PIN_W_UPDATE, q=_Q),
+                    await _refusals(client, _PIN_R_UPDATE, a=2, q=_Q),
+                ]
+                written = await _keys(client, _PIN_W_HITS)
+                ranged_written = await _keys(client, _PIN_R_HITS)
+                selected = await _keys(client, _PIN_R_SELECT, a=2, q=_Q)
+                # SurrealDB 4.x refuses a KNN operator in the WHERE of an UPDATE (the ORM's writes select the ids first).
+                assert [len(texts) for texts in refused] == [1, 1], f"{_ROW_WRITES}: 4.x refuses both writes"
+                assert all("in the WHERE of an UPDATE or DELETE" in texts[0] for texts in refused), refused
+                assert (written, ranged_written) == ([], []), f"{_ROW_WRITES}: 4.x writes nothing"
+                assert selected == ["d4", "d6"], f"{_ROW_WRITES}: SurrealDB 4.x selects the K nearest of the range"
+                return
             returned = await _client.query(client, _PIN_W_UPDATE, {"q": _Q})
             written = await _keys(client, _PIN_W_HITS)
             ranged = await _client.query(client, _PIN_R_UPDATE, {"a": 2, "q": _Q})
@@ -6977,7 +7012,11 @@ class TestLinePinsE2E:
             assert exact == ["d2", "d6"], f"{_ROW_SEARCH}: SurrealDB 3.x keeps the match next to the exact scan"
         else:
             assert exact == [], f"{_ROW_SEARCH}: 2.x and the embedded engine answer no record next to a full-text match"
-        assert matched_first == ["d2", "d6"], f"{_ROW_SEARCH}: the matches selected first in a LET, right everywhere"
+        if line[0] >= 4:
+            # SurrealDB 4.0.0: an HNSW search next to the ids of a LET of the block answers no record.
+            assert matched_first == [], f"{_ROW_SEARCH}: 4.0.0 answers no record for an HNSW search next to a LET"
+        else:
+            assert matched_first == ["d2", "d6"], f"{_ROW_SEARCH}: the matches selected first in a LET, right everywhere"
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_search_score_in_the_let_form(self, kind: str) -> None:
