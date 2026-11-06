@@ -28,6 +28,7 @@ returns a client, or a new context that yields one, fails ``TestFactoryCompleten
 from __future__ import annotations
 
 import ast
+import asyncio
 import textwrap
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -35,9 +36,10 @@ from typing import Any
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel, _sdk
+from surreal_orm_lite import BaseSurrealModel, _client, _sdk
+from surreal_orm_lite._sdk import RecordID
 from surreal_orm_lite.query_set import QuerySet
-from tests import _frontier_spy
+from tests import _frontier_spy, _sdk_calls
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "surreal_orm_lite"
 
@@ -637,3 +639,141 @@ class TestRuntimeSpy:
             "SDK calls outside surreal_orm_lite._client (ORM_FRONTIER_SPY=report: not failing the session)",
             "surreal_orm_lite.edge.f (x.py:1) called C.query()",
         ]
+
+
+# --- tests/_sdk_calls.py: request counting on the frontier ------------------------------------------------
+
+
+class _Builder:
+    """An SDK 3.0-style builder: awaitable, with ``merge()``/``patch()`` refinements."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+
+    def merge(self, data: Any) -> _Builder:
+        return _Builder({"merged": data})
+
+    def patch(self, ops: Any) -> _Builder:
+        return _Builder({"patched": ops})
+
+    def __await__(self) -> Any:
+        async def answer() -> Any:
+            return self.result
+
+        return answer().__await__()
+
+
+class _FakeClient:
+    """Answers each data method with a builder, as SDK 3.0's clients do; never an SDK class (the spy ignores it)."""
+
+    def query(self, sql: str, variables: Any = None) -> _Builder:
+        return _Builder([[{"sql": sql}], [{"second": True}]])
+
+    def query_raw(self, sql: str, variables: Any = None) -> _Builder:
+        return _Builder({"result": [{"status": "OK", "result": sql}]})
+
+    def select(self, target: Any) -> _Builder:
+        return _Builder({"id": target})
+
+    def create(self, target: Any, data: Any) -> _Builder:
+        return _Builder(data)
+
+    def update(self, target: Any, data: Any = None) -> _Builder:
+        return _Builder(data)
+
+
+class TestSdkCalls:
+    """``tests/_sdk_calls.py``: what ``record()`` and ``hold_next()`` see of the frontier, client by client."""
+
+    async def test_record_sees_each_call_of_its_client_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mine, other = _FakeClient(), _FakeClient()
+        calls = _sdk_calls.record(monkeypatch, mine, "query", "query_all", "select", "create", "merge")
+        assert await _client.query(mine, "RETURN $a;", {"a": 1}) == [{"sql": "RETURN $a;"}]
+        assert len(await _client.query_all(mine, "SELECT * FROM t;")) == 2
+        await _client.select(mine, RecordID("t", 1))
+        await _client.create(mine, "t", {"v": 1})
+        assert await _client.merge(mine, RecordID("t", 1), {"v": 2}) == {"merged": {"v": 2}}
+        await _client.query(other, "RETURN 2;")
+        await _client.select(other, "t")
+        assert calls == [
+            _sdk_calls.Call("query", "RETURN $a;", {"a": 1}),
+            _sdk_calls.Call("query_all", "SELECT * FROM t;", {}),
+            _sdk_calls.Call("select", RecordID("t", 1), None),
+            _sdk_calls.Call("create", "t", None),
+            _sdk_calls.Call("merge", RecordID("t", 1), None),
+        ]
+
+    async def test_record_ignores_the_functions_it_was_not_given(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _FakeClient()
+        calls = _sdk_calls.record(monkeypatch, client, "select")
+        await _client.query(client, "RETURN 1;")
+        await _client.query_raw(client, "RETURN 1;")
+        assert calls == []
+
+    async def test_record_keeps_what_entry_gives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _FakeClient()
+        calls = _sdk_calls.record(monkeypatch, client, "query", entry=lambda call: (call.target, call.variables))
+        await _client.query(client, sql="RETURN $x;", variables={"x": 1})
+        assert calls == [("RETURN $x;", {"x": 1})]
+
+    async def test_record_keeps_a_call_that_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _FakeClient()
+
+        def refused(sql: str, variables: Any = None) -> Any:
+            raise RuntimeError("refused")
+
+        monkeypatch.setattr(client, "query", refused)
+        calls = _sdk_calls.record(monkeypatch, client, "query", entry=lambda call: call.target)
+        with pytest.raises(RuntimeError, match="refused"):
+            await _client.query(client, "RETURN 1;")
+        assert calls == ["RETURN 1;"]
+
+    async def test_two_clients_stack_on_one_function(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        first, second = _FakeClient(), _FakeClient()
+        a = _sdk_calls.record(monkeypatch, first, "query", entry=lambda call: call.target)
+        b = _sdk_calls.record(monkeypatch, second, "query", entry=lambda call: call.target)
+        await _client.query(first, "RETURN 1;")
+        await _client.query(second, "RETURN 2;")
+        assert (a, b) == (["RETURN 1;"], ["RETURN 2;"])
+
+    async def test_the_patches_end_with_monkeypatch(self) -> None:
+        real = _client.query
+        with pytest.MonkeyPatch.context() as patched:
+            _sdk_calls.record(patched, _FakeClient(), "query")
+            assert _client.query is not real
+        assert _client.query is real
+
+    def test_names_are_checked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _FakeClient()
+        with pytest.raises(ValueError, match="'version' is not a request function"):
+            _sdk_calls.record(monkeypatch, client, "version")
+        with pytest.raises(ValueError, match="at least one"):
+            _sdk_calls.record(monkeypatch, client)
+        with pytest.raises(ValueError, match="'normalize' is not a request function"):
+            _sdk_calls.hold_next(monkeypatch, client, "normalize")
+        with pytest.raises(ValueError, match="at least one"):
+            _sdk_calls.hold_next(monkeypatch, client)
+
+    async def test_hold_next_holds_one_call_after_its_reply(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client, other = _FakeClient(), _FakeClient()
+        reached, release = _sdk_calls.hold_next(monkeypatch, client, "query", "select")
+        assert await _client.query(other, "RETURN 0;") == [{"sql": "RETURN 0;"}]  # another client: not held
+        assert not reached.is_set()
+        held = asyncio.ensure_future(_client.query(client, "RETURN 1;"))
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        assert not held.done()
+        # Disarmed: the calls made meanwhile pass through, on either function.
+        assert await _client.select(client, RecordID("t", 1)) == {"id": RecordID("t", 1)}
+        assert await _client.query(client, "RETURN 2;") == [{"sql": "RETURN 2;"}]
+        release.set()
+        assert await asyncio.wait_for(held, timeout=5) == [{"sql": "RETURN 1;"}]
+
+    async def test_hold_next_and_record_stack(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _FakeClient()
+        calls = _sdk_calls.record(monkeypatch, client, "query", entry=lambda call: call.target)
+        reached, release = _sdk_calls.hold_next(monkeypatch, client, "query")
+        held = asyncio.ensure_future(_client.query(client, "RETURN 1;"))
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        assert calls == ["RETURN 1;"]
+        release.set()
+        await held

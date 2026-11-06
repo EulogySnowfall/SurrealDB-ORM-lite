@@ -10,7 +10,6 @@ import ast
 import asyncio
 import contextlib
 import dataclasses
-import functools
 import inspect
 import logging
 import os
@@ -61,6 +60,7 @@ from surreal_orm_lite import (
     time_travel,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
+from tests import _sdk_calls
 from tests._proxy import CuttableProxy
 from tests._readme_tables import (
     assert_embedded_rows,
@@ -745,21 +745,10 @@ async def _databases(kind: str, *names: str) -> AsyncIterator[None]:
 
 
 def _record_raw(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
-    """Record the statement of each ``query_raw()`` *client* sends from now on (the batch of a buffered commit,
-    the writes of an interactive transaction). Patched on the client's class and keyed on ``id(client)``, as
-    ``tests.test_time_travel._record_queries`` does."""
-    sent: list[str] = []
-    cls = type(client)
-    real = cls.query_raw
-    owner = id(client)
-
-    async def recording(self: Any, query: str, *args: Any, **kwargs: Any) -> Any:
-        if id(self) == owner:
-            sent.append(query)
-        return await real(self, query, *args, **kwargs)
-
-    monkeypatch.setattr(cls, "query_raw", recording)
-    return sent
+    """Record the statement of each statement request the ORM sends for *client* from now on (the batch of a buffered
+    commit, the writes of an interactive transaction), through any of the frontier's ``QUERIES``
+    (``tests/_sdk_calls.py``)."""
+    return _sdk_calls.record(monkeypatch, client, *_sdk_calls.QUERIES, entry=lambda call: call.target)
 
 
 class _FakeSocket:
@@ -4484,27 +4473,9 @@ _MOMENT = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def _record_requests(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
-    """The statement of each ``query()`` and the target of each ``select()`` *client* sends from now on.
-
-    Patched on the client's class and keyed on ``id(client)``, as ``tests.test_time_travel._record_queries`` does; each
-    wrapper keeps the signature it wraps (``functools.wraps``), so the wrappers of two clients of one class stack.
-    """
-    sent: list[str] = []
-    cls = type(client)
-    owner = id(client)
-
-    def wrap(real: Any) -> Any:
-        @functools.wraps(real)
-        async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if id(self) == owner:
-                sent.append(str(args[0] if args else next(iter(kwargs.values()), "")))
-            return await real(self, *args, **kwargs)
-
-        return recording
-
-    for method in ("query", "select"):
-        monkeypatch.setattr(cls, method, wrap(getattr(cls, method)))
-    return sent
+    """The statement of each ``query()`` and the target of each ``select()`` the ORM sends for *client* from now on
+    (``tests/_sdk_calls.py``; the recordings of two clients stack)."""
+    return _sdk_calls.record(monkeypatch, client, "query", "query_all", "select", entry=lambda call: str(call.target))
 
 
 async def _line_of(name: str) -> int:

@@ -62,6 +62,7 @@ from surreal_orm_lite._sdk import AsyncSurreal, cbor_encode
 from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
+from tests import _sdk_calls
 from tests._readme_tables import (
     assert_guide_sections,
     assert_manual_order,
@@ -3209,57 +3210,21 @@ class TestScopeE2E:
 
 
 def _record_selects(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[Any]:
-    """Record the target of each ``select()`` *client* runs from now on (``_record_queries``' twin)."""
-    calls: list[Any] = []
-    cls = type(client)
-    real = cls.select
-    owner = id(client)
-
-    @functools.wraps(real)
-    async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if id(self) == owner:
-            calls.append(args[0] if args else next(iter(kwargs.values()), None))
-        return await real(self, *args, **kwargs)
-
-    monkeypatch.setattr(cls, "select", recording)
-    return calls
+    """Record the target of each ``select()`` the ORM sends for *client* from now on (``_record_queries``' twin)."""
+    return _sdk_calls.record(monkeypatch, client, "select", entry=lambda call: call.target)
 
 
 def _requests(monkeypatch: pytest.MonkeyPatch, client: Any) -> Callable[[], int]:
-    """The number of ``query()`` and ``select()`` requests *client* sends from now on."""
+    """The number of ``query()`` and ``select()`` requests the ORM sends for *client* from now on."""
     queries = _record_queries(monkeypatch, client)
     selects = _record_selects(monkeypatch, client)
     return lambda: len(queries) + len(selects)
 
 
-def _hold_next_reply(
-    monkeypatch: pytest.MonkeyPatch, client: Any, method: str = "query"
-) -> tuple[asyncio.Event, asyncio.Event]:
-    """Hold the next *method* call of *client* **after** its reply: ``(reached, release)`` (spec §9).
-
-    The call runs for real first, so the rows it returns are computed before whatever the test does while it is
-    held; then ``reached`` is set and the call waits for ``release``. One-shot: disarmed before waiting, so the
-    test's own calls meanwhile pass through. Patched on the client's class and keyed on ``id(client)``.
-    """
-    reached, release = asyncio.Event(), asyncio.Event()
-    cls = type(client)
-    real = getattr(cls, method)
-    owner = id(client)
-    armed = [True]
-
-    @functools.wraps(real)  # keeps the signature: _record_queries() binds it
-    async def holding(self: Any, *args: Any, **kwargs: Any) -> Any:
-        hold = id(self) == owner and armed[0]
-        if hold:
-            armed[0] = False
-        result = await real(self, *args, **kwargs)
-        if hold:
-            reached.set()
-            await release.wait()
-        return result
-
-    monkeypatch.setattr(cls, method, holding)
-    return reached, release
+def _hold_next_reply(monkeypatch: pytest.MonkeyPatch, client: Any) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold the next statement request the ORM sends for *client* **after** its reply: ``(reached, release)`` (spec
+    §9; ``tests._sdk_calls.hold_next``). One-shot: the test's own calls meanwhile pass through."""
+    return _sdk_calls.hold_next(monkeypatch, client, "query", "query_all")
 
 
 async def _until_held(reached: asyncio.Event, task: asyncio.Task[Any]) -> None:

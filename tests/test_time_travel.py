@@ -62,6 +62,7 @@ from surreal_orm_lite.model_base import _snapshot_moment
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import MAX_MOMENT, MIN_MOMENT, AsOf, in_range, line_major, normalise_as_of
+from tests import _sdk_calls
 from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
 from tests._readme_tables import SERVER_BEHAVIOUR as _SERVER_BEHAVIOUR
 from tests._readme_tables import (
@@ -798,25 +799,9 @@ def _strictly_increasing(*moments: datetime) -> None:
 
 
 def _record_queries(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, dict[str, Any]]]:
-    """Record ``(statement, variables)`` of each ``query()`` *client* runs from now on, then run it as usual.
-
-    Patched on the client's class and keyed on ``id(client)``: an instance attribute wrapping a bound method
-    would make the client refer to itself, so dropping it would no longer end its engine (v0.25.0).
-    """
-    calls: list[tuple[str, dict[str, Any]]] = []
-    cls = type(client)
-    real = cls.query
-    signature = inspect.signature(real)
-    owner = id(client)
-
-    async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if id(self) == owner:
-            bound = signature.bind(self, *args, **kwargs).arguments
-            calls.append((bound["query"], dict(bound.get("vars") or {})))
-        return await real(self, *args, **kwargs)
-
-    monkeypatch.setattr(cls, "query", recording)
-    return calls
+    """Record ``(statement, variables)`` of each statement request (``query()``/``query_all()`` of the SDK call
+    frontier) the ORM sends for *client* from now on, then send it as usual (``tests/_sdk_calls.py``)."""
+    return _sdk_calls.record(monkeypatch, client, "query", "query_all", entry=lambda call: (call.target, call.variables or {}))
 
 
 async def _forbidden_client(*args: Any, **kwargs: Any) -> Any:
@@ -1404,30 +1389,14 @@ _SNAPSHOT_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = 
     ("remove_all_relations", "remove_all_relations()", lambda s, tx: s.remove_all_relations("likes", tx=tx)),
 ]
 
-#: The SDK's write methods: a snapshot write must reach none of them.
+#: The SDK call frontier's write functions: a snapshot write must reach none of them.
 _CLIENT_WRITES = ("create", "insert", "insert_relation", "update", "merge", "patch", "upsert", "delete")
 
 
 def _record_writes(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
-    """Record the name of each SDK write method *client* calls from now on, then run it as usual.
-
-    Patched on the client's class and keyed on ``id(client)``, as ``_record_queries()`` does.
-    """
-    calls: list[str] = []
-    cls = type(client)
-    owner = id(client)
-
-    def recording(name: str, real: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-        async def method(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if id(self) == owner:
-                calls.append(name)
-            return await real(self, *args, **kwargs)
-
-        return method
-
-    for name in _CLIENT_WRITES:
-        monkeypatch.setattr(cls, name, recording(name, getattr(cls, name)))
-    return calls
+    """Record the name of each write request (``_CLIENT_WRITES`` of the SDK call frontier) the ORM sends for *client*
+    from now on, then send it as usual (``tests/_sdk_calls.py``)."""
+    return _sdk_calls.record(monkeypatch, client, *_CLIENT_WRITES, entry=lambda call: call.name)
 
 
 @contextlib.contextmanager
