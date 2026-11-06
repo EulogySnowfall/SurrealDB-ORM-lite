@@ -228,6 +228,9 @@ What the ORM cannot see, and you keep on one connection yourself:
   previous engine (with SDK 2.x still running), so stop using it, as after `close_connection()`.
   `set_connection()` and the `set_*()` setters do none of this: clients opened on the previous
   settings keep serving, as in earlier versions.
+- A WebSocket client the ORM gave up refuses every request instead of reconnecting anonymously: after its connection
+  dropped the `SurrealDbConnectionError` is retryable (retry the call; the ORM opens a new client), after
+  `close_connection()`, a new registration or `remove_connection()` it is not (get a new client with `get_client()`).
 
 Entries you cache yourself with `QueryCache.make_key()` and `set()` are not scoped to a connection: the key is
 built from the table, the statement and the variables only. When the same statement runs on two connections, put

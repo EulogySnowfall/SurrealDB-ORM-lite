@@ -1101,7 +1101,7 @@ class SurrealDBConnectionManager:
         _cache.retire_client(client)
         logger.info("The SurrealDB WebSocket connection dropped; opening a new one.")
         uuids = [key for candidate in (client, getattr(client, "_connection", None)) for key in _live_keys(candidate)]
-        await _client.retire(client, _DROPPED_TEXT)
+        await _client.retire(client, _DROPPED_TEXT, retryable=True)
         for key in uuids:
             mark_killed(key)
 
@@ -1148,7 +1148,7 @@ class SurrealDBConnectionManager:
             stale = cls.__clients.pop(loop, None)
             if stale is not None:
                 _cache.retire_client(stale)
-                await _client.retire(stale, _DROPPED_TEXT)
+                await _client.retire(stale, _DROPPED_TEXT, retryable=True)
             raise
 
         return await cls._replay_then_publish(
@@ -3218,7 +3218,7 @@ class SurrealDBConnectionManager:
                 # Before any await: a resubscribe woken by the same drop must find the reader gone.
                 release_subscribers(query_uuid)
                 if client is not None:
-                    await _client.retire(client, _DROPPED_TEXT)
+                    await _client.retire(client, _DROPPED_TEXT, retryable=True)
                 mark_killed(query_uuid)
                 return
             if not is_embedded_url(cls.__url):
@@ -3234,7 +3234,7 @@ class SurrealDBConnectionManager:
                     raise asyncio.CancelledError from exc  # the SDK raised over the caller's cancellation
                 if await cls._dropped_under_request(client, exc):
                     # The server never answered: the connection went down with the request in flight.
-                    await _client.retire(client, _DROPPED_TEXT)
+                    await _client.retire(client, _DROPPED_TEXT, retryable=True)
                 elif not cls._is_unknown_live_query(exc):
                     raise SurrealDbError(f"Failed to kill live query {query_uuid}: {exc}") from exc
             mark_killed(query_uuid)

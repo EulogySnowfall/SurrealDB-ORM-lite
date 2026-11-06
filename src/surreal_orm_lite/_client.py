@@ -27,8 +27,10 @@ reached) and any other ``TransportError`` are retryable, but for an ``HttpStatus
 
 Retired clients (v0.50.0): SDK 3.0's WebSocket client opens a new socket on any request made once its socket is gone,
 and that socket is anonymous (the ORM signs in itself, it never hands the SDK credentials). ``retire()`` makes a client
-the ORM no longer serves refuse every request instead (``SurrealDbConnectionError``, not retryable), then closes it;
-``refuse_on_drop()`` does the refusing part as soon as a client's connection drops, before the ORM has replaced it.
+the ORM no longer serves refuse every request instead (``SurrealDbConnectionError``), then closes it;
+``refuse_on_drop()`` does the refusing part as soon as a client's connection drops, before the ORM has replaced it. A
+refusal caused by a drop is retryable (the retry runs on a new client of the ORM's, as in v0.40.3); a deliberate one
+(``close_connection()``, new settings, a closed loop, an unsupported server) is not, and replaces a drop's.
 
 ``normalize()`` maps the SDK 3.0 values the ORM reads differently: SurrealDB's ``NULL`` (the SDK's ``Null``) is
 ``None``, a native set (``SurrealSet``) is a ``set`` — a ``list`` when a ``set`` would lose an item — and an open range
@@ -240,33 +242,46 @@ def is_retired(client: Any) -> bool:
     return getattr(connect, "_orm_refusal", None) is not None
 
 
-def refuse(client: Any, reason: str) -> None:
-    """Make every further request on the WebSocket *client* raise ``SurrealDbConnectionError(reason)``, not retryable.
+def _refusal_is_retryable(client: Any) -> bool:
+    """Whether the refusal installed on *client* is a drop's (retryable)."""
+    connect = getattr(client, "__dict__", {}).get("connect")
+    return bool(getattr(connect, "_orm_retryable", False))
+
+
+def refuse(client: Any, reason: str, *, retryable: bool = False) -> None:
+    """Make every further request on the WebSocket *client* raise ``SurrealDbConnectionError(reason)``.
 
     Every request path of SDK 3.0's WebSocket client starts with ``connect()``, which opens a new, anonymous socket
     when the old one is gone. The instance's ``connect`` is replaced by one that raises instead, so the client can
-    never open a socket again. Idempotent: the first reason stays. Not for HTTP clients: they hold no socket, their
-    requests never call ``connect()``, and a kept one sends the token it had (measured, SDK 3.0.0), as with SDK 2.0;
-    nor for the embedded engine, which has no socket either.
+    never open a socket again. ``retryable`` is the error's flag: ``True`` for a drop (:func:`refuse_on_drop`), whose
+    retry runs on a new client of the ORM's; ``False`` for a deliberate retirement. Idempotent: the first reason
+    stays, except that a deliberate refusal replaces a drop's (D19 as amended, 2026-11-06), so a client closed on
+    purpose after it dropped is not retried. Not for HTTP clients: they hold no socket, their requests never call
+    ``connect()``, and a kept one sends the token it had (measured, SDK 3.0.0), as with SDK 2.0; nor for the embedded
+    engine, which has no socket either.
     """
-    if is_retired(client) or SdkAsyncWsConnection is None or not isinstance(client, SdkAsyncWsConnection):
+    if SdkAsyncWsConnection is None or not isinstance(client, SdkAsyncWsConnection):
+        return
+    if is_retired(client) and (retryable or not _refusal_is_retryable(client)):
         return
 
     async def _refuse(*args: Any, **kwargs: Any) -> None:
         error = SurrealDbConnectionError(reason)
-        error.retryable = False  # type: ignore[attr-defined]
+        error.retryable = retryable  # type: ignore[attr-defined]
         raise error
 
     # The closure holds the reason, never the client: no reference cycle.
     _refuse._orm_refusal = reason  # type: ignore[attr-defined]
+    _refuse._orm_retryable = retryable  # type: ignore[attr-defined]
     client.connect = _refuse  # type: ignore[method-assign]
 
 
 def refuse_on_drop(client: Any, reason: str) -> None:
-    """:func:`refuse` *client* as soon as its WebSocket's reader stops (a drop, or a close).
+    """:func:`refuse` *client*, retryable, as soon as its WebSocket's reader stops (a drop, or a close).
 
     A request made on the client between the drop and the ORM replacing it (a reference kept by the application, an
-    open interactive transaction) then fails instead of reconnecting anonymously. A no-op for a client with no reader.
+    open interactive transaction) then fails instead of reconnecting anonymously; the failure is retryable, since the
+    ORM itself carries on with a new client. A no-op for a client with no reader.
     """
     task = getattr(client, "recv_task", None)
     if not isinstance(task, asyncio.Task):
@@ -277,19 +292,21 @@ def refuse_on_drop(client: Any, reason: str) -> None:
     def _on_done(_task: asyncio.Task[Any]) -> None:
         dropped = held()
         if dropped is not None:
-            refuse(dropped, reason)
+            refuse(dropped, reason, retryable=True)
 
     task.add_done_callback(_on_done)
 
 
-async def retire(client: Any, reason: str) -> None:
+async def retire(client: Any, reason: str, *, retryable: bool = False) -> None:
     """Make *client* refuse every further request with ``reason`` (:func:`refuse`), then close it.
 
-    The refusal is installed **before** ``close()``: SDK 3.0's ``close()`` never reaches ``connect()``
-    (``tests/test_identity_sdk3.py::TestSdkLayout`` pins it), so the close cannot meet the refusal. The close waits at
-    most two seconds, and what it raises is suppressed: the client is being given up either way.
+    ``retryable=True`` for a client given up because its connection dropped; a deliberate retirement (the default)
+    replaces a drop's refusal already installed. The refusal is installed **before** ``close()``: SDK 3.0's
+    ``close()`` never reaches ``connect()`` (``tests/test_identity_sdk3.py::TestSdkLayout`` pins it), so the close
+    cannot meet the refusal. The close waits at most two seconds, and what it raises is suppressed: the client is being
+    given up either way.
     """
-    refuse(client, reason)
+    refuse(client, reason, retryable=retryable)
     with contextlib.suppress(Exception):
         await asyncio.wait_for(client.close(), _CLOSE_TIMEOUT)
 

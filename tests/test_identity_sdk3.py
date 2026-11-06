@@ -3,7 +3,8 @@
 SDK 3.0's WebSocket client opens a new socket for any request made once its socket is gone, and that socket is
 anonymous: the ORM signs in itself and never hands the SDK credentials (measured, M26). A client the ORM no longer
 serves — dropped, closed by ``close_connection()``, of a connection's previous settings — is **retired**: it refuses
-every request with a ``SurrealDbConnectionError`` (not retryable) and opens no socket. That holds for every holder of
+every request with a ``SurrealDbConnectionError`` and opens no socket: retryable after a drop (the ORM carries on with a
+new client), not retryable after a deliberate retirement (``close_connection()``, new settings, a closed loop). That holds for every holder of
 the client: a ``get_client()`` result the application kept, an interactive transaction begun before the drop, a live
 stream started on it.
 
@@ -32,7 +33,7 @@ import pytest
 from surreal_orm_lite import SurrealDBConnectionManager, _client
 from surreal_orm_lite._sdk import AsyncSurreal, Features, SdkAsyncWsConnection
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
-from surreal_orm_lite.live import is_dead
+from surreal_orm_lite.live import is_connection_failure, is_dead
 from tests._proxy import CuttableProxy, _RequestLog
 from tests.test_auth import AUTH_TABLE, PASSWORD, REFRESH_ACCESS, _unique_email, auth_client
 from tests.test_reconnect import (
@@ -159,6 +160,58 @@ class TestRetireUnit:
             await client.query("RETURN 1")
 
     @pytest.mark.asyncio
+    async def test_a_drop_refusal_is_retryable(self) -> None:
+        """D19 as amended (2026-11-06): a refusal caused by a drop is retryable, as in v0.40.3."""
+        client = _unconnected_ws_client()
+        _client.refuse(client, "dropped", retryable=True)
+
+        with pytest.raises(SurrealDbConnectionError, match="dropped") as caught:
+            await client.query("RETURN 1")
+        assert caught.value.retryable is True  # type: ignore[attr-defined]
+        assert is_connection_failure(caught.value, None)
+
+    @pytest.mark.asyncio
+    async def test_a_deliberate_retirement_replaces_a_drop_refusal(self) -> None:
+        """A client already refused by a drop, then retired on purpose (close_connection(), loop teardown), ends
+        with the deliberate, non-retryable refusal."""
+        client = _unconnected_ws_client()
+        _client.refuse(client, "dropped", retryable=True)
+        await _client.retire(client, "closed on purpose")
+
+        with pytest.raises(SurrealDbConnectionError, match="closed on purpose") as caught:
+            await client.query("RETURN 1")
+        assert caught.value.retryable is False  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_a_drop_never_replaces_a_deliberate_retirement(self) -> None:
+        client = _unconnected_ws_client()
+        await _client.retire(client, "closed on purpose")
+        _client.refuse(client, "dropped", retryable=True)
+
+        with pytest.raises(SurrealDbConnectionError, match="closed on purpose") as caught:
+            await client.query("RETURN 1")
+        assert caught.value.retryable is False  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_refuse_on_drop_installs_a_retryable_refusal(self) -> None:
+        """The reader's end (a drop) installs the retryable drop refusal; close_connection() afterwards replaces it."""
+        client = _unconnected_ws_client()
+        reader: asyncio.Task[None] = asyncio.get_running_loop().create_task(asyncio.sleep(0))
+        client.recv_task = reader
+        _client.refuse_on_drop(client, "dropped")
+        await reader
+        await asyncio.sleep(0)
+
+        with pytest.raises(SurrealDbConnectionError, match="dropped") as caught:
+            await client.query("RETURN 1")
+        assert caught.value.retryable is True  # type: ignore[attr-defined]
+
+        await _client.retire(client, "closed on purpose")
+        with pytest.raises(SurrealDbConnectionError, match="closed on purpose") as caught:
+            await client.query("RETURN 1")
+        assert caught.value.retryable is False  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
     async def test_an_http_client_is_closed_but_not_refused(self) -> None:
         """M33: an HTTP client holds no socket and sends the token it has; nothing to refuse."""
         client = AsyncSurreal("http://127.0.0.1:9", reconnect=False, streaming=False, renew_access=False, timeout=30.0)
@@ -183,7 +236,9 @@ class TestRetiredClientsE2E:
             with pytest.raises(SurrealDbConnectionError) as caught:
                 await kept.query("RETURN 1")
 
-            assert caught.value.retryable is False  # type: ignore[attr-defined]
+            # A drop is retryable (v0.40.3 contract, D19 as amended): the retry runs on a new client of the ORM's.
+            assert caught.value.retryable is True  # type: ignore[attr-defined]
+            assert is_connection_failure(caught.value, None)
             assert proxy.connections == opened
             # The ORM itself carries on, on a new connection of its own.
             assert await Reconnected.objects().all() == []
@@ -239,7 +294,7 @@ class TestRetiredClientsE2E:
                     opened = proxy.connections
                     await Reconnected(id="after", name="b").save(tx=tx)
 
-            assert caught.value.retryable is False  # type: ignore[attr-defined]
+            assert caught.value.retryable is True  # type: ignore[attr-defined]
             assert proxy.connections == opened
             assert await Reconnected.objects().all() == []
 
