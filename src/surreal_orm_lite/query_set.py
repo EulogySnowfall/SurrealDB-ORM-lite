@@ -49,12 +49,12 @@ from .utils import (
     is_select_item,
     non_negative_int,
     parse_lookup,
+    statement_rows,
     unescape_filter_value,
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
     validate_select_item,
-    warn_on_multiple_statements,
     warn_on_variable_names,
 )
 
@@ -3743,8 +3743,14 @@ class QuerySet:
             query: The custom SQL query string to execute.
             variables: A dictionary of variables to substitute into the query.
 
+        Every statement runs and the **list** results of every statement are concatenated in order, then hydrated
+        as model instances (v0.50.0, full SurrealDB-ORM parity; before, only the first statement's rows came back,
+        with a warning). A statement whose result is not a list (``LET``, ``RETURN``) contributes nothing; a failing
+        statement raises, even when it is not the first. The rows of every ``SELECT`` are hydrated as this model:
+        select its own table.
+
         Returns:
-            The result of the query, typically model instances.
+            The rows of every statement, as model instances.
 
         Raises:
             SurrealDbError: the query does not read ``FROM`` the model's table; the queryset is read
@@ -3757,23 +3763,17 @@ class QuerySet:
             raise SurrealDbError(_CACHE_QUERY)
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
-        # Same silent truncation raw_query() warns about: only the first statement's results
-        # come back from the SDK (issue #156).
-        warn_on_multiple_statements(query)
         client = await self._manager().get_client()
         try:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it
             # would corrupt their string literals (issue #156).
-            results = await _client.query(client, query, _encoding.encode(variables or {}))
+            results = await _client.query_all(client, query, _encoding.encode(variables or {}))
         except NotFoundError:
             # SurrealDB 3.x raises for a never-created table; the ORM contract
             # treats a missing table as empty.
             return self.model.from_db([])
-        if isinstance(results, list):
-            return self.model.from_db(results)
-        data = cast(dict, results[0])
-        return self.model.from_db(data.get("result", []))
+        return self.model.from_db(statement_rows(results))
 
 
 #: The annotations computed per record: ``GeoDistance`` (v0.24.0) and the search annotations (v0.35.0).

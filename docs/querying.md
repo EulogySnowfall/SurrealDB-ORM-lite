@@ -348,6 +348,22 @@ results = await User.raw_query(
 )
 ```
 
+`raw_query()` and `QuerySet.query()` run every statement of the query and return the rows of every statement, in
+order (since v0.50.0, as the full SurrealDB-ORM; before, only the first statement's rows came back, with a warning). A
+statement that returns no list (`LET`, `RETURN 5`, `DEFINE`) adds no row, so `RETURN 5` alone returns `[]`. A failing
+statement raises, even when it is not the first.
+
+```python
+rows = await User.raw_query(
+    "LET $min = 18; SELECT * FROM User WHERE age >= $min; SELECT * FROM User WHERE role = 'admin';"
+)  # the adults, then the admins
+```
+
+The rows of every statement are hydrated together, with the usual rule: model instances when every row validates,
+otherwise dicts. With `SELECT`s on **several tables**, a row of another table becomes an instance of the model when it
+validates (the model's fields optional), and a single row that does not validate makes every row a `dict`. Select the
+model's own table, or read dicts with the client of `get_client()`.
+
 ## 27. Time travel (`as_of()`)
 
 Since v0.26.0 a QuerySet can read a model's records **as they were at a moment**: `as_of()` adds

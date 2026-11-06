@@ -173,22 +173,17 @@ def split_statements(query: str) -> list[str]:
     return [statement for statement in statements if statement.strip()]
 
 
-def warn_on_multiple_statements(query: str) -> None:
-    """Warn when a raw query carries more than one statement.
+def statement_rows(results: list[Any]) -> list[Any]:
+    """The rows of every statement of a multi-statement query, in order (``raw_query()``, ``QuerySet.query()``).
 
-    The SDK returns the result set of the **first** statement only, and says nothing about
-    the rest, so a two-statement query silently loses half its output (issue #156). Run one
-    statement per call, or use ``transaction()`` when they must be atomic.
+    *results* holds one result per statement; the **list** results are concatenated, and a result that is not a list
+    (``LET``, ``RETURN 5``, ``DEFINE``) contributes nothing — the full SurrealDB-ORM's ``all_records`` rule.
     """
-    count = len(split_statements(query))
-    if count > 1:
-        warnings.warn(
-            f"The query carries {count} statements but only the first one's results are "
-            "returned by the SurrealDB SDK; run one statement per call, or use "
-            "transaction() if they must be atomic.",
-            UserWarning,
-            stacklevel=user_stacklevel(),
-        )
+    rows: list[Any] = []
+    for result in results:
+        if isinstance(result, list):
+            rows.extend(result)
+    return rows
 
 
 def non_negative_int(method: str, value: object) -> int:

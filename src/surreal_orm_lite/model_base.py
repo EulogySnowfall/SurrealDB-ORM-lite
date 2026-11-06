@@ -112,6 +112,7 @@ from .utils import (
     format_record_id,
     merge_extra_vars,
     replace_content,
+    statement_rows,
     user_namespace,
     user_stacklevel,
     validate_alias_name,
@@ -120,7 +121,6 @@ from .utils import (
     validate_graph_path,
     validate_patch_operations,
     validate_thing,
-    warn_on_multiple_statements,
 )
 from .vector import declared_vectors
 
@@ -5266,11 +5266,20 @@ class BaseSurrealModel(BaseModel):
         variables: dict[str, Any] | None = None,
     ) -> list[Self] | list[dict[str, Any]]:
         """
-        Execute a raw SurrealQL query and return the results.
+        Execute a raw SurrealQL query and return the rows of every statement.
 
         This method allows executing arbitrary SurrealQL queries directly against
         the database. It's useful for complex queries that can't be expressed
         using the QuerySet API.
+
+        Every statement runs; the **list** results of every statement are concatenated in order, as the full
+        SurrealDB-ORM does (v0.50.0; before, only the first statement's rows came back, with a warning). A statement
+        whose result is not a list (``LET``, ``RETURN 5``, ``DEFINE``) contributes nothing, so ``RETURN 5`` alone
+        returns ``[]``. A failing statement raises, even when it is not the first.
+
+        Caveat with ``SELECT`` on several tables: the rows are hydrated together, as for one statement. Rows of
+        another table become instances of this model when they validate (its fields optional), and when one row does
+        not validate every row stays a ``dict``. Select this model's own table, or read dicts with ``get_client()``.
 
         Args:
             query: The SurrealQL query string to execute.
@@ -5278,7 +5287,7 @@ class BaseSurrealModel(BaseModel):
                       Use $variable_name syntax in the query string.
 
         Returns:
-            list[Self] | list[dict]: A list of model instances if the results match
+            list[Self] | list[dict]: A list of model instances if every row matches
             the model schema, otherwise a list of dictionaries.
 
         Example:
@@ -5300,22 +5309,15 @@ class BaseSurrealModel(BaseModel):
             ''', variables={"user_id": "user:123"})
             ```
         """
-        warn_on_multiple_statements(query)
-
         # Sent verbatim: this is the caller's own SurrealQL, so the ORM does not rewrite it
         # (unquoting "$word" occurrences used to corrupt string literals — issue #156).
         client = await cls._connection_manager().get_client()
-        results = await _client.query(client, query, _encoding.encode(variables or {}))
-
-        # SDK 2.0 returns the rows list directly from query()
-        if isinstance(results, list):
-            try:
-                return cls.from_db(results)  # type: ignore
-            except (ValueError, TypeError, ValidationError):
-                # If validation fails, return raw dicts
-                return results
-
-        return []
+        results = statement_rows(await _client.query_all(client, query, _encoding.encode(variables or {})))
+        try:
+            return cls.from_db(results)  # type: ignore
+        except (ValueError, TypeError, ValidationError):
+            # If validation fails, return raw dicts
+            return results
 
     # ==================== Stored Function Calls (v0.15.0) ====================
 
