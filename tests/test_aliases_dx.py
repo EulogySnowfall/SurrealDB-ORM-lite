@@ -14,6 +14,7 @@ from surreal_orm_lite import BaseSurrealModel, Q, SurrealDBConnectionManager, _c
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import Computed, SurrealFunc, computed
 from surreal_orm_lite.model_base import _ALIAS_MAPS, SurrealConfigDict
+from tests import _sdk_calls
 from tests.conftest import orm_client
 
 # ==================== Models ====================
@@ -478,10 +479,10 @@ class TestQuerySetAliasesE2E:
 
 class TestMergeRefreshE2E:
     @pytest.mark.asyncio
-    async def test_default_resyncs_from_the_returned_row(self) -> None:
+    async def test_default_resyncs_from_the_returned_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
-            merges = _spy(client, "merge")
+            merges = _sdk_calls.record(monkeypatch, client, "merge")  # SDK 3.0 has no client.merge()
             await instance.merge(password="rotated")
             assert len(merges) == 1
             assert instance.password == "rotated"
@@ -997,11 +998,11 @@ class TestMergeUsesTheReturnedRow:
             assert await _client.query(client, "SELECT * FROM Aliased:ghost;", {}) == []
 
     @pytest.mark.asyncio
-    async def test_refresh_false_asks_for_no_row(self) -> None:
+    async def test_refresh_false_asks_for_no_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             queries = _spy(client, "query")
-            merges = _spy(client, "merge")
+            merges = _sdk_calls.record(monkeypatch, client, "merge")  # SDK 3.0 has no client.merge()
             await instance.merge(password="rotated", refresh=False)
             assert merges == []
             assert any("RETURN NONE" in call[0][0] for call in queries if call[0])

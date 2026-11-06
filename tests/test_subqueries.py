@@ -1734,7 +1734,7 @@ class _RaisingTx(_RaisingClient):
         return True
 
     async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
-        return await self.query(sql, variables)
+        return await self._answer(sql, variables)  # a transaction's read returns its rows directly
 
     async def add(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
         raise AssertionError("no write expected")

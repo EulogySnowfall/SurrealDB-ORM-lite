@@ -3024,7 +3024,9 @@ class TestLineDispatchE2E:
             if await _line(client) >= 3:
                 assert await executor.migrate() == [name]
                 section, key, clause = stored
-                info = await _info_db(client) if section == "accesses" else await client.query("INFO FOR TABLE ld_t;", {})
+                info = (
+                    await _info_db(client) if section == "accesses" else await _client.query(client, "INFO FOR TABLE ld_t;", {})
+                )
                 assert clause in info[section][key]
                 return
             with pytest.raises(SurrealDbError) as raised:

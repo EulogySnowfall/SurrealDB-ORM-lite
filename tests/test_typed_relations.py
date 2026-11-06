@@ -969,15 +969,15 @@ class TestEdgeSaveE2E:
                 pytest.skip(f"raw duplicate behaviour not measured on {version}")
 
             row = {"id": "raw1", "in": ALICE_P, "out": WIDGET, "quantity": 2}
-            first = await client.insert_relation("tr_purchased", row)
+            first = await _client.insert_relation(client, "tr_purchased", row)
             assert [(r["id"], r["quantity"]) for r in first] == [(RecordID("tr_purchased", "raw1"), 2)]
 
             if keeps_old:
-                again = await client.insert_relation("tr_purchased", {**row, "quantity": 5})
+                again = await _client.insert_relation(client, "tr_purchased", {**row, "quantity": 5})
                 assert [(r["id"], r["quantity"]) for r in again] == [(RecordID("tr_purchased", "raw1"), 2)]
             else:
                 with pytest.raises(AlreadyExistsError):
-                    await client.insert_relation("tr_purchased", {**row, "quantity": 5})
+                    await _client.insert_relation(client, "tr_purchased", {**row, "quantity": 5})
 
             stored = await _stored(client, "tr_purchased")
             assert [(r["id"], r["quantity"]) for r in stored] == [(RecordID("tr_purchased", "raw1"), 2)]

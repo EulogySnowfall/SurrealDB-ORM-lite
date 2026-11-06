@@ -3434,12 +3434,12 @@ class TestReadsE2E:
 
             async def answering(statement: str, variables: Any) -> Any:
                 sent.append(statement)
-                answer = await real(statement, variables)
+                answer, *rest = await real(statement, variables)  # SDK 3.0: one result per statement
                 if statement.startswith("INFO FOR TABLE "):
                     answer = {**answer, "indexes": {**answer["indexes"], "fts_article_title": "DEFINE INDEX fts_article_title"}}
                 elif statement == "INFO FOR DB;":
                     answer = {**answer, "analyzers": {"fts_english": "DEFINE ANALYZER fts_english FILTERS"}}
-                return answer
+                return [answer, *rest]
 
             monkeypatch.setattr(client, "query", answering)
             indexes = await search.read_table_indexes(client, "fts_article", what="index", kind="definition")
@@ -3729,10 +3729,10 @@ class TestDefineIndexesE2E:
             real = client.query
 
             async def answering(statement: str, variables: Any) -> Any:
-                answer = await real(statement, variables)
+                answer, *rest = await real(statement, variables)  # SDK 3.0: one result per statement
                 if statement == _INFO_ARTICLE:
                     answer = {**answer, "indexes": {**answer["indexes"], "fts_article_title": "DEFINE INDEX fts_article_title"}}
-                return answer
+                return [answer, *rest]
 
             monkeypatch.setattr(client, "query", answering)
             applied = await FtsArticle.define_indexes()
@@ -3753,10 +3753,10 @@ class TestDefineIndexesE2E:
             real = client.query
 
             async def answering(statement: str, variables: Any) -> Any:
-                answer = await real(statement, variables)
+                answer, *rest = await real(statement, variables)  # SDK 3.0: one result per statement
                 if statement == _INFO_DB:
                     answer = {**answer, "analyzers": {"fts_english": "DEFINE ANALYZER fts_english FILTERS"}}
-                return answer
+                return [answer, *rest]
 
             monkeypatch.setattr(client, "query", answering)
             applied = await FtsArticle.define_indexes()

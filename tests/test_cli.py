@@ -50,7 +50,7 @@ from typing import Any
 import pytest
 
 import surreal_orm_lite
-from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite import SurrealDBConnectionManager, _client
 from surreal_orm_lite._sdk import RecordID
 from surreal_orm_lite.cli import commands
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
@@ -802,7 +802,8 @@ def _admin(kind: str, database: str, sql: str, *, reset: bool = False) -> Any:
             if reset:
                 await apply_reset(client, sql)
                 return None
-            return await client.query(sql, {})
+            results = await _client.query_all(client, sql, {})  # one result per statement
+            return results[-1] if results else None
         finally:
             await SurrealDBConnectionManager.remove_connection("cli_admin")
 
