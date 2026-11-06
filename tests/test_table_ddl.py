@@ -5722,6 +5722,9 @@ _UNTYPED_CASES: list[tuple[tuple[tuple[str, str], ...], str, object, object, obj
         _NOT_FLEXIBLE,
     ),
 ]
+#: Where SurrealDB 4.x (server and embedded engine, measured on 4.0.0) differs from the last column: a ``TYPE array``
+#: without an item definition keeps an object item, as an optional array does from 3.2.
+_UNTYPED_4X: dict[tuple[tuple[str, str], ...], object] = {(("v", "TYPE array"),): [{"k": 1}]}
 _UNTYPED_IDS = [
     "any-object",
     "any-array",
@@ -5826,6 +5829,8 @@ class TestLineFactsE2E:
         async with _tdl(kind) as client:
             line = await _line(client)
             expected = before_3 if line[0] < 3 else line_3_1 if line == (3, 1) else line_3
+            if line[0] >= 4:
+                expected = _UNTYPED_4X.get(definitions, expected)
             ddl = "DEFINE TABLE tdl_raw SCHEMAFULL; " + " ".join(
                 f"DEFINE FIELD OVERWRITE {path} ON tdl_raw {clauses};" for path, clauses in definitions
             )
@@ -5852,6 +5857,24 @@ class TestLineFactsE2E:
             major = await _major(client)
             await _apply_ddl(client, "CREATE tdl_note:n1 SET body = 'b', extra = {k: 1}, gone = 'g' RETURN NONE;")
             before = await _client.query(client, "SELECT * FROM tdl_note:n1;", {})
+            if major >= 4:
+                # SurrealDB 4.x (compatibility level 4): a field refusing NONE cannot be defined on a populated
+                # SCHEMAFULL table; define_table() relays the server's refusal (D25), the record is unchanged.
+                with pytest.raises(SurrealDbError) as raised:
+                    await TdlNoteStrict.define_table()
+                assert type(raised.value) is SurrealDbError
+                assert str(raised.value).startswith("Can't apply field definition: 'body' on table 'tdl_note' -> ")
+                assert "compatibility level 4 and has rows" in str(raised.value)
+                assert await _client.query(client, "SELECT * FROM tdl_note:n1;", {}) == before
+                await _client.query(client, "DELETE tdl_note;", {})
+                await TdlNoteStrict.define_table()
+                fresh = TdlNoteStrict(id="n2", body="x")
+                await fresh.save()
+                with pytest.raises(InternalError, match="no such field exists"):
+                    await fresh.merge(nope=1)
+                n2 = [{"id": RecordID("tdl_note", "n2"), "body": "x"}]
+                assert await _client.query(client, "SELECT * FROM tdl_note:n2;", {}) == n2, _UNDECLARED_CHANGED
+                return
             await TdlNoteStrict.define_table()
             assert await _client.query(client, "SELECT * FROM tdl_note:n1;", {}) == before
 
@@ -6048,6 +6071,25 @@ class TestSubModelListsE2E:
                 "DEFINE FIELD y.*.n ON tdl_raw TYPE option<string>; "
                 "DEFINE FIELD y.*.s ON tdl_raw TYPE option<object>;",
             )
+            if major >= 4:
+                # SurrealDB 4.x (server and embedded engine) applies FLEXIBLE as documented: only the items of a
+                # FLEXIBLE array keep the key; an object inside an item, a sub-object and the items of any other
+                # array refuse it.
+                writes = [
+                    ("v", "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;"),
+                    ("z", "CREATE tdl_raw:4 SET v = [], z = [{s: {k: 1, stray: 1}}] RETURN NONE;"),
+                    ("o", "CREATE tdl_raw:2 SET v = [], o = {n: 'a', stray: 1} RETURN NONE;"),
+                    ("w", "CREATE tdl_raw:3 SET v = [], w = [{stray: 1}] RETURN NONE;"),
+                    ("y", "CREATE tdl_raw:5 SET v = [], y = [{n: 'a', s: {stray: 1}}] RETURN NONE;"),
+                ]
+                refusals = {name: await _refusal(client, write) for name, write in writes}
+                kept_v = await _client.query(client, "SELECT VALUE v FROM tdl_raw:1;", {})
+                assert all((refusal is None) == (name == "v" and flexible) for name, refusal in refusals.items()), (
+                    f"{_UNDECLARED_CHANGED}: {refusals}"
+                )
+                assert all("no such field exists" in refusal for refusal in refusals.values() if refusal is not None)
+                assert kept_v == ([[{"n": "a", "stray": {"deep": 1}}]] if flexible else []), _UNDECLARED_CHANGED
+                return
             refused = await _refusal(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
             assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
             kept = flexible or major >= 3
@@ -6086,6 +6128,10 @@ class TestSubModelListsE2E:
         async with _tdl(kind) as client:
             await TdlOrderPlain.define_table()
             refused = await _refusal(client, "CREATE tdl_order:p1 SET tags = [{label: 'a', meta: {}, stray: 1}] RETURN NONE;")
+            if await _major(client) >= 4:
+                # SurrealDB 4.x refuses the key: the array is not FLEXIBLE (the ORM never sends such a key).
+                assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
+                return
             assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
             tags = await _client.query(client, "SELECT VALUE tags FROM tdl_order:p1;", {})
             assert tags == [[{"label": "a", "meta": {}, "stray": 1}]], _UNDECLARED_CHANGED
