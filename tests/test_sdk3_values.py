@@ -34,6 +34,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite import connection_manager as connection_manager_module
 from surreal_orm_lite._sdk import (
     ConnectionUnavailableError,
+    HttpStatusError,
     NotFoundError,
     RecordID,
     TransportTimeoutError,
@@ -190,8 +191,10 @@ class TestSdkErrorsUnit:
             (TransportTimeoutError("timed out while querying"), False),
             (UnexpectedResponseError("the response could not be read"), False),
             (ConnectionUnavailableError("the connection to ws://db/rpc failed"), True),
+            (HttpStatusError(401, "The access method 'a' does not exist", "http://db/rpc"), False),
+            (HttpStatusError(503, "", "http://db/rpc"), True),
         ],
-        ids=["timeout", "undecodable", "unavailable"],
+        ids=["timeout", "undecodable", "unavailable", "http-401", "http-503"],
     )
     async def test_an_sdk_transport_or_response_error_is_a_connection_error(
         self, call: str, error: BaseException, retryable: bool
@@ -218,8 +221,18 @@ class TestSdkErrorsUnit:
             (ConnectionUnavailableError("could not connect"), True),
             (TransportTimeoutError("timed out"), False),
             (UnexpectedResponseError("unreadable"), False),
+            # The server answered over HTTP: a refusal (a revoked token's 401, a 400…) would meet the same answer, a
+            # gateway or an overloaded server (502, 503, 504, 408, 429) may not.
+            (HttpStatusError(401, "The access method 'a' does not exist", "http://db/rpc"), False),
+            (HttpStatusError(400, "", "http://db/rpc"), False),
+            (HttpStatusError(500, "", "http://db/rpc"), False),
+            (HttpStatusError(502, "", "http://db/rpc"), True),
+            (HttpStatusError(503, "", "http://db/rpc"), True),
+            (HttpStatusError(504, "", "http://db/rpc"), True),
+            (HttpStatusError(408, "", "http://db/rpc"), True),
+            (HttpStatusError(429, "", "http://db/rpc"), True),
         ],
-        ids=["unavailable", "timeout", "undecodable"],
+        ids=["unavailable", "timeout", "undecodable", "401", "400", "500", "502", "503", "504", "408", "429"],
     )
     def test_a_raw_sdk_error_is_classified_as_the_frontier_does(self, error: BaseException, expected: bool) -> None:
         """A call outside the frontier (``signin``, ``use``, ``begin``) raises the SDK's error itself: the reconnect

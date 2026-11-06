@@ -20,7 +20,8 @@ What changed with the official SDK 3.0, and how this module keeps the ORM's sema
 
 Errors (v0.50.0): the SDK's transport and response errors reach the ORM's callers as ``SurrealDbConnectionError``,
 chained to the SDK's error (``__cause__``). ``ConnectionUnavailableError`` (the connection is gone or could not be
-reached) and any other ``TransportError`` are retryable; ``TransportTimeoutError`` (a deadline set with
+reached) and any other ``TransportError`` are retryable, but for an ``HttpStatusError`` other than 408, 429, 502, 503 or
+504 (the server's own refusal); ``TransportTimeoutError`` (a deadline set with
 ``get_client().timeout(…)``) and ``UnexpectedResponseError`` (a response the SDK cannot read) are not. Server errors
 (``ServerError`` and its subclasses) pass through unchanged.
 
@@ -46,6 +47,7 @@ from typing import Any
 from uuid import UUID
 
 from ._sdk import (
+    HttpStatusError,
     Null,
     RecordID,
     SdkAsyncWsConnection,
@@ -102,15 +104,24 @@ def _sdk_errors() -> Iterator[None]:
         raise connection_error(exc) from exc
 
 
+#: The HTTP statuses that say the request may succeed if sent again: a timeout, a rate limit, a gateway or a server
+#: that is not available. Every other status is the server's answer to this request.
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 502, 503, 504})
+
+
 def connection_error(exc: BaseException) -> SurrealDbConnectionError:
     """The ``SurrealDbConnectionError`` an SDK transport or response error becomes, ``retryable`` set.
 
     Retryable: a connection that is gone or could not be reached (``ConnectionUnavailableError`` and the other
-    ``TransportError``s). Not retryable: a deadline that passed (``TransportTimeoutError``) or a response the SDK cannot
-    read (``UnexpectedResponseError``) — the same request would meet the same answer.
+    ``TransportError``s), and an HTTP answer of a gateway or a busy server (``HttpStatusError`` 408, 429, 502, 503,
+    504). Not retryable: a deadline that passed (``TransportTimeoutError``), a response the SDK cannot read
+    (``UnexpectedResponseError``) or any other HTTP status, a refusal such as a revoked token's 401 — the same request
+    would meet the same answer.
     """
     error = SurrealDbConnectionError(str(exc))
     retryable = isinstance(exc, TransportError) and not isinstance(exc, TransportTimeoutError)
+    if isinstance(exc, HttpStatusError):
+        retryable = exc.status in _RETRYABLE_HTTP_STATUSES
     error.retryable = retryable  # type: ignore[attr-defined]
     return error
 
