@@ -37,7 +37,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic.dataclasses import dataclass as pydantic_dataclass
-from surrealdb import RecordID
+from surrealdb import PreciseDatetime, RecordID
 from surrealdb.cbor import undefined
 from typing_extensions import TypedDict
 
@@ -135,8 +135,8 @@ async def _raw(rid: RecordID) -> dict[str, Any]:
 
 #: How the SDK reads back each value of ``FULL`` once the server stored it natively.
 _NATIVE: dict[str, Callable[[Any], bool]] = {
-    "at": lambda v: type(v) is datetime and v.tzinfo is not None and v == FULL["at"],
-    "day": lambda v: type(v) is datetime and v == datetime(2026, 1, 2, tzinfo=UTC),
+    "at": lambda v: type(v) is PreciseDatetime and v.tzinfo is not None and v == FULL["at"],
+    "day": lambda v: type(v) is PreciseDatetime and v == datetime(2026, 1, 2, tzinfo=UTC),
     "ttl": lambda v: type(v) is surrealdb.Duration and v.elapsed == 5400 * 10**9,
     "grace": lambda v: type(v) is surrealdb.Duration and v.elapsed == 5400 * 10**9 + 1,
     "price": lambda v: type(v) is Decimal and v == Decimal("12.5"),  # value equality: 2.x reads 12.50
@@ -166,7 +166,9 @@ def _assert_native(row: dict[str, Any], keys: Collection[str] = tuple(FULL)) -> 
 
 def _assert_declared(ev: RfEvent) -> None:
     """*ev* (read from ``SEED``) holds every field in its declared type."""
-    assert type(ev.at) is datetime and ev.at.tzinfo is not None and ev.at.microsecond == 123456
+    # v0.50.0 (SDK 3.0): a datetime read from the server is a ``PreciseDatetime`` and keeps its nanoseconds.
+    assert type(ev.at) is PreciseDatetime and ev.at.tzinfo is not None and ev.at.microsecond == 123456
+    assert ev.at.nanosecond == 789
     assert type(ev.day) is date and ev.day == date(2026, 1, 2)
     assert ev.ttl == timedelta(hours=1, minutes=30)
     assert type(ev.grace) is Duration and ev.grace == Duration.parse("1h30m1ns")
@@ -174,7 +176,7 @@ def _assert_declared(ev: RfEvent) -> None:
     assert type(ev.token) is UUID
     assert type(ev.hours) is Range and ev.hours == Range(BoundIncluded(9), BoundExcluded(17))
     assert ev.period is not None and ev.period.end is None
-    assert ev.period.begin is not None and type(ev.period.begin.value) is datetime
+    assert ev.period.begin is not None and type(ev.period.begin.value) is PreciseDatetime
     assert ev.blob == b"abc"
     assert type(ev.tags) is set and ev.tags == {"a"}
     assert ev.durs == [Duration.parse("1h"), Duration.parse("2h")]
@@ -204,15 +206,15 @@ async def _auth_model(model: Any, scheme: str) -> AsyncIterator[Any]:
     finally:
         try:
             root = await _http_client()
-            await root.query(f"REMOVE ACCESS IF EXISTS {model.get_access_name()} ON DATABASE;", {})
-            await root.query(f"REMOVE TABLE IF EXISTS {model.get_table_name()};", {})
+            await _client.query(root, f"REMOVE ACCESS IF EXISTS {model.get_access_name()} ON DATABASE;", {})
+            await _client.query(root, f"REMOVE TABLE IF EXISTS {model.get_table_name()};", {})
         finally:
             await SurrealDBConnectionManager.unset_connection()
 
 
 async def _stored_user(email: str, table: str = "rf_user") -> dict[str, Any]:
     root = await _http_client()
-    rows = await root.query(f"SELECT * FROM {table} WHERE email = $e;", {"e": email})
+    rows = await _client.query(root, f"SELECT * FROM {table} WHERE email = $e;", {"e": email})
     assert isinstance(rows, list) and len(rows) == 1, rows
     row: dict[str, Any] = rows[0]
     return row
@@ -336,7 +338,7 @@ async def _merge_server_values() -> _Written:
         **FULL,
     )
     expires = (await _raw(_W))["expires"]
-    assert type(expires) is datetime
+    assert type(expires) is PreciseDatetime
     assert timedelta(minutes=50) < expires - sent < timedelta(minutes=70), expires  # $ttl arrived as 1h
     return _W, FULL
 
@@ -470,18 +472,18 @@ class TestWriteMatrixE2E:
     @pytest.mark.asyncio
     async def test_call_function_args(self) -> None:
         async with orm_client("rf_event") as client:
-            await client.query("REMOVE FUNCTION IF EXISTS fn::rf_add;", {})
-            await client.query("DEFINE FUNCTION fn::rf_add($d: duration) { RETURN $d + 1h; };", {})
+            await _client.query(client, "REMOVE FUNCTION IF EXISTS fn::rf_add;", {})
+            await _client.query(client, "DEFINE FUNCTION fn::rf_add($d: duration) { RETURN $d + 1h; };", {})
             try:
                 out = await SurrealDBConnectionManager.call_function("fn::rf_add", [timedelta(minutes=30)])
                 assert type(out) is surrealdb.Duration and out.elapsed == 5400 * 10**9
             finally:
-                await client.query("REMOVE FUNCTION IF EXISTS fn::rf_add;", {})
+                await _client.query(client, "REMOVE FUNCTION IF EXISTS fn::rf_add;", {})
 
     @pytest.mark.asyncio
     async def test_buffered_transaction_over_http(self) -> None:
         root = await _http_client()
-        await root.query("REMOVE TABLE IF EXISTS rf_event;", {})
+        await _client.query(root, "REMOVE TABLE IF EXISTS rf_event;", {})
         SurrealDBConnectionManager.set_connection(_http_url(), "root", "root", "ns", "db")
         try:
             async with SurrealDBConnectionManager.transaction() as tx:
@@ -489,7 +491,7 @@ class TestWriteMatrixE2E:
                 await RfEvent(id="w", **FULL).save(tx=tx)
             _assert_native(await _raw(_W))
         finally:
-            await root.query("REMOVE TABLE IF EXISTS rf_event;", {})
+            await _client.query(root, "REMOVE TABLE IF EXISTS rf_event;", {})
             await SurrealDBConnectionManager.unset_connection()
 
 
@@ -847,10 +849,10 @@ class TestHydrateNeverRaisesE2E:
     @pytest.mark.asyncio
     async def test_live_stream_goes_on(self) -> None:
         async with orm_client("rf_event") as client:
-            await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+            await _client.query(client, "DEFINE TABLE rf_event SCHEMALESS;", {})
             async with RfEvent.objects().live() as stream:
-                await client.query(f"CREATE rf_event:big SET ttl = {_BEYOND_TIMEDELTA};", {})
-                await client.query("CREATE rf_event:ok SET ttl = 1h;", {})
+                await _client.query(client, f"CREATE rf_event:big SET ttl = {_BEYOND_TIMEDELTA};", {})
+                await _client.query(client, "CREATE rf_event:ok SET ttl = 1h;", {})
                 big, ok = await _take(stream, 2)
         assert big.record_id == "rf_event:big" and isinstance(big.validation_error, ValidationError)
         assert type(big.instance.ttl) is surrealdb.Duration
@@ -860,11 +862,11 @@ class TestHydrateNeverRaisesE2E:
     @pytest.mark.asyncio
     async def test_change_feed_moves_its_cursor_past_it(self) -> None:
         async with change_feed_database(RF_CF_DATABASE) as client:
-            await client.query("DEFINE TABLE rf_cf SCHEMALESS CHANGEFEED 1h;", {})
+            await _client.query(client, "DEFINE TABLE rf_cf SCHEMALESS CHANGEFEED 1h;", {})
             stream = await RfCf.objects().changes(poll_interval=0.05).start()
             try:
-                await retry_write(lambda: client.query(f"CREATE rf_cf:big SET ttl = {_BEYOND_TIMEDELTA};", {}))
-                await retry_write(lambda: client.query("CREATE rf_cf:ok SET ttl = 1h;", {}))
+                await retry_write(lambda: _client.query(client, f"CREATE rf_cf:big SET ttl = {_BEYOND_TIMEDELTA};", {}))
+                await retry_write(lambda: _client.query(client, "CREATE rf_cf:ok SET ttl = 1h;", {}))
                 [big] = await _take(stream, 1)
                 past_big = stream.cursor
                 [ok] = await _take(stream, 1)
@@ -884,38 +886,38 @@ class TestHydrateNeverRaisesE2E:
 
 
 async def _read_get(client: Any) -> Any:
-    await client.query(SEED, {})
+    await _client.query(client, SEED, {})
     return await RfEvent.objects().get("s")
 
 
 async def _read_filter_exec(client: Any) -> Any:
-    await client.query(SEED, {})
+    await _client.query(client, SEED, {})
     rows = await RfEvent.objects().filter(n=1).exec()
     assert len(rows) == 1, rows
     return rows[0]
 
 
 async def _read_all(client: Any) -> Any:
-    await client.query(SEED, {})
+    await _client.query(client, SEED, {})
     rows = await RfEvent.objects().all()
     assert len(rows) == 1, rows
     return rows[0]
 
 
 async def _read_first(client: Any) -> Any:
-    await client.query(SEED, {})
+    await _client.query(client, SEED, {})
     return await RfEvent.objects().first()
 
 
 async def _read_get_or_create(client: Any) -> Any:
-    await client.query(SEED, {})
+    await _client.query(client, SEED, {})
     event, created = await RfEvent.objects().get_or_create(id="s", defaults={})
     assert not created
     return event
 
 
 async def _read_raw_query(client: Any) -> Any:
-    await client.query(SEED, {})
+    await _client.query(client, SEED, {})
     rows = await RfEvent.raw_query("SELECT * FROM rf_event:s;")
     assert len(rows) == 1, rows
     return rows[0]
@@ -924,15 +926,15 @@ async def _read_raw_query(client: Any) -> Any:
 async def _read_in_transaction(client: Any) -> Any:
     if not await _native_txn_supported():
         pytest.skip("requires SurrealDB 3.x native transactions")
-    await client.query(SEED, {})
+    await _client.query(client, SEED, {})
     async with SurrealDBConnectionManager.transaction() as tx:
         return await RfEvent.objects(tx=tx).get("s")
 
 
 async def _read_live_event(client: Any) -> Any:
-    await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+    await _client.query(client, "DEFINE TABLE rf_event SCHEMALESS;", {})
     async with RfEvent.objects().live() as stream:
-        await client.query(SEED, {})
+        await _client.query(client, SEED, {})
         [event] = await _take(stream, 1)
     assert event.validation_error is None, event.validation_error
     assert type(event.raw["ttl"]) is surrealdb.Duration and type(event.raw["grace"]) is surrealdb.Duration
@@ -941,10 +943,10 @@ async def _read_live_event(client: Any) -> Any:
 
 async def _read_change_feed(client: Any) -> Any:
     # In ``RF_CF_DATABASE``, never ``ns``/``db``: see ``_read_context``.
-    await client.query("DEFINE TABLE rf_event SCHEMALESS CHANGEFEED 1h;", {})
+    await _client.query(client, "DEFINE TABLE rf_event SCHEMALESS CHANGEFEED 1h;", {})
     stream = await RfEvent.objects().changes(poll_interval=0.05).start()
     try:
-        await retry_write(lambda: client.query(SEED, {}))
+        await retry_write(lambda: _client.query(client, SEED, {}))
         [event] = await _take(stream, 1)
     finally:
         stream.stop()
@@ -987,7 +989,9 @@ class TestReadMatrixE2E:
     @pytest.mark.asyncio
     async def test_edge_model_get(self) -> None:
         async with orm_client("rf_event", "rf_link") as client:
-            await client.query("RELATE rf_event:a->rf_link:l->rf_event:b SET ttl = 1h, day = d'2026-01-02T00:00:00Z';", {})
+            await _client.query(
+                client, "RELATE rf_event:a->rf_link:l->rf_event:b SET ttl = 1h, day = d'2026-01-02T00:00:00Z';", {}
+            )
             link = await RfLink.objects().get("l")
         assert isinstance(link, RfLink)
         assert type(link.ttl) is timedelta and link.ttl == timedelta(hours=1)
@@ -996,7 +1000,7 @@ class TestReadMatrixE2E:
     @pytest.mark.asyncio
     async def test_grouped_values_keep_sdk_values(self) -> None:
         async with orm_client("rf_event") as client:
-            await client.query(SEED, {})
+            await _client.query(client, SEED, {})
             rows = await RfEvent.objects().values("ttl", "grace").annotate(count=Count("id")).exec()
         assert len(rows) == 1, rows
         [row] = rows
@@ -1844,7 +1848,7 @@ class TestNestedTimedeltaReadE2E:
         async with orm_client("rf_td_holder") as client:
             # ``encoding.encode``: the SDK's own encoder sends its ``Duration`` in a form the server refuses.
             row = encoding.encode({field: raw for field, (raw, _) in _TD_POSITIONS.items()})
-            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": row})
+            await _client.query(client, "CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": row})
             got = await RfTdHolder.objects().get("k")
             [listed] = await RfTdHolder.objects().all()
             for holder in (got, listed):
@@ -2444,7 +2448,9 @@ class TestNestedTimedeltaRunsUserCodeOnceE2E:
         rid = RecordID("rf_cents", "k")
         async with orm_client("rf_cents") as client:
             # ``encoding.encode``: the SDK's own encoder sends its ``Duration`` in a form the server refuses.
-            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": encoding.encode(_cents_row(_SDK_TD))})
+            await _client.query(
+                client, "CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": encoding.encode(_cents_row(_SDK_TD))}
+            )
             got = await RfCents.objects().get("k")
             [listed] = await RfCents.objects().all()
             for cents in (got, listed):
@@ -2459,7 +2465,7 @@ class TestNestedTimedeltaRunsUserCodeOnceE2E:
         rid = RecordID("rf_tagged", "k")
         async with orm_client("rf_tagged") as client:
             row = {k: v for k, v in _steps_row(RfTagged, sub={"extra": []}).items() if k != "id"}
-            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": encoding.encode(row)})
+            await _client.query(client, "CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": encoding.encode(row)})
             got = await RfTagged.objects().get("k")
             assert got.sub is not None and got.sub.extra == ["x"], got
             assert got.steps == [RfStep(wait=timedelta(seconds=1))]
@@ -2631,7 +2637,7 @@ class TestSubModelSyncValidatorsE2E:
     async def test_a_migrating_model_validator_keeps_the_stored_choice(self, sync: str) -> None:
         async with orm_client("rf_profile") as client:
             rid = RecordID("rf_profile", "p")
-            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"settings": _OLD_SETTINGS}})
+            await _client.query(client, "CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"settings": _OLD_SETTINGS}})
             profile = await RfProfile.objects().get("p")
             assert profile.settings == RfSettings(color_theme="dark", font=14)
             if sync == "refresh":
@@ -2647,7 +2653,7 @@ class TestSubModelSyncValidatorsE2E:
     async def test_a_field_validator_of_the_model_gives_what_a_read_gives(self, sync: str) -> None:
         async with orm_client("rf_clamping") as client:
             rid = RecordID("rf_clamping", "c")
-            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"sub": {"n": 50}}})
+            await _client.query(client, "CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"sub": {"n": 50}}})
             clamping = await RfClamping.objects().get("c")
             if sync == "refresh":
                 await clamping.refresh()
@@ -2676,7 +2682,7 @@ class TestNativeContractE2E:
     @pytest.mark.asyncio
     async def test_precision_of_server_literals(self) -> None:
         async with orm_client("rf_event") as client:
-            await client.query(SEED, {})
+            await _client.query(client, SEED, {})
             event = await RfEvent.objects().get("s")
         assert type(event.ttl) is timedelta and event.ttl == timedelta(hours=1, minutes=30), "1h30m1ns floors to µs"
         assert type(event.grace) is Duration and event.grace.elapsed == 5400 * 10**9 + 1, "a Duration keeps the ns"
@@ -2712,7 +2718,7 @@ class TestNativeContractE2E:
     @pytest.mark.asyncio
     async def test_set_field_on_an_array_column(self) -> None:
         async with orm_client("rf_arr") as client:
-            await client.query("DEFINE FIELD tags ON rf_arr TYPE array<string> VALUE $value.distinct();", {})
+            await _client.query(client, "DEFINE FIELD tags ON rf_arr TYPE array<string> VALUE $value.distinct();", {})
             await RfArr(id="x", tags={"b", "a"}).save()
             got = await RfArr.objects().get("x")
         assert type(got.tags) is set and got.tags == {"a", "b"}
@@ -2726,11 +2732,11 @@ async def _rf_engine(kind: str, ddl: str, *tables: str) -> AsyncIterator[Any]:
     """*ddl* applied on the line under test (``ws``, *tables* dropped before and after) or on a fresh ``mem://``."""
     if kind == "mem":
         async with embedded_database() as client:
-            await client.query(ddl, {})
+            await _client.query(client, ddl, {})
             yield client
         return
     async with orm_client(*tables) as client:
-        await client.query(ddl, {})
+        await _client.query(client, ddl, {})
         yield client
 
 
@@ -2793,8 +2799,10 @@ _RF_SEED = RecordID("rf_stamp", "seed")
 
 async def _stamps(client: Any, rid: RecordID) -> object:
     """The stored datetimes of *rid* as the server writes them, nanoseconds included (``log`` as a whole)."""
-    return await client.query(
-        "SELECT VALUE [<string> created, <string> meta.at, <string> meta.seen, <string> log] FROM ONLY $rid;", {"rid": rid}
+    return await _client.query(
+        client,
+        "SELECT VALUE [<string> created, <string> meta.at, <string> meta.seen, <string> log] FROM ONLY $rid;",
+        {"rid": rid},
     )
 
 
@@ -2802,7 +2810,7 @@ async def _seed_kept(client: Any) -> bool:
     """Whether ``rf_stamp:seed`` still holds the datetimes ``_RF_STAMP_SEED`` wrote, to the nanosecond."""
     stamps = await _stamps(client, _RF_SEED)
     assert isinstance(stamps, list), stamps
-    return stamps[:3] == _RF_STAMP_SEEDED and await client.query(_RF_LOG_SEEDED, {}) is True
+    return stamps[:3] == _RF_STAMP_SEEDED and await _client.query(client, _RF_LOG_SEEDED, {}) is True
 
 
 class TestReplaceKeepsStoredDatetimesE2E:
@@ -2816,7 +2824,7 @@ class TestReplaceKeepsStoredDatetimesE2E:
     @pytest.mark.parametrize("tx", [False, True], ids=["direct", "tx"])
     async def test_readonly_datetimes_are_kept(self, kind: str, write: str, tx: bool) -> None:
         async with _rf_engine(kind, _RF_STAMP_DDL, "rf_stamp", "rf_stamp_link") as client:
-            await client.query(_RF_STAMP_SEED, {})
+            await _client.query(client, _RF_STAMP_SEED, {})
             saved = await RfStamp(id="saved", title="t").save()
             seeded = await RfStamp.objects().get("seed")
             for instance in (saved, seeded):
@@ -2840,15 +2848,15 @@ class TestReplaceKeepsStoredDatetimesE2E:
     @pytest.mark.parametrize("kind", ["ws", "mem"])
     async def test_an_edge_update_keeps_them(self, kind: str) -> None:
         async with _rf_engine(kind, _RF_STAMP_DDL, "rf_stamp", "rf_stamp_link") as client:
-            await client.query(_RF_STAMP_SEED, {})
+            await _client.query(client, _RF_STAMP_SEED, {})
             link = await RfStampLink(in_=_RF_SEED, out=_RF_SEED).save()
             assert isinstance(link.meta.at, datetime) and isinstance(link.meta.seen, datetime), link.meta
             rid = link._record_id()
             assert rid is not None
             query = "SELECT VALUE [<string> meta.at, <string> meta.seen] FROM ONLY $rid;"
-            before = await client.query(query, {"rid": rid})
+            before = await _client.query(client, query, {"rid": rid})
             await link.update()
-            assert await client.query(query, {"rid": rid}) == before
+            assert await _client.query(client, query, {"rid": rid}) == before
 
 
 class TestSaveReadsBackTheStoredRowE2E:
@@ -2875,7 +2883,7 @@ class TestSaveReadsBackTheStoredRowE2E:
             assert isinstance(stamp.meta, RfStampMeta), stamp.meta
             assert stamp.log is not None and len(stamp.log) == 1, stamp.log
             for value in (stamp.created, stamp.meta.at, stamp.meta.seen, stamp.log[0]):
-                assert type(value) is datetime and value.tzinfo is not None, stamp
+                assert type(value) is PreciseDatetime and value.tzinfo is not None, stamp
             rid = stamp._record_id()
             assert rid is not None
             if how != "auto-id":
@@ -3204,7 +3212,7 @@ class TestWriteSyncAppliesDeclaredFieldsE2E:
                 else:
                     assert instance.full == "ADA"
                 assert "full" not in instance.__dict__
-                stored = await client.query("SELECT VALUE full FROM ONLY $rid;", {"rid": rid})
+                stored = await _client.query(client, "SELECT VALUE full FROM ONLY $rid;", {"rid": rid})
                 assert stored == ("Ada Lovelace" if isinstance(instance, RfFullName) else "ADA"), stored
         finally:
             post_save.clear(RfFullName)
@@ -3270,7 +3278,8 @@ async def _write_back_after(client: Any, write: str) -> RfWriteBack:
         return await RfWriteBack(id="w").save()
     if write == "save-auto-id":
         return await RfWriteBack().save()
-    await client.query(
+    await _client.query(
+        client,
         "CREATE rf_write_back:w SET n = 0, price = $price, color = 'red', rank = 1, status = 'active';",
         {"price": _RF_EXACT},
     )
@@ -3433,33 +3442,37 @@ class TestReplaceContentBoundsE2E:
             await _replace(deep, "update", tx)
             got = await RfDeep.objects().get("x")
             assert got.title == "u" and got.doc == deep.doc and got.history == deep.history
-            assert await client.query("RETURN array::len(rf_deep:x.history);", {}) == 500
+            assert await _client.query(client, "RETURN array::len(rf_deep:x.history);", {}) == 500
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["ws", "mem"])
     async def test_readonly_datetimes_within_the_bounds_are_kept(self, kind: str) -> None:
         """``doc`` comes before ``history`` in the data: its datetime three levels down still fits in the budget."""
         async with _rf_engine(kind, _RF_DEEP_DDL, "rf_deep") as client:
-            await client.query(_RF_DEEP_SEED, {})
-            before = await client.query(_RF_DEEP_STAMPS, {})
+            await _client.query(client, _RF_DEEP_SEED, {})
+            before = await _client.query(client, _RF_DEEP_STAMPS, {})
             seed = await RfDeep.objects().get("seed")
             seed.title = "u"
             seed.history = [RfStampMeta(at=_DT) for _ in range(_KEEP_LIMIT)]  # no budget left for all of it: sent as is
             await seed.update()
-            assert await client.query(_RF_DEEP_STAMPS, {}) == before
+            assert await _client.query(client, _RF_DEEP_STAMPS, {}) == before
             assert (await RfDeep.objects().get("seed")).title == "u"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["ws", "mem"])
-    async def test_a_readonly_datetime_past_the_depth_is_refused(self, kind: str) -> None:
-        """The documented limit: four levels down, the datetime is sent as the SDK read it and ``READONLY`` refuses it."""
+    async def test_a_readonly_datetime_past_the_depth_is_sent_back_unchanged(self, kind: str) -> None:
+        """Four levels down, the datetime is sent as the SDK read it. v0.50.0 (SDK 3.0): the SDK reads it with its
+        nanoseconds (``PreciseDatetime``) and sends them back, so ``READONLY`` finds the value unchanged and accepts it
+        (with SDK 2.0 the value was floored to the microsecond and refused)."""
         async with _rf_engine(kind, _RF_DEEP_DDL, "rf_deep") as client:
-            await client.query(_RF_DEEPER_SEED, {})
+            await _client.query(client, _RF_DEEPER_SEED, {})
+            deeper = "SELECT VALUE <string> doc.a.b.c.at FROM ONLY rf_deep:seed;"
+            before = await _client.query(client, deeper, {})
+            assert before == "2026-01-02T03:04:05.000000001Z"
             seed = await RfDeep.objects().get("seed")
             seed.title = "u"
-            with pytest.raises((SurrealError, SurrealDbError), match="readonly"):
-                await seed.update()
-            await seed.merge(title="u")  # the way the docs give
+            await seed.update()
+            assert await _client.query(client, deeper, {}) == before
             assert (await RfDeep.objects().get("seed")).title == "u"
 
 
@@ -3504,33 +3517,33 @@ class TestReplaceKeepsTopLevelDatetimesE2E:
     @pytest.mark.parametrize("events", [0, 10, 11, 500])
     async def test_a_top_level_readonly_datetime_is_kept(self, kind: str, events: int) -> None:
         async with _rf_engine(kind, _rf_history_ddl(""), "rf_history") as client:
-            await client.query(_RF_HISTORY_SEED, {})
+            await _client.query(client, _RF_HISTORY_SEED, {})
             stamp = await RfHistory.objects().get("x")
             stamp.title = "u"
             stamp.history = [RfStampMeta(at=_DT, seen=_DT) for _ in range(events)]
             await stamp.update()
-            stamps = await client.query(_RF_HISTORY_STAMPS, {})
+            stamps = await _client.query(client, _RF_HISTORY_STAMPS, {})
             assert isinstance(stamps, list) and stamps[0] == "2026-01-02T03:04:05.123456789Z", stamps
             got = await RfHistory.objects().get("x")
             assert got.title == "u" and len(got.history) == events
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["ws", "mem"])
-    async def test_a_readonly_datetime_below_the_top_level_depends_on_the_data(self, kind: str) -> None:
-        """``meta.at`` is kept with no event, then refused once ten timestamped events, before it, use the budget up."""
+    async def test_a_readonly_datetime_below_the_top_level_is_kept_whatever_the_data(self, kind: str) -> None:
+        """``meta.at`` is kept with no event, and still once ten timestamped events, before it, use the budget up: the
+        datetime is then sent as the SDK read it, and v0.50.0 (SDK 3.0) reads it with its nanoseconds (with SDK 2.0 it
+        was floored to the microsecond and ``READONLY`` refused it)."""
         async with _rf_engine(kind, _rf_history_ddl("READONLY"), "rf_history") as client:
-            await client.query(_RF_HISTORY_SEED, {})
-            before = await client.query(_RF_HISTORY_STAMPS, {})
+            await _client.query(client, _RF_HISTORY_SEED, {})
+            before = await _client.query(client, _RF_HISTORY_STAMPS, {})
             stamp = await RfHistory.objects().get("x")
             stamp.title = "u"
             await stamp.update()
-            assert await client.query(_RF_HISTORY_STAMPS, {}) == before
+            assert await _client.query(client, _RF_HISTORY_STAMPS, {}) == before
             stamp.history = [RfStampMeta(at=_DT, seen=_DT) for _ in range(10)]
-            with pytest.raises((SurrealError, SurrealDbError), match="readonly"):
-                await stamp.update()
-            await stamp.merge(title="v")  # the way the docs give
-            assert await client.query(_RF_HISTORY_STAMPS, {}) == before
-            assert (await RfHistory.objects().get("x")).title == "v"
+            await stamp.update()
+            assert await _client.query(client, _RF_HISTORY_STAMPS, {}) == before
+            assert len((await RfHistory.objects().get("x")).history) == 10
 
 
 # --- filters and live queries (spec §5.5, §5.6, §6.5; AC-22, AC-23; D12) --------------------------
@@ -3545,14 +3558,17 @@ _ENDPOINT_REFUSAL = (
 
 
 class _RecordingClient:
-    """Stands in for the SDK client: records what ``query()`` is handed, answers no rows."""
+    """Stands in for the SDK client: records what ``query()`` is handed, answers no rows.
+
+    SDK 3.0's ``query()`` resolves to one result per statement: one statement without rows is ``[[]]``.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def query(self, statement: str, variables: dict[str, Any] | None = None) -> list[Any]:
         self.calls.append((statement, dict(variables or {})))
-        return []
+        return [[]]
 
 
 class TestRangeLookup:
@@ -3597,7 +3613,7 @@ class TestRangeLookup:
         assert live == "LIVE SELECT * FROM rf_event WHERE n IN 18..65;"
         live = RfEvent.objects().filter(n__not_in=Range(BoundIncluded(65)))._compile_live(False)
         assert live == "LIVE SELECT * FROM rf_event WHERE n NOT IN 65..;"
-        live = RfEvent.objects().filter(n__in=surrealdb.Range(_sdk.CBOR_NULL, BoundIncluded(5)))._compile_live(False)
+        live = RfEvent.objects().filter(n__in=surrealdb.Range(_sdk.Null, BoundIncluded(5)))._compile_live(False)
         assert live == "LIVE SELECT * FROM rf_event WHERE n IN ..=5;"
 
     # D12: a value range never contains a record id.
@@ -3660,7 +3676,7 @@ class TestRangeLookup:
         sent = variables["_f0"]
         assert type(sent) is surrealdb.Range
         closed_side = "begin" if open_side == "end" else "end"
-        assert getattr(sent, open_side) is _sdk.CBOR_NULL
+        assert getattr(sent, open_side) is _sdk.Null
         expected_bound = BoundExcluded(1) if open_side == "end" else BoundIncluded(5)
         assert getattr(sent, closed_side) == expected_bound
         assert _sdk.cbor_encode(sent).count(b"\xf6") == 1 and b"\xc6\xf6" not in _sdk.cbor_encode(sent)
@@ -3722,13 +3738,13 @@ _FILTER_CASES: list[tuple[str, tuple[Q, ...], dict[str, Any], set[str]]] = [
     ("n__in sdk 1>..9", (), {"n__in": surrealdb.Range(BoundExcluded(1), BoundExcluded(9))}, {"e5"}),
     ("n__in sdk None..=5", (), {"n__in": surrealdb.Range(None, BoundIncluded(5))}, {"e1", "e5"}),
     ("n__in sdk undefined..=5", (), {"n__in": surrealdb.Range(undefined, BoundIncluded(5))}, {"e1", "e5"}),
-    ("n__in sdk CBOR_NULL..=5", (), {"n__in": surrealdb.Range(_sdk.CBOR_NULL, BoundIncluded(5))}, {"e1", "e5"}),
+    ("n__in sdk CBOR_NULL..=5", (), {"n__in": surrealdb.Range(_sdk.Null, BoundIncluded(5))}, {"e1", "e5"}),
     ("n__in sdk Bound()..=5", (), {"n__in": surrealdb.Range(Bound(), BoundIncluded(5))}, {"e1", "e5"}),
     ("n__in sdk None..None", (), {"n__in": surrealdb.Range(None, None)}, _ALL),
     ("n__not_in 5..", (), {"n__not_in": Range(BoundIncluded(5))}, {"e1"}),
     ("n__not_in ..", (), {"n__not_in": Range()}, set()),
     ("n__not_in sdk 1..5", (), {"n__not_in": surrealdb.Range(BoundIncluded(1), BoundExcluded(5))}, {"e5", "e9"}),
-    ("n__not_in sdk CBOR_NULL..=5", (), {"n__not_in": surrealdb.Range(_sdk.CBOR_NULL, BoundIncluded(5))}, {"e9"}),
+    ("n__not_in sdk CBOR_NULL..=5", (), {"n__not_in": surrealdb.Range(_sdk.Null, BoundIncluded(5))}, {"e9"}),
     (
         "Q(n__in) | Q(n__in)",
         (Q(n__in=Range(BoundIncluded(1), BoundExcluded(5))) | Q(n__in=Range(BoundExcluded(8), None)),),
@@ -3764,13 +3780,13 @@ async def _scheme_client(scheme: str, *tables: str) -> AsyncIterator[Any]:
         return
     root = await _http_client()
     for table in tables:
-        await root.query(f"REMOVE TABLE IF EXISTS {table};", {})
+        await _client.query(root, f"REMOVE TABLE IF EXISTS {table};", {})
     SurrealDBConnectionManager.set_connection(_http_url(), "root", "root", "ns", "db")
     try:
         yield await SurrealDBConnectionManager.get_client()
     finally:
         for table in tables:
-            await root.query(f"REMOVE TABLE IF EXISTS {table};", {})
+            await _client.query(root, f"REMOVE TABLE IF EXISTS {table};", {})
         await SurrealDBConnectionManager.unset_connection()
 
 
@@ -3820,15 +3836,15 @@ class TestSetColumnE2E:
             version = await _server_version()
             if (3, 0, 0) <= version < (3, 3, 0):
                 pytest.skip("SurrealDB 3.1 refuses an array in a set<…> column")
-            await client.query("DEFINE FIELD tags ON rf_event TYPE set<string>;", {})
+            await _client.query(client, "DEFINE FIELD tags ON rf_event TYPE set<string>;", {})
             await RfEvent(id="s", tags={"b", "a"}).save()
-            stored = await client.query("SELECT VALUE <string> tags FROM ONLY rf_event:s;", {})
+            stored = await _client.query(client, "SELECT VALUE <string> tags FROM ONLY rf_event:s;", {})
             assert stored == ("{'a', 'b'}" if version >= (3, 0, 0) else "['a', 'b']"), stored
             loaded = await RfEvent.objects().get("s")
             assert type(loaded.tags) is set and loaded.tags == {"a", "b"}
             raw = await _raw(RecordID("rf_event", "s"))
             assert raw["tags"] == ({"a", "b"} if version >= (3, 0, 0) else ["a", "b"]), raw["tags"]
-            assert await client.query("RETURN 1;", {}) == 1
+            assert await _client.query(client, "RETURN 1;", {}) == 1
 
 
 class TestLiveFiltersE2E:
@@ -3855,7 +3871,7 @@ class TestLiveFiltersE2E:
             day=date(2026, 1, 2),
         )
         async with orm_client("rf_event") as client:
-            await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+            await _client.query(client, "DEFINE TABLE rf_event SCHEMALESS;", {})
             async with queryset.live() as stream:
                 for rid, values in misses.items():
                     await RfEvent(id=rid, **values).save()
@@ -3883,10 +3899,12 @@ _D10_PHRASES = ("connection lost", "connection is lost", "drops the connection")
 #: The ``TYPE set<…>`` advice of spec §11, as the README must state it (whitespace normalised); since
 #: #235 the ORM reads the native set of a 3.3 column back.
 _SET_ADVICE = (
-    "`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.3 a `TYPE set<…>` column stores the "
-    "array as a native set, which the field reads back as the declared set (see "
-    "[Values the SDK cannot read](#values-the-sdk-cannot-read)), but 3.1 refuses an array in it; to support "
-    "3.1, declare such columns `array<…>`, optionally with `VALUE $value.distinct()`"
+    "`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.3 and 4.x a `TYPE set<…>` column stores "
+    "the array as a native set, which the field reads back as the declared set; a raw result (`raw_query()`, "
+    "`QuerySet.query()`, a live or change-feed event's `raw`) holds it as a Python `set` (a `list` when an item is "
+    "unhashable, or when two items are equal in Python, such as `1` and `True`). SurrealDB 2.x has no native set: "
+    "the column is an array there, read as a `list`. SurrealDB 3.1 refuses an array in a `set<…>` column; to "
+    "support 3.1, declare such columns `array<…>`, optionally with `VALUE $value.distinct()`"
 )
 
 _D9_SINCE = "pre-existing (documented in v0.23.0)"
@@ -3938,7 +3956,7 @@ class TestReadmeExamplesE2E:
         async with orm_client(*_README_TABLES.values()) as client:
             for language, code in _section_24_examples():
                 if language == "sql":
-                    await client.query(code, {})
+                    await _client.query(client, code, {})
                     continue
                 compiled = compile(code, "<README section 24>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
                 # A doctest of this repository's own README (trusted text), top-level awaits included.
@@ -3949,7 +3967,7 @@ class TestReadmeExamplesE2E:
             # What the examples' comments say.
             subscription = namespace["Subscription"]
             loaded = await subscription.objects().get("acme")
-            assert type(loaded.started_at) is datetime and loaded.started_at.tzinfo is not None
+            assert type(loaded.started_at) is PreciseDatetime and loaded.started_at.tzinfo is not None
             assert type(loaded.renews_on) is date and loaded.renews_on == date(2026, 2, 1)
             assert type(loaded.trial) is timedelta
             assert type(loaded.grace) is Duration and loaded.grace == Duration.parse("1h30m1ns")
@@ -3969,7 +3987,7 @@ class TestReadmeExamplesE2E:
 
             # The array<…> column of the sets example keeps the declared set (3.1 would refuse a set<…> one).
             await loaded.update()
-            stored = await client.query("SELECT VALUE tags FROM ONLY $rid;", {"rid": loaded._record_id()})
+            stored = await _client.query(client, "SELECT VALUE tags FROM ONLY $rid;", {"rid": loaded._record_id()})
             assert sorted(stored) == ["annual", "pro"]
             assert (await subscription.objects().get("acme")).tags == {"annual", "pro"}
 

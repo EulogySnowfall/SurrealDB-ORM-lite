@@ -1163,7 +1163,12 @@ async def _rooms() -> dict[str, tuple[str, int | None]]:
 
 
 def _key(row: Any) -> str:
-    """The key of *row*'s record id, whether ``merge()`` left it a ``RecordID`` or a ``str``."""
+    """The key of *row*'s record id, whether ``merge()`` left it a ``RecordID`` or a ``str``.
+
+    A ``RecordID``'s own key, never its text: SDK 3.0 writes a key that starts with a digit escaped (``fv_room:⟨6a⟩``).
+    """
+    if isinstance(row.id, RecordID):
+        return str(row.id.id)
     return str(row.id).removeprefix("fv_room:")
 
 

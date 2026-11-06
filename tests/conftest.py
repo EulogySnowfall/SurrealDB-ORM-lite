@@ -45,8 +45,9 @@ generated models, ``tests/test_table_ddl.py`` (v0.34.0), whose ORM writes cover 
 table DDL defines, ``tests/test_vector.py`` (v0.36.0), which sends a point for a ``nearby()`` next to a
 vector search, ``tests/test_factories.py`` (v0.40.0), whose factories build and save ``date``/``datetime``
 Faker values, and ``tests/test_pytest_plugin.py`` (v0.40.0), whose pytester inner sessions run in the same
-process under the outer test's guard and may write any value. A new test that needs rich values goes into one of them — never add a pre-existing
-module to that set.
+process under the outer test's guard and may write any value, and ``tests/test_sdk3_values.py`` (v0.50.0), whose
+round trips write the values SDK 3.0 reads (zero durations, sets, open ranges, nanosecond datetimes, dates). A new
+test that needs rich values goes into one of them — never add a pre-existing module to that set.
 
 **The SDK call frontier (v0.50.0) is watched at run time.** ``pytest_configure`` below registers
 ``tests/_frontier_spy.py`` for the whole session: it records every SDK data call a ``surreal_orm_lite`` module makes
@@ -97,6 +98,7 @@ _REWRITE_MODULES = frozenset(
         "tests.test_factories",
         "tests.test_pytest_plugin",
         "tests.test_factories_docs",
+        "tests.test_sdk3_values",
     }
 )
 

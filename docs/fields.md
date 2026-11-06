@@ -207,20 +207,22 @@ both lines.
 
 ### Precision and `Decimal`
 
-- `datetime`: to the microsecond. The SDK truncates the server's nanoseconds, so a stored
-  `d'2026-01-02T03:04:05.123456789Z'` reads `…05.123456`. `update()` and `upsert()` rewrite the
-  whole record, but a `datetime` you did not change (it still floors to the stored value) keeps
-  the stored nanoseconds, on both lines and the embedded engine: a record whose `READONLY`
-  datetimes are top-level fields can be updated after `get()` or `save()`, even when they hold
-  nanoseconds ([#261](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/261)). A
-  datetime you changed is written as you set it, and a `READONLY` field still refuses it. So that
-  the statement stays small whatever the data, only the top-level datetimes are sure to be kept,
-  up to 32 per record. Below the top level (in a sub-model, a `list` or a `tuple`, down to three
-  levels) a datetime is kept only while the values rebuilt to reach it fit in what the fields
-  before it left of those 32, so it depends on the data: an `update()` that passes in a test can
-  fail once a list of timestamped items before the sub-model grows. A datetime not kept, and one
-  in a set (its items have no position to match a stored value by), is written as sent: a
-  `READONLY` field holding one may refuse `update()`, so change such a record with `merge()`.
+- `datetime`: to the nanosecond (since v0.50.0). A datetime read from the server is the SDK's
+  `PreciseDatetime`, a `datetime` subclass that keeps the server's nanoseconds in `.nanosecond`
+  (the part below the microsecond): a stored `d'2026-01-02T03:04:05.123456789Z'` reads
+  `…05.123456` with `.nanosecond == 789`, and `save()`, `update()`, `upsert()` and `merge()` write
+  it back unchanged, on every line and the embedded engine. It compares equal to the `datetime` of
+  the same microsecond. A `datetime` you build in Python is sent to the microsecond, as before.
+  A field validator may convert it: `value.astimezone(UTC)` on a UTC value keeps the nanoseconds,
+  while `astimezone()` to another zone and `replace()` return a value to the microsecond
+  (`.nanosecond == 0`); the model accepts either. `update()` and `upsert()` rewrite the whole
+  record, but a top-level `datetime` that still floors to the stored value keeps the stored
+  nanoseconds, so such a validator does not change what is stored
+  ([#261](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/261), up to 32 top-level
+  datetimes per record). A datetime you changed is written as you set it, and a `READONLY` field
+  still refuses it. Before v0.50.0 the SDK floored datetimes to the microsecond, so a `READONLY`
+  datetime below the top level (in a sub-model, a `list`, a `tuple` or a set) could make
+  `update()` fail; a value read from the server is now written back as it was read.
   SurrealDB 2.x also refuses, for now, `update()` and `upsert()` of an existing record that has
   a field with a non-optional `TYPE` and a `VALUE` clause the model does not write (a `Computed`
   field, such as a generated `updated: Computed[datetime]`): change it with `merge()` there
@@ -238,10 +240,13 @@ both lines.
 
 ### Sets
 
-`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.3 a `TYPE set<…>` column
-stores the array as a native set, which the field reads back as the declared set (see
-[Values the SDK cannot read](#values-the-sdk-cannot-read)), but 3.1 refuses an array in it; to
-support 3.1, declare such columns `array<…>`, optionally with `VALUE $value.distinct()`:
+`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.3 and 4.x a `TYPE set<…>`
+column stores the array as a native set, which the field reads back as the declared set; a raw
+result (`raw_query()`, `QuerySet.query()`, a live or change-feed event's `raw`) holds it as a
+Python `set` (a `list` when an item is unhashable, or when two items are equal in Python, such as
+`1` and `True`). SurrealDB 2.x has no native set: the column is an array there, read as a `list`.
+SurrealDB 3.1 refuses an array in a `set<…>` column; to support 3.1, declare such columns
+`array<…>`, optionally with `VALUE $value.distinct()`:
 
 ```sql
 DEFINE FIELD tags ON subscription TYPE array<string> VALUE $value.distinct();
@@ -250,6 +255,14 @@ DEFINE FIELD tags ON subscription TYPE array<string> VALUE $value.distinct();
 On a schemaless or `array<…>` column the field reads back as the declared `set` or `frozenset`, on
 both lines. The array is sorted when its items can be ordered, so a set is written the same way
 every time.
+
+### `NULL` and open range sides
+
+SurrealDB's `NULL` reads as `None` on every read path (a model, `raw_query()`, `values()`, a live or
+change-feed event), as `NONE` does: the SDK reads it as its `Null` sentinel and the ORM maps it.
+A range read from the server holds `None` on an open side, in a `Range` field and in a raw result,
+and binds back as a parameter as it is: the ORM sends an open side (`None`, or the SDK's `Null`)
+as the protocol's open bound.
 
 ### Values refused before sending
 

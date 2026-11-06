@@ -56,8 +56,16 @@ from tests.test_rich_types import _DECIMAL_FIXED, _decimal_corpus
 
 MAX_NS = Duration.MAX_NANOSECONDS
 _DUR = _sdk.TAG_DURATION_COMPACT
+
+
+def _dur(pair: list[int]) -> Any:
+    """What ``encode`` gives for a duration of ``[seconds, nanoseconds]``: the SDK's ``Duration`` (v0.50.0, SDK 3.0)."""
+    seconds, nanoseconds = pair
+    return surrealdb.Duration(seconds * 10**9 + nanoseconds)
+
+
 _DEC = _sdk.TAG_DECIMAL_STRING
-_NULL = _sdk.CBOR_NULL
+_NULL = _sdk.Null
 _ZEROS_29 = "0." + "0" * 29
 _UUID = UUID("0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11")
 _AT = datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
@@ -292,9 +300,15 @@ class TestEncodeRows:
         ids=repr,
     )
     def test_duration_rows(self, value: Any, expected: list[int]) -> None:
+        """v0.50.0: the SDK's ``Duration``, which SDK 3.0 writes as tag 14 ``[seconds, nanoseconds]`` exactly."""
         out = _encode(value)
-        assert type(out) is CBORTag
-        assert out == CBORTag(_DUR, expected)
+        assert type(out) is surrealdb.Duration
+        assert out == _dur(expected)
+        seconds, nanoseconds = expected
+        assert _sdk.cbor_encode(out) == _sdk.cbor_encode(surrealdb.Duration(seconds * 10**9 + nanoseconds))
+        assert _sdk.cbor_decode(_sdk.cbor_encode(out)) == out  # u64 seconds included
+        if type(value) is surrealdb.Duration:
+            assert out is value  # already the SDK's form
 
     @pytest.mark.parametrize(
         ("value", "match"),
@@ -320,7 +334,7 @@ class TestEncodeRows:
     def test_zero_duration_goes_out(self, zero: Any) -> None:
         """v0.50.0: the SDK reads a zero duration back, so it goes out like any other; nothing refuses it."""
         assert not hasattr(encoding, "reads_zero_duration")
-        assert _encode(zero) == CBORTag(_DUR, [0, 0])
+        assert _encode(zero) == _dur([0, 0])
         assert _sdk.cbor_decode(_sdk.cbor_encode(_encode(zero))) == surrealdb.Duration(0)
 
     def test_date_rows(self) -> None:
@@ -339,7 +353,7 @@ class TestEncodeRows:
     def test_set_rows(self) -> None:
         assert _encode({"b", "a"}) == ["a", "b"]
         assert _encode(frozenset({2, 1})) == [1, 2]
-        assert _encode({timedelta(hours=2), timedelta(hours=1)}) == [CBORTag(_DUR, [3600, 0]), CBORTag(_DUR, [7200, 0])]
+        assert _encode({timedelta(hours=2), timedelta(hours=1)}) == [_dur([3600, 0]), _dur([7200, 0])]
         mixed = _encode({1, "a"})
         assert type(mixed) is list
         assert sorted(mixed, key=repr) == sorted([1, "a"], key=repr)
@@ -387,7 +401,7 @@ class TestEncodeRows:
         assert out.begin is low
         assert out.end is high
 
-    @pytest.mark.parametrize("marker", [None, Bound(), undefined], ids=["None", "Bound()", "undefined"])
+    @pytest.mark.parametrize("marker", [Bound(), undefined], ids=["Bound()", "undefined"])
     def test_range_rows_sdk_open_markers_become_the_cbor_null(self, marker: Any) -> None:
         end = BoundExcluded(5)
         value = SdkRange(marker, end)
@@ -399,6 +413,13 @@ class TestEncodeRows:
         assert _assert_open_side_bytes(out) == _OPEN_TO_FIVE
         assert value.begin is marker  # the input is never mutated
         assert _encode(out) is out
+
+    def test_range_rows_sdk_none_side_is_already_the_cbor_null(self) -> None:
+        """v0.50.0: SDK 3.0's ``Range`` stores a ``None`` side as ``Null``, so the range goes out as it is."""
+        value = SdkRange(None, BoundExcluded(5))
+        assert value.begin is _NULL
+        assert _encode(value) is value
+        assert _assert_open_side_bytes(value) == _OPEN_TO_FIVE
 
     def test_range_rows_sdk_unchanged_is_kept(self) -> None:
         open_begin = SdkRange(_NULL, BoundExcluded(5))
@@ -418,11 +439,11 @@ class TestEncodeRows:
         value = SdkRange(BoundIncluded(timedelta(hours=1)), undefined)
         out = _encode(value)
         assert type(out.begin) is BoundIncluded
-        assert out.begin.value == CBORTag(_DUR, [3600, 0])
+        assert out.begin.value == _dur([3600, 0])
         assert out.end is _NULL
         assert type(value.begin.value) is timedelta  # untouched
         orm = _encode(Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))))
-        assert orm == SdkRange(BoundIncluded(CBORTag(_DUR, [60, 0])), BoundExcluded(CBORTag(_DUR, [3600, 0])))
+        assert orm == SdkRange(BoundIncluded(_dur([60, 0])), BoundExcluded(_dur([3600, 0])))
         dates = _encode(Range(BoundIncluded(date(2026, 1, 2)), BoundExcluded(_SubDate(2026, 2, 1))))
         assert type(dates.begin.value) is datetime and dates.begin.value == _MIDNIGHT
         assert type(dates.end) is BoundExcluded and dates.end.value == datetime(2026, 2, 1, tzinfo=UTC)
@@ -463,7 +484,7 @@ class TestEncodeRows:
         assert out["b"] is not inner
         assert type(out["b"]) is list
         assert out["b"][0] is untouched
-        assert out["b"][1]["c"] == CBORTag(_DUR, [3600, 0])
+        assert out["b"][1]["c"] == _dur([3600, 0])
         assert value["b"][1]["c"] == timedelta(hours=1)  # input untouched
         same = {"a": [1, {"b": (2, "c")}], "d": None}
         assert _encode(same) is same
@@ -479,7 +500,7 @@ class TestEncodeRows:
         unchanged_sub = _SubDict(z=1)
         assert _encode(unchanged_sub) is unchanged_sub
         sub_list = _encode(_SubList([timedelta(seconds=1)]))
-        assert type(sub_list) is list and sub_list == [CBORTag(_DUR, [1, 0])]
+        assert type(sub_list) is list and sub_list == [_dur([1, 0])]
         assert _encode([]) == [] and _encode({}) == {} and _encode(()) == ()
 
     @pytest.mark.parametrize(
@@ -592,7 +613,7 @@ def _v0_22_2_corpus() -> list[Any]:
         RecordID("t", [1, "a"]),
         RecordID("t", {"a": 1}),
         CBORTag(_DEC, "1.5"),
-        CBORTag(_DUR, [5400, 1]),
+        _dur([5400, 1]),
         CBORSimpleValue(22),
         _NULL,
         undefined,
@@ -1376,7 +1397,7 @@ class TestHandOff:
     async def test_buffered_add_encodes_at_entry(self) -> None:
         tx = BufferedTransaction(client=None)
         await tx.add("UPDATE $rid SET v = $v;", {"rid": RecordID("t", 1), "v": timedelta(hours=1)})
-        assert tx.variables["t0_v"] == CBORTag(_DUR, [3600, 0])
+        assert tx.variables["t0_v"] == _dur([3600, 0])
         assert tx.variables["t0_rid"] == RecordID("t", 1)
 
         with pytest.raises(ValueError, match="negative duration") as excinfo:

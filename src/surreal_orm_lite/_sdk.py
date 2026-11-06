@@ -38,15 +38,15 @@ exports the CBOR tag numbers: they are read from ``surrealdb.data.types.constant
 compact datetime and duration tags, the decimal string and the seven geometry tags). New root symbols: ``Null`` and
 ``NullType`` (SurrealDB's ``NULL``, distinct from ``None``, which is ``NONE``), ``SurrealSet``, ``PreciseDatetime``,
 ``Table`` (the CRUD target of a whole table), ``StringRecordId``, ``Features`` (the server-version gates) and the
-transport and SDK-side errors. ``CBOR_NULL`` is now the SDK's ``Null`` sentinel, kept under that name for the ORM's
-internal callers. The read hook takes the SDK's CBOR decoder class (``SdkDecoder``) and its tag readers
-(``SDK_TAG_READERS``) from ``surrealdb.data._decoder``; both are ``None`` when a later SDK moves them, and the hook is
-then not installed. The embedded engine is an optional extra (``surreal-orm-lite[embedded]``):
+transport and SDK-side errors. ``Null`` is also the plain CBOR null (``0xf6``), SurrealDB's open range bound: it
+replaces the ORM's former ``CBOR_NULL`` constant. The read hook takes the SDK's CBOR decoder class (``SdkDecoder``)
+and its tag readers (``SDK_TAG_READERS``) from ``surrealdb.data._decoder``; both are ``None`` when a later SDK moves
+them, and the hook is then not installed. The embedded engine is an optional extra (``surreal-orm-lite[embedded]``):
 ``SdkAsyncEmbeddedConnection`` is ``None`` without it, and importing the ORM never needs it.
 """
 
 import importlib
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
 
 from surrealdb import (  # noqa: F401
     AlreadyExistsError,
@@ -87,11 +87,6 @@ from surrealdb.data.types.constants import (
     TAG_GEOMETRY_POINT,
     TAG_GEOMETRY_POLYGON,
 )
-
-# The plain CBOR null (``0xf6``): SurrealDB's open range bound (protocol tag 49). ``None`` would go
-# out as tag 6, NONE. SDK 3.0: the SDK's ``Null`` singleton (``x is Null``), which it encodes as
-# ``0xf6`` and returns for a CBOR null it reads. The name is kept for the ORM's internal callers.
-CBOR_NULL: Final = Null
 
 
 def _first_of(attr: str, *modules: str, required: bool = True) -> Any:
@@ -212,7 +207,6 @@ __all__ = [
     "TAG_DECIMAL_STRING",
     "CBORTag",
     "CBORSimpleValue",
-    "CBOR_NULL",
     "undefined",
     "Bound",
     "BoundIncluded",

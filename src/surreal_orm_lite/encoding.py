@@ -12,8 +12,8 @@ value alone — no field annotation, no I/O — and it is:
   changed, at every depth; otherwise the object passed in comes back;
 * **idempotent**: ``encode(encode(v)) is encode(v)``.
 
-It converts a ``timedelta`` or a ``Duration`` (the ORM's or the SDK's) to the server's compact
-duration (CBOR tag 14, nanosecond-exact); a ``date`` to midnight UTC; a ``set`` or ``frozenset``
+It converts a ``timedelta`` or a ``Duration`` (the ORM's or the SDK's) to the SDK's ``Duration``,
+which SDK 3.0 sends as the server's compact duration (CBOR tag 14, nanosecond-exact); a ``date`` to midnight UTC; a ``set`` or ``frozenset``
 to a list, sorted when its items can be; an ORM or SDK ``Range`` to an SDK ``Range`` whose open
 sides are the protocol's CBOR null; and a ``Decimal`` in exponent form to its fixed-point text. It
 refuses with a plain ``ValueError``, before anything is sent: an ``int`` outside signed 64-bit, a
@@ -80,6 +80,7 @@ _PASSTHROUGH: Final = frozenset(
         _sdk.RecordID,
         _sdk.CBORTag,
         _sdk.CBORSimpleValue,
+        _sdk.NullType,  # v0.50.0: the SDK's ``Null`` (SurrealDB's NULL), the former ``CBORSimpleValue(22)``
         type(_sdk.undefined),
     }
 )
@@ -177,26 +178,33 @@ def _encode_decimal(value: Decimal) -> Any:
 
 
 def _encode_duration(value: timedelta | Duration | _sdk.SdkDuration) -> Any:
-    """The server's compact duration ``[seconds, nanoseconds]`` (CBOR tag 14), in exact integers.
+    """The SDK's ``Duration`` of exactly that many nanoseconds; a valid SDK ``Duration`` itself.
 
-    Never the SDK's ``get_seconds_and_nano()`` (float error above ~2**53 ns) nor its
-    ``to_compact()`` (drops the nanoseconds).
+    v0.50.0 (SDK 3.0): the SDK writes its ``Duration`` as the server's compact duration
+    ``[seconds, nanoseconds]`` (CBOR tag 14) in exact integers, seconds up to ``2**64 - 1``. The
+    ORM's own ``CBORTag`` of that pair no longer goes out past ``2**63 - 1`` seconds: SDK 3.0
+    refuses any integer outside signed 64-bit, the seconds of a tag 14 included.
     """
     ns = _nanoseconds(value)  # ValueError for a duration whose ``elapsed`` is not an int
     if ns < 0:
         raise ValueError(f"Cannot send a negative duration ({value!r}): SurrealDB durations are never negative.")
-    seconds, nanoseconds = divmod(ns, _NS_PER_SECOND)
-    if seconds >= DURATION_SECONDS_LIMIT:
+    if ns // _NS_PER_SECOND >= DURATION_SECONDS_LIMIT:
         raise ValueError(f"Cannot send {value!r}: a SurrealDB duration holds at most 2**64 - 1 seconds.")
-    return _sdk.CBORTag(_sdk.TAG_DURATION_COMPACT, [seconds, nanoseconds])
+    if type(value) is _sdk.SdkDuration and type(value.elapsed) is int:
+        return value  # already the SDK's exact form: the caller's own object (idempotence)
+    return _sdk.SdkDuration(ns)
 
 
 def _encode_range_side(side: Any) -> Any:
-    """One range side: a CBOR null kept as is, another open marker as the CBOR null, a bound's value encoded."""
-    if isinstance(side, _sdk.CBORSimpleValue) and side.value == 22:
+    """One range side: a CBOR null kept as is, another open marker as the CBOR null, a bound's value encoded.
+
+    The CBOR null is the SDK's ``Null`` (v0.50.0, SDK 3.0): the open side an SDK ``Range`` read from the server holds,
+    and the one ``Range(…, None)`` holds once built. ``None`` alone would go out as NONE, which a range refuses.
+    """
+    if side is _sdk.Null or (isinstance(side, _sdk.CBORSimpleValue) and side.value == 22):
         return side  # already the protocol's open bound: the caller's own object (a subclass too)
     if _is_open_side(side):  # ``None``, a bare SDK ``Bound()``, ``undefined``
-        return _sdk.CBOR_NULL
+        return _sdk.Null
     if isinstance(side, (_sdk.BoundIncluded, _sdk.BoundExcluded)):
         bound_value = _encode(side.value)
         return side if bound_value is side.value else type(side)(bound_value)

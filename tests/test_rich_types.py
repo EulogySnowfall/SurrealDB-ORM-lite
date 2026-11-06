@@ -23,7 +23,7 @@ import surrealdb
 import surrealdb.data.types.range
 from pydantic import BaseModel, PlainSerializer, ValidationError
 from pydantic_core import PydanticSerializationError
-from surrealdb import AsyncSurreal, RecordID
+from surrealdb import AsyncSurreal, PreciseDatetime, RecordID
 from surrealdb import Range as SdkRange
 from surrealdb.cbor import CBORSimpleValue, CBORTag, undefined
 
@@ -482,7 +482,7 @@ class TestNanoseconds:
 _JAN = datetime(2026, 1, 1, tzinfo=UTC)
 _FEB = datetime(2026, 2, 1, tzinfo=UTC)
 _ASYMMETRY = "the SDK's `Range.__eq__` now defers to the ORM type: update the README and spec §5.3"
-_CBOR_NULL_MARKERS: list[Any] = [None, Bound(), undefined, CBORSimpleValue(22), _sdk.CBOR_NULL]
+_CBOR_NULL_MARKERS: list[Any] = [None, Bound(), undefined, CBORSimpleValue(22), _sdk.Null]
 _MARKER_IDS = ["None", "Bound()", "undefined", "CBORSimpleValue(22)", "CBOR_NULL"]
 
 # (range, its SurrealQL text, the range that text parses back to when the bound types differ).
@@ -1032,7 +1032,7 @@ class TestOpenSides:
     def test_constructor_stores_none(self) -> None:
         assert Range(undefined, BoundExcluded(5)).begin is None  # type: ignore[arg-type]
         assert Range(BoundIncluded(1), CBORSimpleValue(22)).end is None  # type: ignore[arg-type]
-        assert Range(_sdk.CBOR_NULL, None).begin is None  # type: ignore[arg-type]
+        assert Range(_sdk.Null, None).begin is None  # type: ignore[arg-type]
         both = Range(Bound(), Bound())  # type: ignore[arg-type]
         assert both.begin is None
         assert both.end is None
@@ -1067,7 +1067,7 @@ class TestOpenSides:
         assert r is not None
         assert r.end is None
 
-    @pytest.mark.parametrize("marker", [undefined, CBORSimpleValue(22), _sdk.CBOR_NULL, Bound()], ids=repr)
+    @pytest.mark.parametrize("marker", [undefined, CBORSimpleValue(22), _sdk.Null, Bound()], ids=repr)
     def test_dump_of_a_raw_sdk_range_with_an_open_marker(self, marker: Any) -> None:
         class M(BaseModel):
             r: Range[int] | None = None
@@ -1085,7 +1085,7 @@ class TestOpenSides:
 
     def test_literal_of_sdk_ranges_with_open_markers(self) -> None:
         assert to_surql_literal(SdkRange(BoundIncluded(1), undefined)) == "1.."
-        assert to_surql_literal(SdkRange(BoundIncluded(1), _sdk.CBOR_NULL)) == "1.."
+        assert to_surql_literal(SdkRange(BoundIncluded(1), _sdk.Null)) == "1.."
         assert to_surql_literal(SdkRange(CBORSimpleValue(22), BoundExcluded(5))) == "..5"
         assert to_surql_literal(SdkRange(Bound(), BoundExcluded(5))) == "..5"
         assert to_surql_literal(SdkRange(None, None)) == ".."  # type: ignore[arg-type]
@@ -1310,7 +1310,7 @@ class TestRichLiterals:
             (Range(), ".."),
             (SdkRange(BoundIncluded(1), BoundExcluded(5)), "1..5"),
             (SdkRange(BoundIncluded(1), undefined), "1.."),
-            (SdkRange(BoundIncluded(1), _sdk.CBOR_NULL), "1.."),
+            (SdkRange(BoundIncluded(1), _sdk.Null), "1.."),
             (SdkRange(CBORSimpleValue(22), BoundExcluded(5)), "..5"),
             (SdkRange(Bound(), BoundExcluded(5)), "..5"),
             (Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))), "1m..1h"),
@@ -1418,13 +1418,14 @@ class TestRichLiterals:
 
 # Every literal of spec §3.3: (value, literal, the parameter the server must find equal). Open range
 # sides go out as the protocol's CBOR null (spec §3.9), never ``undefined``.
-_N = _sdk.CBOR_NULL
+_N = _sdk.Null
 _TAG = _sdk.TAG_DURATION_COMPACT
 _LONG = Duration.parse("1y2w3d4h5m6s7ms8us9ns")
 LIVE_LITERALS: list[tuple[Any, str, Any]] = [
     (Duration.parse("1h30m1ns"), "1h30m1ns", CBORTag(_TAG, [5400, 1])),
     (_LONG, "1y2w3d4h5m6s7ms8us9ns", CBORTag(_TAG, list(divmod(_LONG.elapsed, 10**9)))),
-    (Duration(MAX_NS), "584942417355y3w5d7h15s999ms999us999ns", CBORTag(_TAG, [2**64 - 1, 999_999_999])),
+    # SDK 3.0 refuses an int outside signed 64-bit, inside a tag too: its own ``Duration`` sends u64 seconds.
+    (Duration(MAX_NS), "584942417355y3w5d7h15s999ms999us999ns", surrealdb.Duration(MAX_NS)),
     (timedelta(hours=1, minutes=30, microseconds=1), "1h30m1us", CBORTag(_TAG, [5400, 1000])),
     (surrealdb.Duration(5400 * 10**9 + 1), "1h30m1ns", CBORTag(_TAG, [5400, 1])),
     (date(2026, 1, 2), "d'2026-01-02T00:00:00Z'", datetime(2026, 1, 2, tzinfo=UTC)),
@@ -1509,7 +1510,8 @@ _WIRE_FORMS: list[tuple[str, Any, Any, str | None]] = [
         Decimal("79228162514264337593543950335"),
         None,
     ),
-    ("date", date(2026, 1, 2), datetime(2026, 1, 2, tzinfo=UTC), None),
+    # v0.50.0 (SDK 3.0): every datetime read from the server is a ``PreciseDatetime``.
+    ("date", date(2026, 1, 2), PreciseDatetime(2026, 1, 2, tzinfo=UTC), None),
     ("set", {"b", "a"}, ["a", "b"], None),
     ("1..5", Range(BoundIncluded(1), BoundExcluded(5)), SdkRange(BoundIncluded(1), BoundExcluded(5)), "1..5"),
     ("..5", Range(None, BoundExcluded(5)), SdkRange(None, BoundExcluded(5)), "..5"),
@@ -1539,10 +1541,13 @@ class TestWireFormsE2E:
             assert await _client.query(client, "CREATE rf_wire:1 SET v = $v RETURN NONE;", {"v": encoded}) == []
             read = await _client.query(client, "SELECT VALUE v FROM ONLY rf_wire:1;", {})
             assert type(read) is type(expected)
-            assert read == expected
             if isinstance(expected, SdkRange):
+                # v0.50.0: the ORM reads an open side as ``None`` (SDK 3.0 reads ``Null``; ``SdkRange(None, …)``
+                # stores ``Null``): the expected range normalised the same way.
+                expected = _client.normalize(expected)
                 assert (read.begin is None) == (expected.begin is None)
                 assert (read.end is None) == (expected.end is None)
+            assert read == expected
             if text is not None:
                 assert await _client.query(client, "RETURN <string> $v;", {"v": encoded}) == text
             assert await _client.query(client, "RETURN 1;", {}) == 1
@@ -1571,11 +1576,12 @@ class TestZeroDurationReadE2E:
 class TestNativeSetsE2E:
     """A Python set goes out as a sorted array; what a ``TYPE set<…>`` column does with it depends on the line."""
 
-    def test_sdk_still_cannot_decode_native_sets(self) -> None:
-        assert not _sdk_decodes_native_set(), (
-            "the SDK now decodes native sets (CBOR tag 56): update README behaviour row "
-            "'TYPE set<…> columns' and section 24's array<…> advice"
-        )
+    def test_the_sdk_decodes_native_sets(self) -> None:
+        """v0.50.0 (SDK 3.0): the SDK reads a native set (CBOR tag 56) as ``SurrealSet``; the ORM reads it as a ``set``."""
+        assert _sdk_decodes_native_set()
+        read = _sdk.cbor_decode(_sdk.cbor_encode(CBORTag(56, ["b", "a"])))
+        assert isinstance(read, _sdk.SurrealSet)
+        assert _client.normalize(read) == {"a", "b"}
 
     async def test_set_column_by_line(self) -> None:
         async with orm_client("rf_set"):
@@ -1594,11 +1600,7 @@ class TestNativeSetsE2E:
                     await _client.query(client, write, {"t": tags})
             else:
                 await _client.query(client, write, {"t": tags})
-                if _sdk_decodes_native_set():
-                    assert sorted(await _client.query(client, read, {})) == ["a", "b"]
-                else:
-                    with pytest.raises(BufferError):
-                        await _client.query(client, read, {})
+                assert await _client.query(client, read, {}) == {"a", "b"}  # the native set, read as a ``set``
 
     async def test_array_column_everywhere(self) -> None:
         async with orm_client("rf_arr"):

@@ -43,7 +43,7 @@ def test_sdk_shim_rich_exports() -> None:
         "TAG_DECIMAL_STRING",
         "CBORTag",
         "CBORSimpleValue",
-        "CBOR_NULL",
+        "Null",
         "undefined",
         "Bound",
         "BoundIncluded",
@@ -56,23 +56,25 @@ def test_sdk_shim_rich_exports() -> None:
 
 
 def test_cbor_null_constant() -> None:
-    """AC-3 (spec §6.7): ``CBOR_NULL`` is the plain CBOR null, SurrealDB's open range bound.
+    """AC-3 (spec §6.7): the plain CBOR null is SurrealDB's open range bound.
 
-    v0.50.0: on SDK 3.0 it is the SDK's ``Null`` singleton, which the SDK also returns for a CBOR null it reads.
+    v0.50.0: on SDK 3.0 it is the SDK's ``Null`` singleton, which the SDK also returns for a CBOR null it reads; the
+    ORM's former ``CBOR_NULL`` alias is gone.
     """
     import surrealdb
 
     from surreal_orm_lite import _sdk
 
-    assert _sdk.CBOR_NULL is surrealdb.Null
+    assert _sdk.Null is surrealdb.Null
+    assert not hasattr(_sdk, "CBOR_NULL")
     assert _sdk.cbor_encode is not None
     assert _sdk.cbor_decode is not None
     canary = "the SDK changed how it encodes a CBOR null or a Range: re-check spec §3.1/§3.9 (open range sides)"
     # f6, not c6 f6 (the tag-6 NONE that ``None`` gives).
-    assert _sdk.cbor_encode(_sdk.CBOR_NULL) == b"\xf6", canary
+    assert _sdk.cbor_encode(_sdk.Null) == b"\xf6", canary
     assert _sdk.cbor_encode(None) == b"\xc6\xf6", canary
     assert _sdk.cbor_decode(b"\xf6") is _sdk.Null, canary
-    open_begin = _sdk.SdkRange(_sdk.CBOR_NULL, _sdk.BoundExcluded(5))
+    open_begin = _sdk.SdkRange(_sdk.Null, _sdk.BoundExcluded(5))
     assert _sdk.cbor_encode(open_begin) == bytes.fromhex("d83182f6d83305"), canary
 
 
@@ -427,13 +429,14 @@ def test_sdk3_decoder_layout_exports() -> None:
     assert "SDK_TAG_READERS" in _sdk.__all__
 
 
-def test_sdk3_null_is_the_cbor_null_alias() -> None:
-    """v0.50.0: ``CBOR_NULL`` (kept for internal callers until Task 7) is the SDK 3.0 ``Null`` sentinel."""
+def test_sdk3_null_replaces_the_cbor_null_alias() -> None:
+    """v0.50.0: the SDK 3.0 ``Null`` sentinel is the open range bound; the ``CBOR_NULL`` alias is removed."""
     import surrealdb
 
     from surreal_orm_lite import _sdk
 
-    assert _sdk.CBOR_NULL is surrealdb.Null
+    assert _sdk.Null is surrealdb.Null
+    assert "CBOR_NULL" not in _sdk.__all__
     assert _sdk.cbor_encode is not None
     assert _sdk.cbor_encode(_sdk.Null) == b"\xf6"
 

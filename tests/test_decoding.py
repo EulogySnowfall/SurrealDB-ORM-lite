@@ -1125,7 +1125,8 @@ class TestZeroDurationE2E:
     async def test_a_zero_duration_binds_and_reads_back(self, transport: str) -> None:
         async with _orm(transport) as client:
             for zero in (timedelta(0), Duration(0), surrealdb.Duration(0)):
-                assert encoding.encode(zero) == CBORTag(14, [0, 0])
+                assert encoding.encode(zero) == surrealdb.Duration(0)
+                assert _sdk.cbor_encode(encoding.encode(zero)) == _sdk.cbor_encode(CBORTag(14, [0, 0]))
                 assert to_surql_literal(zero) == "0ns"
                 out = await _client.query(client, "RETURN [$d, $d == 0ns, 0ns];", {"d": encoding.encode(zero)})
                 assert out[1] is True, out
