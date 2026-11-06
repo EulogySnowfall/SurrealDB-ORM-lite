@@ -60,6 +60,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealFunc,
+    _client,
     _sdk,
     computed,
     encoding,
@@ -127,7 +128,7 @@ SEED = (
 async def _raw(rid: RecordID) -> dict[str, Any]:
     """The stored row as the SDK reads it, bypassing the model."""
     client = await SurrealDBConnectionManager.get_client()
-    row = await client.query("SELECT * FROM ONLY $rid;", {"rid": rid})
+    row = await _client.query(client, "SELECT * FROM ONLY $rid;", {"rid": rid})
     assert isinstance(row, dict), row
     return row
 
@@ -500,7 +501,6 @@ _NEG = timedelta(seconds=-1)
 #: ORM's own types would apply first, so the value reaches ``encode`` as a caller could build it.
 _REFUSED_SAVES: dict[str, tuple[Callable[[], RfEvent], str]] = {
     "negative-timedelta": (lambda: RfEvent.model_construct(id="bad", ttl=_NEG), "negative duration"),
-    "zero-timedelta": (lambda: RfEvent(id="bad", ttl=timedelta(0)), "zero duration"),
     "sdk-duration-2**64-seconds": (
         lambda: RfEvent.model_construct(id="bad", grace=surrealdb.Duration(2**64 * 10**9)),
         re.escape("at most 2**64 - 1 seconds"),
@@ -517,7 +517,7 @@ _REFUSED_SAVES: dict[str, tuple[Callable[[], RfEvent], str]] = {
 async def _assert_client_untouched(client: Any) -> None:
     """The shared client survived the refusal: same object, still answering."""
     assert (await SurrealDBConnectionManager.get_client()) is client
-    assert await client.query("RETURN 1;", {}) == 1
+    assert await _client.query(client, "RETURN 1;", {}) == 1
 
 
 async def _refused_by_manager_signin() -> None:
@@ -542,18 +542,15 @@ class TestRefusalsE2E:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", list(_REFUSED_SAVES))
-    async def test_refusals_leave_the_client_untouched(self, case: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_refusals_leave_the_client_untouched(self, case: str) -> None:
         build, message = _REFUSED_SAVES[case]
-        if case == "zero-timedelta":
-            # The ORM reads a zero duration back since #235: the refusal is for an SDK nothing reads it with.
-            monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
         async with orm_client("rf_event") as client:
             await RfEvent(id="witness").save()
             with pytest.raises(ValueError, match=message) as excinfo:
                 await build().save()
             assert type(excinfo.value) is ValueError, f"re-wrapped into {type(excinfo.value).__name__}"
             await _assert_client_untouched(client)
-            assert await client.query("SELECT VALUE id FROM rf_event;", {}) == [RecordID("rf_event", "witness")]
+            assert await _client.query(client, "SELECT VALUE id FROM rf_event;", {}) == [RecordID("rf_event", "witness")]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", list(_REFUSED_PATHS))
@@ -3295,7 +3292,7 @@ async def _stored_after_update(client: Any, instance: RfWriteBack) -> dict[str, 
     assert rid is not None
     instance.n = 5
     await instance.update()
-    row = await client.query("SELECT * FROM ONLY $rid;", {"rid": rid})
+    row = await _client.query(client, "SELECT * FROM ONLY $rid;", {"rid": rid})
     assert isinstance(row, dict), row
     return row
 
@@ -3757,16 +3754,6 @@ class TestFiltersE2E:
                     wrong[label] = got
         assert not wrong, f"filters returned the wrong rows: {wrong!r}"
 
-    @pytest.mark.asyncio
-    async def test_zero_duration_filter_is_refused_before_sending(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)  # an SDK nothing reads a zero with
-        async with orm_client("rf_event"):
-            client = await SurrealDBConnectionManager.get_client()
-            with pytest.raises(ValueError, match="zero duration") as excinfo:
-                await RfEvent.objects().filter(ttl__gt=timedelta(0)).exec()
-            assert type(excinfo.value) is ValueError
-            await _assert_client_untouched(client)
-
 
 @contextlib.asynccontextmanager
 async def _scheme_client(scheme: str, *tables: str) -> AsyncIterator[Any]:
@@ -3788,13 +3775,11 @@ async def _scheme_client(scheme: str, *tables: str) -> AsyncIterator[Any]:
 
 
 class TestZeroDurationE2E:
-    """#235: a zero duration is written, filtered and read back on both lines, now that the clients the
-    ORM opens read it (SDK 2.0.0 cannot: the read hook of ``decoding.py``)."""
+    """A zero duration is written, filtered and read back on every line: the SDK reads it."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("scheme", ["ws", "http"])
     async def test_zero_durations_round_trip(self, scheme: str) -> None:
-        assert encoding.reads_zero_duration()
         async with _scheme_client(scheme, "rf_event"):
             await RfEvent(id="zero", ttl=timedelta(0), grace=Duration(0), durs=[Duration(0), Duration(1)]).save()
             await RfEvent(id="long", ttl=timedelta(hours=1), grace=Duration(1)).save()
@@ -3811,12 +3796,12 @@ class TestZeroDurationE2E:
             assert loaded.ttl == timedelta(0)
             assert (await RfEvent.objects().get("zero")).grace == Duration.parse("1s")
             client = await SurrealDBConnectionManager.get_client()
-            assert await client.query("RETURN 1;", {}) == 1
+            assert await _client.query(client, "RETURN 1;", {}) == 1
 
     @pytest.mark.asyncio
     async def test_zero_duration_live_filter(self) -> None:
         async with orm_client("rf_event") as client:
-            await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+            await _client.query(client, "DEFINE TABLE rf_event SCHEMALESS;", {})
             async with RfEvent.objects().filter(ttl=timedelta(0)).live() as stream:
                 await RfEvent(id="long", ttl=timedelta(hours=1)).save()
                 await RfEvent(id="zero", ttl=timedelta(0)).save()

@@ -828,11 +828,10 @@ class SurrealDBConnectionManager:
         ``use()`` still fail, and leaving that socket behind leaks one live connection per
         attempt against a flaky server.
 
-        Every client opened here — WebSocket, HTTP and embedded — reads the values SDK 2.0.0 cannot
-        decode (zero durations, native sets, degenerate geometries) through the read hook of
-        ``decoding.py`` (#235), installed as soon as the client is built, before ``connect()``. Only
-        these clients get it: a client the application builds itself with ``AsyncSurreal`` keeps the
-        SDK's behaviour.
+        Every client opened here — WebSocket, HTTP and embedded — reads degenerate geometries and
+        out-of-range datetimes as in 0.40.x through the read hook of ``decoding.py`` (#235), installed as
+        soon as the client is built, before ``connect()``. Only these clients get it: a client the
+        application builds itself with ``AsyncSurreal`` keeps the SDK's behaviour.
 
         Like every way the ORM gets a client, it marks the ORM writes in progress as having reached the database
         (``cache.reaching()``, issue #325).
@@ -865,8 +864,8 @@ class SurrealDBConnectionManager:
         credentials = _encoding.encode({"username": user, "password": password})
         try:
             client = _new_sdk_client(url, embedded=embedded)
-            # SDK 3.0 (#205): the read hook is a workaround for SDK 2.0.0's decoder; ``install`` is a
-            # no-op once the SDK reads every value itself (capability probes), or has another layout.
+            # Degenerate geometries and out-of-range datetimes are read as in 0.40.x (``decoding.py``); ``install``
+            # is a no-op once the SDK reads them itself (capability probes), or has another layout.
             _decoding.install(client)
             if embedded:
                 await client.connect()

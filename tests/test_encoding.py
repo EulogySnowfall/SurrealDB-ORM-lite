@@ -1,9 +1,9 @@
 """``encoding.encode()``: the value-driven boundary between the ORM and the SDK (v0.23.0).
 
 Unit tests, no database: one test per row of ``encode`` with its edges, the properties the hand-off
-relies on (identity on every value v0.22.2 could send, idempotence, no mutation of the input) and
-the zero-duration probe the refusal of a zero duration depends on (``decoding.py`` since #235). The raw-SDK round trips of the encoded forms, over WebSocket and
-HTTP on both server lines, live in ``tests/test_rich_types.py``.
+relies on (identity on every value v0.22.2 could send, idempotence, no mutation of the input). The
+raw-SDK round trips of the encoded forms, over WebSocket and HTTP on every server line, live in
+``tests/test_rich_types.py``.
 
 The hand-off itself — every SDK call of ``src/`` given ``_encoding.encode(…)`` of its payload, and
 never inside a ``try`` that would re-wrap the ``ValueError`` of a refused value — is checked here
@@ -49,7 +49,6 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     _sdk,
-    decoding,
     encoding,
 )
 from surreal_orm_lite._sdk import Bound
@@ -318,24 +317,11 @@ class TestEncodeRows:
         assert type(info.value) is ValueError
 
     @pytest.mark.parametrize("zero", [timedelta(0), Duration(0), surrealdb.Duration(0)], ids=repr)
-    @pytest.mark.parametrize("readable", [True, False])
-    def test_zero_duration_follows_reads_zero_duration(
-        self, zero: Any, readable: bool, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """#235: a zero duration goes out while the ORM reads one back, and is refused otherwise."""
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: readable)
-        if readable:
-            assert _encode(zero) == CBORTag(_DUR, [0, 0])
-            return
-        with pytest.raises(ValueError, match="zero duration") as info:
-            _encode(zero)
-        assert type(info.value) is ValueError
-
-    @pytest.mark.parametrize("zero", [timedelta(0), Duration(0), surrealdb.Duration(0)], ids=repr)
-    def test_zero_duration_goes_out_with_the_installed_sdk(self, zero: Any) -> None:
-        """#235: SDK 2.0.0 cannot read a zero duration, but the clients the ORM opens do (read hook)."""
-        assert encoding.reads_zero_duration()
+    def test_zero_duration_goes_out(self, zero: Any) -> None:
+        """v0.50.0: the SDK reads a zero duration back, so it goes out like any other; nothing refuses it."""
+        assert not hasattr(encoding, "reads_zero_duration")
         assert _encode(zero) == CBORTag(_DUR, [0, 0])
+        assert _sdk.cbor_decode(_sdk.cbor_encode(_encode(zero))) == surrealdb.Duration(0)
 
     def test_date_rows(self) -> None:
         out = _encode(date(2026, 1, 2))
@@ -523,7 +509,7 @@ class TestEncodeRows:
         with pytest.raises(ValueError, match="Range bound"):
             _encode(SdkRange(other, BoundExcluded(5)))
 
-    def test_messages(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_messages(self) -> None:
         """The refusal texts, verbatim."""
         cases: list[tuple[Any, str]] = [
             (
@@ -558,14 +544,6 @@ class TestEncodeRows:
             with pytest.raises(ValueError) as info:
                 _encode(value)
             assert str(info.value) == message
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
-        with pytest.raises(ValueError) as info:
-            _encode(Duration(0))
-        assert str(info.value) == (
-            "Cannot send a zero duration (Duration(elapsed=0)): the installed surrealdb SDK cannot read a zero "
-            "duration back. Store None instead, or filter with __gte=Duration(1)."
-        )
-        assert "connection" not in str(info.value)
 
     def test_constants(self) -> None:
         assert encoding.INT64_MIN == -(2**63)
@@ -574,7 +552,7 @@ class TestEncodeRows:
         assert encoding.DURATION_SECONDS_LIMIT == 2**64
         assert encoding.DECIMAL_TEXT_SCALE == 29
         assert encoding.DECIMAL_TEXT_STEP.as_tuple() == (0, (1,), -29)
-        assert encoding.__all__ == ["encode", "reads_zero_duration"]
+        assert encoding.__all__ == ["encode"]
 
 
 # --- properties ---------------------------------------------------------------------------------
@@ -744,70 +722,6 @@ class TestEncodeProperties:
         assert value["open"].begin is sides[0] and value["open"].end is sides[1]
         assert type(value["open"].end.value) is timedelta
         assert type(value["list"][1]["inner"]) is set
-
-
-# --- the local zero-duration probe (``decoding.py`` since #235) ------------------------------------
-
-
-class TestReadsZeroDuration:
-    """#235: a zero duration is readable when the SDK decodes one or the read hook is active."""
-
-    @pytest.mark.parametrize(
-        ("sdk", "hook", "expected"), [(True, False, True), (False, True, True), (False, False, False), (True, True, True)]
-    )
-    def test_sdk_or_hook(self, sdk: bool, hook: bool, expected: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(decoding, "sdk_decodes_zero_duration", lambda: sdk)
-        monkeypatch.setattr(decoding, "active", lambda: hook)
-        assert encoding.reads_zero_duration() is expected
-
-
-class TestZeroProbe:
-    def test_cached(self) -> None:
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            first = probe()
-            second = probe()
-            info = probe.cache_info()
-            assert (info.misses, info.hits) == (1, 1)
-            assert first is second
-            assert isinstance(first, bool)
-        finally:
-            probe.cache_clear()
-
-    @pytest.mark.parametrize("name", ["cbor_decode", "cbor_encode"])
-    def test_false_without_codec(self, name: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            monkeypatch.setattr(_sdk, name, None)
-            assert probe() is False
-        finally:
-            monkeypatch.undo()
-            probe.cache_clear()
-
-    def test_false_when_decode_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def boom(data: bytes) -> Any:
-            raise RuntimeError("cannot decode")
-
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            monkeypatch.setattr(_sdk, "cbor_decode", boom)
-            assert probe() is False
-        finally:
-            monkeypatch.undo()
-            probe.cache_clear()
-
-    def test_true_when_the_codec_reads_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            monkeypatch.setattr(_sdk, "cbor_decode", lambda data: surrealdb.Duration(0))
-            assert probe() is True
-        finally:
-            monkeypatch.undo()
-            probe.cache_clear()
 
 
 # --- the hand-off: every SDK call of src/ goes through encode() (spec §6.2) ----------------------

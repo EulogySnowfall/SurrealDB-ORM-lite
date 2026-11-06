@@ -52,6 +52,7 @@ from surreal_orm_lite import (
     PointField,
     PolygonField,
     SurrealConfigDict,
+    _client,
     encoding,
     geo,
     live,
@@ -1771,14 +1772,14 @@ class TestRawGeometryE2E:
         value = make()
         async with orm_client("geo_raw") as client:
             rid = RecordID("geo_raw", "ws")
-            await client.query("CREATE $rid SET v = $v;", {"rid": rid, "v": value})
-            back = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            await _client.query(client, "CREATE $rid SET v = $v;", {"rid": rid, "v": value})
+            back = await _client.query(client, "SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
             assert type(back) is type(value)
             assert back == value
             http = await _http_client()
             rid = RecordID("geo_raw", "http")
-            await http.query("CREATE $rid SET v = $v;", {"rid": rid, "v": value})
-            back = await http.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            await _client.query(http, "CREATE $rid SET v = $v;", {"rid": rid, "v": value})
+            back = await _client.query(http, "SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
             assert type(back) is type(value)
             assert back == value
 
@@ -1786,18 +1787,18 @@ class TestRawGeometryE2E:
         geojson = {"type": "Point", "coordinates": [-73.98, 40.74]}
         async with orm_client("geo_raw") as client:
             rid = RecordID("geo_raw", "map")
-            await client.query("CREATE $rid SET v = $v;", {"rid": rid, "v": geojson})
-            back = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            await _client.query(client, "CREATE $rid SET v = $v;", {"rid": rid, "v": geojson})
+            back = await _client.query(client, "SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
             assert type(back) is dict and back == geojson
-            assert await client.query("RETURN $v.is_geometry();", {"v": geojson}) is False
-            assert await client.query("RETURN $v.is_geometry();", {"v": SdkPoint(*A)}) is True
-            await client.query("DEFINE FIELD loc ON geo_raw TYPE option<geometry<point>>;", {})
+            assert await _client.query(client, "RETURN $v.is_geometry();", {"v": geojson}) is False
+            assert await _client.query(client, "RETURN $v.is_geometry();", {"v": SdkPoint(*A)}) is True
+            await _client.query(client, "DEFINE FIELD loc ON geo_raw TYPE option<geometry<point>>;", {})
             with pytest.raises(surrealdb.ServerError, match="geometry<point>"):
-                await client.query("CREATE geo_raw:x SET loc = $map;", {"map": geojson})
+                await _client.query(client, "CREATE geo_raw:x SET loc = $map;", {"map": geojson})
 
     async def test_distance_of_the_reference_points(self) -> None:
         async with orm_client("geo_raw") as client:
-            metres = await client.query("RETURN geo::distance($a, $b);", {"a": SdkPoint(*A), "b": SdkPoint(*B)})
+            metres = await _client.query(client, "RETURN geo::distance($a, $b);", {"a": SdkPoint(*A), "b": SdkPoint(*B)})
             assert metres == pytest.approx(AB_METRES, abs=1e-6)
 
 
@@ -1812,7 +1813,7 @@ class TestDecimalCoordinatesE2E:
         async with orm_client("geo_raw") as client:
             rid = RecordID("geo_raw", k)
             await GeoProbe.raw_query("CREATE $rid SET v = $v;", {"rid": rid, "v": SdkPoint(d, 1.0)})
-            back = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            back = await _client.query(client, "SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
             assert type(back) is SdkPoint
             assert type(back.longitude) is float
             assert back.longitude == stored
@@ -1824,7 +1825,7 @@ class TestDecimalCoordinatesE2E:
             probe = GeoProbe(id=f"m{k}")
             await probe.save()
             await probe.merge(location=SdkPoint(d, 1.0))
-            back = await client.query("SELECT VALUE location FROM ONLY $rid;", {"rid": RecordID("geo_raw", f"m{k}")})
+            back = await _client.query(client, "SELECT VALUE location FROM ONLY $rid;", {"rid": RecordID("geo_raw", f"m{k}")})
             assert type(back) is SdkPoint
             assert back.longitude == stored
 
@@ -1836,9 +1837,9 @@ class TestDecimalCoordinatesE2E:
                 d = Decimal(text)
                 orm_rid, raw_rid = RecordID("geo_raw", f"orm{k}"), RecordID("geo_raw", f"raw{k}")
                 await GeoProbe.raw_query("CREATE $rid SET v = $v;", {"rid": orm_rid, "v": SdkPoint(d, 1.0)})
-                await client.query("CREATE $rid SET v = $v;", {"rid": raw_rid, "v": SdkPoint(d, 1.0)})
-                via_orm = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": orm_rid})
-                raw = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": raw_rid})
+                await _client.query(client, "CREATE $rid SET v = $v;", {"rid": raw_rid, "v": SdkPoint(d, 1.0)})
+                via_orm = await _client.query(client, "SELECT VALUE v FROM ONLY $rid;", {"rid": orm_rid})
+                raw = await _client.query(client, "SELECT VALUE v FROM ONLY $rid;", {"rid": raw_rid})
                 assert via_orm == raw, text
                 assert via_orm.longitude == DECIMAL_STORED[d], text
 
@@ -2071,7 +2072,7 @@ class TestGeometryLiteralE2E:
         bound = encoding.encode(value)
         literal = to_surql_literal(value)
         async with orm_client("geo_raw") as client:
-            equal, back = await client.query(f"RETURN [{literal} == $v, {literal}];", {"v": bound})
+            equal, back = await _client.query(client, f"RETURN [{literal} == $v, {literal}];", {"v": bound})
         assert equal is True, literal
         twin = bound if expected is None else expected()
         assert type(back) is type(twin), literal

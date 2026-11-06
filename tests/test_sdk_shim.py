@@ -302,13 +302,16 @@ _SDK_CONNECTION_CLASSES = {
 def test_sdk_shim_read_hook_exports() -> None:
     """#235: what the read hook (``decoding.py``) takes from the SDK enters through ``_sdk.py``."""
     import surrealdb
-    import surrealdb.data.cbor
+    import surrealdb.data._decoder
     import surrealdb.data.types.constants
 
     from surreal_orm_lite import _sdk
 
-    assert _sdk.cbor_tag_decoder is surrealdb.data.cbor.tag_decoder
-    assert "cbor_tag_decoder" in _sdk.__all__
+    # The SDK's CBOR decoder class and its tag readers, which the read hook extends.
+    assert _sdk.SdkDecoder is surrealdb.data._decoder.Decoder
+    assert _sdk.SDK_TAG_READERS is surrealdb.data._decoder._TAGS
+    assert {"SdkDecoder", "SDK_TAG_READERS"} <= set(_sdk.__all__)
+    assert not hasattr(_sdk, "cbor_tag_decoder")
     # #279: the compact datetime tag, read when its value is outside years 1-9999.
     assert _sdk.TAG_DATETIME_COMPACT == surrealdb.data.types.constants.TAG_DATETIME_COMPACT == 12
     assert "TAG_DATETIME_COMPACT" in _sdk.__all__
@@ -318,16 +321,16 @@ def test_sdk_shim_read_hook_exports() -> None:
 
 
 def test_read_hook_without_the_sdk_symbols() -> None:
-    """#235: an SDK without a ``tag_decoder`` or a connection class still imports; the hook is then off."""
+    """#235: an SDK without its decoder class or a connection class still imports; the hook is then off."""
     result = _run_isolated(
         """
-        import surrealdb, surrealdb.data.cbor
-        del surrealdb.data.cbor.tag_decoder
+        import surrealdb, surrealdb.data._decoder
+        del surrealdb.data._decoder.Decoder
         del surrealdb.AsyncHttpSurrealConnection
         import surrealdb.connections.async_http as http
         del http.AsyncHttpSurrealConnection
         from surreal_orm_lite import _sdk, decoding
-        assert _sdk.cbor_tag_decoder is None and _sdk.SdkAsyncHttpConnection is None
+        assert _sdk.SdkDecoder is None and _sdk.SdkAsyncHttpConnection is None
         assert decoding.needed() and not decoding.available() and not decoding.active()
         print("ok")
         """

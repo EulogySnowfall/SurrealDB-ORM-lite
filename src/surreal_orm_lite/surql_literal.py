@@ -22,8 +22,7 @@ neither has a decimal or non-finite coordinate. That form is also a geometry's `
 
 A ``Range`` also has a text form, ``_range_text``: what its ``str()`` and its JSON write and a
 ``Range`` field reads back. It never reaches the server, so it writes every bound value exactly and
-drops the refusals that only protect a live filter: a zero duration is ``0ns`` whatever the ORM
-reads back, a ``Decimal`` keeps all its digits, an ``int`` may exceed 64 bits and a string may hold
+drops the refusals that only protect a live filter: a ``Decimal`` keeps all its digits, an ``int`` may exceed 64 bits and a string may hold
 ``\\x00``.
 
 Two choices worth knowing:
@@ -191,12 +190,8 @@ def _decimal_text(value: Decimal) -> str:
     return f"{format(value, 'f')}dec"
 
 
-def _duration(value: timedelta | Duration | SdkDuration, *, text: bool = False) -> str:
-    """Every unit, largest first, from the exact nanoseconds: ``1h30m1ns`` (ASCII ``us``).
-
-    With ``text``, a zero duration is ``0ns`` whatever the ORM reads back: the range text form never
-    reaches the server.
-    """
+def _duration(value: timedelta | Duration | SdkDuration) -> str:
+    """Every unit, largest first, from the exact nanoseconds: ``1h30m1ns`` (ASCII ``us``); a zero duration is ``0ns``."""
     try:
         nanoseconds = _nanoseconds(value)
     except ValueError:
@@ -205,12 +200,6 @@ def _duration(value: timedelta | Duration | SdkDuration, *, text: bool = False) 
         raise TypeError(f"Cannot inline a negative duration ({value!r}): SurrealDB durations are never negative.")
     if nanoseconds // 10**9 >= _DURATION_SECONDS_LIMIT:
         raise TypeError(f"Cannot inline {value!r}: a SurrealDB duration holds at most 2**64 - 1 seconds.")
-    # SDK 3.0 (#205): goes with ``encoding.reads_zero_duration()`` once the SDK reads a zero duration itself.
-    if nanoseconds == 0 and not text and not _encoding.reads_zero_duration():
-        raise TypeError(
-            f"Cannot inline a zero duration ({value!r}): the installed surrealdb SDK cannot read a zero "
-            "duration back. Filter with __gte=Duration(1) instead."
-        )
     return Duration(nanoseconds).to_string()
 
 
@@ -248,7 +237,7 @@ def _range_bound(value: Any, *, text: bool = False) -> str:
         if isinstance(value, Decimal):
             return _decimal_text(value)
         if isinstance(value, timedelta | Duration | SdkDuration):
-            return _duration(value, text=True)
+            return _duration(value)
     return to_surql_literal(value)
 
 
@@ -270,8 +259,7 @@ def _range_text(value: Range[Any] | SdkRange) -> str:
 
     Exactly the grammar ``types._parse_range_text`` reads, so the text reads back to an equal
     ``Range``. Unlike the live-filter literal it never reaches the server, so it keeps every bound
-    value whole: a zero duration is ``0ns`` whatever the ORM reads back, a ``Decimal`` is
-    written in full (no 28-fractional-digit or 96-bit limit), an ``int`` may exceed 64 bits and a
+    value whole: a ``Decimal`` is written in full (no 28-fractional-digit or 96-bit limit), an ``int`` may exceed 64 bits and a
     string may hold ``\\x00``. Otherwise the same text as ``to_surql_literal``.
 
     :raises TypeError: for a side that is not a bound, a bound value outside the closed set (or a
@@ -284,8 +272,8 @@ def _range_text(value: Range[Any] | SdkRange) -> str:
     return rendered
 
 
-# SDK 3.0 (#205): keep ``geo._geometry_text`` for live-query literals, never the SDK's ``str()``
-# (surrealdb/surrealdb.py#403: its ``GeometryCollection`` writes point members as ``(x, y)``).
+# ``geo._geometry_text`` for live-query literals, never the SDK's ``str()`` (surrealdb/surrealdb.py#403: its
+# ``GeometryCollection`` writes point members as ``(x, y)``).
 def _geometry(value: Any) -> str:
     """An ORM or SDK geometry's GeoJSON object literal, from ``geo._geometry_text`` (v0.24.0).
 
@@ -310,9 +298,7 @@ def to_surql_literal(value: Any) -> str:
     :raises TypeError: for a type with no verified literal form, a string containing ``\\x00``,
         an ``int`` outside signed 64-bit, a ``Decimal`` that is non-finite or beyond SurrealDB's
         28 fractional digits / 96-bit mantissa, a non-``str`` dict key, a negative duration, one
-        of 2**64 seconds or more, a zero duration while nothing reads one back
-        (``encoding.reads_zero_duration()``),
-        or a range whose side is not a bound or whose bound value is outside the closed set
+        of 2**64 seconds or more, or a range whose side is not a bound or whose bound value is outside the closed set
         (``int`` but not ``bool``, finite ``float``, ``Decimal``, ``str``, ``datetime``, ``date``,
         ``timedelta``, ``Duration``), an SDK geometry SurrealDB refuses, and a geometry with a
         coordinate that is not a finite ``int`` or ``float``.

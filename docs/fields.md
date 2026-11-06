@@ -261,7 +261,6 @@ is sent, with a plain `ValueError` that says why, never re-wrapped in a `Surreal
 | ----------------------------------------------------------------------------------------- | ---------------------------- |
 | A negative duration (a `timedelta`, the SDK's `Duration`)                                 | `ValueError`                 |
 | A duration of `2**64` seconds or more                                                     | `ValueError`                 |
-| A zero duration, if neither the SDK nor the ORM reads one back (never with SDK 2.0.0)     | `ValueError`                 |
 | A finite `Decimal` whose integer part, rounded, exceeds `2**96 - 1`                       | `ValueError`                 |
 | An `int` outside the signed 64-bit range                                                  | `ValueError` (use `Decimal`) |
 | A `Range` side that is neither `BoundIncluded`/`BoundExcluded` nor an open side           | `ValueError`                 |
@@ -271,11 +270,7 @@ is sent, with a plain `ValueError` that says why, never re-wrapped in a `Surreal
 | A `Duration` or `Range` field given a value it does not accept                            | Pydantic's `ValidationError` |
 
 A zero duration (`timedelta(0)`, `Duration(0)`) is written, filtered and read back like any
-other, on both lines: the surrealdb SDK 2.0.0 cannot read one, but the clients the ORM opens do
-(see [Values the SDK cannot read](#values-the-sdk-cannot-read)); in the one case where nothing
-reads it back, a live filter refuses it with `TypeError` too. Since v0.24.3 the ORM stores zero
-durations, so a record it writes can hold one that a reader outside its clients cannot read: an
-`AsyncSurreal` client the application builds itself, or another service on the SDK 2.0.0. Filter
+other, on every line, in a live filter too (`0ns`). Filter
 "longer than zero" with `__gt=Duration(0)` or `__gte=Duration(1)`. `atomic_increment()` adds
 numbers only: SurrealDB 2.x ignores `+=` with a duration, so the ORM refuses it on both lines; set
 the new value with `merge()`:
@@ -324,19 +319,14 @@ an `IntEnum` gives the value), so use `.value` to build a key, a URL or a log li
 
 ### Values the SDK cannot read
 
-The surrealdb SDK 2.0.0 cannot decode a zero duration, a SurrealDB 3.x native set (a
-`TYPE set<…>` column on SurrealDB 3.3, see [Sets](#sets)), a degenerate geometry (see
-[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)) or a datetime outside years
-1-9999, the years a Python `datetime` holds (SurrealDB stores years -262143 to +262142, on both
-lines): one such value fails the whole response it is in. The clients the ORM opens read them
-anyway, through a hook around the SDK's own CBOR decoder that handles only these values; everything
-else reads exactly as the SDK reads it:
+The surrealdb SDK refuses two kinds of values SurrealDB stores and returns: a degenerate geometry
+(see [Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)) and a datetime outside
+years 1-9999, the years a Python `datetime` holds (SurrealDB stores years -262143 to +262142, on
+every line). The clients the ORM opens read them as in 0.40.x, through the SDK's own CBOR decoder
+with these two values handled; everything else reads exactly as the SDK reads it, a zero duration
+and a native set included (see [Sets](#sets)):
 
-- a zero duration reads as zero: `timedelta(0)` or `Duration(0)` in a typed field, the SDK's
-  `Duration(0)` in an untyped one;
-- a native set reads as a Python `set`, which `set[X]` and `frozenset[X]` fields validate, or as a
-  `list` when its items are unhashable (record ids, objects, nested sets) or two of them are equal
-  in Python, like `1` and `true`: every item the server holds comes back;
+- a degenerate geometry reads as its GeoJSON `dict`;
 - a datetime before `0001-01-01T00:00:00Z` or after `9999-12-31T23:59:59.999999999Z` reads as its
   RFC 3339 text, the one SurrealDB gives it (`<string>`): `"0000-06-01T00:00:00Z"`,
   `"-0001-01-01T00:00:00Z"`, `"+10000-01-01T00:00:00.500Z"` (a sign and at least four digits outside
@@ -347,23 +337,16 @@ else reads exactly as the SDK reads it:
   `datetime`, as before.
 
 Written back through the ORM (`merge(v=row.v)`, or `update()`, which rewrites the whole row, the
-untouched fields included), a zero duration stays a duration, but a native set is stored as an
-array, like every set the ORM writes, unless its column is `TYPE set<…>` (see [Sets](#sets)), a
-degenerate geometry as a plain object (see
+untouched fields included), a degenerate geometry is stored as a plain object (see
 [Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)), and a datetime outside years
-1-9999 as its text, a string. In an untyped field, `update()` flattens the SDK's `Duration(0)` into
-an object, like any SDK value there
-([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)).
+1-9999 as its text, a string.
 
 The hook is installed only while the installed SDK cannot decode these values, and only on the
 ORM's own clients (`SurrealDBConnectionManager.get_client()`, `ephemeral_client()`), the embedded
-engine's included (see [Embedded engine and test fixtures](embedded.md#26-embedded-engine-and-test-fixtures)):
-there a zero duration, a degenerate geometry and a datetime outside years 1-9999 read as on a
-server, and `<set>[…]` is stored as an array, as on 2.x. An `AsyncSurreal` client the application
-builds itself keeps the SDK's behaviour and fails on them.
-A later SDK reads zero durations and native sets itself
-([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)), and the hook then
-leaves them to it.
+engine's included (see [Embedded engine and test fixtures](embedded.md#26-embedded-engine-and-test-fixtures)).
+An `AsyncSurreal` client the application builds itself keeps the SDK's behaviour: an undecodable
+value raises the SDK's `UnexpectedResponseError` there, and through the ORM an undecodable value
+raises `SurrealDbConnectionError`.
 
 ### Authentication
 
@@ -705,8 +688,8 @@ in type-checked code, use the aliases or the classes.
 ### Geometries the SDK cannot read
 
 A degenerate geometry written by another client (a line of fewer than 2 points, alone or inside
-another geometry, or a polygon ring of fewer than 4 points) cannot be decoded by the surrealdb SDK
-2.0.0, nor by its 3.0 pre-releases. The clients the ORM opens read it as its GeoJSON dict, such as
+another geometry, or a polygon ring of fewer than 4 points) cannot be decoded by the surrealdb SDK.
+The clients the ORM opens read it as in 0.40.x, as its GeoJSON dict, such as
 `{"type": "LineString", "coordinates": [[1.0, 2.0]]}`; a multi-geometry or a collection holding
 one reads as GeoJSON as a whole (see
 [Values the SDK cannot read](#values-the-sdk-cannot-read) for where this applies):

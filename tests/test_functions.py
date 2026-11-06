@@ -12,6 +12,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    _client,
     around_save,
     around_update,
     post_save,
@@ -411,7 +412,7 @@ class TestSaveServerValuesE2E:
             user = SvUser(id="evil", name="E", bio=evil)
             await user.save(server_values={"joined_at": SurrealFunc("time::now()")})
 
-            rows = await client.query("SELECT * FROM SvUser:evil;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:evil;", {})
             assert rows[0]["bio"] == evil  # stored verbatim, table intact
 
     @pytest.mark.asyncio
