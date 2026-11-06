@@ -819,6 +819,9 @@ _SDK_METHODS = frozenset(
 )
 #: Their payload is the first positional argument; for every other method, the second.
 _AUTH_METHODS = frozenset({"signin", "signup"})
+#: The SDK call frontier (v0.50.0): ``_client.<m>(client, …)`` takes the client first, so its payload is one argument
+#: further. The module itself only forwards what its callers encoded, and is not scanned.
+_FRONTIER = "_client"
 #: Receivers that call one of those names but are not SDK clients, reviewed at ``cc2cfa3``: dict
 #: ``.update()`` calls (``collected``, ``all_variables``, ``self._variables``, ``variables``,
 #: ``self._annotations``) and ``obj.merge()`` on a model instance (``QuerySet.bulk_update``).
@@ -956,7 +959,8 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
     1. A *data call* is ``<R>.<m>(…)`` with ``m`` in ``_SDK_METHODS`` and ``R`` ending in
        ``client`` (payload: 1st argument for ``signin``/``signup``, else the 2nd), or
        ``getattr(<R>, …)(…)`` with ``R`` ending in ``client`` (every positional argument). It
-       passes no ``*args`` and no keyword but ``txn_id=``.
+       passes no ``*args`` and no keyword but ``txn_id=``. Through the SDK call frontier,
+       ``_client.<m>(client, …)``, the payload is one argument further (v0.50.0).
     2. Each payload is **bare** (absent, or ``{}``), **inline** (``_encoding.encode(…)``) or an
        **encoded name** (a name whose last binding before the call, in the same function, is
        ``name = _encoding.encode(…)``).
@@ -1036,7 +1040,7 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
                     if receiver not in _NON_SDK_RECEIVERS:
                         offend(node, f"guard: {what} is on a receiver that is not a client nor a reviewed non-SDK receiver")
                 elif well_formed(node, what):
-                    index = 0 if func.attr in _AUTH_METHODS else 1
+                    index = (0 if func.attr in _AUTH_METHODS else 1) + (receiver == _FRONTIER)
                     check_payload(node, node.args[index] if len(node.args) > index else None, what)
             elif func.attr in {"add", "run_read"} and _TX.search(receiver) and _guard_around(node, parents) is not None:
                 given = [kw.value for kw in node.keywords if kw.arg == "variables"]
@@ -1058,9 +1062,13 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
 
 
 def _package_modules() -> list[pathlib.Path]:
-    """The modules the boundary covers: ``src/surreal_orm_lite/*.py`` and the migrations package's (v0.38.0)."""
+    """The modules the boundary covers: ``src/surreal_orm_lite/*.py`` and the migrations package's (v0.38.0).
+
+    ``_client.py``, the SDK call frontier (v0.50.0), forwards the payloads its callers encoded: they are checked at
+    those callers' ``_client.<m>(client, …)`` calls.
+    """
     package = pathlib.Path(surreal_orm_lite.__file__).parent
-    return sorted([*package.glob("*.py"), *package.glob("migrations/*.py")])
+    return sorted(path for path in [*package.glob("*.py"), *package.glob("migrations/*.py")] if path.name != "_client.py")
 
 
 def _package_report() -> _BoundaryReport:
@@ -1158,6 +1166,20 @@ _REJECTED = {
         """,
         "shape",
     ),
+    "an unencoded payload through the frontier": (
+        """
+        async def f(client, v):
+            await _client.query(client, "q", v)
+        """,
+        "payload",
+    ),
+    "a frontier call with another keyword": (
+        """
+        async def f(client, v):
+            await _client.insert(client, "t", _encoding.encode(v), relation=True)
+        """,
+        "shape",
+    ),
     "an unwrapped signin payload": (
         """
         async def f(client):
@@ -1252,6 +1274,16 @@ _ACCEPTED = {
                 raise RuntimeError() from exc
         """,
         (0, 0, 0),
+    ),
+    "through the frontier": (
+        """
+        async def f(self, client, s, rid, v):
+            payload = _encoding.encode(v)
+            await _client.query(client, s, _encoding.encode(v), txn_id=self._txn_id)
+            await _client.update(client, rid, payload)
+            await _client.query(client, "INFO FOR DB;", {})
+        """,
+        (1, 1, 1),
     ),
     "a dict update": (
         """
