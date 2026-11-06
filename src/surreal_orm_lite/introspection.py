@@ -23,9 +23,10 @@ the only records it ever reads —, and nothing else: nothing is defined or writ
 indexes and events), ``analyzers``, ``accesses``, ``functions`` and ``params`` become the typed states of
 :mod:`surreal_orm_lite.schema_state`; ``users`` is **never read** — not parsed, stored or logged (before SurrealDB
 3.2.2 ``INFO`` shows user password hashes); every other section (``apis``, ``configs``, ``models``, 3.x ``buckets``,
-``modules``, ``sequences``, a future one) is kept as returned in ``SchemaState.other``. Of ``INFO FOR TABLE``, the
-``lives`` (running live queries) and ``tables`` (views fed by the table) sections are ignored and any other section
-goes to ``TableState.other``. Kinds, nullability, field paths, flags and names are normalised to one form on
+``modules``, ``sequences``, a future one) is kept as returned in ``SchemaState.other``; the 4.x ``compatibility``
+level is not a section and is not kept there. Of ``INFO FOR TABLE``, the ``lives`` (running live queries),
+``tables`` (views fed by the table) and 4.x ``migrations`` (row-migration counters) sections are ignored and any other
+section goes to ``TableState.other``. Kinds, nullability, field paths, flags and names are normalised to one form on
 SurrealDB 2.x, 3.x and the embedded engine; expression texts are kept as each line rendered them.
 ``SchemaState.applied_migrations`` lists the migrations the tracking table records, in the order they were applied
 (``()`` without the table), whatever ``tables=`` says: the history is the database's.
@@ -124,10 +125,12 @@ _CLIENT_OBJECT = (
     "(add_connection()), or call DatabaseIntrospector() inside SurrealDBConnectionManager.using(name)."
 )
 
-#: The ``INFO FOR DB`` sections that are not kept in ``SchemaState.other``: never read, or read on their own.
-_NOT_OTHER = frozenset({"users", "tables"})
-#: The ``INFO FOR TABLE`` sections that are ignored: running live queries, views fed by the table.
-_IGNORED_TABLE_SECTIONS = frozenset({"lives", "tables"})
+#: The ``INFO FOR DB`` sections that are not kept in ``SchemaState.other``: never read, or read on their own; and the
+#: 4.x ``compatibility`` key (the database's compatibility level, a number, not a section of definitions).
+_NOT_OTHER = frozenset({"users", "tables", "compatibility"})
+#: The ``INFO FOR TABLE`` sections that are ignored: running live queries, views fed by the table, and the 4.x
+#: ``migrations`` key (the state of the table's row migrations, counters rather than definitions).
+_IGNORED_TABLE_SECTIONS = frozenset({"lives", "tables", "migrations"})
 
 #: The issue texts of a ``TYPE`` kept as written and of a second definition with the same name.
 _TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written"

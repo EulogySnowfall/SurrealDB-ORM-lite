@@ -454,6 +454,21 @@ class TestSections:
             SchemaIssue("section", "params", None, "section 'params' is not a mapping of names to definitions"),
         )
 
+    async def test_the_4x_compatibility_level_and_table_migrations_are_not_sections(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # SurrealDB 4.x: INFO FOR DB holds the database's compatibility level (an int), INFO FOR TABLE the state of
+        # the table's row migrations (an object of counters): neither is a section of definitions, neither is an issue.
+        caplog.set_level(logging.DEBUG, logger=_LOGGER)
+        answer = _table(migrations={"generation": 2, "guaranteed": [], "migrations": []})
+        client = _FakeClient(_db(tables={"a": _TABLE_A}, compatibility=4), {"a": answer})
+        _install(monkeypatch, client)
+        schema = await DatabaseIntrospector().introspect()
+        assert schema.issues == ()
+        assert _issue_records(caplog) == []
+        assert "compatibility" not in schema.other
+        assert schema.tables["a"].other == {}
+
     @pytest.mark.parametrize("tables", [[], "x", None], ids=["list", "str", "missing"])
     async def test_a_tables_section_that_is_not_a_mapping(self, monkeypatch: pytest.MonkeyPatch, tables: object) -> None:
         db = _db(tables=tables)
@@ -1532,7 +1547,10 @@ def _check_fixture(schema: SchemaState, major: int) -> None:
     )
     assert schema.accesses == {}
     expected_other: dict[str, dict[str, str]] = {"apis": {}, "configs": {}, "models": {}}
-    if major >= 3:
+    if major >= 4:
+        # SurrealDB 4.x: no ``modules`` section; ``extensions`` and ``types`` instead (measured on 4.0.0).
+        expected_other = {**expected_other, "buckets": {}, "extensions": {}, "sequences": {}, "types": {}}
+    elif major >= 3:
         expected_other = {**expected_other, "buckets": {}, "modules": {}, "sequences": {}}
     assert schema.other == expected_other
     assert "users" not in schema.other
