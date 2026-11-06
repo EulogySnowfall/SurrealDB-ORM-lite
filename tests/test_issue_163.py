@@ -130,7 +130,7 @@ def test_two_live_loops_keep_their_own_client() -> None:
         started.set()
         await asyncio.get_running_loop().run_in_executor(None, release.wait)
         # The other loop has since asked for a client; this one must still work.
-        results["first_query"] = await asyncio.wait_for(client.query("RETURN 1;"), TIMEOUT)
+        results["first_query"] = await asyncio.wait_for(_client.query(client, "RETURN 1;"), TIMEOUT)
         await SurrealDBConnectionManager.close_connection()
 
     thread = threading.Thread(target=lambda: _run(hold_then_query()))
