@@ -1949,8 +1949,9 @@ async def _embedded_tx_db() -> Any:
 
 
 class TestEmbeddedCommitErrorE2E:
-    """The embedded engine raises a bare ``RuntimeError`` for a query it cannot parse: the commit raises
-    ``SurrealDbError`` (``SurrealDbConflictError`` for a retryable conflict), as on a server."""
+    """The commit of a query the embedded engine cannot parse raises ``SurrealDbError`` (``SurrealDbConflictError`` for
+    a retryable conflict), as on a server. Its 4.0 core (SDK 3.0) answers such a query with the server's envelope, the
+    engine's message kept in ``__context__``; a bare ``RuntimeError`` from the engine is mapped the same way."""
 
     @pytest.mark.asyncio
     async def test_the_commit_error_is_a_surreal_db_error_without_the_statement_text(self) -> None:
@@ -1966,8 +1967,7 @@ class TestEmbeddedCommitErrorE2E:
             assert message.endswith("(at line 1, column 7 of the statement)")
             assert _shown(info.value, _LITERAL) == []
             assert info.value.__cause__ is None
-            assert isinstance(info.value.__context__, RuntimeError)  # the engine's error stays reachable
-            assert _LITERAL in str(info.value.__context__)
+            assert _LITERAL in str(info.value.__context__)  # the engine's error stays reachable
             assert await _stored_ages(client) == {}
 
     @pytest.mark.asyncio
