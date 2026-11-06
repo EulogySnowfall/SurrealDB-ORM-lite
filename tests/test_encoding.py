@@ -749,7 +749,7 @@ class TestEncodeProperties:
 
 #: SDK client methods that carry data to the server.
 _SDK_METHODS = frozenset(
-    {"query", "query_raw", "create", "update", "upsert", "merge", "patch", "insert", "insert_relation"}
+    {"query", "query_all", "query_raw", "create", "update", "upsert", "merge", "patch", "insert", "insert_relation"}
     | {"signin", "signup", "run", "let"}
 )
 #: Their payload is the first positional argument; for every other method, the second.
