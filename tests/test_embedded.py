@@ -77,6 +77,7 @@ from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _tables
 from tests.conftest import _REWRITE_MODULES, _ws_url, default_connection_class, orm_client
+from tests.test_time_travel import _now
 
 _T = TypeVar("_T")
 
@@ -2562,7 +2563,7 @@ class TestEmbeddedEngineLineE2E:
         async with embedded(f"surrealkv+versioned://{tmp_path / 'kv'}") as client:
             await Person(id="ada", name="Ada").save()
             await EmbPost(id="p", title="t", author=RecordID("person", "ada")).save()
-            moment = await _client.query(client, "RETURN time::now();")
+            moment = await _now(client)
             [post] = await EmbPost.objects().fetch("author").as_of(moment).exec()
             assert post.author == {"id": RecordID("person", "ada"), "name": "Ada", "age": 0}
             del client

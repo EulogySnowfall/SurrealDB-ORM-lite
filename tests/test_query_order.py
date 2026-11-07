@@ -21,7 +21,6 @@ import contextlib
 import os
 import random
 from collections.abc import AsyncIterator
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,13 +35,13 @@ from surreal_orm_lite import (
     QueryCache,
     SurrealConfigDict,
     SurrealDBConnectionManager,
-    _client,
 )
 from surreal_orm_lite import query_set as _query_set
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import line_major
 from tests import _sdk_calls
 from tests.conftest import orm_client
+from tests.test_time_travel import _now
 
 _TABLE = "ord_t"
 _FRIEND = "ord_friend"
@@ -221,8 +220,7 @@ class TestFirstOrderAsOfE2E:
     async def _check(client: Any, line: int, monkeypatch: pytest.MonkeyPatch) -> None:
         await OrdT.define_indexes()
         await client.query(_creates())
-        moment = await _client.query(client, "RETURN time::now();")
-        assert isinstance(moment, datetime)
+        moment = await _now(client)
         sent = _statements(monkeypatch, client)
         found = await OrdT.objects().filter(r__gt=5).as_of(moment).first()
         statement = sent[-1]

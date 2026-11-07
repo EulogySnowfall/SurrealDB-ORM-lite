@@ -835,8 +835,18 @@ async def history_db(
         yield _History(client, t0, t1, t2)
 
 
+#: Seconds :func:`_now` waits before it reads the database clock.
+_CLOCK_SETTLE = 0.05
+
+
 async def _now(client: Any) -> datetime:
-    """The database's clock, never the host's (spec §9)."""
+    """The database's clock, never the host's (spec §9), read :data:`_CLOCK_SETTLE` seconds after the last write.
+
+    A host clock that steps back a few milliseconds (WSL2 does, about every 30 s) makes SDK 3.0's embedded engine
+    (SurrealDB 4.0) stamp a write just before the step later than a ``time::now()`` read right after it, and
+    ``as_of()`` that moment then misses the write. The wait lets the read land after the write's stamp.
+    """
+    await asyncio.sleep(_CLOCK_SETTLE)
     moment = await _client.query(client, "RETURN time::now();")
     assert isinstance(moment, datetime)
     return moment
