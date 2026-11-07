@@ -3594,6 +3594,24 @@ async def _populated(tmp_path: Path, client: Any, *extra: Operation) -> tuple[Mi
     return executor, first
 
 
+class FrSynced(BaseSurrealModel):
+    """D25: a SCHEMAFULL table made by ``define_table()``, ``age int``."""
+
+    model_config = SurrealConfigDict(table_name="fr_sync", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    age: int = 0
+
+
+class FrSyncedText(BaseSurrealModel):
+    """D25: the same table with ``age`` as a string — a narrowing on a populated table."""
+
+    model_config = SurrealConfigDict(table_name="fr_sync", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    age: str = ""
+
+
 class TestFieldRuleE2E:
     """SurrealDB 4.x at compatibility level 4 refuses, on a populated SCHEMAFULL table, a field redefined with a type
     that does not accept every old value, and a new field that does not accept ``NONE``: ``migrate()`` and
@@ -3776,6 +3794,49 @@ class TestFieldRuleE2E:
             assert "TYPE string" in (await _fields(client, "fr_person"))["age"]
 
     @pytest.mark.parametrize("kind", _KINDS)
+    async def test_number_spelt_as_its_members(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P2, M38: ``number`` → ``int | float | decimal`` is a widening for ``kind_accepts()``, so no guard is written;
+        SurrealDB 4.0.0 refuses it all the same, read through its text as ``FieldChangeRefusedError``, nothing applied.
+        A later 4.x that accepts it applies the migration: either outcome, never a guard."""
+        async with migration_database(kind) as client:
+            major = await _major_of(client)
+            first = _write(tmp_path, "person", [*_FR_TABLE, AddField("fr_person", "n", "number")])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first]
+            await _run(client, "CREATE fr_person:a SET age = 5, n = 5;")
+            change = AlterField("fr_person", "n", "int | float | decimal", previous_type="number")
+            second = _write(tmp_path, "n_members", [change], [first])
+            sent = _batches(monkeypatch, client)
+            try:
+                applied = await executor.migrate()
+            except FieldChangeRefusedError as error:
+                assert major >= 4
+                assert (error.migration, error.table, error.field) == (second, "fr_person", "n")
+                assert await executor.get_applied_migrations() == [first]
+                assert "number" in (await _fields(client, "fr_person"))["n"]
+            else:
+                assert applied == [second]
+            assert all("_orm_populated_" not in text for text, _ in sent)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_table_keeps_the_server_s_refusal(self, kind: str) -> None:
+        """D25: the guard covers the migration executor only; ``define_table(overwrite=True)`` narrowing a column of a
+        populated SCHEMAFULL table keeps the server's refusal on 4.x (a ``SurrealDbError``, never a migration error)."""
+        async with migration_database(kind) as client:
+            major = await _major_of(client)
+            await FrSynced.define_table()
+            await _run(client, "CREATE fr_sync:a SET age = 5;")
+            if major < 4:
+                await FrSyncedText.define_table(overwrite=True)
+                assert "TYPE string" in (await _fields(client, "fr_sync"))["age"]
+                return
+            with pytest.raises(SurrealDbError) as raised:
+                await FrSyncedText.define_table(overwrite=True)
+            assert not isinstance(raised.value, MigrationStatementError)
+            assert "compatibility level 4" in str(raised.value)
+            assert "TYPE int" in (await _fields(client, "fr_sync"))["age"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_analyzer_of_the_migration_is_restored(self, kind: str, tmp_path: Path) -> None:
         async with migration_database(kind) as client:
             if await _major_of(client) < 4:
@@ -3834,6 +3895,8 @@ def _person_state(*, mode: str = "SCHEMAFULL", compatibility: int | None = 4) ->
         "age": FieldState("age", "int", nullable=False),
         "o": FieldState("o", "object", nullable=True),
         "o.x": FieldState("o.x", "int", nullable=True),
+        "a": FieldState("a", "array<object>", nullable=True),
+        "a.*.z": FieldState("a.*.z", "int", nullable=True),
     }
     return SchemaState({"person": TableState("person", mode, fields=fields)}, compatibility=compatibility)
 
@@ -3859,7 +3922,11 @@ class TestFieldRuleUnit:
             (AlterField("person", "o.x", "string", previous_type="option<int>"), True),
             (AlterField("person", "o.x", "option<int> | string", previous_type="option<int>"), False),
             (AddField("person", "o.y", "string"), True),
+            (AlterField("person", "a.*.z", "string", previous_type="option<int>"), True),
+            (AlterField("person", "a.*.z", "option<int> | string", previous_type="option<int>"), False),
+            (AddField("person", "a.*.w", "string"), True),
             (AddField("person", "a[*].z", "string", path=["a[*]", "z"]), False),
+            (AlterField("person", "a[*].z", "string", path=["a[*]", "z"], previous_type="option<int>"), False),
             (AlterField("person", "tags", "array<string>", previous_type="array<int>"), True),  # absent: a new field
             (RawSQL("DEFINE FIELD OVERWRITE age ON person TYPE string;"), False),
             (AlterTable("person", "SCHEMAFULL", "normal", previous_schema_mode="SCHEMALESS"), False),
