@@ -62,10 +62,12 @@ try:
     await Note.objects().count()
 except SurrealDbConnectionError as error:
     print(error)
-# The installed surrealdb SDK cannot open 'rocksdb://app.db': 'rocksdb' is not a valid UrlScheme.
-# The URL schemes it accepts are: file, http, https, mem, memory, surrealkv, surrealkv+versioned,
-# ws, wss. Embedded RocksDB (rocksdb://) is not supported by the official SDK yet: see
-# https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/233.
+# The installed surrealdb SDK cannot open 'rocksdb://app.db': Unsupported protocol in URL:
+# rocksdb://app.db. Use 'ws://', 'wss://', 'http://', or 'https://' for remote connections. For
+# embedded connections ('memory', 'mem://', 'file://', 'surrealkv://', 'surrealkv+versioned://'),
+# install: pip install surrealdb[embedded]. The URL schemes it accepts are: file, http, https, mem,
+# memory, surrealkv, surrealkv+versioned, ws, wss. Embedded RocksDB (rocksdb://) is not supported by
+# the official SDK yet: see https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/233.
 
 # Back to mem://: the same in-memory database as above, which only a close discards.
 SurrealDBConnectionManager.set_connection(url="mem://", namespace="app", database="app")
