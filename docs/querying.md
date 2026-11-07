@@ -595,17 +595,19 @@ reads the linked record as it was on 3.x and as it is now on 2.x.
 
 ### Writing history at a past moment
 
-The ORM writes now. A raw query can write a record at a past moment, one statement per
-`client.query()` call:
+The ORM writes now, and so history is written: read it at moments taken from the database's
+clock between the writes, as above. A raw `CREATE … VERSION` writes a record at a past moment on
+a SurrealDB 2.x server only. SurrealDB 3.x, 4.x and the embedded engine (SurrealDB 4.0) version
+the table definition too: they accept the statement, but a moment before the table existed reads
+no records, and a `CREATE` of an id that exists raises. The record reads from now on:
 
 ```python
 await client.query("CREATE Product:stool SET name = 'Stool', price = 15.0 VERSION d'2020-01-01T00:00:00Z';")
-# SurrealDB 2.x and the embedded engine: stored at that moment, readable with as_of()
-assert await Product.objects().as_of(datetime(2021, 1, 1, tzinfo=UTC)).count() == 1
+# The embedded engine: the shop's table did not exist in 2021, so that moment reads no records.
+assert await Product.objects().as_of(datetime(2021, 1, 1, tzinfo=UTC)).count() == 0
+[now] = await client.query("RETURN time::now();")
+assert (await Product.objects().as_of(now).get("stool")).price == 15.0
 ```
-
-SurrealDB 3.x accepts the statement, but the record is not readable at that moment (the table did
-not exist then), and a `CREATE` of an id that exists raises.
 
 ### Coming from the full SurrealDB-ORM
 

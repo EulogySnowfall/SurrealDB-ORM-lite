@@ -68,6 +68,7 @@ from tests.test_embedded import _cells, _doc_part, _normalised, _subsection, _ta
 from tests.test_time_travel import (
     _SERVER_BEHAVIOUR,
     _assert_refused_by_the_server,
+    _History,
     _http_url,
     _line,
     _now,
@@ -77,6 +78,7 @@ from tests.test_time_travel import (
     _versioned_url,
     _versioned_ws_url,
     connected,
+    write_history,
 )
 
 M2020 = datetime(2020, 6, 1, tzinfo=UTC)
@@ -2526,26 +2528,27 @@ class TestSubqueryLiveE2E:
 
 # --- AC-10: time travel — every subquery reads at the outer as_of() moment ---------------------------------
 
-#: Spec AC-10's history on the embedded ``surrealkv+versioned://`` engine, one statement per ``client.query()``:
-#: in 2020 ``a`` is active and ``b`` is not, each with a post; in 2021 they swap. ``b`` is the older, so the
-#: oldest active person is ``a`` in 2020 and ``b`` since.
-_SQ_HISTORY = (
-    "CREATE sq_person:a SET name = 'Ada', active = true, age = 36 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_person:b SET name = 'Bob', active = false, age = 50 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_post:p1 SET title = 'one', author = sq_person:a, score = 5 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_post:p2 SET title = 'two', author = sq_person:b, score = 8 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_person:b SET name = 'Bob', active = true, age = 50 VERSION d'2021-01-01T00:00:00Z';",
-    "CREATE sq_person:a SET name = 'Ada', active = false, age = 36 VERSION d'2021-01-01T00:00:00Z';",
+#: Spec AC-10's history on the embedded ``surrealkv+versioned://`` engine, on the database clock (spec §9), one
+#: statement per ``client.query()``: before ``t1`` ``a`` is active and ``b`` is not, each with a post; between ``t1``
+#: and ``t2`` they swap. ``b`` is the older, so the oldest active person is ``a`` at ``t1`` and ``b`` since.
+_SQ_HISTORY_T1 = (
+    "CREATE sq_person:a SET name = 'Ada', active = true, age = 36;",
+    "CREATE sq_person:b SET name = 'Bob', active = false, age = 50;",
+    "CREATE sq_post:p1 SET title = 'one', author = sq_person:a, score = 5;",
+    "CREATE sq_post:p2 SET title = 'two', author = sq_person:b, score = 8;",
+)
+_SQ_HISTORY_T2 = (
+    "UPDATE sq_person:b SET active = true;",
+    "UPDATE sq_person:a SET active = false;",
 )
 
 
 @contextlib.asynccontextmanager
-async def sq_history_db(tmp_path: Path) -> AsyncIterator[Any]:
-    """``_SQ_HISTORY`` on a fresh embedded ``surrealkv+versioned://`` database; yields its client."""
+async def sq_history_db(tmp_path: Path) -> AsyncIterator[_History]:
+    """The history on a fresh embedded ``surrealkv+versioned://`` database, nothing written after ``t2``."""
     async with embedded_database(_versioned_url(tmp_path)) as client:
-        for statement in _SQ_HISTORY:
-            await client.query(statement)
-        yield client
+        t0, t1, t2 = await write_history(client, _SQ_HISTORY_T1, _SQ_HISTORY_T2, ())
+        yield _History(client, t0, t1, t2)
 
 
 def _by_active_authors() -> Any:
@@ -2602,61 +2605,68 @@ async def _still_shows(moment: datetime, expected: _State) -> None:
 class TestSubqueryAsOfE2E:
     """AC-10: under the outer ``as_of()``, every subquery reads at the same moment, on every versioned store.
 
-    The embedded ``surrealkv+versioned://`` engine (no server) with history written at fixed past moments: like a
-    2.x server, it never applies the outer ``VERSION`` to a sub-SELECT (spec M13), so a subquery read without its
-    own ``VERSION`` would see the current state (``b`` active) and ``M2020`` would give ``p2`` instead of ``p1``.
+    The embedded ``surrealkv+versioned://`` engine (no server), its history read at moments taken from the database
+    clock between the writes: a subquery read without its own ``VERSION`` would see the current state (``b``
+    active) where it never applies the outer ``VERSION`` to a sub-SELECT (spec M13: a 2.x server, and the embedded
+    engine of SDK 2.x), and ``t1`` would give ``p2`` instead of ``p1``.
     Then the server of ``SURREALDB_PORT`` (in memory, no history: one branch per line) and a server started with
     versioned storage (``SURREALDB_VERSIONED_PORT``, skipped without it), over WebSocket and HTTP.
     """
 
     async def test_reads_at_each_moment(self, tmp_path: Path) -> None:
-        async with sq_history_db(tmp_path):
-            assert _keys_in_order(await _by_active_authors().as_of(M2020).exec()) == ["p1"]
-            assert await _by_active_authors().as_of(M2020).count() == 1
-            assert await _by_active_authors().as_of(M2020).exists() is True
-            assert await _by_active_authors().as_of(M2020).sum("score") == 5
-            grouped = await _by_active_authors().as_of(M2020).values("author").annotate(n=Count()).exec()
+        async with sq_history_db(tmp_path) as h:
+            assert _keys_in_order(await _by_active_authors().as_of(h.t1).exec()) == ["p1"]
+            assert await _by_active_authors().as_of(h.t1).count() == 1
+            assert await _by_active_authors().as_of(h.t1).exists() is True
+            assert await _by_active_authors().as_of(h.t1).sum("score") == 5
+            grouped = await _by_active_authors().as_of(h.t1).values("author").annotate(n=Count()).exec()
             assert grouped == [{"author": _person("a"), "n": 1}]
 
-            assert _keys_in_order(await _by_active_authors().as_of(M2021).exec()) == ["p2"]
-            assert await _by_active_authors().as_of(M2021).count() == 1
-            grouped = await _by_active_authors().as_of(M2021).values("author").annotate(n=Count()).exec()
+            assert _keys_in_order(await _by_active_authors().as_of(h.t2).exec()) == ["p2"]
+            assert await _by_active_authors().as_of(h.t2).count() == 1
+            grouped = await _by_active_authors().as_of(h.t2).values("author").annotate(n=Count()).exec()
             assert grouped == [{"author": _person("b"), "n": 1}]
 
             assert _keys_in_order(await _by_active_authors().exec()) == ["p2"]
             assert await _by_active_authors().count() == 1
 
     async def test_an_ordered_subquery_reads_at_the_moment(self, tmp_path: Path) -> None:
-        async with sq_history_db(tmp_path):
+        async with sq_history_db(tmp_path) as h:
             for _ in range(_RUNS):
-                assert _keys_in_order(await _by_oldest_active().as_of(M2020).exec()) == ["p1"]
-                assert _keys_in_order(await _by_oldest_active().as_of(M2021).exec()) == ["p2"]
+                assert _keys_in_order(await _by_oldest_active().as_of(h.t1).exec()) == ["p1"]
+                assert _keys_in_order(await _by_oldest_active().as_of(h.t2).exec()) == ["p2"]
                 assert _keys_in_order(await _by_oldest_active().exec()) == ["p2"]
 
     async def test_a_first_value_subquery_reads_at_the_moment(self, tmp_path: Path) -> None:
         """``exact`` with the first value: the score of the oldest active person's post, at each moment."""
         best = SqPost.objects().filter(author__in=Subquery(_active().order_by("-age").limit(1))).select("score")
-        async with sq_history_db(tmp_path):
+        async with sq_history_db(tmp_path) as h:
             for _ in range(_RUNS):
-                assert _keys_in_order(await SqPost.objects().as_of(M2020).filter(score=Subquery(best)).exec()) == ["p1"]
-                assert _keys_in_order(await SqPost.objects().as_of(M2021).filter(score=Subquery(best)).exec()) == ["p2"]
+                assert _keys_in_order(await SqPost.objects().as_of(h.t1).filter(score=Subquery(best)).exec()) == ["p1"]
+                assert _keys_in_order(await SqPost.objects().as_of(h.t2).filter(score=Subquery(best)).exec()) == ["p2"]
 
     async def test_a_subquery_of_its_own_moment_is_refused_s5(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        async with sq_history_db(tmp_path) as client:
-            calls = _record_queries(monkeypatch, client)
-            for outer in (SqPost.objects().as_of(M2020), SqPost.objects()):
+        async with sq_history_db(tmp_path) as h:
+            calls = _record_queries(monkeypatch, h.client)
+            for outer in (SqPost.objects().as_of(h.t1), SqPost.objects()):
                 with pytest.raises(SurrealDbError) as info:
-                    await outer.filter(author__in=Subquery(_active().as_of(M2021))).exec()
+                    await outer.filter(author__in=Subquery(_active().as_of(h.t2))).exec()
                 assert str(info.value) == _S5
             assert calls == []
 
     async def test_a_missing_subquery_table_reads_as_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """As without ``as_of()``: the embedded engine reads a missing subquery table as empty, in one request."""
-        async with sq_history_db(tmp_path) as client:
-            calls = _record_queries(monkeypatch, client)
-            assert _keys_in_order(await SqPost.objects().as_of(M2020).filter(author__not_in=_ghost()).exec()) == ["p1", "p2"]
-            assert await SqPost.objects().as_of(M2020).filter(author__in=_ghost()).exec() == []
-            assert len(calls) == 2
+        """A missing subquery table reads as empty at the moment too. The embedded engine of SDK 3.0 (SurrealDB 4.0)
+        versions the table definition, so the ``LET`` with its own ``VERSION`` raises the missing-table error, as a
+        3.x versioned server does: the ORM probes the table and sends the statement again with that subquery empty."""
+        async with sq_history_db(tmp_path) as h:
+            calls = _record_queries(monkeypatch, h.client)
+            assert _keys_in_order(await SqPost.objects().as_of(h.t1).filter(author__not_in=_ghost()).exec()) == ["p1", "p2"]
+            sent_not_in = list(calls)
+            calls.clear()
+            assert await SqPost.objects().as_of(h.t1).filter(author__in=_ghost()).exec() == []
+            sent_in = list(calls)
+        for sent in (sent_not_in, sent_in):
+            _assert_probed_then_sent_again(sent)
 
     @pytest.mark.parametrize("kind", ["ws", "http"])
     async def test_a_server_without_history(self, kind: str) -> None:

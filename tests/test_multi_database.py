@@ -83,7 +83,7 @@ from tests.test_embedded import (
     _tables,
 )
 from tests.test_query_cache import _bullets
-from tests.test_time_travel import _SERVER_BEHAVIOUR, _forbidden_client
+from tests.test_time_travel import _SERVER_BEHAVIOUR, _forbidden_client, write_history
 
 #: The prefix of the manager's name-mangled private attributes.
 _P = "_SurrealDBConnectionManager__"
@@ -2132,9 +2132,12 @@ class TestRoutedModelsE2E:
             "md_a", url=f"surrealkv+versioned://{tmp_path / 'kv'}", namespace="ns", database="md_a"
         )
         client = await SurrealDBConnectionManager.get_client("md_a")
-        await client.query("CREATE md_event:a SET title = 'old', n = 1 VERSION d'2020-01-01T00:00:00Z';")
-        await client.query("CREATE md_event:a SET title = 'new', n = 2 VERSION d'2021-01-01T00:00:00Z';")
-        [old] = await MdEvent.objects().as_of(datetime(2020, 6, 1, tzinfo=UTC)).exec()
+        # History on the database clock (spec §9): SDK 3.0's embedded engine (SurrealDB 4.0) writes no past moment.
+        [before, then] = await write_history(
+            client, ["CREATE md_event:a SET title = 'old', n = 1;"], ["UPDATE md_event:a SET title = 'new', n = 2;"]
+        )
+        assert await MdEvent.objects().as_of(before).exec() == []
+        [old] = await MdEvent.objects().as_of(then).exec()
         assert (old.title, old.n) == ("old", 1)
         [current] = await MdEvent.objects().exec()
         assert (current.title, current.n) == ("new", 2)
