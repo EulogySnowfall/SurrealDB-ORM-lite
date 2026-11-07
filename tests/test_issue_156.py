@@ -229,6 +229,28 @@ class TestMultiStatementRowsE2E:
             with pytest.raises(ServerError, match="boom"):
                 await MqNote.objects().query("SELECT * FROM mq_absent; SELECT * FROM mq_note; THROW 'boom';")
 
+    async def test_queryset_query_does_not_hide_a_cancelled_transaction(self) -> None:
+        """A missing-table read that cancels a transaction raises: the write did not run (3.x/4.x). On 2.x the missing
+        table reads as empty and the transaction commits. Gated on the server's missing-table behaviour."""
+        async with orm_client("mq_note", "mq_absent") as client:
+            try:
+                await _client.query(client, "SELECT * FROM mq_absent;", {})
+                fails_missing_table = False
+            except ServerError:
+                fails_missing_table = True
+            sql = "BEGIN; CREATE mq_note:1 SET note = 'n'; SELECT * FROM mq_note; SELECT * FROM mq_absent; COMMIT;"
+            if fails_missing_table:
+                with pytest.raises(SurrealDbError, match="transaction was cancelled") as raised:
+                    await MqNote.objects().query(sql)
+                assert "mq_absent" in str(raised.value)
+                # The CREATE did not run: mq_note was never created, which query() reads as empty outside a transaction.
+                assert await MqNote.objects().query("SELECT * FROM mq_note;") == []
+            else:
+                rows = await MqNote.objects().query(sql)
+                # The CREATE's row, then the SELECT's: every statement's list result comes back.
+                assert [(type(row), row.id) for row in rows] == [(MqNote, "1"), (MqNote, "1")]
+                assert len(await _client.query(client, "SELECT * FROM mq_note;", {})) == 1
+
     async def test_queryset_query_returns_the_rows_of_every_select(self) -> None:
         async with orm_client("mq_note") as client:
             await _client.query(client, "CREATE mq_note:a SET note = 'a'; CREATE mq_note:b SET note = 'b';", {})

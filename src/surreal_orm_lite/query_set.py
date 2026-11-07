@@ -3803,7 +3803,11 @@ class QuerySet:
             SurrealDbError: the query does not read ``FROM`` the model's table; the queryset is read
                 ``as_of()`` (v0.26.0): the custom statement would ignore the moment, so it is refused rather
                 than run on the current data; the queryset has ``cache()`` (v0.28.0): your own SurrealQL is
-                never cached — cache its result yourself with ``QueryCache.make_key()``, ``get()`` and ``set()``.
+                never cached — cache its result yourself with ``QueryCache.make_key()``, ``get()`` and ``set()``;
+                a ``BEGIN … COMMIT`` of the query was cancelled because one of its statements failed, a read of a
+                missing table included (SurrealDB 3.x and 4.x; v0.50.0): the message quotes the server's error for
+                that statement, the transaction's writes did not run, and nothing is read as empty. On 2.x the
+                missing table reads as empty and the transaction commits.
         """
         self._reject_time_travel("query()")
         if self._cache is not None:

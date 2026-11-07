@@ -97,6 +97,22 @@ _V050_ROWS = [
         "v0.50.0",
     ],
     [
+        "`QuerySet.query()` with several statements, one reading a table that does not exist",
+        "that statement reads as empty; the rows of the others come back",
+        "the server fails that statement alone; the ORM reads it as empty, as on 2.x (inside `BEGIN … "
+        "COMMIT`, see the next row); any other failure still raises",
+        "as 3.x",
+        "v0.50.0",
+    ],
+    [
+        "`QuerySet.query()` with a `BEGIN … COMMIT` whose statement reads a table that does not exist",
+        "that statement reads as empty, the transaction commits and its rows come back",
+        "the server cancels the transaction: the ORM raises `SurrealDbError` (transaction cancelled, quoting "
+        "the server's message), the writes did not run",
+        "as 3.x",
+        "v0.50.0",
+    ],
+    [
         "`transaction()` strategy with the SDK 3.0",
         "buffered: the SDK refuses `begin()` up front, so no probe error",
         "interactive on WebSocket (the SDK's `Features.TRANSACTIONS`), buffered over HTTP",

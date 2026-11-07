@@ -68,7 +68,7 @@ from ._sdk import (
     parse_query_error,
     parse_rpc_error,
 )
-from .exceptions import SurrealDbConnectionError
+from .exceptions import SurrealDbConnectionError, SurrealDbError
 
 __all__ = [
     "connection_error",
@@ -193,9 +193,11 @@ async def query_all_tolerant(
 
     One ``query_raw()`` request: SDK 3.0's ``query()`` raises for any failing statement and loses the results of the
     others. Any other failing statement raises its SDK error, as ``query_at()`` does (the first one that failed, a
-    statement of an aborted transaction that did not run giving way to the one that failed). A statement that did not
-    run because an accepted failure aborted its transaction answers ``[]`` as well. A query the server refuses as a
-    whole raises the SDK's error for it.
+    statement of an aborted transaction that did not run giving way to the one that failed). The tolerance never
+    covers a cancelled transaction: when a statement of the response did not run because another failed, even a
+    failure *empty* accepts, the query raises ``SurrealDbError`` naming the cancelled transaction and quoting the
+    server's message for the statement that failed (chained to its SDK error), so that no write is silently lost. A
+    query the server refuses as a whole raises the SDK's error for it.
     """
     raw = await query_raw(client, sql, variables, txn_id=txn_id)
     if raw.get("error") is not None:
@@ -215,6 +217,16 @@ async def query_all_tolerant(
             refused.append(error)
     if refused:
         raise refused[0]
+    cancelled = [statement for statement in statements if statement.get("status") == "ERR" and _not_executed(statement)]
+    cause = next(
+        (statement for statement in statements if statement.get("status") == "ERR" and not _not_executed(statement)),
+        None,
+    )
+    if cancelled and cause is not None:
+        # An accepted failure cancelled its transaction: the statements that did not run (writes included) are lost,
+        # which SurrealDB reports as an error. Not the SDK's NotFoundError, which callers read as an empty table.
+        message = str(cause.get("result") or "").strip()
+        raise SurrealDbError(f"The transaction was cancelled: {message}") from parse_query_error(cause)
     if not any(statement.get("status") == "ERR" and not _not_executed(statement) for statement in statements):
         # Only "not executed" failures and nothing that failed: raise the first, as query() would.
         failed = [statement for statement in statements if statement.get("status") == "ERR"]

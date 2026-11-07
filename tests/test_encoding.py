@@ -766,9 +766,23 @@ class TestEncodeProperties:
 
 #: SDK client methods that carry data to the server.
 _SDK_METHODS = frozenset(
-    {"query", "query_all", "query_raw", "create", "update", "upsert", "merge", "patch", "insert", "insert_relation"}
+    {
+        "query",
+        "query_all",
+        "query_all_tolerant",
+        "query_raw",
+        "create",
+        "update",
+        "upsert",
+        "merge",
+        "patch",
+        "insert",
+        "insert_relation",
+    }
     | {"signin", "signup", "run", "let"}
 )
+#: The keywords a data call may pass: none of them carries data to the server.
+_CALL_KEYWORDS = frozenset({"txn_id", "empty"})
 #: Their payload is the first positional argument; for every other method, the second.
 _AUTH_METHODS = frozenset({"signin", "signup"})
 #: The SDK call frontier (v0.50.0): ``_client.<m>(client, …)`` takes the client first, so its payload is one argument
@@ -911,7 +925,8 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
     1. A *data call* is ``<R>.<m>(…)`` with ``m`` in ``_SDK_METHODS`` and ``R`` ending in
        ``client`` (payload: 1st argument for ``signin``/``signup``, else the 2nd), or
        ``getattr(<R>, …)(…)`` with ``R`` ending in ``client`` (every positional argument). It
-       passes no ``*args`` and no keyword but ``txn_id=``. Through the SDK call frontier,
+       passes no ``*args`` and no keyword but ``txn_id=`` (and ``query_all_tolerant()``'s ``empty=``, a predicate
+       that carries no data). Through the SDK call frontier,
        ``_client.<m>(client, …)``, the payload is one argument further (v0.50.0).
     2. Each payload is **bare** (absent, or ``{}``), **inline** (``_encoding.encode(…)``) or an
        **encoded name** (a name whose last binding before the call, in the same function, is
@@ -967,8 +982,8 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
             offend(call, f"shape: {what} passes *args")
             ok = False
         for keyword in call.keywords:
-            if keyword.arg != "txn_id":
-                offend(call, f"shape: {what} passes the keyword {keyword.arg or '**'}= (only txn_id= is allowed)")
+            if keyword.arg not in _CALL_KEYWORDS:
+                offend(call, f"shape: {what} passes the keyword {keyword.arg or '**'}= (only txn_id= and empty= are allowed)")
                 ok = False
         return ok
 

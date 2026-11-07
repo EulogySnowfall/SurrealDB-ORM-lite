@@ -20,6 +20,7 @@ import pytest
 
 from surreal_orm_lite import _client, _sdk
 from surreal_orm_lite._sdk import BoundIncluded, Null, PreciseDatetime, RecordID, SdkRange, SurrealSet, Table
+from surreal_orm_lite.exceptions import SurrealDbError
 from tests.conftest import orm_client
 
 
@@ -196,9 +197,13 @@ class TestQueryAllTolerant:
             await _client.query_all_tolerant(client, "q", empty=_missing)
         assert not isinstance(raised.value, _sdk.NotFoundError)
 
-    async def test_statements_of_a_transaction_aborted_by_an_accepted_failure_are_empty(self) -> None:
+    async def test_a_transaction_cancelled_by_an_accepted_failure_raises(self) -> None:
+        """An accepted failure that cancelled its transaction is no longer empty: the writes did not run."""
         client = _FakeClient(result={"result": [{"status": "OK", "result": None}, _NOT_RUN, _MISSING, _NOT_RUN]})
-        assert await _client.query_all_tolerant(client, "q", empty=_missing) == [None, [], [], []]
+        with pytest.raises(SurrealDbError, match=r"transaction was cancelled: The table 'gone' does not exist") as raised:
+            await _client.query_all_tolerant(client, "q", empty=_missing)
+        assert not isinstance(raised.value, _sdk.ServerError)
+        assert isinstance(raised.value.__cause__, _sdk.NotFoundError)
 
     async def test_a_not_executed_failure_alone_raises(self) -> None:
         client = _FakeClient(result={"result": [_NOT_RUN]})
