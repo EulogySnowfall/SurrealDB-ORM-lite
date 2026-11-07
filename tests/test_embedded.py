@@ -67,6 +67,7 @@ from surreal_orm_lite.live import require_websocket
 from surreal_orm_lite.schema import Event
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction
+from tests._clock import now as _now
 from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
 from tests._readme_tables import assert_embedded_rows, assert_guide_sections, assert_manual_order, release
 from tests._readme_tables import cells as _cells
@@ -77,7 +78,6 @@ from tests._readme_tables import subsection as _subsection
 from tests._readme_tables import table_rows as _table_rows
 from tests._readme_tables import tables as _tables
 from tests.conftest import _REWRITE_MODULES, _ws_url, default_connection_class, orm_client
-from tests.test_time_travel import _now
 
 _T = TypeVar("_T")
 

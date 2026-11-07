@@ -65,6 +65,7 @@ from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import MAX_MOMENT, MIN_MOMENT, AsOf, in_range, line_major, normalise_as_of
 from tests import _sdk_calls
+from tests._clock import now as _now
 from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
 from tests._readme_tables import SERVER_BEHAVIOUR as _SERVER_BEHAVIOUR
 from tests._readme_tables import (
@@ -73,8 +74,13 @@ from tests._readme_tables import (
     assert_server_rows,
     assert_server_table,
 )
+from tests._readme_tables import cells as _cells
+from tests._readme_tables import doc_part as _doc_part
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _tables
 from tests.conftest import orm_client
-from tests.test_embedded import _cells, _doc_part, _normalised, _subsection, _table_rows, _tables
 
 # --- shared models and moments (later tasks reuse them) --------------------------------------------
 
@@ -833,23 +839,6 @@ async def history_db(
     async with embedded_database(_versioned_url(tmp_path)) as client:
         t0, t1, t2 = await write_history(client, (*_HISTORY_T1, *at_t1), _HISTORY_T2, (*_HISTORY_NOW, *after_t2), pause=pause)
         yield _History(client, t0, t1, t2)
-
-
-#: Seconds :func:`_now` waits before it reads the database clock.
-_CLOCK_SETTLE = 0.05
-
-
-async def _now(client: Any) -> datetime:
-    """The database's clock, never the host's (spec §9), read :data:`_CLOCK_SETTLE` seconds after the last write.
-
-    A host clock that steps back a few milliseconds (WSL2 does, about every 30 s) makes SDK 3.0's embedded engine
-    (SurrealDB 4.0) stamp a write just before the step later than a ``time::now()`` read right after it, and
-    ``as_of()`` that moment then misses the write. The wait lets the read land after the write's stamp.
-    """
-    await asyncio.sleep(_CLOCK_SETTLE)
-    moment = await _client.query(client, "RETURN time::now();")
-    assert isinstance(moment, datetime)
-    return moment
 
 
 def _strictly_increasing(*moments: datetime) -> None:

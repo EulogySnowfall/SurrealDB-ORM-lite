@@ -40,8 +40,8 @@ from surreal_orm_lite import query_set as _query_set
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import line_major
 from tests import _sdk_calls
+from tests._clock import now as _now
 from tests.conftest import orm_client
-from tests.test_time_travel import _now
 
 _TABLE = "ord_t"
 _FRIEND = "ord_friend"
