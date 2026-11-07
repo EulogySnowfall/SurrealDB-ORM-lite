@@ -6511,7 +6511,7 @@ _PART_NEEDLES_36 = {
         "the full SurrealDB-ORM's",
         "`SearchOffsets`",
         "SurrealDB 2.x, 3.x and the embedded engine",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
         "`mem://`",
     ),
     "Declare and apply": (
@@ -6689,10 +6689,10 @@ _SEARCH_ROWS = [
 #: The row v0.35.0 adds to the embedded engine's table, cell by cell.
 _EMBEDDED_SEARCH_ROW = [
     "Full-text search (v0.35.0)",
-    "as on a 2.x server: `SEARCH ANALYZER`, a term in more than half the documents scores below zero, BM25 statistics "
-    "grow with each rebuild and keep deleted records, `remove_analyzer()` refuses an analyzer an index uses; an index "
-    "defined in the transaction that defines its analyzer sees it, which `define_indexes(tx=…)` refuses all the same",
-    "3.x writes `FULLTEXT ANALYZER`, scores such a term `0.0`, keeps BM25 statistics exact and refuses that removal",
+    "as on a 4.x server: `FULLTEXT ANALYZER`, 4.x's BM25 scores (a term in more than half the documents adds to the "
+    "score), `remove_analyzer()` of an analyzer in use refused by the engine; an index may be defined in the "
+    "transaction that defines its analyzer",
+    "3.x scores such a term `0.0`, 2.x below zero; 2.x writes `SEARCH`",
     "v0.35.0",
 ]
 #: Issue #304: the sentence v0.35.3 adds to the 2.x/3.x table's intro, its row there and its row in the embedded
@@ -6712,8 +6712,7 @@ _TX_WRITE_ROW = [
 ]
 _EMBEDDED_TX_WRITE_ROW = [
     "`define_indexes(tx=)` in a block that writes to the model's table",
-    "an ORM write before it: refused all the same, although this engine indexes its records; a write after it is "
-    "committed and indexed",
+    "as on a 4.x server: an ORM write before it refused; a write after it committed and indexed",
     "refused (left out of the index); on 2.x a write after it, to a table holding records, fails the commit",
     "v0.35.3",
 ]
@@ -6936,7 +6935,7 @@ class TestReadmeSection36:
         """Every table v0.35.0 touches keeps one cell count per line and no escaped pipe; section 36 has no table."""
         parts = [
             _doc_part("## Features"),
-            _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"),
             _doc_part("## ORM behaviour: the embedded engine"),
             _doc_part("## Roadmap"),
             _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),

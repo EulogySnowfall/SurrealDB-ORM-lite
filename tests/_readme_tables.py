@@ -5,7 +5,7 @@ Shared by the documentation tests. The README is the project's front page; the u
 :func:`doc_part` finds a heading in the README or in a guide, wherever it lives, so a test names the heading it pins,
 not the file.
 
-Each release adds rows to "ORM behaviour: SurrealDB 2.x vs 3.x" (and maybe to "ORM behaviour: the embedded engine"),
+Each release adds rows to "ORM behaviour: SurrealDB 2.x, 3.x and 4.x" (and maybe to "ORM behaviour: the embedded engine"),
 both in ``docs/compatibility.md``, and a sentence to the intro paragraph of the first table; the test of that release
 owns them. It checks their exact text, that the releases are in version order and that the table keeps its column
 widths and its final row (:func:`assert_server_rows`, :func:`assert_embedded_rows`,
@@ -29,16 +29,21 @@ ROADMAP = DOCS / "ROADMAP.md"
 GITHUB_BLOB = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/"
 GITHUB_TREE = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/tree/main/"
 
-SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x vs 3.x"
+SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"
 EMBEDDED_BEHAVIOUR = "## ORM behaviour: the embedded engine"
 
-#: Every line of the 2.x/3.x table is 535 characters, its columns 136, 175, 181 and 38 wide between the pipes:
-#: a new row is padded to them.
-SERVER_TABLE_LINE = 535
-SERVER_TABLE_WIDTHS = [136, 175, 181, 38]
-#: Every line of the embedded table is 539 characters, its columns 69, 343, 113 and 9 wide.
+#: Every line of the 2.x/3.x/4.x table is 786 characters, its columns 136, 175, 181, 250 and 38 wide between the
+#: pipes: a new row is padded to them.
+SERVER_TABLE_LINE = 786
+SERVER_TABLE_WIDTHS = [136, 175, 181, 250, 38]
+#: The 2.x/3.x/4.x table's header cells. Its 4.x column (index 3) was added in v0.50.0: :func:`table_rows` leaves it
+#: out of that table's rows, so each release's test keeps reading its capability, 2.x, 3.x and Since cells; the
+#: v0.50.0 tests read the whole rows (:func:`server_rows_4x`).
+SERVER_HEADER = ["ORM capability", "SurrealDB 2.6.x / 2.7.x", "SurrealDB 3.2.x / 3.3.x", "SurrealDB 4.0.x", "Since"]
+SERVER_4X_COLUMN = 3
+#: Every line of the embedded table is 539 characters, its columns 96, 316, 113 and 9 wide (re-measured in v0.50.0).
 EMBEDDED_TABLE_LINE = 539
-EMBEDDED_TABLE_WIDTHS = [69, 343, 113, 9]
+EMBEDDED_TABLE_WIDTHS = [96, 316, 113, 9]
 
 #: The 2.x/3.x table is in version order from its first v0.20.0 row, right after its last row of an earlier release,
 #: to the row before its final one. The rows above it are not checked: v0.9.0's come before v0.7.0's, and the v0.30.3
@@ -138,7 +143,7 @@ def anchors(text: str) -> set[str]:
 def guide_order() -> list[str]:
     """The guides in the order of the index's "Guides" list (``docs/README.md``)."""
     guides_part = part("## Guides", guide("README.md"))
-    return re.findall(r"^- \*\*\[[^]]+\]\(([\w-]+\.md)\)\*\*$", guides_part, re.MULTILINE)
+    return re.findall(r"^- \*\*\[[^]]+\]\(([\w.-]+\.md)\)\*\*$", guides_part, re.MULTILINE)
 
 
 def manual() -> str:
@@ -199,11 +204,17 @@ def tables(text: str) -> list[list[str]]:
     return [block.splitlines() for block in re.findall(r"(?:^\|.*\n)+", text, re.MULTILINE)]
 
 
-def table_rows(text: str, header: str | None = None) -> list[tuple[str, list[str]]]:
-    """The body rows of the first table of ``text`` (whose header line contains ``header``, when given)."""
+def table_rows(text: str, header: str | None = None, *, every_column: bool = False) -> list[tuple[str, list[str]]]:
+    """The body rows of the first table of ``text`` (whose header line contains ``header``, when given).
+
+    The rows of the 2.x/3.x/4.x table come without their 4.x cell, unless *every_column* (see :data:`SERVER_HEADER`)."""
     found = [lines for lines in tables(text) if header is None or header in lines[0]]
     assert found, f"no table with {header!r} in its header"
-    return [(line, cells(line)) for line in found[0][2:]]
+    release_view = not every_column and cells(found[0][0]) == SERVER_HEADER
+    rows = [(line, cells(line)) for line in found[0][2:]]
+    if release_view:
+        return [(line, row[:SERVER_4X_COLUMN] + row[SERVER_4X_COLUMN + 1 :]) for line, row in rows]
+    return rows
 
 
 # --- Releases and their order ---------------------------------------------------------------------------------------
@@ -300,6 +311,11 @@ def server_rows() -> list[list[str]]:
     return [row for _, row in table_rows(doc_part(SERVER_BEHAVIOUR))]
 
 
+def server_rows_4x() -> list[list[str]]:
+    """The cells of every body row of the 2.x/3.x/4.x table, its 4.x cell included, in order."""
+    return [row for _, row in table_rows(doc_part(SERVER_BEHAVIOUR), every_column=True)]
+
+
 def embedded_rows() -> list[list[str]]:
     """The cells of every body row of the embedded table, in order."""
     return [row for _, row in table_rows(doc_part(EMBEDDED_BEHAVIOUR))]
@@ -311,7 +327,7 @@ def server_header() -> str:
 
 
 def assert_server_table() -> None:
-    """The 2.x/3.x table keeps its widths (no line re-padded) and its final row, v0.19.1's re-run of the suite."""
+    """The 2.x/3.x/4.x table keeps its widths (no line re-padded) and its final row, v0.19.1's re-run of the suite."""
     _assert_widths(SERVER_BEHAVIOUR, SERVER_TABLE_LINE, SERVER_TABLE_WIDTHS)
     last = server_rows()[-1]
     assert last[0].startswith("Full suite and every divergence") and last[-1] == "v0.19.1", last

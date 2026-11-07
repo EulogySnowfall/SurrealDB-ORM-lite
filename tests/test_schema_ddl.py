@@ -3396,7 +3396,7 @@ print(await SurrealDBConnectionManager.define_event(stock_guard, "product"))
 await SurrealDBConnectionManager.remove_event("stock_guard", "product")
 await Account.remove_event("no_negative_balance")  # declared or not: removal is by name
 """
-#: Example C, exactly: it opens "Asynchronous events (SurrealDB 3.x)"; on ``mem://`` it prints C1.
+#: Example C, exactly: it opens "Asynchronous events (SurrealDB 3.x)"; on ``mem://`` (a 4.0 core) it defines the event.
 _EXAMPLE_C = """\
 from surreal_orm_lite import SurrealDbError
 
@@ -3412,9 +3412,11 @@ print(notify.ddl("shipment"))
 
 try:
     await SurrealDBConnectionManager.define_event(notify, "shipment")
-except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server
+except SurrealDbError as exc:  # SurrealDB 2.x cannot parse ASYNC
     print(exc)
-# ASYNC events need SurrealDB 3.x, and this connection runs the embedded engine (a SurrealDB 2.x core): 'notify_shipping' cannot be defined with async_mode=True. Drop async_mode, retry and max_depth, or connect to a SurrealDB 3.x server. Nothing was defined.
+else:  # SurrealDB 3.x, 4.x and the embedded engine (a SurrealDB 4.0 core)
+    print("defined")
+# defined
 """
 #: Example D, exactly: it opens "Stored functions: `define_function()`".
 _EXAMPLE_D = """\
@@ -3645,8 +3647,8 @@ _HEADER_SENTENCE_31 = "Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and t
 #: Spec §11.1 item 7: the row v0.31.0 adds to the embedded-engine table, cell by cell.
 _EMBEDDED_EVENTS_ROW = [
     "Server-side events and stored functions (v0.31.0)",
-    "as on a 2.x server: `$input` is `NONE`; `Event(async_mode=True)` raises `SurrealDbError` before any DDL",
-    "`ASYNC` events on 3.x",
+    "as on a 4.x server: `$input` holds the fields the write sent, `Event(async_mode=True)` is defined (since v0.50.0)",
+    "`ASYNC` events on 3.x and 4.x",
     "v0.31.0",
 ]
 #: Spec §11.1 item 8: section 17's signature-cache paragraph, whitespace normalised.

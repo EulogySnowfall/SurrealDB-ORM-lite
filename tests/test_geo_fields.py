@@ -71,6 +71,7 @@ from tests._readme_tables import (
     readme,
 )
 from tests._readme_tables import doc_part as _doc_part
+from tests._readme_tables import table_rows as _shared_table_rows
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, line_major, orm_client
 from tests.test_geo_types import (
@@ -1677,16 +1678,14 @@ def _normalised(text: str) -> str:
 
 
 def _table_rows(text: str) -> list[tuple[str, list[str]]]:
-    """The body rows of the first table in ``text``: each raw line and its cells."""
-    tables = re.findall(r"(?:^\|.*\n)+", text, re.MULTILINE)
-    assert tables, "no table"
-    lines = [line.strip() for line in tables[0].splitlines()]
-    return [(line, [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip("|"))]) for line in lines[2:]]
+    """The body rows of the first table in ``text``: each raw line and its cells (the 2.x/3.x/4.x table's without its
+    4.x cell, as :func:`tests._readme_tables.table_rows` reads them)."""
+    return [(line.strip(), cells) for line, cells in _shared_table_rows(text)]
 
 
 def _v0_24_0_rows() -> list[tuple[str, list[str]]]:
     """The behaviour-table rows v0.24.0 adds: the two ``v0.24.0`` rows and the retroactive untyped-field row."""
-    rows = _table_rows(_doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"))
+    rows = _table_rows(_doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"))
     return [(line, cells) for line, cells in rows if cells[-1] in _V0_24_0_SINCE]
 
 

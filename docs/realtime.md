@@ -163,8 +163,9 @@ async with Order.objects().filter(status="open").live(on_reconnect=catch_up) as 
 
 The connection manager benefits too: `get_client()` now replaces a dropped WebSocket client
 instead of handing back a dead one, and concurrent callers share one new connection. A request
-that was already in flight when the socket dropped still fails — with the SDK's own `KeyError` —
-because retrying arbitrary queries is planned for v0.41.0.
+that was already in flight when the socket dropped still fails — with a retryable `SurrealDbConnectionError` since
+v0.50.0 (SDK 2.0 raised its own `KeyError`) — because retrying arbitrary queries is planned for v0.51.0 (connection
+resilience).
 
 **One exception: an identity the manager does not store.** `signin()`, `signup()` and
 `authenticate()` with `store=False` change the connection's own identity (that is the SDK's

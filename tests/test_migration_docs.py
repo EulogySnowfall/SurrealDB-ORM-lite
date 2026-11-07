@@ -12,6 +12,7 @@ is gone and its rewrite is there, the rule for removing a clause a model no long
 import ast
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,6 +30,7 @@ from surreal_orm_lite.migrations import (
     DropTable,
     MigrationGenerator,
     Operation,
+    RawSQL,
     RebuildIndex,
     RemoveAccess,
     RemoveAnalyzer,
@@ -155,6 +157,22 @@ _BLOCK_DRIFT = """from surreal_orm_lite import schema_diff
 for operation in await schema_diff(models=[Person, Post]):
     print(operation.describe())
 """
+#: v0.50.0: the two ``RawSQL`` replacements of a field change SurrealDB 4.x refuses on a populated table (spec §5.10).
+_BLOCK_4X_MIGRATE_ROWS = """from surreal_orm_lite.migrations import AlterField, RawSQL
+
+age_as_text = RawSQL(
+    "DEFINE FIELD OVERWRITE age ON person TYPE string MIGRATE EXISTING ROWS AS age_text USING <string> $value FALLBACK '';",
+    state_operations=[AlterField(table="person", name="age", field_type="string")],
+)
+"""
+_BLOCK_4X_PORTABLE = """age_as_text_on_every_line = RawSQL(
+    "DEFINE TABLE OVERWRITE person SCHEMALESS; "
+    "DEFINE FIELD OVERWRITE age ON person TYPE string; "
+    "UPDATE person SET age = <string> age; "
+    "DEFINE TABLE OVERWRITE person SCHEMAFULL;",
+    state_operations=[AlterField(table="person", name="age", field_type="string")],
+)
+"""
 #: Each part's blocks, in order (the parts not named hold none).
 _BLOCKS_BY_PART_39 = {
     "Write a migration": [_BLOCK_WRITE, _GENERATED_FILE],
@@ -163,6 +181,7 @@ _BLOCKS_BY_PART_39 = {
     "Data migrations": [_BLOCK_DATA],
     "Roll back": [_BLOCK_ROLLBACK],
     "Drift": [_BLOCK_DRIFT],
+    "Server lines": [_BLOCK_4X_MIGRATE_ROWS, _BLOCK_4X_PORTABLE],
 }
 
 # --- The operations table ---------------------------------------------------------------------------------------------
@@ -282,20 +301,36 @@ _NEEDLES_39 = {
         "compares every clause: carrying what a model leaves to the database applies only to a state built from models",
     ),
     "Server lines": (
-        "A full-text `CreateIndex` writes `FULLTEXT` on 3.x and `SEARCH` on 2.x and the embedded engine",
-        "On SurrealDB 2.x and the embedded engine, an `AddField` or `AlterField` of an `any` column of a `SCHEMAFULL` "
-        "table writes `FLEXIBLE`, and an `AlterTable` that makes a table `SCHEMAFULL` also redefines its `any` columns, "
-        "untyped lists and lists of sub-models `FLEXIBLE` in the same transaction, so their object values are kept",
+        "A full-text `CreateIndex` writes `FULLTEXT` on 3.x, 4.x and the embedded engine, and `SEARCH` on 2.x",
+        "On SurrealDB 2.x, an `AddField` or `AlterField` of an `any` column of a `SCHEMAFULL` table writes `FLEXIBLE`, "
+        "and an `AlterTable` that makes a table `SCHEMAFULL` also redefines its `any` columns, untyped lists and lists "
+        "of sub-models `FLEXIBLE` in the same transaction, so their object values are kept",
         "`migrate()` and `rollback()` render from the database's schema with the migrations replayed, while "
         "`show_sql()` renders from the migration files alone",
         "`migrate()`'s batch may also redefine `FLEXIBLE` columns defined outside migrations that `show_sql(line=2)` "
         "does not show",
         "When the database's definition of a table cannot be read entirely, and the `FLEXIBLE` clauses of such an "
         "`AlterTable`, or of a field holding `any` or a list of objects, would be chosen from that reading, "
-        "`migrate()` and `rollback()` raise `SurrealDbError` on those lines before any change",
-        "`DefineEvent(async_mode=True)`, `DefineAccess(with_refresh=True)` and `COMPUTED` fields need SurrealDB 3.x",
+        "`migrate()` and `rollback()` raise `SurrealDbError` on that line before any change",
+        "`DefineEvent(async_mode=True)`, `DefineAccess(with_refresh=True)` and `COMPUTED` fields need SurrealDB 3.x or "
+        "4.x: on 2.x they raise `SurrealDbError` before any change",
         "`record_references`",
-        "The embedded engine behaves as a 2.x server and applies each migration atomically too",
+        "Since v0.50.0 the embedded engine is a SurrealDB 4.0 core: it behaves as a 4.x server and applies each "
+        "migration atomically too",
+        # v0.50.0, the 4.x subsection (spec §5.10, §11; C1, D25, P4, P5).
+        "SurrealDB 4.x creates its databases at compatibility level 4",
+        "a field can only be redefined with a type that accepts every value the old type accepted, and a new field must "
+        "accept `NONE`",
+        "Empty tables, `SCHEMALESS` tables and databases defined `COMPATIBILITY 3` are not subject to the rule",
+        "`migrate()` and `rollback()` raise `FieldChangeRefusedError` for such a change: refused inside the migration's "
+        "transaction, before the field change runs; nothing is applied",
+        "It is a `MigrationStatementError` exported from `surreal_orm_lite.migrations`; its `table` and `field` "
+        "attributes name the field",
+        "A `RawSQL` whose own `DEFINE FIELD` the server refuses stays a `MigrationStatementError` carrying the server's reason",
+        "`define_table(overwrite=True)` and the other schema-sync paths keep the server's refusal",
+        "its text is 4.x-only, a parse error on 2.x and 3.x",
+        "`DEFINE FIELD nickname ON person TYPE string MIGRATE EXISTING ROWS AS fill USING '' FALLBACK ''`",
+        "A `MigrateRows` operation that writes `MIGRATE EXISTING ROWS` for you is planned for v0.56.0",
     ),
     "Limits": (
         "surrealdb/surrealdb#7618",
@@ -519,7 +554,7 @@ class TestReadmeSection39:
         assert links == [
             "schema.md#35-model-table-ddl-define_table-schema_mode-permissions",
             "compatibility.md#orm-behaviour-the-embedded-engine",
-            "compatibility.md#orm-behaviour-surrealdb-2x-vs-3x",
+            "compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x",
             "cli.md#40-command-line-surreal-orm-lite",
         ], links
         assert_links_resolve(_section_39(), "migrations.md")
@@ -563,10 +598,10 @@ _MIGRATION_ROWS = [
 ]
 _EMBEDDED_MIGRATION_ROW = [
     "Migrations (v0.38.0)",
-    "as on a 2.x server: `SEARCH` for a full-text `CreateIndex`, `FLEXIBLE` on `any` columns (also in the redefinitions "
-    "of an `AlterTable` that makes a table `SCHEMAFULL`), `ASYNC` events, `WITH REFRESH` and `COMPUTED` fields refused "
-    "before any DDL; each migration atomic, its analyzers committed first and compensated as on the servers",
-    "3.x writes `FULLTEXT`, no `FLEXIBLE` on `any`, and applies `ASYNC`, `WITH REFRESH` and `COMPUTED`",
+    "as on a 4.x server: `FULLTEXT` for a full-text `CreateIndex`, no `FLEXIBLE` on `any` columns, `ASYNC` events, "
+    "`WITH REFRESH` and `COMPUTED` fields applied; each migration atomic, its analyzers committed first and "
+    "compensated as on the servers",
+    "2.x writes `SEARCH` and `FLEXIBLE`, refuses `ASYNC`, `WITH REFRESH` and `COMPUTED` before any DDL",
     "v0.38.0",
 ]
 _FEATURES_ROW_39 = ["Migrations (makemigrations / migrate / rollback)", "✅"]
@@ -575,7 +610,7 @@ _ROADMAP_ROWS_39 = [
     ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
     ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "✅ Released"],
     ["v0.40.0", "Tier 3 — Test fixtures & factories", "✅ Released"],
-    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.50.0", "Official SDK 3.0 and SurrealDB 4.x", "✅ Released"],
 ]
 _COMPARISON_ROW_39 = ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"]
 
@@ -704,3 +739,41 @@ class TestReadmeForwardReferences:
         assert text.count("write an `AlterTable` or `AlterField` migration by hand") == 1
         assert text.count("A key left out never removes a stored clause") == 1
         assert "[section 35](schema.md#35-model-table-ddl-define_table-schema_mode-permissions) says how to remove one" in text
+
+
+# --- v0.50.0: the SurrealDB 4.x subsection of "Server lines" (spec §5.10, §11; C1, D25, P4, P5) -----------------------
+
+_SUBSECTION_4X = "#### SurrealDB 4.x: changing a field on a populated table"
+
+
+class TestServerLines4x:
+    """The 4.x rule, ``FieldChangeRefusedError`` and its two ``RawSQL`` replacements, in "Server lines"."""
+
+    def test_the_subsection_is_in_server_lines(self) -> None:
+        part = _part_39("Server lines")
+        assert re.findall(r"^#### (.*)$", part, re.MULTILINE) == [_SUBSECTION_4X.removeprefix("#### ")]
+        assert "FieldChangeRefusedError" in _subsection(_SUBSECTION_4X, part)
+
+    def test_the_two_replacements_are_raw_sql_operations(self) -> None:
+        """Both blocks run as written, in order, and build a ``RawSQL`` whose ``state_operations`` is the
+        ``AlterField`` they describe; the first is 4.x's own clause, the second the portable detour."""
+        namespace: dict[str, Any] = {"__name__": "migrations_4x"}
+        for block in _blocks(_subsection(_SUBSECTION_4X, _part_39("Server lines"))):
+            exec(compile(block, "<migrations guide, 4.x>", "exec"), namespace)  # this repository's own guide
+        first, portable = namespace["age_as_text"], namespace["age_as_text_on_every_line"]
+        for operation in (first, portable):
+            assert type(operation) is RawSQL
+            [state] = operation.state_operations
+            assert type(state) is AlterField and (state.table, state.name, state.field_type) == ("person", "age", "string")
+        assert "MIGRATE EXISTING ROWS" in first.sql and "MIGRATE" not in portable.sql
+        assert portable.sql.startswith("DEFINE TABLE OVERWRITE person SCHEMALESS;"), portable.sql
+        assert portable.sql.endswith("DEFINE TABLE OVERWRITE person SCHEMAFULL;"), portable.sql
+
+    def test_limits_points_to_the_rule(self) -> None:
+        limits = _normalised(_part_39("Limits"))
+        assert '`FieldChangeRefusedError` (see "SurrealDB 4.x: changing a field on a populated table"' in limits
+
+    def test_the_error_is_exported(self) -> None:
+        from surreal_orm_lite import migrations
+
+        assert issubclass(migrations.FieldChangeRefusedError, migrations.MigrationStatementError)

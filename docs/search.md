@@ -2,13 +2,18 @@
 
 Full-text, vector and hybrid search.
 
+> **The embedded engine since v0.50.0** is a SurrealDB 4.0 core (SDK 3.0), and the ORM treats it as a 4.x
+> server. Where a passage below groups "SurrealDB 2.x and the embedded engine", it describes the SDK 2.0 engine
+> of `0.40.x` (a 2.3.10 core); the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) lists what the
+> engine does now.
+
 ## 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)
 
 Since v0.35.0 a queryset searches text with the full SurrealDB-ORM's API — `search()`, with `SearchScore` and
 `SearchHighlight` in `annotate()` — plus `SearchOffsets`, over the full-text indexes a model declares with `Analyzer`
 and `Index` and applies with `define_indexes()`. SurrealDB tokenises, matches, scores (BM25) and highlights on the
 server; the ORM binds every search text and highlight tag as a query variable. The same code runs on SurrealDB 2.x,
-3.x and the embedded engine, except where the [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The
+3.x and the embedded engine, except where the [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) says otherwise. The
 examples assume a configured connection: they run as written, in order, on the embedded engine (`mem://`).
 
 ### Declare and apply
@@ -64,7 +69,7 @@ print(*Article.index_ddl(), sep="\n")
 # DEFINE INDEX OVERWRITE `article_slug` ON `article` FIELDS `slug` UNIQUE;
 await Article.define_table()  # the table first
 applied = await Article.define_indexes()
-print(applied == Article.index_ddl(line=2))  # the embedded engine is a SurrealDB 2.x core: SEARCH
+print(applied == Article.index_ddl())  # the embedded engine is a SurrealDB 4.0 core: FULLTEXT
 # True
 print(await Article.define_indexes())  # nothing changed, nothing applied
 # []
@@ -123,8 +128,8 @@ articles = await (
 )
 for article in articles:
     print(article.id, round(article.relevance, 3), article.snippet, article.spans)
-# a2 0.613 Cooking with <b>physics</b> {'0': [{'e': 20, 's': 13}]}
-# a1 0.543 Quantum <b>physics</b> for beginners {'0': [{'e': 15, 's': 8}]}
+# a2 1.074 Cooking with <b>physics</b> {'0': [{'e': 20, 's': 13}]}
+# a1 0.952 Quantum <b>physics</b> for beginners {'0': [{'e': 15, 's': 8}]}
 ```
 
 `search()` applies wherever `filter()` does, AND-ed after `filter()`, `Q` and `nearby()`: `count()`, `exists()`, the
@@ -354,7 +359,7 @@ API — `similar_to()`, each record's distance set as `_knn_distance` — over t
 `VectorField` and the HNSW indexes it declares with `Index(hnsw=True)` and applies with `define_indexes()`. SurrealDB
 searches the index and computes the distances on the server; the ORM binds the query vector as a query variable. The
 same code runs on SurrealDB 2.x, 3.x and the embedded engine, except where the
-[2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The examples assume a configured connection: they
+[2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) says otherwise. The examples assume a configured connection: they
 run as written, in order, on the embedded engine (`mem://`).
 
 ### Declare and apply
@@ -414,7 +419,7 @@ print(*Document.index_ddl(), sep="\n")
 # DEFINE INDEX OVERWRITE `document_title` ON `document` FIELDS `title` FULLTEXT ANALYZER `plain` HIGHLIGHTS;
 await Document.define_table()  # the table first, its `embedding` column an option<array<float, 3>>
 applied = await Document.define_indexes()
-print(applied == Document.index_ddl(line=2))  # the embedded engine is a SurrealDB 2.x core: SEARCH
+print(applied == Document.index_ddl())  # the embedded engine is a SurrealDB 4.0 core: FULLTEXT
 # True
 print(await Document.define_indexes())  # nothing changed, nothing applied: the vector index is not rebuilt
 # []
@@ -585,12 +590,12 @@ print([document.id for document in await in_subquery.exec()])
 # ['d6', 'd4']
 ```
 
-On SurrealDB 3.x, search annotations (`SearchScore`, `SearchHighlight`, `SearchOffsets`) give each of the nearest
-matches the score, highlight and offsets that the same `search()` gives it without `similar_to()`. On SurrealDB 2.x
-and the embedded engine the ORM refuses them before the statement is sent, since there it selects the matches first
-and the vector search holds no match to score, highlight or locate; `count()`, `exists()` and the aggregations, which
-return no annotation, still answer. The examples run on the embedded engine, which is why this one prints the
-refusal.
+On SurrealDB 3.x, 4.x and the embedded engine, search annotations (`SearchScore`, `SearchHighlight`,
+`SearchOffsets`) give each of the nearest matches the score, highlight and offsets that the same `search()` gives it
+without `similar_to()`. On SurrealDB 2.x the ORM refuses them before the statement is sent, since there it selects the
+matches first and the vector search holds no match to score, highlight or locate; `count()`, `exists()` and the
+aggregations, which return no annotation, still answer. The examples run on the embedded engine, a SurrealDB 4.0 core
+since v0.50.0, so this one prints the annotations; on 2.x it prints the refusal.
 
 ```python
 programming = Document.objects().search(title="programming").similar_to("embedding", [0.0, 1.0, 0.0], 2)
@@ -598,9 +603,10 @@ annotated = programming.annotate(score=SearchScore(0), snippet=SearchHighlight("
 try:
     for document in await annotated.exec():
         print(document.title, document.snippet, round(document.score, 4), round(document._knn_distance, 4))
-except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server
+except SurrealDbError as exc:  # SurrealDB 2.x: the ORM refuses the annotations
     print(exc)
-# similar_to() cannot be combined with SearchScore on SurrealDB 2.x or the embedded engine: there the ORM selects the full-text matches first, so the vector search holds no match to score, highlight or locate. Keep search() as a condition, or use SurrealDB 3.x.
+# Rust programming Rust <b>programming</b> 1.0935 0.0
+# Python programming Python <b>programming</b> 1.0935 0.0061
 print(await annotated.count(), await annotated.exists())
 # 2 True
 ```
@@ -786,7 +792,7 @@ except SurrealDbError as error:
 - Each list is SurrealDB's own: the vector list as `similar_to()` finds it — HNSW is approximate (section 37) — and
   the full-text list as `search()` ranks it, with section 36's BM25 scores. Those depend on the line: a term found in
   more than half the documents scores `0.0` on SurrealDB 3.x and below zero on 2.x and the embedded engine
-  ([2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)), so the full-text list, and the fused ranking with it, can
+  ([2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)), so the full-text list, and the fused ranking with it, can
   differ between lines.
 - **An exact scan (`dist=`) returns the same vector list on every call**, on every line. SurrealDB 2.x's and the
   embedded engine's own scan picks among records at an equal distance at the `vector_limit`-th place in no fixed order,

@@ -2,6 +2,11 @@
 
 Schema introspection, materialized views and the DDL of a model's table.
 
+> **The embedded engine since v0.50.0** is a SurrealDB 4.0 core (SDK 3.0), and the ORM treats it as a 4.x
+> server. Where a passage below groups "SurrealDB 2.x and the embedded engine", it describes the SDK 2.0 engine
+> of `0.40.x` (a 2.3.10 core); the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) lists what the
+> engine does now.
+
 ## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)
 
 Since v0.30.0 the ORM reads the schema of a database — its tables with their fields, indexes and events, and its
@@ -357,7 +362,7 @@ Since v0.32.0 a model can read a **materialized view**: a table SurrealDB comput
 date as its source table changes — counts, sums, filtered copies. The view is declared on the model with
 `view_query`, applied idempotently with `define_view()` and read like any model, and every write of the model is
 refused: SurrealDB computes the view's records itself. The same code runs on SurrealDB 2.x, 3.x and the embedded
-engine, except where the [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The examples assume a
+engine, except where the [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) says otherwise. The examples assume a
 configured connection: they run as written on the embedded engine (`mem://`).
 
 ```python
@@ -557,7 +562,7 @@ print([(str(order.id), order.amount) for order in await PaidOrder.objects().orde
   any DDL, and a raw `REMOVE TABLE` leaves the views reading it as ordinary tables keeping their last records.
 - On every line, a source write missing an aggregated field is refused
   ([surrealdb/surrealdb#7447](https://github.com/surrealdb/surrealdb/issues/7447)): write `math::sum(amount ?? 0)`.
-- The [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) lists these differences; the embedded engine behaves as a
+- The [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) lists these differences; the embedded engine behaves as a
   2.x server.
 
 ### Security
@@ -606,7 +611,7 @@ Since v0.34.0 a model declares its table's schema mode, change feed, permissions
 SurrealDB-ORM's keys — `schema_mode`, `changefeed`, `permissions`, `comment` and `flexible_fields` — and
 `define_table()` writes its `DEFINE TABLE` and one `DEFINE FIELD` per column from the annotations and applies them,
 keeping what the model does not declare. The same code runs on SurrealDB 2.x, 3.x and the embedded engine, except
-where the [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The examples assume a configured
+where the [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) says otherwise. The examples assume a configured
 connection: they run as written on the embedded engine (`mem://`).
 
 ```python
@@ -1025,7 +1030,7 @@ print(*table, sep="\n")
   writes `FLEXIBLE`. The 3.x exception is a gap fixed in SurrealDB 3.4 (nightly at the time of writing).
 - `COMPUTED` fields are SurrealDB 3.x's: `define_table()` keeps a stored one `COMPUTED`, and writes a new computed
   field `VALUE` on both lines.
-- The [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) and the
+- The [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) and the
   [embedded engine's](compatibility.md#orm-behaviour-the-embedded-engine) list these rows.
 
 ### Transactions, connections and the cache

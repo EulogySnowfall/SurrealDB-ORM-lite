@@ -5,7 +5,8 @@ The official SDK's in-process engine (`mem://`, `surrealkv://`) and the test fix
 ## 26. Embedded engine and test fixtures
 
 Since v0.25.0 the ORM also runs on the official SDK's **in-process** SurrealDB engine: no server
-and no Docker, the database lives inside your Python process. It suits tests, notebooks and
+and no Docker, the database lives inside your Python process. Since v0.50.0 the engine is an
+optional extra: `pip install "surreal-orm-lite[embedded]"`. It suits tests, notebooks and
 small tools, and the same models and queries run unchanged against a server. The
 `surreal_orm_lite.testing` module adds the test helpers: `embedded_database()` (an isolated
 database per block) and the full SurrealDB-ORM's `SurrealFixture` / `@fixture`.
@@ -35,17 +36,18 @@ configuration switches between a server and `mem://` by its URL alone.
 `SurrealDBConnectionManager.is_embedded()` tells code that must run on both kinds of connection
 which one is configured.
 
-| Embedded URL                   | surreal-orm-lite (official SDK 2.0.0)                                                    | Full SurrealDB-ORM       |
-| ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
-| `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
-| `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
-| `surrealkv+versioned://<path>` | ✅ on disk, keeps history: time travel with `as_of()` (section 27)                       | ❌                       |
-| `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
-| `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233): the ORM raises the SDK's refusal        | ❌                       |
+| Embedded URL                    | surreal-orm-lite (official SDK 3.0, `[embedded]`)                                        | Full SurrealDB-ORM       |
+| ------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------ |
+| `mem://`, `memory://`, `memory` | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
+| `surrealkv://<path>`            | ✅ on disk (SurrealKV)                                                                   | ❌                       |
+| `surrealkv+versioned://<path>`  | ✅ on disk, keeps history: time travel with `as_of()` (section 27)                       | ❌                       |
+| `file://<path>`                 | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
+| `rocksdb://<path>`              | ❌ not yet supported by the official SDK (#233): the ORM raises the SDK's refusal        | ❌                       |
 
-A bare `memory` (no `://`) is refused by SDK 2.0.0 and accepted by the SDK 3.0 line; write
-`memory://`. The engine is SurrealDB core **2.3.10**, bundled with SDK 2.0.0 — not the 2.x and
-3.x server lines the ORM is tested against (see below). surreal-orm-lite keeps no list of
+A bare `memory` (no `://`) is accepted too (SDK 2.0.0 refused it). The engine is SurrealDB core
+**4.0.0**, bundled with SDK 3.0.0 (it was 2.3.10 with SDK 2.0.0): the ORM reads it as a 4.x server
+(see below). Without the `embedded` extra, opening an embedded URL raises `SurrealDbConnectionError`
+naming `surreal-orm-lite[embedded]`; importing the ORM or `surreal_orm_lite.testing` does not need it. surreal-orm-lite keeps no list of
 embedded schemes: the SDK decides, so `rocksdb://` will work with no ORM change once a released
 SDK accepts it ([#233](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/233)).
 
@@ -91,9 +93,9 @@ assert await Note.objects().count() == 0              # a new, empty one
 ```
 
 - **Namespace and database** are a selection on that engine. After a change (`set_connection()`,
-  `set_namespace()`, `set_database()`), the next call resets the shared session on the same
-  engine — nothing is lost — and selects the new pair; a stored session ends (see
-  [Identity](#identity-on-the-embedded-engine)). A new **URL** closes the old engine and opens
+  `set_namespace()`, `set_database()`), the next call selects the new pair on the same engine —
+  nothing is lost — after returning the shared session to the owner if an identity was signed in;
+  a stored session ends (see [Identity](#identity-on-the-embedded-engine)). A new **URL** closes the old engine and opens
   the new one.
 - **Closing** — `close_connection()` (from any loop), `close_all_connections()`,
   `unset_connection()`, `reconnect()` and the exit of `async with SurrealDBConnectionManager():`
@@ -114,11 +116,11 @@ assert await Note.objects().count() == 0              # a new, empty one
   choice of identity. `close_all_connections()` and `unset_connection()` close the server
   clients too.
 
-With the surrealdb SDK 2.x, closing does not stop an in-process engine: a client you obtained
-before `close_connection()` (or inside an `embedded_database()` block) is still a running
-database. Do not use it after the close, and drop it (`del client`) before reopening the same
-`surrealkv://` path: two engines on one path miss each other's writes. Never open one path from
-two processes.
+Since v0.50.0 (SDK 3.0) closing stops the engine: a client you obtained before
+`close_connection()` (or inside an `embedded_database()` block) no longer runs, so drop it
+(`del client`) and get a new one with `get_client()` (with the surrealdb SDK 2.x, closing did not
+stop an in-process engine, and two engines on one path missed each other's writes). The engine
+locks its store. Never open one path from two processes.
 
 ### What the embedded engine does not do
 
@@ -127,22 +129,21 @@ error:
 
 - **Live queries** (`live()`, `watch()`, `subscribe_live()`): the engine has no notification
   channel. Read the table's change feed instead (`Model.objects().changes()`,
-  [section 22](realtime.md#22-change-feeds-changes)), which works from now and from a cursor.
-- **`changes(since=<datetime>)`**: the SDK 2.x engine keeps no timestamps for change-feed
-  positions; pass a cursor (`ChangeModelStream.cursor`) or `since=None`.
+  [section 22](realtime.md#22-change-feeds-changes)), which works from now, from a cursor and,
+  since v0.50.0, from a datetime.
 - **Model auth needs `bind=True`**: the engine has a single session per database, so
   `AuthenticatedUserMixin` calls with `bind=False` (a session of their own) and
   `ephemeral_client()` are refused.
 - **`rocksdb://`**: refused by the SDK
   ([#233](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/233)), see above.
 
-And two differences that raise nothing:
+And one difference that raises nothing:
 
 - **Transactions are buffered**: the SDK refuses interactive transactions on the engine, so
   `transaction()` picks the buffered strategy, as on HTTP ([section 11](writing.md#11-transactions-atomic-all-or-nothing)).
-- **Parse errors are a bare `RuntimeError`** with SDK 2.0.0 (a server raises the SDK's error
-  classes). The DDL helpers (`define_computed_fields()`, `define_access()`) raise their usual
-  `SurrealDbError`.
+
+Parse errors are the SDK's error classes, as on a server (with SDK 2.0.0 they were a bare
+`RuntimeError`).
 
 ```python
 from surreal_orm_lite import SurrealDbError
@@ -157,15 +158,16 @@ except SurrealDbError as error:
 # Model.objects().changes() instead, or connect to a server.
 ```
 
-### Its SurrealQL is the 2.x line
+### Its SurrealQL is the 4.x line
 
-SDK 2.0.0 bundles the SurrealDB **2.3.10** engine: write 2.x SurrealQL in raw queries and
-computed fields (`type::is::string`, not 3.x's `type::is_string`; no `DEFINE FIELD … COMPUTED`),
-and expect the 2.x column of the
-[behaviour table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) — a table that does not exist reads as
-`[]`. `client.version()` reports the SDK's version (`surrealdb-2.0.0`), not the engine's. The SDK
-3.0 line bundles a 3.x engine
-([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)).
+SDK 3.0.0 bundles the SurrealDB **4.0.0** engine: write 4.x SurrealQL in raw queries and
+computed fields, and expect the 4.x column of the
+[behaviour table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x): rows in no fixed order
+without `ORDER BY`, a raw query on a table that does not exist raises `NotFoundError` (the ORM
+reads `[]`), and a migration's field change on a populated `SCHEMAFULL` table follows the 4.x rule
+([section 39](migrations.md#surrealdb-4x-changing-a-field-on-a-populated-table)).
+`client.version()` reports the engine (`surrealdb-4.0.0`). With SDK 2.0.0 (`0.40.x`) the engine was
+SurrealDB core 2.3.10, a 2.x line.
 
 ### Identity on the embedded engine
 
@@ -176,6 +178,10 @@ and expect the 2.x column of the
   `PERMISSIONS` apply as on a server. A sign-in changes the session of the **whole process**:
   every event loop and thread shares the engine's single session.
 - `invalidate()` returns to the in-process owner: a configured user, if any, is never signed in.
+  A file-backed store is closed and opened again (data kept); `mem://` and `memory` sign back in
+  as a temporary root user, `__surreal_orm_lite_owner`, removed right after: that name is reserved
+  on in-memory embedded engines only
+  ([authentication](authentication.md#the-embedded-engines-owner)).
 - A namespace/database change returns the session to the owner and **ends** the stored session:
   a token belongs to the database it was issued for, and replaying it would move the session
   back there.
@@ -185,8 +191,7 @@ and expect the 2.x column of the
   same session, are serialised (each `bind=True` call reads back its own record and adopts its
   own token) and the last one wins. A failed `bind=True` puts the previous session back, with
   one exception, as on a server: when `signup()` or `signin()` succeeded but the record does not
-  fit the model, the session stays signed in as that record (the error says so). `refresh()`
-  cannot succeed on the engine: its SurrealQL does not parse `WITH REFRESH`.
+  fit the model, the session stays signed in as that record (the error says so).
 
 ```python
 assert await SurrealDBConnectionManager.info() is None  # anonymous: the in-process owner

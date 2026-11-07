@@ -89,6 +89,25 @@ persist(tokens.refresh)   # REQUIRED — see below
 > permanently. If you keep the old value and drop the new one, the user is logged out for good
 > — and nothing is raised at the moment you make the mistake.
 
+**Refresh tokens (SurrealDB 3.x and 4.x).** The ORM builds its clients with the SDK's own token renewal off: a stored
+refresh token is spent only by your own `signin(refresh=…)` or `Model.refresh()`, never behind your back. A WebSocket client the ORM gave up (after a drop, `close_connection()`
+or a new registration) refuses its next request with `SurrealDbConnectionError` instead of reopening an anonymous
+session ([connections](connections.md#the-clients-the-orm-builds)).
+
+### The embedded engine's owner
+
+On the embedded engine (`mem://`, `surrealkv://`) the session starts as the in-process owner, and the ORM never signs
+in on it. After a record user signs in on the shared session (`signin(..., bind=True)`, `signup()`, a replayed
+token), `invalidate()` — and a refused replay or a new database selection — returns it to the owner. With SDK 3.0
+`invalidate()` alone would leave it anonymous and denied, so the ORM goes back by itself: a file-backed store
+(`surrealkv://`, `file://`) is closed and opened again, data kept; an in-memory engine (`mem://`, `memory`) signs back
+in as a temporary root user, `__surreal_orm_lite_owner`, that the ORM defines (a plain `DEFINE USER … ROLES OWNER`
+with a random password, never logged) right before the first identity exchange and removes right after the return.
+`__surreal_orm_lite_owner` is reserved on in-memory embedded engines only: if the application defines a root user of
+that name on such an engine, the next sign-in raises `SurrealDbConnectionError` before anything is exchanged, and that
+user is never removed. A failed sign-in leaves the session as it was. Servers and file-backed engines never get that
+user.
+
 ## 19. Model-level authentication (`AuthenticatedUserMixin`)
 
 Where section 18 authenticates the _connection_, this authenticates a **model**: declare a user

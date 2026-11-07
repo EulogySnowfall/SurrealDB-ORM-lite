@@ -7276,7 +7276,7 @@ _SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_mo
 _SECTION_33 = "## 33. Materialized views (`view_query`, `define_view()`)"
 _SECTION_34 = "## 34. Relation constraints (`relation_in`, `define_relation()`)"
 _SECTION_35 = "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
-_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x vs 3.x"
+_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"
 _EMBEDDED_BEHAVIOUR = "## ORM behaviour: the embedded engine"
 #: Section 35's anchor, as the sections that point to it write it.
 _LINK_35 = "(#35-model-table-ddl-define_table-schema_mode-permissions)"
@@ -7555,7 +7555,7 @@ _INTRO_NEEDLES_35 = (
     "one `DEFINE FIELD` per column from the annotations",
     "keeping what the model does not declare",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
     "`mem://`",
 )
 _PART_NEEDLES_35 = {
@@ -7691,7 +7691,7 @@ _PART_NEEDLES_35 = {
         "sub-models `define_table()` writes), on 2.x and the embedded engine of a list `define_table()` writes "
         "`FLEXIBLE`. The 3.x exception is a gap fixed in SurrealDB 3.4 (nightly at the time of writing).",
         "`COMPUTED` fields are SurrealDB 3.x's",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
         "(compatibility.md#orm-behaviour-the-embedded-engine)",
     ),
     "Transactions, connections and the cache": (
@@ -7840,14 +7840,13 @@ _HEADER_SENTENCE_34 = (
     "Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it "
     "refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`."
 )
-#: The row v0.34.0 adds to the embedded engine's table, cell by cell: the list-item exception in the words of the
+#: The row v0.34.0 adds to the embedded engine's table, cell by cell, re-measured in v0.50.0 (a 4.0 core): the 3.x list-item exception in the words of the
 #: 2.x/3.x row ``_UNDECLARED_ROW``, with its 3.4 note (#321).
 _EMBEDDED_TABLE_DDL_ROW = [
     _EMBEDDED_TABLE_DDL_FIRST,
-    "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and "
-    "to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops "
-    "that field, except in the items of a list `define_table()` writes `FLEXIBLE`, which keep it",
-    "3.x keeps them without `FLEXIBLE`, refuses that write except in list items defining a field, a gap fixed in 3.4",
+    "as on a 4.x server: no `FLEXIBLE` on `Any` and untyped columns; a write naming a field the table does not define "
+    "is refused, in the items of a list too unless the list is `FLEXIBLE`",
+    "2.x drops such a field; 3.x keeps it in list items defining a field, a gap fixed in 3.4",
     "v0.34.0",
 ]
 #: The v0.7.0 row of the 2.x/3.x table on the same writes, cell by cell: the list-item exception in the words of the

@@ -2719,8 +2719,8 @@ _HEADER_CLAUSE_26 = "rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on 
 #: The row v0.26.0 adds to the embedded table, cell by cell.
 _EMBEDDED_TIME_TRAVEL_ROW = [
     "Time travel (`as_of()`)",
-    "`surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → "
-    "`SurrealDbError` before any request; `fetch()` refused (2.x core)",
+    "`surrealkv+versioned://` only; any other URL → `SurrealDbError` before any request; `fetch()` runs (4.x core); "
+    "the table definition is versioned, so a moment before the table existed reads no records",
     "versioned storage required (see the 2.x/3.x table)",
     "v0.26.0",
 ]
@@ -2850,10 +2850,11 @@ class TestTimeTravelDocs:
         [row] = [line for line in lines if line.startswith(("| v0.26.0", "| ✅ v0.26.0"))]
         assert "²" in row, row
         below = _normalised(tier_2.split(lines[-1], 1)[1])
-        assert "¹ The embedded engine ships in the SDK 2.0.0 base wheel" in below, below
+        # v0.50.0: the SDK 3.0 engine is the `surrealdb[embedded]` extra, and 4.x servers take `?versioned=true` too.
+        assert "¹ The embedded engine shipped in the SDK 2.0.0 base wheel" in below, below
         assert (
-            "² The versioned engine is the SDK 2.0.0 embedded engine's `surrealkv+versioned://`; versioned servers "
-            "(3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too." in below
+            "² The versioned engine is the embedded engine's `surrealkv+versioned://`; versioned servers "
+            "(3.x and 4.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too." in below
         ), below
         rows = _table_rows(_roadmap_part("### Embedded URLs"), "Embedded URL")
         [versioned] = [cells for _, cells in rows if cells[0] == "`surrealkv+versioned://<path>`"]

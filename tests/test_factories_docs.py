@@ -147,8 +147,8 @@ _NEEDLES_41: dict[str, list[str]] = {
         "a test run cannot wipe a server's database through `surreal_db`",
     ],
     "Server lines": [
-        "Factories behave the same on SurrealDB 3.x, 2.x and the embedded engine",
-        "answers as a 2.x server (core 2.3.10)",
+        "Factories behave the same on SurrealDB 3.x, 2.x, 4.x and the embedded engine",
+        "answers as a 4.x server (core 4.0.0 since v0.50.0",
     ],
     # One phrase per departure from the full ORM's factories, in the order of the bullets.
     "Coming from the full SurrealDB-ORM": [
@@ -365,8 +365,8 @@ _SERVER_ROW_40 = [
 _EMBEDDED_ROW_40 = [
     "Model factories and the pytest plugin (v0.40.0)",
     "the plugin's `surreal_db` is a fresh `mem://` database per test (`surreal_db_url` may name "
-    "`surrealkv://<path>`), answering as a 2.x server (core 2.3.10); factories build and create as on a server, "
-    "`SurrealFunc` attributes included",
+    "`surrealkv://<path>`), answering as a 4.x server (core 4.0.0) and needing the `[embedded]` extra; factories "
+    "build and create as on a server, `SurrealFunc` attributes included",
     "`surreal_db` refuses a server URL (embedded engines only); factories behave the same",
     "v0.40.0",
 ]
@@ -374,7 +374,7 @@ _FEATURES_ROW_40 = ["Test data factories (`ModelFactory`, `Faker`) & pytest plug
 _ROADMAP_ROWS_40 = [
     ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "✅ Released"],
     ["v0.40.0", "Tier 3 — Test fixtures & factories", "✅ Released"],
-    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.50.0", "Official SDK 3.0 and SurrealDB 4.x", "✅ Released"],
 ]
 _COMPARISON_ROW_40 = ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; ✅ v0.40.0 factories", "✅"]
 _PLUGIN_SENTENCE_26 = (

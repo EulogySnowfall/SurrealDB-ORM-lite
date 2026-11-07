@@ -96,8 +96,8 @@ altered by one. A migration that defines analyzers commits them first, in a tran
 an index with the committed analyzer only), and restores them to the definition the database held if the rest of the
 migration fails. Another process applying the same migration at the same time is safe: the tracking table's unique
 index lets one of them record it, and the other skips it with a warning. `migrate(target="0001_initial")` stops after
-that migration, and `show_sql(name)` prints a migration's statements without a request (`line=2` for SurrealDB 2.x and
-the embedded engine, `backwards=True` for its rollback). To adopt a database built before its migrations,
+that migration, and `show_sql(name)` prints a migration's statements without a request (`line=2` for SurrealDB 2.x,
+`backwards=True` for its rollback). To adopt a database built before its migrations,
 `migrate(target="0001_initial", fake=True)` records the migrations up to that one without applying them, then
 `migrate()` applies the next ones. `executor = MigrationExecutor("migrations", connection="analytics")` uses a named
 connection. A refused statement raises `MigrationStatementError`, which names the migration, the operation and
@@ -217,25 +217,74 @@ model leaves to the database applies only to a state built from models.
 
 ### Server lines
 
-The same migration applies on SurrealDB 3.x, 2.x and the embedded engine: the statements that differ are chosen
-when they are applied. A full-text `CreateIndex` writes `FULLTEXT` on 3.x and `SEARCH` on 2.x and the embedded
-engine. On SurrealDB 2.x and the embedded engine, an `AddField` or `AlterField` of an `any` column of a `SCHEMAFULL`
-table writes `FLEXIBLE`, and an `AlterTable` that makes a table `SCHEMAFULL` also redefines its `any` columns,
-untyped lists and lists of sub-models `FLEXIBLE` in the same transaction, so their object values are kept (3.x keeps
-them without it). Those columns are the database's: `migrate()` and `rollback()` render from the database's schema
-with the migrations replayed, while `show_sql()` renders from the migration files alone, so on 2.x and the embedded
-engine `migrate()`'s batch may also redefine `FLEXIBLE` columns defined outside migrations that `show_sql(line=2)`
-does not show. When the database's definition of a table cannot be read entirely, and the `FLEXIBLE` clauses of such
-an `AlterTable`, or of a field holding `any` or a list of objects, would be chosen from that reading, `migrate()` and
-`rollback()` raise `SurrealDbError` on those lines before any change
-(`DatabaseIntrospector().introspect().issues` lists what could not be read). `DefineEvent(async_mode=True)`,
-`DefineAccess(with_refresh=True)` and `COMPUTED` fields need SurrealDB 3.x: on 2.x and the embedded engine they raise
-`SurrealDbError` before any change. `AddField(reference=True)` is left to the server: SurrealDB 2.x refuses it unless
-its `record_references` capability is enabled. A `RemoveAnalyzer` of an analyzer an index still uses and a `DropTable`
-of a table a view reads raise `ValueError` before any change on every line (SurrealDB 2.x would accept them, then
-refuse every write). The embedded engine behaves as a 2.x server and applies each migration atomically too
-([embedded table](compatibility.md#orm-behaviour-the-embedded-engine)); the [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) lists
-the differences.
+The same migration applies on SurrealDB 2.x, 3.x, 4.x and the embedded engine: the statements that differ are chosen
+when they are applied. A full-text `CreateIndex` writes `FULLTEXT` on 3.x, 4.x and the embedded engine, and `SEARCH`
+on 2.x. On SurrealDB 2.x, an `AddField` or `AlterField` of an `any` column of a `SCHEMAFULL` table writes `FLEXIBLE`,
+and an `AlterTable` that makes a table `SCHEMAFULL` also redefines its `any` columns, untyped lists and lists of
+sub-models `FLEXIBLE` in the same transaction, so their object values are kept (3.x and 4.x keep them without it).
+Those columns are the database's: `migrate()` and `rollback()` render from the database's schema with the migrations
+replayed, while `show_sql()` renders from the migration files alone, so on 2.x `migrate()`'s batch may also redefine
+`FLEXIBLE` columns defined outside migrations that `show_sql(line=2)` does not show. When the database's definition
+of a table cannot be read entirely, and the `FLEXIBLE` clauses of such an `AlterTable`, or of a field holding `any` or
+a list of objects, would be chosen from that reading, `migrate()` and `rollback()` raise `SurrealDbError` on that line
+before any change (`DatabaseIntrospector().introspect().issues` lists what could not be read).
+`DefineEvent(async_mode=True)`, `DefineAccess(with_refresh=True)` and `COMPUTED` fields need SurrealDB 3.x or 4.x: on
+2.x they raise `SurrealDbError` before any change. `AddField(reference=True)` is left to the server: SurrealDB 2.x
+refuses it unless its `record_references` capability is enabled. A `RemoveAnalyzer` of an analyzer an index still
+uses and a `DropTable` of a table a view reads raise `ValueError` before any change on every line (SurrealDB 2.x would
+accept them, then refuse every write). Since v0.50.0 the embedded engine is a SurrealDB 4.0 core: it behaves as a 4.x
+server and applies each migration atomically too
+([embedded table](compatibility.md#orm-behaviour-the-embedded-engine)); the
+[2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) lists the differences.
+
+#### SurrealDB 4.x: changing a field on a populated table
+
+SurrealDB 4.x creates its databases at compatibility level 4. At that level, on a `SCHEMAFULL` table that holds rows,
+a field can only be redefined with a type that accepts every value the old type accepted, and a new field must accept
+`NONE`: from `int`, `AlterField` to `"string"` is refused, to `"int | string"` or `"option<int>"` accepted;
+`AddField` of a `"string"` field is refused, of an `"option<string>"` one accepted; `DEFAULT`, `DEFAULT ALWAYS` and
+`VALUE` do not change that. Empty tables, `SCHEMALESS` tables and databases defined `COMPATIBILITY 3` are not subject
+to the rule, and SurrealDB 2.x and 3.x apply every such change. The embedded engine follows the rule too.
+
+`migrate()` and `rollback()` raise `FieldChangeRefusedError` for such a change: refused inside the migration's
+transaction, before the field change runs; nothing is applied (the analyzers committed first are restored, as for any
+other refusal). It is a `MigrationStatementError` exported from `surreal_orm_lite.migrations`; its `table` and `field`
+attributes name the field (its dotted path for a nested one), next to `migration`, `operation`, `description` and
+`analyzers_restored`. The check is one `SELECT` of a row of the table, its name bound, inside the migration's
+transaction. A change the ORM cannot judge (`array<int>` to `array<string>`, `record<a>` to `record<b>`, a `number`
+field redefined as `int | float | decimal`) is left to the server, whose refusal raises the same error. A `RawSQL`
+whose own `DEFINE FIELD` the server refuses stays a `MigrationStatementError` carrying the server's reason, and
+`define_table(overwrite=True)` and the other schema-sync paths keep the server's refusal: change such a field with a
+migration.
+
+Write the change as a `RawSQL` that converts the existing rows, with `state_operations` describing the result. With
+SurrealDB 4.x's own clause (its text is 4.x-only, a parse error on 2.x and 3.x: keep such a migration for 4.x
+databases); a new required field is written the same way, `DEFINE FIELD nickname ON person TYPE string MIGRATE
+EXISTING ROWS AS fill USING '' FALLBACK ''`:
+
+```python
+from surreal_orm_lite.migrations import AlterField, RawSQL
+
+age_as_text = RawSQL(
+    "DEFINE FIELD OVERWRITE age ON person TYPE string MIGRATE EXISTING ROWS AS age_text USING <string> $value FALLBACK '';",
+    state_operations=[AlterField(table="person", name="age", field_type="string")],
+)
+```
+
+The portable form runs on every line, in the migration's one transaction: the table is `SCHEMALESS` while the rows
+are converted (restate its other clauses, which `OVERWRITE` resets):
+
+```python
+age_as_text_on_every_line = RawSQL(
+    "DEFINE TABLE OVERWRITE person SCHEMALESS; "
+    "DEFINE FIELD OVERWRITE age ON person TYPE string; "
+    "UPDATE person SET age = <string> age; "
+    "DEFINE TABLE OVERWRITE person SCHEMAFULL;",
+    state_operations=[AlterField(table="person", name="age", field_type="string")],
+)
+```
+
+A `MigrateRows` operation that writes `MIGRATE EXISTING ROWS` for you is planned for v0.56.0.
 
 ### Limits
 
@@ -262,8 +311,10 @@ the differences.
   `from_db=True` they are read and kept).
 - `migrate()` and `rollback()` read the schema once, before their first change, so a definition another client
   changes meanwhile is not seen.
-- On SurrealDB 2.x and the embedded engine, `show_sql()` shows the statements rendered from the migration files, and
-  `migrate()`'s batch may hold more `FLEXIBLE` redefinitions (see "Server lines").
+- On SurrealDB 2.x, `show_sql()` shows the statements rendered from the migration files, and `migrate()`'s batch may
+  hold more `FLEXIBLE` redefinitions (see "Server lines").
+- On SurrealDB 4.x, a field change on a populated `SCHEMAFULL` table may raise `FieldChangeRefusedError` (see
+  "SurrealDB 4.x: changing a field on a populated table" under "Server lines").
 - Functions are not compared and there is no squashing; the command line is in [section 40](cli.md#40-command-line-surreal-orm-lite).
 
 ### Coming from the full SurrealDB-ORM

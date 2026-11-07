@@ -73,6 +73,7 @@ from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import _KEEP_LIMIT, _KEEP_MAX_DEPTH, PLAIN_CONTENT, build_filter_condition, replace_content
 from tests._readme_tables import assert_server_header_sentence, assert_server_rows
 from tests._readme_tables import doc_part as _doc_part
+from tests._readme_tables import table_rows as _shared_table_rows
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_model_auth import AUTH_PASSWORD, _connect, _unique_email
@@ -3919,10 +3920,11 @@ def _normalised(text: str) -> str:
 
 
 def _behaviour_rows() -> list[tuple[str, list[str]]]:
-    """Each row of the "ORM behaviour: SurrealDB 2.x vs 3.x" table: its raw line and its cells."""
-    table = _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x")
-    lines = [line.strip() for line in table.splitlines() if line.startswith("|")]
-    return [(line, [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip("|"))]) for line in lines[2:]]
+    """Each row of the "ORM behaviour: SurrealDB 2.x, 3.x and 4.x" table: its raw line and its cells, the 4.x cell
+    left out as :func:`tests._readme_tables.table_rows` does."""
+    return [
+        (line.strip(), cells) for line, cells in _shared_table_rows(_doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"))
+    ]
 
 
 def _v0_23_0_rows() -> list[tuple[str, list[str]]]:

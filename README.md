@@ -1,16 +1,16 @@
 # Surreal ORM Lite
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![SurrealDB](https://img.shields.io/badge/SurrealDB-2.7.0%20%7C%203.3.5-purple)
-![SDK](https://img.shields.io/badge/SDK-Official%202.0-green)
+![SurrealDB](https://img.shields.io/badge/SurrealDB-2.7.0%20%7C%203.3.5%20%7C%204.0.0-purple)
+![SDK](https://img.shields.io/badge/SDK-Official%203.0-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![codecov](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite/graph/badge.svg)](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite)
 
 **Surreal ORM Lite** is a lightweight, Django-style ORM for [SurrealDB](https://surrealdb.com/) that uses the **official SurrealDB Python SDK**. It provides a simple and intuitive interface for database operations with full async support and Pydantic validation.
 
-- **Official SDK only**: built on `surrealdb[pydantic]`, no custom protocol, few dependencies.
-- **Two server lines**: the same code runs on SurrealDB **2.x and 3.x**, and on the SDK's in-process engine
-  (`mem://`, `surrealkv://`) for tests and notebooks.
+- **Official SDK only**: built on `surrealdb[pydantic]` 3.0, no custom protocol, few dependencies.
+- **Three server lines**: the same code runs on SurrealDB **2.x, 3.x and 4.x**, and on the SDK's in-process engine
+  (`mem://`, `surrealkv://`, with the `[embedded]` extra) for tests and notebooks.
 - **Django-style queries**: `filter(age__gte=18)`, `Q` objects, `order_by("-age")`, aggregations, subqueries.
 - **SurrealDB-native**: graph relations and typed edges, live queries, change feeds, time travel, full-text, vector
   and hybrid search, events, views and schema DDL.
@@ -28,14 +28,16 @@
 pip install surreal-orm-lite
 # or
 uv add surreal-orm-lite
+# with the SDK's in-process engine (mem://, surrealkv://) and the testing helpers
+pip install "surreal-orm-lite[embedded]"
 ```
 
-| Dependency   | Version                                                      |
-| ------------ | ------------------------------------------------------------ |
-| Python       | 3.11+ (tested on 3.11 to 3.15)                               |
-| SurrealDB    | 2.6.x / 2.7.x or 3.2.x / 3.3.x, or the SDK's embedded engine |
-| Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0                            |
-| Pydantic     | >=2.13.4                                                     |
+| Dependency   | Version                                                                                   |
+| ------------ | ----------------------------------------------------------------------------------------- |
+| Python       | 3.11+ (tested on 3.11 to 3.15)                                                            |
+| SurrealDB    | 2.x / 3.x / 4.x (2.6, 2.7, 3.2, 3.3, 4.0), or the SDK's embedded engine with `[embedded]` |
+| Official SDK | surrealdb[pydantic]>=3.0.0,<4.0.0                                                         |
+| Pydantic     | >=2.13.4                                                                                  |
 
 ## Quick start
 
@@ -99,14 +101,14 @@ lists every QuerySet method and filter lookup.
 | [Migrations](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/migrations.md)                            | `makemigrations()`, operations, `MigrationExecutor`                                                        |
 | [Command line](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/cli.md)                                 | `surreal-orm-lite`: migrate, rollback, inspectdb, schemadiff, shell                                        |
 | [Testing](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/testing.md)                                  | `ModelFactory`, `Faker` and the pytest plugin                                                              |
-| [Compatibility](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md)                      | Tested versions and every behaviour that differs between SurrealDB 2.x, 3.x and the embedded engine        |
+| [Compatibility](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md)                      | Tested versions and every behaviour that differs between SurrealDB 2.x, 3.x, 4.x and the embedded engine   |
 
 The [documentation index](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/README.md) lists every section of the guides.
 
 ## Using with AI assistants
 
 The [guide for AI coding assistants](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/ai/CLAUDE.md)
-gives an assistant such as Claude Code the idioms, the 2.x/3.x differences and the common mistakes in one page,
+gives an assistant such as Claude Code the idioms, the 2.x/3.x/4.x differences and the common mistakes in one page,
 each example checked by the test suite. Download it into your project, then add the line `@docs/surreal-orm-lite.md`
 to your `CLAUDE.md` to import it:
 
@@ -119,81 +121,92 @@ find every guide listed there.
 
 ## Features
 
-| Feature                                                                       | Status |
-| ----------------------------------------------------------------------------- | ------ |
-| Async/await support                                                           | ✅     |
-| Pydantic validation                                                           | ✅     |
-| CRUD operations                                                               | ✅     |
-| QuerySet with filters                                                         | ✅     |
-| Django-style lookups                                                          | ✅     |
-| Custom primary keys                                                           | ✅     |
-| HTTP connections                                                              | ✅     |
-| WebSocket connections                                                         | ✅     |
-| Aggregations                                                                  | ✅     |
-| GROUP BY                                                                      | ✅     |
-| Model Signals                                                                 | ✅     |
-| Raw SurrealQL queries                                                         | ✅     |
-| Q Objects (OR/AND/NOT)                                                        | ✅     |
-| Parameterized filters                                                         | ✅     |
-| Bulk operations                                                               | ✅     |
-| `-field` ordering                                                             | ✅     |
-| Relations & Graph                                                             | ✅     |
-| FETCH clause                                                                  | ✅     |
-| Transactions (`tx=`)                                                          | ✅     |
-| upsert / get_or_create                                                        | ✅     |
-| patch / atomic ops                                                            | ✅     |
-| Retry on conflict                                                             | ✅     |
-| Server-side functions                                                         | ✅     |
-| Computed fields                                                               | ✅     |
-| Stored `fn::` calls                                                           | ✅     |
-| JWT / record auth                                                             | ✅     |
-| Model-level auth mixin                                                        | ✅     |
-| Field aliases & DX                                                            | ✅     |
-| Live queries (raw)                                                            | ✅     |
-| Typed live queries                                                            | ✅     |
-| Live auto-resubscribe                                                         | ✅     |
-| Change feeds (CDC)                                                            | ✅     |
-| Typed edges (`insert_relation`)                                               | ✅     |
-| Custom table name                                                             | ✅     |
-| Rich field types (datetime, date, duration, decimal, uuid, bytes, set, range) | ✅     |
-| Geospatial fields (nearby, distance, spatial lookups)                         | ✅     |
-| Embedded engine (mem://, surrealkv://) & test fixtures                        | ✅     |
-| Time travel (`as_of()`, versioned storage)                                    | ✅     |
-| Subqueries (`Subquery`, a QuerySet as a filter value)                         | ✅     |
-| Query cache (`cache()`, TTL, invalidated by ORM writes)                       | ✅     |
-| Multiple databases (named connections, `using()`)                             | ✅     |
-| Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)    | ✅     |
-| Server-side events & function DDL (`Event`, `define_function()`)              | ✅     |
-| Materialized views (`view_query`, `define_view()`, read-only)                 | ✅     |
-| Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)    | ✅     |
-| Model table DDL (`define_table()`, `schema_mode`, `permissions`)              | ✅     |
-| Full-text search (`search()`, BM25 score and highlights)                      | ✅     |
-| Vector search (`similar_to()`, KNN, HNSW indexes)                             | ✅     |
-| Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)                     | ✅     |
-| Migrations (makemigrations / migrate / rollback)                              | ✅     |
-| Command line (`surreal-orm-lite`: migrations, inspectdb, shell)               | ✅     |
-| Test data factories (`ModelFactory`, `Faker`) & pytest plugin                 | ✅     |
+| Feature                                                                                                                                       | Status |
+| --------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| Async/await support                                                                                                                           | ✅     |
+| Pydantic validation                                                                                                                           | ✅     |
+| CRUD operations                                                                                                                               | ✅     |
+| QuerySet with filters                                                                                                                         | ✅     |
+| Django-style lookups                                                                                                                          | ✅     |
+| Custom primary keys                                                                                                                           | ✅     |
+| HTTP connections                                                                                                                              | ✅     |
+| WebSocket connections                                                                                                                         | ✅     |
+| Aggregations                                                                                                                                  | ✅     |
+| GROUP BY                                                                                                                                      | ✅     |
+| Model Signals                                                                                                                                 | ✅     |
+| Raw SurrealQL queries                                                                                                                         | ✅     |
+| Q Objects (OR/AND/NOT)                                                                                                                        | ✅     |
+| Parameterized filters                                                                                                                         | ✅     |
+| Bulk operations                                                                                                                               | ✅     |
+| `-field` ordering                                                                                                                             | ✅     |
+| Relations & Graph                                                                                                                             | ✅     |
+| FETCH clause                                                                                                                                  | ✅     |
+| Transactions (`tx=`)                                                                                                                          | ✅     |
+| upsert / get_or_create                                                                                                                        | ✅     |
+| patch / atomic ops                                                                                                                            | ✅     |
+| Retry on conflict                                                                                                                             | ✅     |
+| Server-side functions                                                                                                                         | ✅     |
+| Computed fields                                                                                                                               | ✅     |
+| Stored `fn::` calls                                                                                                                           | ✅     |
+| JWT / record auth                                                                                                                             | ✅     |
+| Model-level auth mixin                                                                                                                        | ✅     |
+| Field aliases & DX                                                                                                                            | ✅     |
+| Live queries (raw)                                                                                                                            | ✅     |
+| Typed live queries                                                                                                                            | ✅     |
+| Live auto-resubscribe                                                                                                                         | ✅     |
+| Change feeds (CDC)                                                                                                                            | ✅     |
+| Typed edges (`insert_relation`)                                                                                                               | ✅     |
+| Custom table name                                                                                                                             | ✅     |
+| Rich field types (datetime, date, duration, decimal, uuid, bytes, set, range)                                                                 | ✅     |
+| Geospatial fields (nearby, distance, spatial lookups)                                                                                         | ✅     |
+| Embedded engine (mem://, surrealkv://) & test fixtures                                                                                        | ✅     |
+| Time travel (`as_of()`, versioned storage)                                                                                                    | ✅     |
+| Subqueries (`Subquery`, a QuerySet as a filter value)                                                                                         | ✅     |
+| Query cache (`cache()`, TTL, invalidated by ORM writes)                                                                                       | ✅     |
+| Multiple databases (named connections, `using()`)                                                                                             | ✅     |
+| Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)                                                                    | ✅     |
+| Server-side events & function DDL (`Event`, `define_function()`)                                                                              | ✅     |
+| Materialized views (`view_query`, `define_view()`, read-only)                                                                                 | ✅     |
+| Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)                                                                    | ✅     |
+| Model table DDL (`define_table()`, `schema_mode`, `permissions`)                                                                              | ✅     |
+| Full-text search (`search()`, BM25 score and highlights)                                                                                      | ✅     |
+| Vector search (`similar_to()`, KNN, HNSW indexes)                                                                                             | ✅     |
+| Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)                                                                                     | ✅     |
+| Migrations (makemigrations / migrate / rollback)                                                                                              | ✅     |
+| Command line (`surreal-orm-lite`: migrations, inspectdb, shell)                                                                               | ✅     |
+| Test data factories (`ModelFactory`, `Faker`) & pytest plugin                                                                                 | ✅     |
+| Official SDK 3.0 & SurrealDB 4.x ([migration note](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/migrating-to-0.50.md)) | ✅     |
 
 ## Supported versions
 
-Surreal ORM Lite runs on **both** SurrealDB release lines, 2.x (2.6 / 2.7) and 3.x (3.2 / 3.3), and on the official
-SDK's in-process engine. It is tested against SurrealDB **v2.7.0** and **v3.3.5**; SurrealDB
-3.1.5 is run as a backward-compatibility check. A few capabilities rely on server features introduced in SurrealDB
-3.x: on 2.x the ORM degrades gracefully or says so before sending anything. The
-[compatibility guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md) lists every tested version and every difference between the two lines
-and the embedded engine.
+| ORM version | Official SDK                        | SurrealDB lines | Status                          |
+| ----------- | ----------------------------------- | --------------- | ------------------------------- |
+| `0.50.x`    | `surrealdb[pydantic]>=3.0.0,<4.0.0` | 2.x, 3.x, 4.x   | current                         |
+| `0.40.x`    | `surrealdb[pydantic]>=2.0.0,<3.0.0` | 2.x, 3.x        | deprecated, security fixes only |
+
+The ORM's minor series follows the SDK major, and the ORM supports exactly the SurrealDB versions the SDK supports,
+from the ORM version that adopts that SDK. It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.0**, and
+on the SDK's in-process engine (a SurrealDB 4.0 core); SurrealDB 3.1.5 is run as a backward-compatibility check. A
+few capabilities rely on server features introduced in SurrealDB 3.x: on 2.x the ORM degrades gracefully or says so
+before sending anything. The [compatibility guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md) lists every tested version and every
+difference between the three lines and the embedded engine.
+
+**Upgrading from 0.40.x**: 0.50.0 moves to the official SDK 3.0, so multi-statement raw queries, the client of
+`get_client()`, the order of `first()` and the embedded engine change; the
+[migration note](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/migrating-to-0.50.md) shows each change. To stay on SDK 2.0, pin
+`pip install "surreal-orm-lite<0.50"`.
 
 ## SurrealDB-ORM-lite vs SurrealDB-ORM
 
 This project prioritizes **stability and compatibility** with the official SurrealDB Python SDK. The full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) uses a custom SDK for advanced features.
 
 Both projects target the same feature set; the difference is **how** (official SDK vs custom
-SDK) and **server support**. Everything below is on the lite roadmap via the official SDK 2.0
+SDK) and **server support**. Everything below is on the lite roadmap via the official SDK 3.0
 — only the custom-SDK internals stay exclusive to the full ORM; the official SDK's in-process engine (section 26) is lite-only.
 
 | Feature                       | ORM-lite (official SDK)                                               | ORM (custom SDK)                          |
 | ----------------------------- | --------------------------------------------------------------------- | ----------------------------------------- |
-| Supported SurrealDB           | **2.6/2.7 + 3.2/3.3**                                                 | 3.x only                                  |
+| Supported SurrealDB           | **2.6/2.7 + 3.2/3.3 + 4.0**                                           | 3.x only                                  |
 | CRUD & QuerySet               | ✅                                                                    | ✅                                        |
 | Aggregations & GROUP BY       | ✅                                                                    | ✅                                        |
 | Model Signals                 | ✅                                                                    | ✅                                        |
@@ -235,12 +248,12 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Hybrid Search (RRF)           | ✅ v0.37.0 (`hybrid_search()`)                                        | ✅                                        |
 | Migrations & CLI              | ✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)                             | ✅                                        |
 | Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; ✅ v0.40.0 factories                       | ✅                                        |
-| Retry, Logging, Metrics       | v0.41.0                                                               | ✅                                        |
+| Retry, Logging, Metrics       | v0.51.0 (reconnect), v0.59.0 (logging, metrics)                       | ✅                                        |
 | Connection Pool               | post-GA (tentative)                                                   | ✅                                        |
 | Custom SDK / CBOR Protocol    | ❌ never                                                              | ✅                                        |
 
 **Choose ORM-lite** if you want the official SDK, minimal dependencies, support for SurrealDB
-2.x (2.6 / 2.7) **and** 3.x (3.2 / 3.3), and a full feature roadmap built entirely on the official SDK.
+2.x (2.6 / 2.7), 3.x (3.2 / 3.3) **and** 4.x (4.0), and a full feature roadmap built entirely on the official SDK.
 
 **Choose ORM** if you need the custom-SDK internals (CBOR protocol, native connection pool)
 or those features available today rather than on the roadmap.
@@ -250,9 +263,10 @@ or those features available today rather than on the roadmap.
 
 ## Project status
 
-Surreal ORM Lite is in **alpha** (0.x): every Tier 1 to Tier 3 feature of the roadmap has shipped, and the next
-release, v0.41.0, opens the **beta** phase (API freeze and hardening) on the way to GA as v2.0.0, numbered after the
-official SDK 2.0. The [release overview](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/README.md#roadmap) lists every release, and
+Surreal ORM Lite is in **alpha** (0.x): every Tier 1 to Tier 3 feature of the roadmap has shipped, and v0.50.0 moved
+it to the official SDK 3.0 and SurrealDB 4.x. The SDK 3.0 features come next, v0.51.0 to v0.58.0, then the **beta**
+phase (API freeze and hardening) in v0.59.0, on the way to GA as v3.0.0, numbered after the official SDK 3.0. The
+[release overview](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/README.md#roadmap) lists every release, and
 [docs/ROADMAP.md](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/ROADMAP.md) details each one.
 
 ## Contributing

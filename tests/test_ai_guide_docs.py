@@ -37,7 +37,7 @@ SECTIONS = [
     "Models and idioms",
     "Querying",
     "Writing data and transactions",
-    "SurrealDB 2.x vs 3.x",
+    "SurrealDB 2.x, 3.x and 4.x",
     "Common mistakes",
     "Errors to catch",
     "Testing",

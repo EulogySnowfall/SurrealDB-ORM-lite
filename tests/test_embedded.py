@@ -3070,7 +3070,7 @@ class TestReadmeEmbeddedWording:
             "In-process databases",
             "One engine per process",
             "What the embedded engine does not do",
-            "Its SurrealQL is the 2.x line",
+            "Its SurrealQL is the 4.x line",
             "Identity on the embedded engine",
             "Test fixtures",
             "Coming from the full SurrealDB-ORM",
@@ -3081,7 +3081,7 @@ class TestReadmeEmbeddedWording:
         firsts = [cells[0] for _, cells in rows]
         for scheme in ("mem://", "memory://", "surrealkv://", "surrealkv+versioned://", "file://", "rocksdb://"):
             assert any(scheme in first for first in firsts), scheme
-        assert "`memory`" not in firsts, "a bare memory is refused by SDK 2.0.0"
+        assert "`mem://`, `memory://`, `memory`" in firsts, "a bare memory is accepted by SDK 3.0 (v0.50.0)"
         [file_row] = [cells for _, cells in rows if "file://" in cells[0]]
         assert "SurrealKV" in file_row[1], file_row
         [rocksdb] = [cells for _, cells in rows if "rocksdb://" in cells[0]]
@@ -3090,7 +3090,7 @@ class TestReadmeEmbeddedWording:
         assert all(cells[1].startswith("✅") for _, cells in rows if cells is not rocksdb), rows
         assert all(cells[2].startswith("❌") for _, cells in rows), "the full SurrealDB-ORM has no embedded engine"
         sentence = _normalised(_section_26())
-        assert "A bare `memory` (no `://`) is refused by SDK 2.0.0 and accepted by the SDK 3.0 line" in sentence
+        assert "A bare `memory` (no `://`) is accepted too (SDK 2.0.0 refused it)" in sentence
         assert "keeps no list of embedded schemes" in sentence
 
     def test_section_26_tables_have_no_raw_pipe_in_a_cell(self) -> None:
@@ -3103,7 +3103,7 @@ class TestReadmeEmbeddedWording:
     def test_closed_client_rule_and_concurrency_advice(self) -> None:
         section = _section_26()
         engine = _normalised(_subsection("### One engine per process", section))
-        assert "closing does not stop an in-process engine" in engine and "`del client`" in engine
+        assert "Since v0.50.0 (SDK 3.0) closing stops the engine" in engine and "`del client`" in engine
         assert "Never open one path from two processes" in engine
         fixtures = _normalised(_subsection("### Test fixtures", section))
         assert "`DEFINE TABLE`" in fixtures and "@retry_on_conflict()" in fixtures, fixtures
@@ -3143,7 +3143,12 @@ class TestReadmeEmbeddedWording:
         that keeps its widths and its catch-all last row (later releases add their rows in version order)."""
         part = _doc_part(_EMBEDDED_BEHAVIOUR)
         [lines] = _tables(part)
-        assert _cells(lines[0]) == ["ORM capability", "Embedded engine (SDK 2.0.0)", "Servers (2.x and 3.x)", "Since"]
+        assert _cells(lines[0]) == [
+            "ORM capability",
+            "Embedded engine (SDK 3.0, SurrealDB 4.0 core)",
+            "Servers (2.x, 3.x and 4.x)",
+            "Since",
+        ]
         rows = [cells for _, cells in _table_rows(part)]
         assert all(len(cells) == 4 for cells in rows), rows
         assert release(rows[0][3]) == (0, 25, 0), rows[0]
@@ -3166,7 +3171,7 @@ class TestReadmeEmbeddedWording:
             assert row in firsts, row
 
     def test_behaviour_tables_point_to_each_other(self) -> None:
-        header = _normalised(_doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
+        header = _normalised(_doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x").split("\n|", 1)[0])
         assert "(#orm-behaviour-the-embedded-engine)" in header, header
         assert "(embedded.md#26-embedded-engine-and-test-fixtures)" in _doc_part(_EMBEDDED_BEHAVIOUR)
 
@@ -3176,7 +3181,11 @@ class TestReadmeEmbeddedWording:
         requirements = [cells for _, cells in _table_rows(_doc_part("## Requirements"))]
         assert any(cells[0] == "SurrealDB" and "the SDK's embedded engine" in cells[1] for cells in requirements)
         compatibility = [cells for _, cells in _table_rows(_doc_part("# Compatibility"))]
-        assert ["Embedded engine (SDK 2.0.0: SurrealDB 2.3.10 core)", "2.0", "✅ Tested (in-process)"] in compatibility
+        assert [
+            "Embedded engine (SDK 3.0.0: SurrealDB 4.0.0 core)",
+            "3.0",
+            "✅ Tested (in-process, `[embedded]`)",
+        ] in compatibility
         features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         assert ["Embedded engine (mem://, surrealkv://) & test fixtures", "✅"] in features, features
         roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
@@ -3225,7 +3234,7 @@ class TestReadmeEmbeddedWording:
         raw_note = roadmap.split("\n### Embedded URLs\n", 1)[1].split("\n## ", 1)[0]
         note = _normalised(raw_note)
         assert "The full SurrealDB-ORM has no embedded engine (HTTP/WebSocket only)" in note
-        assert "SurrealDB core 2.3.10 with SDK 2.0.0" in note
+        assert "SurrealDB core 4.0.0 with SDK 3.0.0" in note and "SurrealDB core 2.3.10 with SDK 2.0.0" in note
         assert (_RELEASED_FIXTURES_NOTE_40 if released_40 else _PLANNED_FIXTURES_NOTE_40) in note, note
         rows = _table_rows(raw_note, "Embedded URL")
         firsts = [cells[0] for _, cells in rows]

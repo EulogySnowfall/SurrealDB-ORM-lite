@@ -2,6 +2,11 @@
 
 The QuerySet: filters and lookups, `Q` objects, `FETCH`, aggregations, time travel, subqueries and the query cache.
 
+> **The embedded engine since v0.50.0** is a SurrealDB 4.0 core (SDK 3.0), and the ORM treats it as a 4.x
+> server. Where a passage below groups "SurrealDB 2.x and the embedded engine", it describes the SDK 2.0 engine
+> of `0.40.x` (a 2.3.10 core); the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) lists what the
+> engine does now.
+
 ## 4. QuerySet Methods
 
 ```python
@@ -68,8 +73,35 @@ as `"10"`, a `float`, `None` — raises `TypeError`, and a negative one or one a
 (SurrealQL's largest integer) `ValueError`, naming the method and the value, when `limit()` or
 `offset()` is called, before any request; the value in place is kept. The same holds wherever the
 queryset is read: `exec()`, `first()`, `get()`, `values(…).annotate(…)`, `cache()`, `as_of()` and
-a subquery. The server may still refuse a large value when the read runs: SurrealDB 2.x and the
-embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads it.
+a subquery. The server may still refuse a large value when the read runs: SurrealDB 2.x, 4.x and
+the embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads it.
+
+### Order of `first()` and of pages
+
+```python
+oldest = await User.objects().order_by("-age").first()  # your order: kept as written
+smallest_id = await User.objects().filter(age__gt=17).first()  # 3.x and 4.x: ORDER BY id
+page = await User.objects().order_by("name").limit(10).offset(20).exec()  # a page in a stated order
+```
+
+Since v0.50.0, on SurrealDB 3.x, 4.x and the embedded engine, a `first()` whose statement has no order of its own
+ends with `ORDER BY id`: it returns the matching record with the smallest id, a filter on an indexed field or a
+`search()` included. These keep their own order: `order_by()` (a score or `_knn_distance` included), `similar_to()`
+(nearest first), `hybrid_search()` and the `values()`/`annotate()` aggregations. `filter()`, `exclude()`, `Q`,
+`nearby()`, `search()` without `order_by()`, `select()`, `fetch()`, a subquery and `as_of()` get the clause. On
+SurrealDB 2.x the statement is unchanged and `first()` returns the server's first row, as before: server order: id
+order for a plain scan, index order for an indexed filter. The two forms never share a `cache()` entry.
+
+The clause costs nothing on a table scan or on an equality filter on an index, and a sort of the matches on a range
+filter over an indexed field. Measured with the ORM on 60 000 rows (best of three; SurrealDB 3.3.5, 4.0.0 and the
+embedded engine): a scan `first()` 1.1, 1.5 and 0.9 ms; an equality on an indexed field 2.7, 1.5 and 1.0 ms; a range
+on an indexed field matching 1 000 rows 3.2, 3.3 and 4.7 ms; one matching 59 900 rows 91.9, 90.2 and 189.5 ms, against
+2.9, 1.5 and 1.5 ms with `order_by()` on the indexed field. When the indexed field's order is the one you want,
+`order_by()` on the indexed field avoids the sort.
+
+`all()`, `values()`, `exec()` and `limit()`/`offset()` pages without `order_by()` are unordered: SurrealDB 4.x returns
+rows in no fixed order without `ORDER BY`, and an indexed filter returns index order on every line. Add `order_by()`
+to page deterministically.
 
 ## Supported Filter Lookups
 

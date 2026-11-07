@@ -58,32 +58,40 @@ def rules(primary: str, legacy: str, latest: str) -> list[tuple[str, str, str]]:
     Every pattern captures the surrounding literal text and rewrites just the version, so a
     rule can never rewrite an unrelated version-shaped string elsewhere in the file.
     """
-    p_major, l_major = primary.split(".")[0], legacy.split(".")[0]
+    p_major, l_major, n_major = primary.split(".")[0], legacy.split(".")[0], latest.split(".")[0]
     return [
+        # The badge and the "tested against" sentence name the three lines, oldest first (since v0.50.0).
         (
             "README badge",
-            r"(badge/SurrealDB-)\d+\.\d+\.\d+(%20%7C%20)\d+\.\d+\.\d+(-purple)",
-            rf"\g<1>{legacy}\g<2>{primary}\g<3>",
+            r"(badge/SurrealDB-)\d+\.\d+\.\d+(%20%7C%20)\d+\.\d+\.\d+(%20%7C%20)\d+\.\d+\.\d+(-purple)",
+            rf"\g<1>{legacy}\g<2>{primary}\g<3>{latest}\g<4>",
         ),
         (
             "'tested against' note",
-            r"(It is tested against SurrealDB \*\*v)\d+\.\d+\.\d+(\*\* and \*\*v)\d+\.\d+\.\d+(\*\*)",
-            rf"\g<1>{legacy}\g<2>{primary}\g<3>",
+            r"(It is tested against SurrealDB \*\*v)\d+\.\d+\.\d+(\*\*, \*\*v)\d+\.\d+\.\d+(\*\* and \*\*v)"
+            r"\d+\.\d+\.\d+(\*\*)",
+            rf"\g<1>{legacy}\g<2>{primary}\g<3>{latest}\g<4>",
         ),
         (
             "function-catalog coverage",
             r"(member is tested against SurrealDB )\d+\.\d+\.\d+( and )\d+\.\d+\.\d+",
             rf"\g<1>{legacy}\g<2>{primary}",
         ),
+        # One row per line, each on SDK 3.0 (since v0.50.0).
         (
             "compatibility table (primary)",
-            rf"(\|\s*){p_major}\.\d+\.\d+(\s*\|\s*2\.0\s*\|\s*✅ Tested)",
+            rf"(\|\s*){p_major}\.\d+\.\d+(\s*\|\s*3\.0\s*\|\s*✅ Tested)",
             rf"\g<1>{primary}\g<2>",
         ),
         (
             "compatibility table (legacy)",
-            rf"(\|\s*){l_major}\.\d+\.\d+(\s*\|\s*2\.0\s*\|\s*✅ Tested)",
+            rf"(\|\s*){l_major}\.\d+\.\d+(\s*\|\s*3\.0\s*\|\s*✅ Tested)",
             rf"\g<1>{legacy}\g<2>",
+        ),
+        (
+            "compatibility table (latest)",
+            rf"(\|\s*){n_major}\.\d+\.\d+(\s*\|\s*3\.0\s*\|\s*✅ Tested)",
+            rf"\g<1>{latest}\g<2>",
         ),
         # Two columns, one per line — anchor on the major or the primary rule rewrites the
         # 2.6.x cell and silently corrupts the table.

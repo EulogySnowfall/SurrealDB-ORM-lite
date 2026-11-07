@@ -64,3 +64,28 @@ def test_repository_is_in_sync_with_the_pins() -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "v4" in (ROOT / ".github" / "workflows" / "ci.yml").read_text().split("surrealdb-version: [")[1].split("]")[0]
+
+
+def _rule(name: str) -> tuple[str, str]:
+    script = _load_script()
+    (rule,) = [r for r in script.rules("3.3.5", "2.7.0", "4.0.0") if r[0] == name]
+    return rule[1], rule[2]
+
+
+def test_the_badge_and_the_tested_note_name_the_three_lines() -> None:
+    """v0.50.0: the README badge and the "tested against" sentence restate the three pins, oldest line first."""
+    pattern, replacement = _rule("README badge")
+    badge = "badge/SurrealDB-2.6.0%20%7C%203.3.0%20%7C%204.0.1-purple"
+    assert re.sub(pattern, replacement, badge) == "badge/SurrealDB-2.7.0%20%7C%203.3.5%20%7C%204.0.0-purple"
+    pattern, replacement = _rule("'tested against' note")
+    note = "It is tested against SurrealDB **v2.6.0**, **v3.3.0** and **v4.0.1**"
+    assert re.sub(pattern, replacement, note) == "It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.0**"
+
+
+def test_the_compatibility_table_rules_cover_the_three_lines_on_sdk_3() -> None:
+    """The tested-versions table of ``docs/compatibility.md`` has one SDK 3.0 row per line, each rewritten from its pin."""
+    table = "| 3.3.0 | 3.0 | ✅ Tested |\n| 2.6.0 | 3.0 | ✅ Tested |\n| 4.0.1 | 3.0 | ✅ Tested |\n"
+    for name in ("compatibility table (primary)", "compatibility table (legacy)", "compatibility table (latest)"):
+        pattern, replacement = _rule(name)
+        table = re.sub(pattern, replacement, table)
+    assert table == "| 3.3.5 | 3.0 | ✅ Tested |\n| 2.7.0 | 3.0 | ✅ Tested |\n| 4.0.0 | 3.0 | ✅ Tested |\n"

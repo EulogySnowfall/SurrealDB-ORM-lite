@@ -7333,12 +7333,12 @@ _S37_FILTERS = (
     "them in a `LET` first, which is slower: upgrade to SurrealDB 3.x for large tables."
 )
 _S37_SCORES = (
-    "On SurrealDB 3.x, search annotations (`SearchScore`, `SearchHighlight`, `SearchOffsets`) give each of the "
-    "nearest matches the score, highlight and offsets that the same `search()` gives it without `similar_to()`. "
-    "On SurrealDB 2.x and the embedded engine the ORM refuses them before the statement is sent, since there it "
+    "On SurrealDB 3.x, 4.x and the embedded engine, search annotations (`SearchScore`, `SearchHighlight`, "
+    "`SearchOffsets`) give each of the nearest matches the score, highlight and offsets that the same `search()` gives "
+    "it without `similar_to()`. On SurrealDB 2.x the ORM refuses them before the statement is sent, since there it "
     "selects the matches first and the vector search holds no match to score, highlight or locate; `count()`, "
     "`exists()` and the aggregations, which return no annotation, still answer. The examples run on the embedded "
-    "engine, which is why this one prints the refusal."
+    "engine, a SurrealDB 4.0 core since v0.50.0, so this one prints the annotations; on 2.x it prints the refusal."
 )
 _S37_APPROX = (
     "HNSW is approximate: with a condition that keeps few records, a search can return fewer than `limit` "
@@ -7390,7 +7390,7 @@ _PART_NEEDLES_37 = {
         "`Index(hnsw=True)`",
         "binds the query vector",
         "SurrealDB 2.x, 3.x and the embedded engine",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
         "`mem://`",
     ),
     "Declare and apply": (
@@ -7515,7 +7515,7 @@ _COMING_FROM_PHRASES_37 = (
     "does not write `VectorField` yet",
 )
 #: The search annotations' block (*With other conditions*): run on the embedded engine, it prints the ORM's refusal.
-_ANNOTATED_EXCEPT = "except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server"
+_ANNOTATED_EXCEPT = "except SurrealDbError as exc:  # SurrealDB 2.x: the ORM refuses the annotations"
 #: The term that block searches: found in fewer than half the section's documents, so its BM25 score is not 0.
 _ANNOTATED_TERM = "programming"
 _HEADER_SENTENCE_36 = (
@@ -7581,11 +7581,9 @@ _VECTOR_ROWS = [
 #: The row v0.36.0 adds to the embedded engine's table, cell by cell.
 _EMBEDDED_VECTOR_ROW = [
     "Vector search (v0.36.0)",
-    "as on a 2.x server: `MTREE` accepted, at most `ef` records returned (the ORM raises `ef` to `limit`), other "
-    "conditions selected first in a `LET` (search annotations refused), writes made by the ids of the nearest, "
-    "fewer records with a selective condition; an index without `TYPE` is `F64` (servers: `F32`), so the ORM "
-    "always writes `TYPE`",
-    "3.x refuses `MTREE`, applies the conditions during the index search and keeps search annotations",
+    "as on a 4.x server: `MTREE` refused, the conditions applied during the index search (next to a subquery's ids, "
+    "its `LET`s sent first), search annotations kept; an index without `TYPE` is `F32`",
+    "2.x accepts `MTREE` and selects the other conditions first",
     "v0.36.0",
 ]
 _FEATURES_ROW_37 = ["Vector search (`similar_to()`, KNN, HNSW indexes)", "✅"]
@@ -7712,13 +7710,14 @@ class TestReadmeSection37:
 
     def test_the_search_annotations_block(self) -> None:
         """*With other conditions*: one block annotates a ``SearchScore`` and a ``SearchHighlight`` next to
-        ``similar_to()`` inside ``try``, catching ``SurrealDbError`` on the embedded engine; what it prints is the
-        ORM's refusal for ``SearchScore``. The section's full-text index declares ``highlights=True``."""
+        ``similar_to()`` inside ``try``, catching ``SurrealDbError`` on SurrealDB 2.x; on the embedded engine (a 4.0
+        core since v0.50.0) it prints the annotated matches. The section's full-text index declares
+        ``highlights=True``."""
         [block] = [code for code in _readme_blocks(_part_37("With other conditions")) if "SearchScore(" in code]
         assert "similar_to(" in block and 'SearchHighlight("<b>", "</b>", 0)' in block, block
         assert f'search(title="{_ANNOTATED_TERM}")' in block, block
         assert re.search(rf"^{re.escape(_ANNOTATED_EXCEPT)}$", block, re.MULTILINE), block
-        assert _readme_printed(block)[0] == _VS1.format("SearchScore"), _readme_printed(block)
+        assert _readme_printed(block)[0].startswith("Rust programming Rust <b>programming</b> "), _readme_printed(block)
         assert "highlights=True" in "".join(_readme_blocks(_part_37("Declare and apply")))
 
     def test_limit_and_ef_within_the_range(self) -> None:
@@ -7782,7 +7781,7 @@ class TestReadmeSection37:
         """Every table v0.36.0 touches keeps one cell count per line and no escaped pipe; section 37 has no table."""
         parts = [
             _doc_part("## Features"),
-            _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"),
             _doc_part("## ORM behaviour: the embedded engine"),
             _doc_part("## Roadmap"),
             _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),

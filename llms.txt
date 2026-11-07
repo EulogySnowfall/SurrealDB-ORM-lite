@@ -1,12 +1,12 @@
 # Surreal ORM Lite
 
-> Surreal ORM Lite (`pip install surreal-orm-lite`, imported as `surreal_orm_lite`) is an async, Django-style ORM for SurrealDB with Pydantic models, built on the official SurrealDB Python SDK. The same code runs on SurrealDB 2.x, 3.x and the SDK's embedded engine (`mem://`, `surrealkv://`).
+> Surreal ORM Lite (`pip install surreal-orm-lite`, imported as `surreal_orm_lite`) is an async, Django-style ORM for SurrealDB with Pydantic models, built on the official SurrealDB Python SDK 3.0. The same code runs on SurrealDB 2.x, 3.x and 4.x, and on the SDK's embedded engine (`mem://`, `surrealkv://`, with the `[embedded]` extra).
 
-Every database call is a coroutine. Models subclass `BaseSurrealModel`; queries go through `Model.objects()` QuerySets with Django-style lookups and `Q` objects; values are always bound as SurrealQL parameters. Start with the guide for AI coding assistants: it holds the idioms, the 2.x/3.x differences and the common mistakes in one page.
+Every database call is a coroutine. Models subclass `BaseSurrealModel`; queries go through `Model.objects()` QuerySets with Django-style lookups and `Q` objects; values are always bound as SurrealQL parameters. Start with the guide for AI coding assistants: it holds the idioms, the 2.x/3.x/4.x differences and the common mistakes in one page.
 
 ## Docs
 
-- [Guide for AI coding assistants](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ai/CLAUDE.md): connection, models and idioms, 2.x vs 3.x, common mistakes, errors, testing
+- [Guide for AI coding assistants](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ai/CLAUDE.md): connection, models and idioms, 2.x, 3.x and 4.x, common mistakes, errors, testing
 - [README](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/README.md): overview, installation and quick start
 - [Documentation index](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/README.md): every guide and numbered section
 - [Getting started](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/getting-started.md): requirements, installation, connection, a first model and CRUD
@@ -25,7 +25,8 @@ Every database call is a coroutine. Models subclass `BaseSurrealModel`; queries 
 - [Migrations](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/migrations.md): makemigrations(), operations, MigrationExecutor
 - [Command line](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/cli.md): surreal-orm-lite migrate, rollback, inspectdb, schemadiff, shell
 - [Testing](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/testing.md): ModelFactory, Faker and the pytest plugin
-- [Compatibility](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/compatibility.md): tested versions and every behaviour that differs between SurrealDB 2.x, 3.x and the embedded engine
+- [Compatibility](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/compatibility.md): tested versions and every behaviour that differs between SurrealDB 2.x, 3.x, 4.x and the embedded engine
+- [Migrating to 0.50](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/migrating-to-0.50.md): from 0.40.x (the deprecated SDK 2.0 line) to the SDK 3.0 line: raw queries, get_client(), first() order, the embedded engine, 4.x migrations
 
 ## Optional
 

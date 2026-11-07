@@ -2,6 +2,11 @@
 
 Calling `fn::` stored functions, and defining server-side events and functions from Python.
 
+> **The embedded engine since v0.50.0** is a SurrealDB 4.0 core (SDK 3.0), and the ORM treats it as a 4.x
+> server. Where a passage below groups "SurrealDB 2.x and the embedded engine", it describes the SDK 2.0 engine
+> of `0.40.x` (a 2.3.10 core); the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) lists what the
+> engine does now.
+
 ## 17. Stored functions: `call_function()`
 
 Invoke a function declared server-side with `DEFINE FUNCTION fn::…`. Arguments are **bound as
@@ -122,8 +127,7 @@ declared next to the model, in `SurrealConfigDict(events=[…])`; the ORM writes
 quoted names and expressions checked for mistakes, applies them idempotently, and section 31's introspection reads
 them back ([section 31](schema.md#31-schema-introspection-databaseintrospector-generate_models_from_db)). The same code runs on
 SurrealDB 2.x, 3.x and the embedded engine; asynchronous events and `$input` are 3.x only. The examples assume a
-configured connection: they run as written on the embedded engine (`mem://`), a 2.x core, which is why the
-asynchronous example prints a refusal.
+configured connection: they run as written on the embedded engine (`mem://`), a SurrealDB 4.0 core since v0.50.0.
 
 ### Declaring events on a model
 
@@ -243,9 +247,11 @@ print(notify.ddl("shipment"))
 
 try:
     await SurrealDBConnectionManager.define_event(notify, "shipment")
-except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server
+except SurrealDbError as exc:  # SurrealDB 2.x cannot parse ASYNC
     print(exc)
-# ASYNC events need SurrealDB 3.x, and this connection runs the embedded engine (a SurrealDB 2.x core): 'notify_shipping' cannot be defined with async_mode=True. Drop async_mode, retry and max_depth, or connect to a SurrealDB 3.x server. Nothing was defined.
+else:  # SurrealDB 3.x, 4.x and the embedded engine (a SurrealDB 4.0 core)
+    print("defined")
+# defined
 ```
 
 - On SurrealDB 3.x an event with `async_mode=True` (`ASYNC`) runs after the write's transaction commits, never for a
@@ -256,8 +262,9 @@ except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a Surre
   deep a chain of asynchronous events may go, 3 by default; both take `0` to `65535` and need `async_mode=True`. Read
   back, an asynchronous event has `async_mode`, `retry` and `max_depth` set on its `EventState`, the defaults filled
   in.
-- On SurrealDB 2.x and the embedded engine, which cannot parse `ASYNC`, the ORM raises `SurrealDbError` before
-  sending anything: no event of the call is defined. `event.ddl()` renders an asynchronous event on any line.
+- On SurrealDB 2.x, which cannot parse `ASYNC`, the ORM raises `SurrealDbError` before sending anything: no event
+  of the call is defined. `event.ddl()` renders an asynchronous event on any line. The embedded engine (a SurrealDB
+  4.0 core since v0.50.0) defines it as a 3.x or 4.x server does.
 
 ### Stored functions: `define_function()`
 
@@ -338,7 +345,7 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
   record — which fires one `UPDATE` event.
 - Read back (section 31), each line renders the definitions its own way: on 3.x a block is one line and a single
   statement loses its `;`, on 2.x a block of several statements spans several lines; an optional parameter reads
-  `none | int` on 3.x and `option<int>` on 2.x. The [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) lists the
+  `none | int` on 3.x and `option<int>` on 2.x. The [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) lists the
   differences.
 
 ### Security

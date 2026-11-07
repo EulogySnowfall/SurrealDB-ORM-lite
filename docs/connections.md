@@ -50,6 +50,27 @@ the manager keeps one client for the whole process ([section 26](embedded.md#26-
 While it is configured, `close_connection()` closes that client only, not the loop's server client:
 `is_connected()` stays `True` on a loop that keeps one.
 
+### The clients the ORM builds
+
+Since v0.50.0 the clients are the official SDK 3.0's. The ORM builds a server client with the SDK's own reconnection,
+query streaming and token renewal off (`reconnect=False`, `streaming=False`, `renew_access=False`): it keeps its own
+reconnection and session replay, and spends a refresh token only when you ask. A WebSocket client gets no request
+timeout (`timeout=None`: a long migration or index build is not cut; a dead peer is still detected by the SDK's
+pings); an HTTP request keeps a 30-second deadline. The SDK's version check stays on: a server outside SurrealDB
+2.0.0 to 5.0.0 (excluded) raises `SurrealDbConnectionError` at connect time, naming its version.
+
+`get_client()` returns that SDK 3.0 client, for what the ORM does not cover. Its methods are the SDK's: `query()`
+returns one result per statement, `update(record).merge(…)` replaces `merge()`, and a plain `str` target is a table
+name ([migration note](migrating-to-0.50.md#the-client-of-get_client)). A client the ORM gave up refuses every request
+instead of reconnecting anonymously: after its WebSocket connection dropped, a kept client — an
+`InteractiveTransaction` begun before, a `LiveStream` — raises a retryable `SurrealDbConnectionError` (retry the call;
+the ORM opens a new client); after `close_connection()`, a new registration or `remove_connection()` it raises a
+non-retryable one (get a new client with `get_client()`).
+
+An HTTP answer is the server's answer: a status other than 408, 429, 502, 503 and 504 (a revoked token's 401, for
+example) is not a lost connection, so `reconnect()` over HTTP raises `SurrealDbAuthenticationError` for it; those five
+statuses are retryable connection failures.
+
 ## 30. Multiple databases (`add_connection()`, `using()`)
 
 Since v0.29.0 one process can work with several databases at once. Beside the default connection

@@ -5026,7 +5026,7 @@ _INTRO_NEEDLES_33 = (
     "idempotently",
     "every write of the model is refused",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
     "`mem://`",
 )
 _PART_NEEDLES_33 = {
@@ -5168,7 +5168,7 @@ _PART_NEEDLES_33 = {
         "keeping their last records",
         "surrealdb#7447",
         "`math::sum(amount ?? 0)`",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
     ),
     "Security": (
         "identifier",
@@ -5275,10 +5275,9 @@ _HEADER_SENTENCE_32 = (
 #: Spec §11.1 item 6: the row v0.32.0 adds to the embedded-engine table, cell by cell.
 _EMBEDDED_VIEWS_ROW = [
     "Materialized views (v0.32.0)",
-    "as on a 2.x server: `int` sums and `Decimal` means; in a grouped view, `math::stddev()`/`math::variance()`, an "
-    "expression around an aggregate, a field outside `GROUP BY` and a `GROUP BY` on an alias raise `SurrealDbError` "
-    "before any DDL; writes to a view refused by the ORM (the engine would accept them); no live queries",
-    "`float` sums and means on 3.x",
+    "as on a 4.x server: a sum of integers is an `int`; the grouped forms 3.x accepts are accepted; writes to a view "
+    "refused by the ORM; no live queries",
+    "`float` sums on 3.x; `int` sums of integers on 2.x and 4.x",
     "v0.32.0",
 ]
 #: Spec §11.1 item 7: section 31's generated-models bullet, whitespace normalised (v0.34.0's text: the table keys are

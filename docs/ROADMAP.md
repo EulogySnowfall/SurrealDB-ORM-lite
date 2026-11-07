@@ -3,8 +3,9 @@
 > Feature implementation roadmap inspired by [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM)
 >
 > **Main constraint**: every feature must be implementable with the official SDK
-> `surrealdb[pydantic]>=2.0.0,<3.0.0` (SurrealDB 3.x protocol) — **no custom SDK**. Features
-> with no native SDK method are reached through `query()`, which runs any SurrealQL (DDL included).
+> `surrealdb[pydantic]>=3.0.0,<4.0.0` (SurrealDB 2.x, 3.x and 4.x; since v0.50.0) — **no custom SDK**.
+> Features with no native SDK method are reached through `query()`, which runs any SurrealQL (DDL
+> included). The ORM supports exactly the SurrealDB versions the SDK supports.
 
 ---
 
@@ -49,26 +50,41 @@
 | v0.38.0           | Tier 3 — Migration system                           | Done    |
 | v0.39.0           | Tier 3 — Command line (`surreal-orm-lite`)          | Done    |
 | v0.40.0           | Tier 3 — Test fixtures & factories                  | Done    |
-| v0.41.0           | Beta Phase (API freeze, hardening)                  | Planned |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
-| v2.1.0+           | Future (post-GA)                                    | Future  |
+| v0.50.0           | Official SDK 3.0 and SurrealDB 4.x                  | Done    |
+| v0.51.0           | SDK 3.0 — Connection resilience ³                   | Planned |
+| v0.52.0           | SDK 3.0 — Typed errors, per-statement results ³     | Planned |
+| v0.53.0           | SDK 3.0 — Sessions and transaction options ³        | Planned |
+| v0.54.0           | SDK 3.0 — Streaming QuerySet iteration ³            | Planned |
+| v0.55.0           | SDK 3.0 — New field types ³                         | Planned |
+| v0.56.0           | SDK 3.0 — Schema evolution on 4.x ³                 | Planned |
+| v0.57.0           | SDK 3.0 — Files and buckets ³                       | Planned |
+| v0.58.0           | SDK 3.0 — Server endpoints, export/import ³         | Planned |
+| v0.59.0           | Beta Phase (API freeze, hardening)                  | Planned |
+| v3.0.0            | Production / GA (aligned with SDK 3.0)              | Planned |
+| v3.1.0+           | Future (post-GA)                                    | Future  |
 
-> **Versioning note**: the GA is numbered **v2.0.0** to mirror the official SurrealDB SDK 2.0
-> as a branding choice. This is **independent** of the dependency pin, which stays
-> `surrealdb[pydantic]>=2.0.0,<3.0.0`. The `1.x` line is intentionally skipped; the Future
-> track lives on `2.x`.
+> **Versioning note**: the ORM's minor series follows the official SDK's major — `0.40.x` is the
+> SDK 2.0 line (deprecated, security fixes only), `0.50.x` and later the SDK 3.0 line — and the
+> ORM supports exactly the SurrealDB versions that SDK supports, from the ORM version that adopts
+> it. The GA is numbered **v3.0.0** to mirror the official SurrealDB SDK 3.0; the `1.x` and `2.x`
+> lines are intentionally skipped, and the Future track lives on `3.x`.
+
+³ The eight SDK 3.0 feature epics, one release each: v0.51.0 #422 (native reconnect and token
+renewal), v0.52.0 #423, v0.53.0 #424, v0.54.0 #425, v0.55.0 #426 (sized numbers, calendar kinds,
+bigdecimal, regex), v0.56.0 #427 (named types and record migrations, `MigrateRows`), v0.57.0 #428,
+v0.58.0 #429 (`DEFINE API`, GraphQL, GQL). The Beta is #419.
 
 ---
 
 ## ⭐ Compatibility differentiator (lite vs full)
 
-A key advantage of ORM-lite: it runs on **both** major SurrealDB lines, while the full ORM
+A key advantage of ORM-lite: it runs on **three** SurrealDB lines, while the full ORM
 (custom SDK) targets 3.x only.
 
-| Project                               | Supported SurrealDB versions            |
-| ------------------------------------- | --------------------------------------- |
-| **SurrealDB-ORM-lite** (official SDK) | **2.x (2.6 / 2.7) and 3.x (3.2 / 3.3)** |
-| **SurrealDB-ORM** (custom SDK)        | **3.x only**                            |
+| Project                               | Supported SurrealDB versions                       |
+| ------------------------------------- | -------------------------------------------------- |
+| **SurrealDB-ORM-lite** (official SDK) | **2.x (2.6 / 2.7), 3.x (3.2 / 3.3) and 4.x (4.0)** |
+| **SurrealDB-ORM** (custom SDK)        | **3.x only**                                       |
 
 ---
 
@@ -115,22 +131,23 @@ pieces stay out.
 | Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`            | ✅ v0.38.0     |
 | CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                                 | ✅ v0.39.0     |
 | Test fixtures & factories              | `ModelFactory`, pytest fixtures                             | ✅ v0.40.0     |
-| QueryLogger / profiling                | wraps `query()` calls                                       | v0.41.0 (Beta) |
+| QueryLogger / profiling                | wraps `query()` calls                                       | v0.59.0 (Beta) |
 
 ¹ SDK 2.0.0 exposes **no** `run()`/`call()` method, so the call goes through `query()` with
 the bare form `fn::name($args);` — never `RETURN fn::name(…)`, which silently truncates a
 `BEGIN … COMMIT` batch on both DB lines.
 
-² The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
-moves it to the `surrealdb[embedded]` extra.
+² The embedded engine shipped in the SDK 2.0.0 base wheel (engine core 2.3.10); with SDK 3.0
+(v0.50.0) it is the `surrealdb[embedded]` extra, a SurrealDB 4.0 core (`surreal-orm-lite[embedded]`).
 
-**Still NOT in lite** (full-ORM only, even with SDK 2.0):
+**Still NOT in lite** (full-ORM only, even with SDK 3.0):
 
 - **Custom SDK (`surreal_sdk`)** — the full ORM's founding architecture.
 - **Custom CBOR manipulation** — handled internally by the official SDK, not exposed.
 
-> Note: the official SDK 2.0 is still single-connection; a true connection pool is a future
-> _tentative_ (client-side pool of official connections), not an SDK-native primitive.
+> Note: the official SDK 3.0 is still single-connection; a true connection pool is a future
+> _tentative_ (client-side pool of official connections), not an SDK-native primitive. Its native
+> reconnection and token renewal are adopted by v0.51.0 (#422).
 
 ---
 
@@ -178,7 +195,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Hybrid Search (RRF)           | yes        | ✅ v0.37.0                                |
 | Migrations & CLI              | yes        | ✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI) |
 | Test fixtures & factories     | yes        | ✅ v0.25.0 + ✅ v0.40.0                   |
-| QueryLogger / profiling       | yes        | v0.41.0                                   |
+| QueryLogger / profiling       | yes        | v0.59.0                                   |
 | Custom SDK (`surreal_sdk`)    | yes        | never                                     |
 | CBOR protocol internals       | yes        | never                                     |
 
@@ -187,7 +204,7 @@ moves it to the `surrealdb[embedded]` extra.
 The full SurrealDB-ORM has no embedded engine (HTTP/WebSocket only); surreal-orm-lite runs on the
 official SDK's in-process engine from v0.25.0.
 
-| Embedded URL                   | surreal-orm-lite (official SDK 2.0.0)                                                    | Full SurrealDB-ORM       |
+| Embedded URL                   | surreal-orm-lite (official SDK 3.0)                                                      | Full SurrealDB-ORM       |
 | ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
 | `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
 | `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
@@ -195,8 +212,9 @@ official SDK's in-process engine from v0.25.0.
 | `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
 | `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233)                                          | ❌                       |
 
-The embedded engine is SurrealDB core 2.3.10 with SDK 2.0.0, not the 2.x/3.x server lines the ORM
-is tested on. A bare `memory` (no `://`) is refused by SDK 2.0.0; write `memory://`. Base test
+Since v0.50.0 the embedded engine is SurrealDB core 4.0.0 with SDK 3.0.0, the `surrealdb[embedded]`
+extra, read as a 4.x server (it was SurrealDB core 2.3.10 with SDK 2.0.0). A bare `memory` (no `://`)
+is accepted. Base test
 fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; factories
 (`ModelFactory`, `Faker`) and the pytest plugin shipped in v0.40.0 (README section 41).
 
@@ -363,7 +381,8 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   rather than at the first iteration and a write made in between is still reported
 - `LiveAction` (`StrEnum`) lets `notif["action"] == LiveAction.CREATE` work against the raw
   string, keeping the envelope a plain dict
-- **The SDK's own `subscribe_live()` is unusable here**: its body is `yield ret["result"]`, which
+- **The SDK's own `subscribe_live()` is unusable here** (SDK 2.0; SDK 3.0's yields the whole
+  envelope, and moving onto it is #422): its body is `yield ret["result"]`, which
   discards the envelope and makes CREATE, UPDATE and DELETE indistinguishable. The ORM registers
   its own queue in the connection's public `live_queues` registry — the same mechanism — and
   keeps the action. Two tests guard the coupling: one fails if the attribute disappears, the
@@ -971,6 +990,22 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Deferred: lazy values (`LazyAttribute`, `Sequence`, `SubFactory`, which the full ORM has none
   of either), `SurrealFunc` on an edge factory
 
+### Version 0.50.0 — Official SDK 3.0 and SurrealDB 4.x
+
+- Depends on `surrealdb[pydantic]>=3.0.0,<4.0.0`; SurrealDB 2.x, 3.x and **4.x** supported and
+  tested (2.7.0, 3.3.5, 4.0.0), a server outside the SDK's range refused at connect time. The
+  embedded engine is the optional extra `surreal-orm-lite[embedded]`, a SurrealDB 4.0 core
+- Every SDK call goes through one internal frontier: NULL reads as `None`, native sets as `set`,
+  datetimes keep their nanoseconds (`PreciseDatetime`), zero durations read natively
+- `raw_query()` / `QuerySet.query()` return the rows of every statement (full-ORM parity);
+  `first()` returns the smallest matching id on 3.x and 4.x (`ORDER BY id`)
+- Retired clients refuse their next request instead of reconnecting anonymously; the ORM keeps
+  its own reconnection and token handling (the SDK's are adopted in v0.51.0, #422)
+- Migrations raise `FieldChangeRefusedError` for a field change SurrealDB 4.x refuses on a
+  populated `SCHEMAFULL` table, with `RawSQL` replacements; `MigrateRows` is v0.56.0 (#427)
+- The SDK 2.0 line `0.40.x` is deprecated (security fixes only):
+  `pip install "surreal-orm-lite<0.50"` stays on it. Migration note: `docs/migrating-to-0.50.md`
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -1147,21 +1182,21 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 > Still official-SDK only; also absorbs spillover from the heavy core themes.
 
-| Version    | Theme                                                                | SDK 2.0 realization               |
-| ---------- | -------------------------------------------------------------------- | --------------------------------- |
+| Version    | Theme                                                                | SDK 2.0 realization                |
+| ---------- | -------------------------------------------------------------------- | ---------------------------------- |
 | ✅ v0.23.0 | Rich field types: `Datetime`, `Duration`, `Decimal`, `Range`, `Uuid` | typed Pydantic ↔ native SDK types |
-| ✅ v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
-| ✅ v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
-| ✅ v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
-| ✅ v0.27.0 | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
-| ✅ v0.28.0 | Query cache (TTL + invalidation), client-side                        | client cache                      |
-| ✅ v0.29.0 | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
+| ✅ v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`       |
+| ✅ v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection            |
+| ✅ v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine          |
+| ✅ v0.27.0 | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`      |
+| ✅ v0.28.0 | Query cache (TTL + invalidation), client-side                        | client cache                       |
+| ✅ v0.29.0 | Multi-database: named connection registry                            | N × `AsyncSurreal` instances       |
 
-¹ The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
-moves it to the `surrealdb[embedded]` extra.
+¹ The embedded engine shipped in the SDK 2.0.0 base wheel (engine core 2.3.10); with SDK 3.0
+(v0.50.0) it is the `surrealdb[embedded]` extra, a SurrealDB 4.0 core.
 
-² The versioned engine is the SDK 2.0.0 embedded engine's `surrealkv+versioned://`; versioned
-servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
+² The versioned engine is the embedded engine's `surrealkv+versioned://`; versioned servers
+(3.x and 4.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 
 ---
 
@@ -1198,41 +1233,58 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 
 ---
 
+## Planned — SDK 3.0 features (v0.51.0 – v0.58.0)
+
+One release per feature epic of the official SDK 3.0, in this order, before the Beta freeze:
+
+| Version | Theme                                                              | Epic |
+| ------- | ------------------------------------------------------------------ | ---- |
+| v0.51.0 | Connection resilience (native reconnect and token renewal)         | #422 |
+| v0.52.0 | Typed errors and per-statement results                             | #423 |
+| v0.53.0 | Sessions and transaction options                                   | #424 |
+| v0.54.0 | Streaming QuerySet iteration                                       | #425 |
+| v0.55.0 | New field types (sized numbers, calendar kinds, bigdecimal, regex) | #426 |
+| v0.56.0 | Schema evolution on 4.x (named types and record migrations)        | #427 |
+| v0.57.0 | Files and buckets                                                  | #428 |
+| v0.58.0 | Server endpoints (DEFINE API, GraphQL, GQL) and export/import      | #429 |
+
+---
+
 ## Planned — Tier 4: Stabilization
 
-### Version 0.41.0 — Beta Phase (API freeze)
+### Version 0.59.0 — Beta Phase (API freeze)
 
-- Connection-level retry/reconnect (network resilience, distinct from `retry_on_conflict`)
 - Configurable logging; **QueryLogger / profiling**
 - Metrics (request/error/latency counters, export hooks)
 - Documented performance benchmarks
 - Complete documentation (docstrings, migration guide, examples)
 - **Public API freeze** — no breaking changes until GA
+- Connection-level retry/reconnect moved to v0.51.0 (#422)
 
-**Completion criteria**: E2E green on the pinned 2.x and 3.x lines, coverage ≥ 75 %, full API docs, API-freeze
-changelog published, no regression since v0.40.0.
+**Completion criteria**: E2E green on the pinned 2.x, 3.x and 4.x lines, coverage ≥ 75 %, full API docs, API-freeze
+changelog published, no regression since v0.58.0.
 
-### Version 2.0.0 — Production / GA
+### Version 3.0.0 — Production / GA
 
 - Production stability, coverage ≥ **80 %**
-- Complete documentation + `0.x → 2.0` migration guide
+- Complete documentation + `0.x → 3.0` migration guide
 - Published performance benchmarks
-- No breaking change since v0.41.0 (the Beta-frozen API is honored)
-- `v2.0.0-rcN` release candidates tagged before GA
+- No breaking change since v0.59.0 (the Beta-frozen API is honored)
+- `v3.0.0-rcN` release candidates tagged before GA
 
 ---
 
-## 🔮 Future (post-GA, v2.1.0+)
+## 🔮 Future (post-GA, v3.1.0+)
 
-The SDK-2.0-feasible scope is now **fully committed** across Tiers 1–3. One tentative candidate
-remains for after GA:
+The SDK-feasible scope is **fully committed** across Tiers 1–3 and the SDK 3.0 epics. One tentative
+candidate remains for after GA:
 
 - **Connection pool (client-side)** — the official SDK is single-connection; a pool of
   `AsyncSurreal` instances is possible but low-priority, to be evaluated after GA.
 
 ---
 
-## Out of scope (full-ORM only, even with SDK 2.0)
+## Out of scope (full-ORM only, even with SDK 3.0)
 
 | Feature                    | Reason                                 |
 | -------------------------- | -------------------------------------- |

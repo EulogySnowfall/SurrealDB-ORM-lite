@@ -193,7 +193,10 @@ An edge factory takes its endpoints at the call, as `in_` (or `in`) and `out`: a
 
 ### The pytest plugin
 
-Enable it in the root `conftest.py`, or with `pytest -p surreal_orm_lite.testing.pytest_plugin`:
+Enable it in the root `conftest.py`, or with `pytest -p surreal_orm_lite.testing.pytest_plugin`. Its embedded
+database, as `embedded_database()`, needs the `embedded` extra (`pip install "surreal-orm-lite[embedded]"`); without
+it the fixture raises `SurrealDbConnectionError` naming the extra when a test uses it, and importing
+`surreal_orm_lite.testing` still works:
 
 ```python
 pytest_plugins = ["surreal_orm_lite.testing.pytest_plugin"]
@@ -243,9 +246,9 @@ else (no hook, no marker, no option). It is the `surreal_db` recipe of section 2
 
 ### Server lines
 
-Factories behave the same on SurrealDB 3.x, 2.x and the embedded engine: `build()` needs no database and `create()` is
-the model's `save()`, `SurrealFunc` attributes included. `surreal_db` is an embedded database, which answers as a 2.x
-server (core 2.3.10). The [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) and the
+Factories behave the same on SurrealDB 3.x, 2.x, 4.x and the embedded engine: `build()` needs no database and
+`create()` is the model's `save()`, `SurrealFunc` attributes included. `surreal_db` is an embedded database, which
+answers as a 4.x server (core 4.0.0 since v0.50.0; it answered as a 2.x server (core 2.3.10) with SDK 2.0). The [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) and the
 [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) hold their rows.
 
 ### Coming from the full SurrealDB-ORM
@@ -263,8 +266,9 @@ server (core 2.3.10). The [2.x/3.x table](compatibility.md#orm-behaviour-surreal
 - **`choice` returns a deep copy** of the item it draws, where the full ORM returns the item itself, shared by every
   instance that draws it.
 - **`uuid` follows `random.seed()`**: it draws from `random`, where the full ORM calls `uuid.uuid4()`.
-- **The pytest plugin is opt-in**: `pytest_plugins` or `-p`, no entry point and no extra to install; the full ORM has
-  no `surreal_db` fixture.
+- **The pytest plugin is opt-in**: `pytest_plugins` or `-p`, no entry point; its embedded database needs the
+  `embedded` extra (`pip install "surreal-orm-lite[embedded]"`), as every embedded URL does; the full ORM has no
+  `surreal_db` fixture.
 - **`create_batch()` saves one record at a time**, as in the full ORM, with signals and server values per record;
   `bulk_create(build_batch(n))` is the one-`INSERT` path.
 - **A `Faker` override is generated**, where the full ORM hands the `Faker` object itself to the model.

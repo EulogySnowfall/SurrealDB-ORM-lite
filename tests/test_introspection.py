@@ -2476,8 +2476,8 @@ _HEADER_SENTENCE_30 = (
 #: Spec §11.1 item 6: the row v0.30.0 adds to the embedded-engine table, cell by cell.
 _EMBEDDED_INTROSPECTION_ROW = [
     "Schema introspection (`DatabaseIntrospector`)",
-    "reads like a 2.x server (core 2.3.10): same state and same generated model types as on the servers; the anonymous "
-    "owner session may run `INFO`; `COUNT` indexes cannot be defined",
+    "reads like a 4.x server (core 4.0.0): same state and same generated model types as on the servers; the "
+    "anonymous owner session may run `INFO`",
     "need a system user (root, namespace or database user)",
     "v0.30.0",
 ]
