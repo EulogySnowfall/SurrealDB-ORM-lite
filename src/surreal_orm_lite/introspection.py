@@ -391,7 +391,13 @@ class _Reader:
             params=params,
             other=other,
             issues=tuple(self.issues),
+            compatibility=_compatibility(info.get("compatibility")),
         )
+
+
+def _compatibility(value: object) -> int | None:
+    """The database's compatibility level from ``INFO FOR DB``'s ``compatibility`` key (SurrealDB 4.x), else ``None``."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class DatabaseIntrospector:

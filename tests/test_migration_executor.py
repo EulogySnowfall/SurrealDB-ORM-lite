@@ -37,6 +37,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import pickle
 import sys
 import uuid
 from collections.abc import Callable, Sequence
@@ -73,6 +74,7 @@ from surreal_orm_lite.migrations import (
     DropField,
     DropIndex,
     DropTable,
+    FieldChangeRefusedError,
     Migration,
     MigrationExecutor,
     MigrationGenerator,
@@ -97,6 +99,7 @@ from surreal_orm_lite.schema_state import (
     TableState,
 )
 from surreal_orm_lite.time_travel import cached_major
+from tests import _sdk_calls
 from tests._retry import apply_reset
 from tests.conftest import _migration_url as _url
 from tests.conftest import migration_database
@@ -3564,3 +3567,409 @@ class TestReferenceE2E:
             assert str(raised.value).startswith(f"Migration '{name}' failed at operation 2 of 2 (Add field o to rf_pet): ")
             assert "record_references" in str(raised.value)
             assert await executor.get_applied_migrations() == []
+
+
+# --- v0.50.0: SurrealDB 4.x's compatibility-level-4 field rule (spec §5.10, AC-22) --------------------------------------
+
+#: The person table of these tests: SCHEMAFULL, ``age int``.
+_FR_TABLE = [CreateTable("fr_person"), AddField("fr_person", "age", "int")]
+
+
+async def _major_of(client: Any) -> int:
+    """The major version of the engine *client* talks to (the embedded engine of SDK 3.0: 4)."""
+    return await cached_major(client)
+
+
+def _batches(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Record each ``query_raw()`` request (statement, variables) the ORM sends for *client* from now on."""
+    return _sdk_calls.record(monkeypatch, client, "query_raw", entry=lambda call: (call.target, call.variables or {}))
+
+
+async def _populated(tmp_path: Path, client: Any, *extra: Operation) -> tuple[MigrationExecutor, str]:
+    """``0001``: the person table (and *extra*), applied, then one row ``age = 5``."""
+    first = _write(tmp_path, "person", [*_FR_TABLE, *extra])
+    executor = MigrationExecutor(tmp_path)
+    assert await executor.migrate() == [first]
+    await _run(client, "CREATE fr_person:a SET age = 5;")
+    return executor, first
+
+
+class TestFieldRuleE2E:
+    """SurrealDB 4.x at compatibility level 4 refuses, on a populated SCHEMAFULL table, a field redefined with a type
+    that does not accept every old value, and a new field that does not accept ``NONE``: ``migrate()`` and
+    ``rollback()`` raise ``FieldChangeRefusedError``, refused inside the migration's transaction before the field
+    change runs (the guard, or the server's own text), nothing applied. Empty tables, widenings and the lines below 4
+    migrate as in v0.40.3, with no guard."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_narrowing_on_a_populated_table(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with migration_database(kind) as client:
+            major = await _major_of(client)
+            executor, first = await _populated(tmp_path, client)
+            second = _write(tmp_path, "age_text", [AlterField("fr_person", "age", "string", previous_type="int")], [first])
+            sent = _batches(monkeypatch, client)
+            if major < 4:
+                assert await executor.migrate() == [second]
+                assert all("_orm_populated_" not in text for text, _ in sent)
+                assert "TYPE string" in (await _fields(client, "fr_person"))["age"]
+                return
+            with pytest.raises(FieldChangeRefusedError) as raised:
+                await executor.migrate()
+            rows = await _client.query(client, "SELECT VALUE age FROM fr_person;", {})
+            fields = await _fields(client, "fr_person")
+            applied = await executor.get_applied_migrations()
+        error = raised.value
+        assert isinstance(error, MigrationStatementError | SurrealDbError | RuntimeError)
+        assert (error.migration, error.operation, error.description) == (second, 1, "Alter field age on fr_person")
+        assert (type(error.table), type(error.field), error.table, error.field) == (str, str, "fr_person", "age")
+        assert error.analyzers_restored is None
+        assert str(error) == (
+            f"Migration '{second}', operation 1 (Alter field age on fr_person): SurrealDB 4.x refuses this change because "
+            "table 'fr_person' is SCHEMAFULL, holds rows, and its database is at compatibility level 4. On such a table "
+            "a field can only be redefined with a type that accepts every value of the old one, and a new field must "
+            "accept NONE. Nothing was applied. Write the change as a RawSQL operation that converts the existing rows "
+            "(SurrealDB 4.x: `DEFINE FIELD … MIGRATE EXISTING ROWS AS <name> USING <expression> FALLBACK <value>`), "
+            "with `state_operations=[…]` describing the result; a MigrateRows operation is planned for v0.56.0."
+        )
+        assert "DEFINE FIELD OVERWRITE" not in str(error)  # the template names the clause, never the statement
+        assert rows == [5]
+        assert "TYPE int" in fields["age"]
+        assert applied == [first]
+        [(batch, variables)] = [(text, bound) for text, bound in sent if "_orm_populated_" in text]
+        guard = 'IF (SELECT id FROM type::table($_orm_populated_1) LIMIT 1) { THROW "surreal-orm-lite: populated SCHEMAFULL table" };'
+        assert guard in batch.split("\n")
+        assert batch.split("\n").index(guard) + 1 == next(
+            index for index, line in enumerate(batch.split("\n")) if line.startswith("DEFINE FIELD")
+        )
+        assert variables["_orm_populated_1"] == "fr_person"
+        assert "fr_person" not in guard
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_empty_table_migrates(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            first = _write(tmp_path, "person", _FR_TABLE)
+            second = _write(tmp_path, "age_text", [AlterField("fr_person", "age", "string", previous_type="int")], [first])
+            assert await MigrationExecutor(tmp_path).migrate() == [first, second]
+            assert "TYPE string" in (await _fields(client, "fr_person"))["age"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_widenings_and_new_fields(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            major = await _major_of(client)
+            executor, first = await _populated(tmp_path, client)
+            wider = _write(tmp_path, "wider", [AlterField("fr_person", "age", "int | string", previous_type="int")], [first])
+            optional = _write(tmp_path, "nick", [AddField("fr_person", "nick", "option<string>")], [wider])
+            assert await executor.migrate() == [wider, optional]
+            required = _write(tmp_path, "code", [AddField("fr_person", "code", "string")], [optional])
+            if major < 4:
+                assert await executor.migrate() == [required]
+                return
+            with pytest.raises(FieldChangeRefusedError) as raised:
+                await executor.migrate()
+            assert (raised.value.table, raised.value.field) == ("fr_person", "code")
+            assert "code" not in await _fields(client, "fr_person")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_rollback_that_narrows(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            major = await _major_of(client)
+            executor, first = await _populated(tmp_path, client)
+            wider = _write(tmp_path, "wider", [AlterField("fr_person", "age", "int | string", previous_type="int")], [first])
+            assert await executor.migrate() == [wider]
+            await _run(client, "UPDATE fr_person:a SET age = 'five';")
+            if major < 4:
+                # 2.x and 3.x redefine the field and keep the row as it is.
+                assert await executor.rollback(first) == [wider]
+                return
+            with pytest.raises(FieldChangeRefusedError) as raised:
+                await executor.rollback(first)
+            assert str(raised.value).startswith(f"Rollback of migration '{wider}', operation 1 (Alter field age on ")
+            assert await executor.get_applied_migrations() == [first, wider]
+            assert "int | string" in (await _fields(client, "fr_person"))["age"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_undecided_change_reads_the_server_s_refusal(
+        self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A parametrised kind (``array<int>`` → ``array<string>``) gets no guard: SurrealDB 4.x's own refusal is read
+        as the same error (its two phrases)."""
+        async with migration_database(kind) as client:
+            if await _major_of(client) < 4:
+                pytest.skip("SurrealDB 4.x only")
+            first = _write(tmp_path, "person", [*_FR_TABLE, AddField("fr_person", "tags", "array<int>")])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first]
+            await _run(client, "CREATE fr_person:a SET age = 5, tags = [1];")
+            change = AlterField("fr_person", "tags", "array<string>", previous_type="array<int>")
+            second = _write(tmp_path, "tags_text", [change], [first])
+            sent = _batches(monkeypatch, client)
+            with pytest.raises(FieldChangeRefusedError) as raised:
+                await executor.migrate()
+        assert (raised.value.table, raised.value.field) == ("fr_person", "tags")
+        assert all("_orm_populated_" not in text for text, _ in sent)
+        assert raised.value.migration == second
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_nested_field(self, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """M37 (outcome A): a nested field follows the rule as a top-level one, whether a row holds its object or not."""
+        async with migration_database(kind) as client:
+            if await _major_of(client) < 4:
+                pytest.skip("SurrealDB 4.x only")
+            nested = [AddField("fr_person", "o", "option<object>"), AddField("fr_person", "o.x", "option<int>")]
+            first = _write(tmp_path, "person", [*_FR_TABLE, *nested])
+            executor = MigrationExecutor(tmp_path)
+            assert await executor.migrate() == [first]
+            await _run(client, "CREATE fr_person:a SET age = 5;")
+            second = _write(
+                tmp_path, "x_text", [AlterField("fr_person", "o.x", "string", previous_type="option<int>")], [first]
+            )
+            sent = _batches(monkeypatch, client)
+            with pytest.raises(FieldChangeRefusedError) as raised:
+                await executor.migrate()
+        assert (raised.value.table, raised.value.field) == ("fr_person", "o.x")
+        assert any("_orm_populated_1" in text for text, _ in sent)
+        assert raised.value.migration == second
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_raw_sql_field_change_stays_a_statement_error(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            if await _major_of(client) < 4:
+                pytest.skip("SurrealDB 4.x only")
+            executor, first = await _populated(tmp_path, client)
+            _write(tmp_path, "raw", [RawSQL("DEFINE FIELD OVERWRITE age ON fr_person TYPE string;")], [first])
+            with pytest.raises(MigrationStatementError) as raised:
+                await executor.migrate()
+        assert type(raised.value) is MigrationStatementError
+        assert "compatibility level 4" in str(raised.value)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_raw_sql_recipes(self, kind: str, tmp_path: Path) -> None:
+        """Spec §5.10's two replacements: SurrealDB 4.x's ``MIGRATE EXISTING ROWS``, and the portable SCHEMALESS detour."""
+        async with migration_database(kind) as client:
+            major = await _major_of(client)
+            executor, first = await _populated(tmp_path, client)
+            state = [AlterField("fr_person", "age", "string", previous_type="int")]
+            if major >= 4:
+                sql = (
+                    "DEFINE FIELD OVERWRITE age ON fr_person TYPE string MIGRATE EXISTING ROWS AS age_text "
+                    "USING <string> $value FALLBACK '';"
+                )
+            else:
+                sql = (
+                    "DEFINE TABLE OVERWRITE fr_person SCHEMALESS; DEFINE FIELD OVERWRITE age ON fr_person TYPE string; "
+                    "UPDATE fr_person SET age = <string> age; DEFINE TABLE OVERWRITE fr_person SCHEMAFULL;"
+                )
+            name = _write(tmp_path, "age_text", [RawSQL(sql, state_operations=state)], [first])
+            assert await executor.migrate() == [name]
+            assert await _client.query(client, "SELECT VALUE age FROM fr_person;", {}) == ["5"]
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_database_at_compatibility_level_3(self, kind: str, tmp_path: Path) -> None:
+        database = _database_name()
+        async with migration_database(kind, database=database) as client:
+            if await _major_of(client) < 4:
+                pytest.skip("SurrealDB 4.x only: DEFINE DATABASE … COMPATIBILITY")
+            await _run(client, f"REMOVE DATABASE {database}; DEFINE DATABASE {database} COMPATIBILITY 3;")
+            executor, first = await _populated(tmp_path, client)
+            second = _write(tmp_path, "age_text", [AlterField("fr_person", "age", "string", previous_type="int")], [first])
+            assert await executor.migrate() == [second]
+            assert "TYPE string" in (await _fields(client, "fr_person"))["age"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_analyzer_of_the_migration_is_restored(self, kind: str, tmp_path: Path) -> None:
+        async with migration_database(kind) as client:
+            if await _major_of(client) < 4:
+                pytest.skip("SurrealDB 4.x only")
+            executor, first = await _populated(tmp_path, client)
+            change = AlterField("fr_person", "age", "string", previous_type="int")
+            _write(tmp_path, "age_text", [DefineAnalyzer("fr_plain", ["blank"], ["lowercase"]), change], [first])
+            with pytest.raises(FieldChangeRefusedError) as raised:
+                await executor.migrate()
+            info = await _client.query(client, "INFO FOR DB;", {})
+        assert raised.value.analyzers_restored is True
+        assert "fr_plain" not in info["analyzers"]
+
+
+#: ``render.kind_accepts(new, old)``, spec M34 row by row, then the ``old = "none"`` rows (P1) and P2's.
+_KIND_ACCEPTS: list[tuple[str | None, str | None, bool | None]] = [
+    ("string", "int", False),
+    ("float", "int", False),
+    ("int", "option<int>", False),
+    ("int", "int | string", False),
+    ("int | string", "int", True),
+    ("string | int", "int", True),
+    ("option<int>", "int", True),
+    ("int | none", "int", True),
+    ("int | null", "int", True),
+    ("number", "int", True),
+    ("any", "int", True),
+    (None, "int", True),
+    ("int", "int", True),
+    ("int", None, False),
+    ("array<string>", "array<int>", None),
+    ("record<b>", "record<a>", None),
+    ("string", "none", False),
+    ("option<string>", "none", True),
+    ("int | none", "none", True),
+    (None, "none", True),
+    ("any", "none", True),
+    ("array<int>", "none", False),
+    ("record<a>", "none", False),
+    ("int | float | decimal", "number", True),
+    ("number", "int | float", True),
+    ("string | any", "int", True),
+]
+
+
+@pytest.mark.parametrize(("new", "old", "expected"), _KIND_ACCEPTS)
+def test_kind_accepts(new: str | None, old: str | None, expected: bool | None) -> None:
+    from surreal_orm_lite.migrations import render
+
+    assert render.kind_accepts(new, old) is expected
+
+
+def _person_state(*, mode: str = "SCHEMAFULL", compatibility: int | None = 4) -> SchemaState:
+    """A read holding ``person`` (*mode*) with ``age int`` and an object ``o`` with ``o.x option<int>``."""
+    fields = {
+        "age": FieldState("age", "int", nullable=False),
+        "o": FieldState("o", "object", nullable=True),
+        "o.x": FieldState("o.x", "int", nullable=True),
+    }
+    return SchemaState({"person": TableState("person", mode, fields=fields)}, compatibility=compatibility)
+
+
+class TestFieldRuleUnit:
+    """The pre-pass marking of the compatibility-level-4 rule (no request) and the reading of the answers."""
+
+    @staticmethod
+    def _marked(operation: Operation, state: SchemaState, *, level_4: bool = True, backwards: bool = False) -> dict[int, str]:
+        refusals = executor_module._Refusals(3, backwards=backwards, level_4=level_4)
+        migration = Migration(name="0002_x", operations=[operation])
+        refusals.of(migration)(1, operation, state)
+        return refusals.guards.get("0002_x", {})
+
+    @pytest.mark.parametrize(
+        ("operation", "marked"),
+        [
+            (AlterField("person", "age", "string", previous_type="int"), True),
+            (AlterField("person", "age", "int | string", previous_type="int"), False),
+            (AddField("person", "nick", "string"), True),
+            (AddField("person", "nick", "option<string>"), False),
+            (AddField("person", "age", "string", overwrite=True), True),
+            (AlterField("person", "o.x", "string", previous_type="option<int>"), True),
+            (AlterField("person", "o.x", "option<int> | string", previous_type="option<int>"), False),
+            (AddField("person", "o.y", "string"), True),
+            (AddField("person", "a[*].z", "string", path=["a[*]", "z"]), False),
+            (AlterField("person", "tags", "array<string>", previous_type="array<int>"), True),  # absent: a new field
+            (RawSQL("DEFINE FIELD OVERWRITE age ON person TYPE string;"), False),
+            (AlterTable("person", "SCHEMAFULL", "normal", previous_schema_mode="SCHEMALESS"), False),
+            (DropField("person", "age"), False),
+        ],
+    )
+    def test_marking(self, operation: Operation, marked: bool) -> None:
+        assert self._marked(operation, _person_state()) == ({0: "person"} if marked else {})
+
+    def test_an_undecided_kind_is_not_marked(self) -> None:
+        state = SchemaState(
+            {"person": TableState("person", fields={"tags": FieldState("tags", "array<int>", nullable=False)})},
+            compatibility=4,
+        )
+        assert self._marked(AlterField("person", "tags", "array<string>", previous_type="array<int>"), state) == {}
+
+    def test_an_alter_field_s_backwards_is_marked(self) -> None:
+        wider = SchemaState(
+            {"person": TableState("person", fields={"age": FieldState("age", "int | string", nullable=False)})},
+            compatibility=4,
+        )
+        change = AlterField("person", "age", "int | string", previous_type="int")
+        assert self._marked(change, wider, backwards=True) == {0: "person"}
+        assert self._marked(AddField("person", "nick", "string"), wider, backwards=True) == {}
+
+    def test_no_marking_off_the_rule(self) -> None:
+        change = AlterField("person", "age", "string", previous_type="int")
+        assert self._marked(change, _person_state(), level_4=False) == {}
+        assert self._marked(change, _person_state(mode="SCHEMALESS")) == {}
+
+    async def test_compatibility_below_4_leaves_the_rule_off(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        change = AlterField("person", "age", "string", previous_type="int")
+        _write(tmp_path, "age", [change])
+        executor = MigrationExecutor(tmp_path)
+        for compatibility, guarded in ((None, False), (3, False), (4, True)):
+            read = _person_state(compatibility=compatibility)
+
+            async def fake_read(self: DatabaseIntrospector, read: SchemaState = read) -> SchemaState:
+                return read
+
+            monkeypatch.setattr(DatabaseIntrospector, "introspect", fake_read)
+            [item] = await executor._prepare(executor._ordered(), 3, backwards=False, level_4=True)
+            assert ("_orm_populated_1" in item.main.text()) is guarded, compatibility
+            assert item.main.variables == ({"_orm_populated_1": "person"} if guarded else {})
+
+    def test_the_guard_is_the_operation_s_entry(self) -> None:
+        change = AlterField("person", "age", "string", previous_type="int")
+        migration = Migration(name="0002_x", operations=[CreateTable("other"), change])
+        state = _person_state()
+        prepared = executor_module._prepared(
+            migration, line=3, before=state, after=change.state_forwards(state), guards={1: "person"}
+        )
+        statements = prepared.main.statements
+        guard = next(index for index, text in enumerate(statements) if "_orm_populated_2" in text)
+        assert statements[guard] == (
+            'IF (SELECT id FROM type::table($_orm_populated_2) LIMIT 1) { THROW "surreal-orm-lite: populated SCHEMAFULL '
+            'table" };'
+        )
+        assert statements[guard + 1].startswith("DEFINE FIELD OVERWRITE")
+        assert prepared.main.owners[guard] == prepared.main.owners[guard + 1] == 1
+        assert prepared.main.variables == {"_orm_populated_2": "person"}
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "An error occurred: surreal-orm-lite: populated SCHEMAFULL table",
+            "Cannot change field `age` of table `person`: the table is SCHEMAFULL in a database at compatibility level 4 "
+            "and has rows, and the new definition does not accept every value the old one did: add MIGRATE EXISTING ROWS",
+            "Cannot change field `nick` of table `person`: the table is SCHEMAFULL in a database at compatibility level 4 "
+            "and has rows, and the field's TYPE does not accept NONE: add MIGRATE EXISTING ROWS to say what existing rows hold",
+        ],
+        ids=["guard", "narrowing", "none"],
+    )
+    @pytest.mark.parametrize(
+        ("operation", "subclass"),
+        [
+            (AlterField("person", "age", "string", previous_type="int"), True),
+            (AddField("person", "nick", "string"), True),
+            (RawSQL("DEFINE FIELD OVERWRITE age ON person TYPE string;"), False),
+        ],
+        ids=["alter", "add", "raw"],
+    )
+    def test_reading_the_refusal(self, reason: str, operation: Operation, subclass: bool) -> None:
+        migration = Migration(name="0002_x", operations=[operation])
+        error = executor_module._statement_error(migration, executor_module._Failure(1, 0, reason, False))
+        if not subclass:
+            assert type(error) is MigrationStatementError
+            assert reason in str(error)
+            return
+        assert type(error) is FieldChangeRefusedError
+        assert (type(error.table), type(error.field)) == (str, str)
+        assert error.table == "person" and error.field == operation.name  # type: ignore[attr-defined]
+        assert "Nothing was applied." in str(error) and reason not in str(error)
+        assert "before sending" not in str(error)
+        restored = pickle.loads(pickle.dumps(error))
+        assert (type(restored), str(restored), restored.table, restored.field, restored.operation) == (
+            FieldChangeRefusedError,
+            str(error),
+            "person",
+            operation.name,  # type: ignore[attr-defined]
+            1,
+        )
+
+    def test_another_refusal_of_a_field_operation_is_unchanged(self) -> None:
+        migration = Migration(name="0002_x", operations=[AddField("person", "nick", "string")])
+        error = executor_module._statement_error(migration, executor_module._Failure(1, 0, "boom", False))
+        assert type(error) is MigrationStatementError
+
+    def test_it_is_exported(self) -> None:
+        import surreal_orm_lite.migrations as migrations
+
+        assert "FieldChangeRefusedError" in migrations.__all__
+        assert issubclass(migrations.FieldChangeRefusedError, MigrationStatementError | SurrealDbError | RuntimeError)

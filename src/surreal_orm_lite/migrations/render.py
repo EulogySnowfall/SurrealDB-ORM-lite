@@ -83,6 +83,7 @@ __all__ = [
     "flexible_candidate",
     "flexible_redefinitions",
     "index_statement",
+    "kind_accepts",
     "literal_value",
     "plain",
     "read_own",
@@ -227,6 +228,60 @@ def _field_kind(field: FieldState) -> Kind:
     if field.nullable and not _admits_none(kind):
         kind = KUnion((_NONE, *(kind.members if isinstance(kind, KUnion) else (kind,))))
     return kind
+
+
+#: The kind keywords :func:`kind_accepts` decides on, written bare (no ``<…>``); ``none`` and ``null`` are literals.
+_BARE_KINDS = frozenset(
+    {
+        "any", "bool", "bytes", "datetime", "decimal", "duration", "float", "int", "number", "object", "string", "uuid",
+        "array", "set", "record", "geometry",
+    }
+)  # fmt: skip
+#: ``number``, as its members (P2).
+_NUMBER = (KName("int"), KName("float"), KName("decimal"))
+
+
+def _members(kind: Kind) -> tuple[Kind, ...]:
+    """The top-level members of *kind* (``option<X>`` is ``none`` and ``X``'s), ``number`` expanded (P2)."""
+    members = kind.members if isinstance(kind, KUnion) else (kind,)
+    return tuple(item for member in members for item in (_NUMBER if member == KName("number") else (member,)))
+
+
+def _bare(member: Kind) -> bool:
+    """Whether *member* is a kind keyword written bare, or the literal ``none`` or ``null``."""
+    if isinstance(member, KLiteral):
+        return member.text in ("none", "null")
+    return isinstance(member, KName) and member.name in _BARE_KINDS and not member.args
+
+
+def kind_accepts(new: str | None, old: str | None) -> bool | None:
+    """Whether the kind *new* accepts every value the kind *old* accepts (v0.50.0, spec §5.10): ``True``, ``False``, or
+    ``None`` when the comparison cannot tell. Conservative and pure: ``False`` only when the server certainly refuses
+    the change; *new* always first.
+
+    ``None`` (no ``TYPE``) is ``any`` for *old*, and accepts everything as *new*. ``old == "none"`` (a new field, which
+    every existing row holds as ``NONE``) is ``True`` only when *new* is ``None``, ``any`` or has a top-level ``none``
+    or ``option<…>`` member. Otherwise ``True`` when *new* has a top-level ``any`` member or holds every member of
+    *old*, ``number`` read as ``int | float | decimal`` on both sides; ``False`` when both are made of bare kind
+    keywords only (``int``, ``string``, ``array``…, the literals ``none`` and ``null``); ``None`` for a parametrised
+    kind that differs (``array<int>`` → ``array<string>``), a literal, or a kind the parser cannot read.
+    """
+    if new is None:
+        return True
+    try:
+        wanted = _members(parse_kind(new))
+        if old == "none":
+            return _ANY in wanted or _NONE in wanted
+        if _ANY in wanted:
+            return True
+        held = (_ANY,) if old is None else _members(parse_kind(old))
+    except DefineParseError:
+        return None
+    if all(member in wanted for member in held):
+        return True
+    if all(map(_bare, (*wanted, *held))):
+        return False
+    return None
 
 
 def _holds_object_items(kind: Kind) -> bool:
