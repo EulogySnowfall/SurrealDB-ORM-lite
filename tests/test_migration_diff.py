@@ -2978,6 +2978,7 @@ class TestGenerateSkipsTrackingTableE2E:
 
 #: Spec §5.1's ``surreal_orm_lite.migrations.__all__``.
 _MIGRATIONS_ALL = {
+    "FieldChangeRefusedError",  # v0.50.0
     "Migration",
     "Operation",
     "CreateTable",
@@ -3022,7 +3023,7 @@ class TestExports:
     def test_the_migrations_package(self) -> None:
         import surreal_orm_lite.migrations as migrations
 
-        assert len(migrations.__all__) == len(set(migrations.__all__)) == 33
+        assert len(migrations.__all__) == len(set(migrations.__all__)) == 34
         assert set(migrations.__all__) == _MIGRATIONS_ALL
         for name in _MIGRATIONS_ALL:
             assert getattr(migrations, name) is not None, name

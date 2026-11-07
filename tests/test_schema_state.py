@@ -47,6 +47,7 @@ _PARITY: dict[type, list[tuple[str, object, bool]]] = {
         ("params", _FACTORY, True),
         ("other", _FACTORY, True),
         ("issues", (), True),
+        ("compatibility", None, True),  # v0.50.0: SurrealDB 4.x's compatibility level
     ],
     TableState: [
         ("name", _MISSING, False),

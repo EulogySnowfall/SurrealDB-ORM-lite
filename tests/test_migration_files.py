@@ -1228,7 +1228,7 @@ class TestLoader:
             MigrationExecutor(tmp_path, "other")  # type: ignore[misc]
 
     def test_the_module_exports(self) -> None:
-        assert executor_module.__all__ == ["MigrationExecutor", "MigrationStatementError"]
+        assert executor_module.__all__ == ["FieldChangeRefusedError", "MigrationExecutor", "MigrationStatementError"]
         assert migrations.MigrationExecutor is executor_module.MigrationExecutor
 
 
