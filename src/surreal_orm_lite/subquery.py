@@ -71,6 +71,8 @@ LET_PREFIX: Final = "_sq"
 #: SurrealDB 4.x folds next to a KNN operator (``id IN [] AND <|k|>``) and then refuses the statement ("no KNN operator
 #: found in WHERE condition"). Every line reads it as ``[]``.
 EMPTY: Final = "<array> []"
+#: A reference to a ``LET`` of the statement (``$_sq0``…), matched whole.
+_LET_REFERENCE: Final = re.compile(rf"\${LET_PREFIX}\d+\b")
 #: The lookups that compare a field with all the values of a subquery.
 COLLECTION_LOOKUPS: Final = frozenset({"in", "not_in", "containsall", "containsany"})
 #: The lookups that compare a field with the first value of a subquery (no record when it is empty).
@@ -239,6 +241,12 @@ class SubqueryCompiler:
         implicit_order: the statement is ``first()``'s without an order of its own (v0.50.0): in the form for SurrealDB
             3 and later it ends ``ORDER BY id``, below 3 (``knn_prefilter``) it has no ``ORDER BY``: the caller reads
             the line.
+        hnsw_let: an HNSW KNN operator (``<|K,EF|>``) of the statement shares its ``WHERE`` with a condition that reads
+            a ``LET`` (``id IN $_sq0``…: :func:`reads_a_let`), in the statement itself, in a subquery or in the
+            ``SELECT`` of a KNN write's ids (v0.50.0): the caller reads the line.
+        top_level: send the ``LET`` s as statements of their own, before the statement (v0.50.0, :meth:`wrap`): set for
+            a statement with ``hnsw_let`` on SurrealDB 4.x and later, the embedded engine of SDK 3.0 included, where an
+            HNSW search next to the ids of a ``LET`` of a block answers no record.
         warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
             ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
             re-send for a missing subquery table), so each read warns once (v0.28.1).
@@ -264,6 +272,8 @@ class SubqueryCompiler:
     knn_prefilter: bool = False
     knn_conditions: bool = False
     implicit_order: bool = False
+    hnsw_let: bool = False
+    top_level: bool = False
     warn: bool = True
     variable_like: list[str] = field(default_factory=list)
     _stack: list[int] = field(default_factory=list)
@@ -320,10 +330,42 @@ class SubqueryCompiler:
         return f"${name}", values, counter
 
     def wrap(self, statement: str) -> str:
-        """The statement to send: unchanged without subqueries, else the block ``{ LET …; (<statement>) };``."""
+        """The statement to send: unchanged without subqueries, else the block ``{ LET …; (<statement>) };``.
+
+        With :attr:`top_level` (SurrealDB 4.x, v0.50.0) the ``LET`` s are statements of their own instead, the
+        statement after them, in one request: ``BEGIN TRANSACTION; LET …; <statement>; COMMIT TRANSACTION;``, so that
+        a ``LET`` that fails leaves the statement without effect, as in the block; inside a transaction (the request
+        joins it, or the statement is queued in its batch) without ``BEGIN``/``COMMIT``, the transaction failing as a
+        whole. A top-level ``LET`` is scoped to its request: it never reaches the next request of the session or of
+        the transaction. A statement whose ``LET`` s all bind :data:`EMPTY` (every subquery table missing) keeps the
+        block: there no ``LET`` holds a ``SELECT``, and SurrealDB 4.0 refuses a KNN next to a top-level empty ``LET``
+        on a table that does not exist ("no KNN operator found"). :meth:`statement_index` says which result is the
+        statement's.
+        """
         if not self.lets:
             return statement
-        return "{ " + " ".join(self.lets) + f" ({statement.removesuffix(';')}) }};"
+        if not self._top_level_form():
+            return "{ " + " ".join(self.lets) + f" ({statement.removesuffix(';')}) }};"
+        sent = f"{' '.join(self.lets)} {statement.removesuffix(';')};"
+        return sent if self.outer_tx is not None else f"BEGIN TRANSACTION; {sent} COMMIT TRANSACTION;"
+
+    def statement_index(self) -> int:
+        """Which result of the request :meth:`wrap` built is the statement's: ``0`` for the block and a statement
+        without subqueries (the request's only result), else the statement's place after ``BEGIN`` and its ``LET`` s
+        (the top-level form, v0.50.0)."""
+        if not self._top_level_form():
+            return 0
+        return len(self.lets) + (0 if self.outer_tx is not None else 1)
+
+    def _top_level_form(self) -> bool:
+        """Whether :meth:`wrap` sends the top-level form: :attr:`top_level`, and a ``LET`` that holds a ``SELECT``."""
+        return self.top_level and any(not let.endswith(f" = {EMPTY};") for let in self.lets)
+
+
+def reads_a_let(condition: str) -> bool:
+    """Whether the compiled *condition* reads a ``LET`` of the statement (``id IN $_sq0``, ``$_sq1 CONTAINS id``,
+    ``($_sq2 != [] AND score > array::first($_sq2))``…, v0.50.0)."""
+    return _LET_REFERENCE.search(condition) is not None
 
 
 class _MissingSubqueryTable(Exception):

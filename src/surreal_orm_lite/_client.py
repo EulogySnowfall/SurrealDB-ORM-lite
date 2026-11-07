@@ -10,6 +10,9 @@ What changed with the official SDK 3.0, and how this module keeps the ORM's sema
 - ``query()`` resolves to one result per statement, and a failing statement raises even when it is not the first.
   ``query()`` here returns the first statement's result (``None`` for an empty result list), as the ORM's internal
   single-statement calls expect; ``query_all()`` returns them all.
+- ``query_at()`` (v0.50.0) reads one statement's result of a request of several, through ``query_raw()``, and raises
+  the error of the statement that failed rather than the "not executed" of the statements of its transaction: the
+  form a statement whose subqueries go before it, as statements of their own, is sent on SurrealDB 4.x.
 - The data methods return awaitable builders. Each function awaits its builder exactly once.
 - ``merge()``, ``patch()`` and ``insert_relation()`` are gone from the SDK clients: they are ``update(target).merge()``,
   ``update(target).patch()`` and ``insert(table, data, relation=True)``. A missing record still answers ``None``.
@@ -59,6 +62,8 @@ from ._sdk import (
     TransportError,
     TransportTimeoutError,
     UnexpectedResponseError,
+    parse_query_error,
+    parse_rpc_error,
 )
 from .exceptions import SurrealDbConnectionError
 
@@ -73,6 +78,7 @@ __all__ = [
     "patch",
     "query",
     "query_all",
+    "query_at",
     "query_raw",
     "is_retired",
     "refuse",
@@ -146,6 +152,40 @@ async def query_all(client: Any, sql: str, variables: dict[str, Any] | None = No
     with _sdk_errors():
         results = await client.query(sql, variables, **_txn(txn_id))
     return [normalize(result) for result in results]
+
+
+async def query_at(
+    client: Any, sql: str, variables: dict[str, Any] | None = None, *, index: int, txn_id: UUID | None = None
+) -> Any:
+    """Statement *index*'s result, normalised (``None`` past the last), of a request of several statements: a statement
+    whose subqueries are sent as statements of their own before it, in ``BEGIN … COMMIT`` outside a transaction
+    (``SubqueryCompiler.wrap()``, SurrealDB 4.x).
+
+    One ``query_raw()`` request. A failing statement raises the SDK's error for it, as ``query()`` raises it: the
+    first failing statement's, except that a statement SurrealDB reports as not executed because another failed
+    (``details.kind`` ``NotExecuted``) gives way to the one that failed — ``query()`` would raise the first ``LET``'s
+    "not executed". A query the server refuses as a whole raises the SDK's error for it.
+    """
+    raw = await query_raw(client, sql, variables, txn_id=txn_id)
+    if raw.get("error") is not None:
+        raise parse_rpc_error(raw["error"])
+    statements = [statement for statement in raw.get("result") or [] if isinstance(statement, dict)]
+    failed = [statement for statement in statements if statement.get("status") == "ERR"]
+    if failed:
+        raise parse_query_error(next((statement for statement in failed if not _not_executed(statement)), failed[0]))
+    return statements[index].get("result") if index < len(statements) else None
+
+
+#: What SurrealDB answers for a statement of a failed transaction that did not run (some servers give no ``details``).
+_NOT_EXECUTED = "The query was not executed due to a failed transaction"
+
+
+def _not_executed(statement: dict[str, Any]) -> bool:
+    """Whether the failed *statement* only did not run because another statement of its transaction failed."""
+    details = statement.get("details")
+    if isinstance(details, dict) and details.get("kind") == "NotExecuted":
+        return True
+    return str(statement.get("result") or "").strip().rstrip(".") == _NOT_EXECUTED
 
 
 async def query_raw(

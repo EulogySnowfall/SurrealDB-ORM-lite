@@ -88,6 +88,7 @@ from surrealdb.data.types.constants import (
     TAG_GEOMETRY_POINT,
     TAG_GEOMETRY_POLYGON,
 )
+from surrealdb.errors import parse_query_error, parse_rpc_error
 
 
 def _first_of(attr: str, *modules: str, required: bool = True) -> Any:
@@ -178,6 +179,8 @@ __all__ = [
     # Subqueries (v0.27.0): SurrealDB 3.1's form of the missing-table error inside a block
     "ThrownError",
     # SDK 3.0 (v0.50.0)
+    "parse_query_error",
+    "parse_rpc_error",
     "Null",
     "NullType",
     "SurrealSet",

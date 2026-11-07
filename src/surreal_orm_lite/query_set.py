@@ -1053,6 +1053,7 @@ class QuerySet:
         inline: bool = False,
         warn: bool = True,
         knn_prefilter: bool = False,
+        top_level: bool = False,
     ) -> SubqueryCompiler:
         """A compiler for the subqueries of one statement of this queryset (v0.27.0).
 
@@ -1068,6 +1069,7 @@ class QuerySet:
             warn: emit the warnings of the filter values (v0.28.1); ``False`` for a statement this read compiled once.
             knn_prefilter: compile the form below SurrealDB 3 (v0.36.0): the conditions next to a KNN selected first,
                 in a ``LET`` (:meth:`_where_parts`).
+            top_level: send the ``LET`` s as statements of their own (v0.50.0, ``SubqueryCompiler.wrap()``).
         """
         return SubqueryCompiler(
             inline=inline,
@@ -1077,6 +1079,7 @@ class QuerySet:
             variables=dict(self._variables),
             warn=warn,
             knn_prefilter=knn_prefilter,
+            top_level=top_level,
             _stack=[id(self)],
         )
 
@@ -1170,6 +1173,8 @@ class QuerySet:
             knn = self._similar.condition(variable)
             variables[variable] = list(self._similar.vector)
             counter += 1
+            if subqueries is not None and self._similar.dist is None and any(map(_subquery.reads_a_let, parts)):
+                subqueries.hnsw_let = True
             others = [part for part in parts if not _vector.id_subquery_part(part)]
             exact = self._similar.dist is not None
             if subqueries is None or not (others or exact):
@@ -1718,6 +1723,7 @@ class QuerySet:
         subquery_tables: frozenset[str] = frozenset(),
         searched: Mapping[str, str] | None = None,
         knn_fields: Mapping[str, str] | None = None,
+        index: int = 0,
     ) -> list[dict[str, Any]]:
         """
         Execute a read query. Routes through the transaction when one is attached
@@ -1757,6 +1763,9 @@ class QuerySet:
                 its subqueries' (:meth:`_searched_columns`); ``None``: this queryset's own.
             knn_fields: the columns the statement searches with a KNN, each mapped to its field as given — this
                 queryset's and its subqueries' (:meth:`_knn_columns`); ``None``: this queryset's own.
+            index: which statement's result the rows are (v0.50.0, ``SubqueryCompiler.statement_index()``): ``0``,
+                the first, but for a statement whose subqueries are sent before it as statements of their own,
+                read with ``_client.query_at()``; an error of any of them is read as the statement's.
 
         Raises:
             _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist (caught by
@@ -1771,7 +1780,8 @@ class QuerySet:
         subject = {} if self._refusal_subject is None else {"subject": self._refusal_subject}
         if self._tx is not None:
             try:
-                return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
+                at = {"index": index} if index else {}
+                return await self._tx.run_read(query, vars_, **at)  # type: ignore[no-any-return]
             except ServerError as exc:
                 # A read the ORM answers itself (no rows, or sent again without the missing subquery table) does not
                 # fail the transaction (issue #268); an error relayed does.
@@ -1798,6 +1808,8 @@ class QuerySet:
         encoded = _encoding.encode(vars_)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
         try:
+            if index:
+                return await _client.query_at(client, query, encoded, index=index)  # type: ignore[no-any-return]
             return await _client.query(client, query, encoded)  # type: ignore
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
@@ -1917,6 +1929,7 @@ class QuerySet:
         write: bool = False,
         warn: bool = True,
         knn_prefilter: bool | None = None,
+        top_level: bool = False,
     ) -> Any:
         """The loop of :meth:`_run_compiled`, as in v0.27.0: compile, send, and on a confirmed missing subquery
         table compile again with that subquery bound to ``[]`` and send again.
@@ -1931,23 +1944,27 @@ class QuerySet:
         ``None`` decides it once, right after the first compilation and its link check — the line read once per
         client (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is keyed,
         queued or sent — and every later compilation of this read or write (a re-send for a missing subquery table
-        included) uses that decision; :meth:`_run_cached` passes the one it took."""
+        included) uses that decision; :meth:`_run_cached` passes the one it took. The same decision says whether an
+        HNSW search next to a ``LET`` (``compiler.hnsw_let``) sends the ``LET`` s as statements of their own (*top_level*,
+        SurrealDB 4.x and later, v0.50.0): its result is then read at ``compiler.statement_index()``."""
         empty: frozenset[str] = frozenset()
         while True:
-            compiler = self._subquery_compiler(empty, warn=warn, knn_prefilter=bool(knn_prefilter))
+            compiler = self._subquery_compiler(empty, warn=warn, knn_prefilter=bool(knn_prefilter), top_level=top_level)
             warn = False
             query, variables = compile_statement(compiler)
             # A link to another connection is refused before the line is read (v0.50.0: first() reads it too).
             self._check_links()
             if knn_prefilter is None:
-                knn_prefilter = await self._below_3(compiler)
-                if knn_prefilter:
+                knn_prefilter, top_level = await self._line_forms(compiler)
+                if knn_prefilter or top_level:
                     continue
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
+            # The statement's result among the request's (v0.50.0): passed only for the top-level form.
+            at: dict[str, Any] = {"index": index} if (index := compiler.statement_index()) else {}
             read = frozenset(compiler.tables) - empty
             if not read:
-                return await self._execute_query(query, variables)
+                return await self._execute_query(query, variables, **at)
             # The fields the subqueries search (v0.35.0), which a missing-index error names; _execute_query() maps
             # this queryset's own. Only a subquery that searches adds the argument: the call is otherwise v0.27.0's.
             # The same for the fields their similar_to() searches (v0.36.0), which a dimension error names.
@@ -1955,7 +1972,7 @@ class QuerySet:
             if compiler.knn_fields:
                 searched["knn_fields"] = self._knn_columns(compiler)
             try:
-                return await self._execute_query(query, variables, subquery_tables=read, **searched)
+                return await self._execute_query(query, variables, subquery_tables=read, **at, **searched)
             except _subquery._MissingSubqueryTable as missing:
                 empty |= {missing.table}
 
@@ -1979,9 +1996,9 @@ class QuerySet:
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
         self._check_links()
-        knn_prefilter = await self._below_3(compiler)
-        if knn_prefilter:
-            compiler = self._subquery_compiler(warn=False, knn_prefilter=True)
+        knn_prefilter, top_level = await self._line_forms(compiler)
+        if knn_prefilter or top_level:
+            compiler = self._subquery_compiler(warn=False, knn_prefilter=knn_prefilter, top_level=top_level)
             query, variables = compile_statement(compiler)
         tables = {self._model_table, *compiler.tables}
         if self.model.__surreal_edge__ or compiler.edge_tables:
@@ -1999,19 +2016,27 @@ class QuerySet:
             variables,
             frozenset(tables),
             any_table,
-            lambda: self._run_uncached(compile_statement, warn=False, knn_prefilter=knn_prefilter),
+            lambda: self._run_uncached(compile_statement, warn=False, knn_prefilter=knn_prefilter, top_level=top_level),
         )
 
-    async def _below_3(self, compiler: SubqueryCompiler) -> bool:
-        """Whether the statement *compiler* compiled is for a line below SurrealDB 3 and needs the form with the
-        conditions next to its KNN selected first (v0.36.0), or an exact scan's nearest ranked by distance then id, or
-        ``first()``'s statement without its implicit ``ORDER BY id`` (v0.50.0): only when it has such conditions or such
-        a scan (``compiler.knn_conditions``) or that clause (``compiler.implicit_order``) is the line read, once per client
-        (``time_travel.cached_major()``) — on the connection's client, an interactive transaction's included. A version
-        that cannot be read counts as 3."""
-        if not (compiler.knn_conditions or compiler.implicit_order):
-            return False
-        return await _time_travel.cached_major(await self._manager().get_client()) < 3
+    async def _line_forms(self, compiler: SubqueryCompiler) -> tuple[bool, bool]:
+        """The forms of the statement *compiler* compiled that depend on the line: ``(knn_prefilter, top_level)``.
+
+        *knn_prefilter*: the statement is for a line below SurrealDB 3 and needs the form with the conditions next to
+        its KNN selected first (v0.36.0), or an exact scan's nearest ranked by distance then id, or ``first()``'s
+        statement without its implicit ``ORDER BY id`` (v0.50.0). *top_level*: it holds an HNSW search next to a
+        condition that reads a ``LET`` (``compiler.hnsw_let``) and is for SurrealDB 4.x or later, the embedded engine of SDK 3.0 included, which answers
+        no record for an HNSW search next to the ids of a ``LET`` of a block: the ``LET`` s are sent as statements of
+        their own (v0.50.0, ``SubqueryCompiler.wrap()``). Only when the statement has such conditions or such a scan
+        (``compiler.knn_conditions``), that clause (``compiler.implicit_order``) or such a search is the line read, once
+        per client (``time_travel.cached_major()``) — on the connection's client, an interactive transaction's
+        included. A version that cannot be read counts as 3."""
+        below_3 = compiler.knn_conditions or compiler.implicit_order
+        top_level = compiler.hnsw_let and bool(compiler.lets)
+        if not (below_3 or top_level):
+            return False, False
+        major = await _time_travel.cached_major(await self._manager().get_client())
+        return below_3 and major < 3, top_level and major >= 4
 
     async def _cached_read(
         self,

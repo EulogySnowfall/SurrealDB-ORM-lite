@@ -52,6 +52,7 @@ from surreal_orm_lite.subquery import (
     _MissingSubqueryTable,
     _same_value,
     missing_table,
+    reads_a_let,
     subquery_of,
 )
 from surreal_orm_lite.testing import embedded_database
@@ -359,6 +360,126 @@ _SAME: list[tuple[object, object]] = [
     (None, None),
 ]
 _SAME_IDS = ["same-object", "equal-strings", "equal-lists", "equal-nested-dicts", "equal-aware-datetimes", "none"]
+
+
+#: Two subqueries' ``LET`` s and the statement after them, for :class:`TestTopLevelForm`.
+_TL_LETS = ["LET $_sq0 = (SELECT VALUE id FROM a);", "LET $_sq1 = (SELECT VALUE id FROM b);"]
+_TL_STATEMENT = "SELECT * FROM t WHERE id IN $_sq0 AND id IN $_sq1 AND e <|2,100|> $_f0;"
+
+
+def _ok(result: Any) -> dict[str, Any]:
+    return {"status": "OK", "time": "1ms", "result": result}
+
+
+#: A statement of a failed ``BEGIN … COMMIT`` request that did not run, as SurrealDB 4.0 reports it.
+_SKIPPED = {
+    "status": "ERR",
+    "kind": "Query",
+    "result": "The query was not executed due to a failed transaction",
+    "details": {"kind": "NotExecuted"},
+}
+#: SurrealDB 4.0's missing-table error for a ``LET`` of that request.
+_LET_MISSING = {
+    "status": "ERR",
+    "kind": "NotFound",
+    "result": "The table 'sq_ghost' does not exist",
+    "details": {"kind": "Table", "details": {"name": "sq_ghost"}},
+}
+
+
+class _RawClient:
+    """A client whose ``query_raw()`` answers *envelope* and records each statement."""
+
+    def __init__(self, envelope: dict[str, Any]) -> None:
+        self.envelope = envelope
+        self.sent: list[str] = []
+
+    async def query_raw(self, statement: str, variables: Any = None, **kwargs: Any) -> Any:
+        self.sent.append(statement)
+        return self.envelope
+
+
+class TestTopLevelForm:
+    """v0.50.0 (SurrealDB 4.x): an HNSW search next to a ``LET`` sends the ``LET`` s as statements of their own —
+    ``SubqueryCompiler.wrap()`` and ``statement_index()`` — and ``_client.query_at()`` reads the statement's result
+    and the error of the statement that failed."""
+
+    def test_the_block_is_unchanged_without_top_level(self) -> None:
+        compiler = SubqueryCompiler(lets=list(_TL_LETS))
+        assert compiler.wrap(_TL_STATEMENT) == "{ " + " ".join(_TL_LETS) + f" ({_TL_STATEMENT[:-1]}) }};"
+        assert compiler.statement_index() == 0
+
+    def test_outside_a_transaction(self) -> None:
+        compiler = SubqueryCompiler(lets=list(_TL_LETS), top_level=True)
+        assert compiler.wrap(_TL_STATEMENT) == (f"BEGIN TRANSACTION; {' '.join(_TL_LETS)} {_TL_STATEMENT} COMMIT TRANSACTION;")
+        assert compiler.statement_index() == 3
+
+    def test_inside_a_transaction(self) -> None:
+        compiler = SubqueryCompiler(lets=list(_TL_LETS), top_level=True, outer_tx=object())
+        assert compiler.wrap(_TL_STATEMENT) == f"{' '.join(_TL_LETS)} {_TL_STATEMENT}"
+        assert compiler.statement_index() == 2
+
+    def test_every_let_empty_keeps_the_block(self) -> None:
+        lets = ["LET $_sq0 = <array> [];", "LET $_sq1 = <array> [];"]
+        compiler = SubqueryCompiler(lets=list(lets), top_level=True)
+        assert compiler.wrap(_TL_STATEMENT) == "{ " + " ".join(lets) + f" ({_TL_STATEMENT[:-1]}) }};"
+        assert compiler.statement_index() == 0
+        compiler.lets[1] = _TL_LETS[1]
+        assert compiler.wrap(_TL_STATEMENT).startswith("BEGIN TRANSACTION; LET $_sq0 = <array> []; LET $_sq1 = (")
+
+    def test_no_let_no_change(self) -> None:
+        compiler = SubqueryCompiler(top_level=True)
+        assert compiler.wrap(_TL_STATEMENT) == _TL_STATEMENT
+        assert compiler.statement_index() == 0
+
+    @pytest.mark.parametrize(
+        ("condition", "reads"),
+        [
+            ("id IN $_sq0", True),
+            ("$_sq12 CONTAINS id", True),
+            ("($_sq0 != [] AND score > array::first($_sq0))", True),
+            ("author IN $_sqz", False),
+            ("n > $_f0", False),
+            ("embedding <|2,100|> $_f1", False),
+        ],
+    )
+    def test_reads_a_let(self, condition: str, reads: bool) -> None:
+        assert reads_a_let(condition) is reads
+
+    async def test_query_at_reads_the_statement_s_result(self) -> None:
+        client = _RawClient({"result": [_ok(None), _ok(None), _ok(None), _ok([{"n": 1}]), _ok(None)]})
+        assert await _client.query_at(client, "…", {}, index=3) == [{"n": 1}]
+        assert await _client.query_at(client, "…", {}, index=9) is None
+
+    async def test_an_error_in_a_let_is_the_one_raised(self) -> None:
+        """The ``LET``'s missing-table error, past the statements reported as not executed: :func:`missing_table`
+        reads it as the server's own, so the ORM probes the table and sends the statement again."""
+        client = _RawClient({"result": [_ok(None), _LET_MISSING, _SKIPPED, _SKIPPED, _SKIPPED]})
+        with pytest.raises(NotFoundError) as raised:
+            await _client.query_at(client, "…", {}, index=2)
+        assert str(raised.value) == "The table 'sq_ghost' does not exist"
+        assert missing_table(raised.value) == "sq_ghost"
+
+    async def test_the_failed_statement_wins_over_the_skipped_ones(self) -> None:
+        failed = {"status": "ERR", "kind": "Internal", "result": "Incorrect vector dimension (2)."}
+        skipped_without_details = {"status": "ERR", "result": "The query was not executed due to a failed transaction"}
+        client = _RawClient({"result": [_ok(None), skipped_without_details, _SKIPPED, failed, _SKIPPED]})
+        with pytest.raises(InternalError) as raised:
+            await _client.query_at(client, "…", {}, index=3)
+        assert str(raised.value) == "Incorrect vector dimension (2)."
+
+    async def test_only_skipped_statements_raise_the_first(self) -> None:
+        conflict = {**_SKIPPED, "result": "Cannot COMMIT: Transaction conflict"}
+        client = _RawClient({"result": [_ok(None), _ok(None), _ok([]), conflict]})
+        with pytest.raises(ServerError) as raised:
+            await _client.query_at(client, "…", {}, index=2)
+        assert str(raised.value) == "Cannot COMMIT: Transaction conflict"
+
+    async def test_a_refused_query(self) -> None:
+        client = _RawClient({"error": {"code": -32000, "message": "Parse error: boom"}})
+        with pytest.raises(ServerError) as raised:
+            await _client.query_at(client, "…", {}, index=2)
+        assert "boom" in str(raised.value)
 
 
 class TestCompilerBookkeeping:

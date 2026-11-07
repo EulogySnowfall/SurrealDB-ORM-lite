@@ -249,7 +249,7 @@ from surreal_orm_lite.subquery import TABLE_PROBE, SubqueryCompiler, _MissingSub
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import user_namespace, validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
-from tests import _compaction
+from tests import _compaction, _sdk_calls
 from tests._readme_tables import DOCS as _DOCS
 from tests._readme_tables import (
     assert_embedded_rows,
@@ -3226,6 +3226,22 @@ def _query(statement: str) -> list[tuple[str, object]]:
     return [("query", statement), ("query_raw", statement)]
 
 
+def _top_level(block: str, *, in_tx: bool = False) -> str:
+    """*block* (``{ LET …; (<statement>) };``) in the form SurrealDB 4.x and later are sent it (v0.50.0,
+    ``SubqueryCompiler.wrap()``): its ``LET`` s as statements of their own, then the statement, in ``BEGIN … COMMIT``
+    outside a transaction."""
+    assert block.startswith("{ LET ") and block.endswith(") };"), block
+    end = block.rindex(";", 0, len(block) - len(" };"))
+    sent = f"{block[2 : end + 1]} {block[end + 3 : -len(') };')]};"
+    return sent if in_tx else f"BEGIN TRANSACTION; {sent} COMMIT TRANSACTION;"
+
+
+def _query_on(major: int, block: str) -> list[tuple[str, object]]:
+    """The calls of an HNSW search next to ``LET`` s (*block*) on line *major*: from SurrealDB 4 one ``query_raw()`` of
+    its top-level form (``_client.query_at()``), below 4 the block as :func:`_query` sends it."""
+    return [("query_raw", _top_level(block))] if major >= 4 else _query(block)
+
+
 def _sent(statements: Sequence[str]) -> list[tuple[str, object]]:
     """The calls of ``client.query(statement, {})`` for each of *statements*, in order."""
     return [call for statement in statements for call in _query(statement)]
@@ -4785,6 +4801,13 @@ _K9 = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); (SELECT *, vector::distance::knn() AS "
     "_knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f1 ORDER BY _knn_distance) };"
 )
+#: K9 on SurrealDB 4.x and later (v0.50.0): the ``LET`` as a statement of its own, before the statement, in one
+#: transaction — 4.0 answers no record for an HNSW search next to the ids of a ``LET`` of a block.
+_K9_TOP_LEVEL = (
+    "BEGIN TRANSACTION; LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); SELECT *, "
+    "vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f1 ORDER BY "
+    "_knn_distance; COMMIT TRANSACTION;"
+)
 #: K10: a comparison and a function lookup next to the KNN, in the form for SurrealDB 3.x.
 _K10 = (
     "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE category = $_f0 AND ((title).is_string() AND "
@@ -5253,10 +5276,33 @@ class TestPrefilter:
 
     async def test_no_line_without_a_condition(self, monkeypatch: pytest.MonkeyPatch) -> None:
         reads = _line_answers(monkeypatch, 2)
-        for queryset in (VecDoc.objects().similar_to("embedding", _Q, 2), _k9(), VecDoc.objects().filter(category="x")):
+        exact_k9 = VecDoc.objects().filter(id__in=Subquery(VecDoc.objects().search(title="cats")))
+        for queryset in (VecDoc.objects().similar_to("embedding", _Q, 2), VecDoc.objects().filter(category="x"), exact_k9):
             _executed(monkeypatch, queryset)
             await queryset.exec()
         assert reads == []
+
+    @pytest.mark.parametrize(("major", "sent"), [(2, _K9), (3, _K9), (4, _K9_TOP_LEVEL), (5, _K9_TOP_LEVEL)])
+    async def test_an_hnsw_search_next_to_a_subquery_reads_the_line(
+        self, monkeypatch: pytest.MonkeyPatch, major: int, sent: str
+    ) -> None:
+        """v0.50.0: an HNSW search next to ``LET`` s reads the line once; from SurrealDB 4 the ``LET`` s are sent as
+        statements of their own, in ``BEGIN … COMMIT``, and the rows are the statement's, the third result."""
+        reads = _line_answers(monkeypatch, major)
+        queryset = _k9()
+        indexes: list[int] = []
+
+        async def execute(query: str, variables: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+            indexes.append(kwargs.get("index", 0))
+            executed.append((query, dict(variables or {})))
+            return []
+
+        executed: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(queryset, "_execute_query", execute)
+        assert await queryset.exec() == []
+        assert executed == [(sent, {"_f0": "cats", "_f1": [1.0, 0.0, 0.0]})]
+        assert indexes == [2 if major >= 4 else 0]
+        assert len(reads) == 1
 
 
 def _scored(*annotations: tuple[str, Any], annotate_first: bool = False) -> Any:
@@ -5464,7 +5510,7 @@ class TestPrefilterE2E:
     """``similar_to()`` next to every kind of condition, on every engine: the same records on every line — SurrealDB
     3.x gets the conditions inline, SurrealDB 2.x and the embedded engine the ``LET`` form (the spy shows each), an exact
     scan's ``LET`` ranking its nearest by distance then id —, the line read once per client and only for a statement
-    with such a condition or an exact scan."""
+    with such a condition, an exact scan or an HNSW search next to a subquery's ids (v0.50.0)."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize(
@@ -5528,7 +5574,11 @@ class TestPrefilterE2E:
             tech = await VecDoc.objects().filter(category="tech").similar_to("embedding", _Q, 2).exec()
             count = await VecDoc.objects().filter(title__startswith="Cats").similar_to("embedding", _Q, 2).count()
             versions = [call for call in _calls(calls) if call[0] == "version"]
-        assert before == [*_query("SELECT * FROM vec_doc WHERE category = $_f0;"), *_query(_K1), *_query(_K9)]
+            major = await _major(client)
+        plain_and_alone = [*_query("SELECT * FROM vec_doc WHERE category = $_f0;"), *_query(_K1)]
+        # An HNSW search next to a LET reads the line too (v0.50.0); from SurrealDB 4 the LET goes first, on its own.
+        by_ids_sent = [("version", None), ("query_raw", _K9_TOP_LEVEL)] if major >= 4 else [("version", None), *_query(_K9)]
+        assert before == [*plain_and_alone, *by_ids_sent]
         assert sorted(_ids(plain)) == ["d3", "d4"]
         assert _ids(alone) == ["d1", "d2"]
         assert _ids(by_ids) == ["d1", "d2"]
@@ -5824,7 +5874,8 @@ class TestWriteByIds:
     the KNN ``SELECT`` returns, bound in a ``LET`` of the statement's block — the other conditions' ``LET`` s first,
     below SurrealDB 3 the pre-filter's too —, so the write itself never carries the KNN operator; the ``LET`` reads the
     model's table, so a table SurrealDB 3.x confirms missing binds it to ``[]``. The line is read once per write, and
-    only for a KNN next to another condition or an exact scan; a transaction queues the block of its line."""
+    only for a KNN next to another condition, an exact scan or a subquery's ids (v0.50.0: from SurrealDB 4 the ``LET`` s
+    then go first, on their own); a transaction queues the block of its line."""
 
     @pytest.mark.parametrize("knn_prefilter", [False, True])
     async def test_k12_similar_to_alone(self, knn_prefilter: bool, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5930,12 +5981,36 @@ class TestWriteByIds:
             lambda: alone.bulk_update(hit=True),
             lambda: alone.bulk_delete(),
             lambda: alone.patch(_HIT),
-            lambda: by_ids.similar_to("embedding", _Q, 2).bulk_update(hit=True),
+            lambda: by_ids.bulk_update(hit=True),
         ):
             for queryset in (alone, by_ids):
                 _executed(monkeypatch, queryset, [])
             await call()
         assert reads == []
+
+    @pytest.mark.parametrize("major", [2, 3, 4])
+    async def test_a_write_by_the_nearest_of_a_subquery_reads_the_line(
+        self, major: int, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.50.0: the KNN ``SELECT`` of the ids next to a subquery's ``LET`` reads the line; from SurrealDB 4 the
+        ``LET`` s are sent on their own, in ``BEGIN … COMMIT``: a ``LET`` that fails leaves the write undone."""
+        reads = _line_answers(monkeypatch, major)
+        queryset = VecRanked.objects().filter(id__in=Subquery(VecRanked.objects().filter(n__gt=2)))
+        nearest = queryset.similar_to("embedding", _Q, 2)
+        indexes: list[int] = []
+        sent: list[str] = []
+
+        async def execute(query: str, variables: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+            sent.append(query)
+            indexes.append(kwargs.get("index", 0))
+            return []
+
+        monkeypatch.setattr(nearest, "_execute_query", execute)
+        assert await nearest.bulk_update(hit=True) == 0
+        [statement] = sent
+        assert statement.startswith("BEGIN TRANSACTION; LET $_sq0 = " if major >= 4 else "{ LET $_sq0 = "), statement
+        assert indexes == [3 if major >= 4 else 0]
+        assert len(reads) == 1
 
     async def test_a_transaction_queues_the_block_of_its_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
         reads = _line_answers(monkeypatch, 2)
@@ -6049,6 +6124,118 @@ class TestWriteByIdsTxE2E:
         assert added == [(_RANGE_PREFILTERED if major < 3 else _RANGE_INLINE, _RANGE_VARIABLES)]
         assert written == (2 if interactive else 0)
         assert hits == ["d4", "d6"]
+
+
+def _ghost_ids() -> Any:
+    """``VecDoc``'s nearest next to a subquery of ``VecRanked``, a table the test never writes: it does not exist."""
+    return VecDoc.objects().filter(id__not_in=Subquery(VecRanked.objects())).similar_to("embedding", _Q, 2)
+
+
+def _cats_nearest(tx: Any = None) -> Any:
+    """K9's queryset (the nearest among the matches of ``"cats"``), in *tx* when given."""
+    matches = Subquery(VecDoc.objects(tx=tx).search(title="cats"))
+    return VecDoc.objects(tx=tx).filter(id__in=matches).similar_to("embedding", _Q, 2)
+
+
+async def _ids_where(client: Any, condition: str = "true") -> list[str]:
+    """The keys of ``vec_doc``'s records matching *condition* (the test's own text), in id order."""
+    rows = await _client.query(client, f"SELECT VALUE id FROM vec_doc WHERE {condition} ORDER BY id;")
+    return [str(record.id) for record in rows]
+
+
+class TestHnswNextToALetE2E:
+    """v0.50.0: an HNSW search next to the ids of a subquery's ``LET``, on every engine. SurrealDB 4.0 answers no
+    record for it inside a block, so from SurrealDB 4 the ORM sends the ``LET`` s as statements of their own before the
+    statement, in ``BEGIN … COMMIT`` (one request): the nearest records on every line, a ``LET`` that fails leaving the
+    statement without effect, the server's errors read as before."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_missing_subquery_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The missing-table contract: the table reads as empty — on 3.x and 4.x through the probe and the statement
+        sent again with the subquery empty, which keeps the block (no ``LET`` holds a ``SELECT`` there)."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            kept = await _ghost_ids().exec()
+            sent = [statement for method, statement in _calls(calls) if method == "query_raw"]  # each request once
+            none = await VecDoc.objects().filter(id__in=Subquery(VecRanked.objects())).similar_to("embedding", _Q, 2).exec()
+        assert _ids(kept) == ["d1", "d2"]
+        assert none == []
+        if major >= 4:
+            first, probe, again = sent
+            assert first.startswith("BEGIN TRANSACTION; LET $_sq0 = (SELECT VALUE id FROM vec_ranked"), first
+            assert first.endswith("; COMMIT TRANSACTION;"), first
+            assert probe == TABLE_PROBE
+            assert again.startswith("{ LET $_sq0 = <array> []; (SELECT "), again
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_next_to_a_missing_subquery_table_runs_once(self, kind: str) -> None:
+        """The write that met the missing table is never applied: the statement sent again deletes the two nearest
+        records, and only them."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            deleted = await _ghost_ids().bulk_delete()
+            left = await _ids_where(client)
+        assert deleted == 2
+        assert left == ["d3", "d4", "d5", "d6"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_failing_let_leaves_the_write_undone(self, kind: str) -> None:
+        """A ``LET`` whose ``SELECT`` fails (a search on a field without a full-text index) raises the ORM's error, as
+        the same subquery does without ``similar_to()``, and writes no record."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            if await _major(client) < 3:
+                pytest.skip("SurrealDB 3.x and later refuse a search on a field without a full-text index")
+            searched = Subquery(VecDoc.objects().search(category="pets"))
+            with pytest.raises(SurrealDbError, match="category") as plain:
+                await VecDoc.objects().filter(id__in=searched).bulk_update(featured=True)
+            with pytest.raises(SurrealDbError, match="category") as raised:
+                await VecDoc.objects().filter(id__in=searched).similar_to("embedding", _Q, 2).bulk_update(featured=True)
+            featured = await _ids_where(client, "featured = true")
+        assert str(raised.value) == str(plain.value)
+        assert featured == []
+
+    async def test_an_interactive_transaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """In an interactive transaction (WebSocket, SurrealDB 3.x and later) the form joins the transaction's request,
+        without ``BEGIN``/``COMMIT``; its ``LET`` reaches neither the transaction's next request nor the session's."""
+        async with _vec_models("ws") as client:
+            await _seed(client)
+            major = await _major(client)
+            if major < 3:
+                pytest.skip("SurrealDB 3.x and later: 2.x has no interactive transaction")
+            async with SurrealDBConnectionManager.transaction("vec") as tx:
+                assert tx.is_interactive
+                sent = _sdk_calls.record(monkeypatch, tx._client, *_sdk_calls.QUERIES, entry=lambda call: call.target)
+                nearest = await _cats_nearest(tx).exec()
+                written = await _cats_nearest(tx).bulk_update(featured=True)
+                in_tx = await _client.query(tx._client, "RETURN $_sq0;", txn_id=tx._txn_id)
+            in_session = await _client.query(tx._client, "RETURN $_sq0;")
+            featured = await _ids_where(client, "featured = true")
+        assert _ids(nearest) == ["d1", "d2"]
+        assert written == 2
+        assert (in_tx, in_session) == (None, None)
+        assert featured == ["d1", "d2"]
+        if major >= 4:
+            read, write = sent[:2]
+            assert read == _top_level(_K9, in_tx=True), read
+            assert write.startswith("LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); LET $_sq1 = "), write
+
+    async def test_the_raw_block_still_answers_no_record_on_4_0(self) -> None:
+        """The server's answer the ORM works around (README row "``similar_to()`` next to a subquery"): inside a block,
+        an HNSW search next to the ids of a ``LET`` holding a ``SELECT`` answers no record on SurrealDB 4.0; the same
+        ``LET`` sent as a statement of its own, the nearest. When a 4.x release answers the records, this test fails:
+        the ORM's top-level form (``SubqueryCompiler.top_level``) can then be dropped for that release."""
+        async with _vec_models("ws") as client:
+            await _seed(client)
+            if await _major(client) < 4:
+                pytest.skip("SurrealDB 4.x only: the earlier lines answer the records in the block")
+            variables = {"_f0": "cats", "_f1": list(_Q)}
+            block = await _client.query(client, _K9, variables)
+            top_level = (await _client.query_all(client, _top_level(_K9), variables))[2]
+        assert block == [], "SurrealDB 4.x answers the records in the block now: drop the ORM's top-level form there"
+        assert [str(row["id"].id) for row in top_level] == ["d1", "d2"]
 
 
 #: SurrealDB's refusal of a query vector of two numbers for a vector index of dimension 3, the same on every engine.
@@ -6242,23 +6429,41 @@ async def _seed_loose(client: Any) -> None:
 
 
 class _DimensionClient:
-    """A client whose every query fails with SurrealDB's dimension error: records what it was sent."""
+    """A client whose every query fails with SurrealDB's dimension error: records what it was sent. Its ``version()``
+    answers *version*, ``None`` failing the test; its ``query_raw()`` answers a ``BEGIN … COMMIT`` request of
+    *statements* statements (v0.50.0's top-level form) with the error on the one before ``COMMIT``, every other
+    statement after ``BEGIN`` reported as not executed."""
 
-    def __init__(self) -> None:
+    def __init__(self, version: str | None = None, statements: int = 4) -> None:
         self.error = InternalError("Internal", _DIMENSION_ERROR)
         self.sent: list[str] = []
+        self.answer = version
+        self.statements = statements
 
     async def query(self, statement: str, variables: Any = None) -> Any:
         self.sent.append(statement)
         raise self.error
 
+    async def query_raw(self, statement: str, variables: Any = None) -> Any:
+        self.sent.append(statement)
+        skipped = {"status": "ERR", "kind": "Query", "result": _NOT_EXECUTED, "details": {"kind": "NotExecuted"}}
+        failed = {"status": "ERR", "kind": "Internal", "result": _DIMENSION_ERROR}
+        middle = [skipped] * (self.statements - 3)
+        return {"result": [{"status": "OK", "result": None}, *middle, failed, skipped]}
+
     async def version(self) -> str:
-        pytest.fail("a statement without another condition reads no line")
+        if self.answer is None:
+            pytest.fail("a statement without another condition reads no line")
+        return self.answer
 
 
-def _dimension_client(monkeypatch: pytest.MonkeyPatch) -> _DimensionClient:
+#: SurrealDB's text for a statement of a failed transaction that did not run.
+_NOT_EXECUTED = "The query was not executed due to a failed transaction"
+
+
+def _dimension_client(monkeypatch: pytest.MonkeyPatch, version: str | None = None) -> _DimensionClient:
     """Every read acquires one :class:`_DimensionClient`, returned."""
-    client = _DimensionClient()
+    client = _DimensionClient(version)
 
     async def get_client(*args: Any, **kwargs: Any) -> Any:
         return client
@@ -6349,8 +6554,11 @@ class TestDimensionRefusal:
         assert raised.value.__cause__ is client.error
         assert len(client.sent) == 1
 
-    async def test_its_own_and_a_subquery_s_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = _dimension_client(monkeypatch)
+    @pytest.mark.parametrize("version", ["surrealdb-2.7.0", "surrealdb-3.3.5", "surrealdb-4.0.0"])
+    async def test_its_own_and_a_subquery_s_fields(self, monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+        """An HNSW search next to a subquery reads the line (v0.50.0); from SurrealDB 4 its ``LET`` goes first, on
+        its own, and the error of the statement that failed is read past the statements reported as not executed."""
+        client = _dimension_client(monkeypatch, version)
         inner = VecDoc.objects().similar_to("summary_vec", [1.0, 0.0, 0.0], 2)
         queryset = VecLoose.objects().filter(id__in=Subquery(inner)).similar_to("embedding", _SHORT)
         with pytest.raises(SurrealDbError) as raised:
@@ -6359,7 +6567,14 @@ class TestDimensionRefusal:
             "similar_to(): the vector has 2 dimensions; the vector index on one of the fields 'embedding', "
             "'summary_vec' expects 3."
         )
-        assert raised.value.__cause__ is client.error
+        [sent] = client.sent
+        if version.startswith("surrealdb-4"):
+            assert sent.startswith("BEGIN TRANSACTION; LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE "), sent
+            assert type(raised.value.__cause__) is InternalError
+            assert str(raised.value.__cause__) == str(client.error)
+        else:
+            assert sent.startswith("{ LET $_sq0 = "), sent
+            assert raised.value.__cause__ is client.error
 
     async def test_a_write_by_the_ids_of_the_nearest(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _dimension_client(monkeypatch)

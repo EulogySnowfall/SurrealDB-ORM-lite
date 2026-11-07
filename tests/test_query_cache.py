@@ -2617,10 +2617,10 @@ class TestTags:
         self, reads: list[_Read], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # first() reads the line for its implicit ORDER BY id (v0.50.0): SurrealDB 3 or later here, without a client.
-        async def line_3_or_later(self: QuerySet, compiler: Any) -> bool:
-            return False
+        async def line_3_or_later(self: QuerySet, compiler: Any) -> tuple[bool, bool]:
+            return False, False
 
-        monkeypatch.setattr(QuerySet, "_below_3", line_3_or_later)
+        monkeypatch.setattr(QuerySet, "_line_forms", line_3_or_later)
         qs = QcItem.objects().filter(price__gt=1).cache()
         assert await qs.exec() == []
         with pytest.raises(SurrealDbNotFoundError):
