@@ -36,6 +36,9 @@ supports. See [the migration note](https://github.com/EulogySnowfall/SurrealDB-O
 
 ### Fixed
 
+- `QuerySet.query()` no longer hides a cancelled transaction: on SurrealDB 3.x and 4.x a `BEGIN … COMMIT` whose
+  statement reads a missing table raises `SurrealDbError` (the server cancelled it, its writes did not run) instead
+  of returning `[]`; 2.x reads the missing table as empty and commits.
 - A retired client refuses its next request instead of reconnecting anonymously.
 - An HTTP refusal is the server's answer, not a lost connection.
 - Introspection reads the SurrealDB 4.x `INFO` shapes; an HNSW search next to a subquery sends its `LET`s first on
@@ -44,6 +47,8 @@ supports. See [the migration note](https://github.com/EulogySnowfall/SurrealDB-O
 
 ### Notes
 
+- Staying on the SDK 2.0 for now? Pin the deprecated `0.40.x` line, which receives security fixes only, with
+  `pip install "surreal-orm-lite<0.50"`, and plan the move to `0.50.x` with the migration note.
 - Behaviour that differs between 2.x, 3.x and 4.x is listed in the
   [compatibility guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md).
 - Not in this version: the SDK's own reconnection and token handling (v0.51.0, #422) and `MigrateRows` (v0.56.0,

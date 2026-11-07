@@ -356,9 +356,8 @@ class TestV050Guides:
 
 
 class TestV050Security:
-    """AC-15 (c): ``SECURITY.md``'s supported versions. The release-manager writes it with the release."""
+    """AC-15 (c): ``SECURITY.md``'s supported versions."""
 
-    @pytest.mark.xfail(strict=True, reason="release-manager writes SECURITY.md")
     def test_supported_versions(self) -> None:
         """``0.50.x`` supported, ``0.40.x`` deprecated with security fixes only, ``< 0.40`` not supported."""
         rows = {cells[0]: cells[1] for _, cells in _table_rows(doc_part_of("## Supported Versions", _security()))}

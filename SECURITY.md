@@ -4,11 +4,11 @@
 
 The following versions of Surreal-ORM-Lite are currently supported with security updates:
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.50.x  | :white_check_mark: |
-| 0.40.x  | :white_check_mark: |
-| < 0.40  | :x:                |
+| Version | Supported                       |
+| ------- | ------------------------------- |
+| 0.50.x  | :white_check_mark:              |
+| 0.40.x  | Deprecated, security fixes only |
+| < 0.40  | :x:                             |
 
 `0.50.x` runs on the official SDK 3.0; `0.40.x` is the SDK 2.0 line, deprecated, and receives security fixes only.
 
