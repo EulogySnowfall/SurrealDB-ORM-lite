@@ -4523,16 +4523,22 @@ async def _remove_server_database(url: str, database: str) -> None:
 
 @contextlib.asynccontextmanager
 async def _mixed_lines() -> AsyncIterator[list[_Side]]:
-    """``md_3x`` on ``SURREALDB_PORT_3X`` and ``md_2x`` on ``SURREALDB_PORT_2X`` (same ``SURREALDB_HOST``), each on
-    database ``md_mixed`` of namespace ``ns``, removed before and after; skips without both ports (spec §9.1, §9.3).
-    ``SURREALDB_PORT`` is not read: the pair is the same in each line's run."""
+    """``md_3x`` on ``SURREALDB_PORT_3X`` and ``md_2x`` on ``SURREALDB_PORT_2X`` (same ``SURREALDB_HOST``), plus
+    ``md_4x`` on ``SURREALDB_PORT_4X`` when it is set (v0.50.0, the CI ``mixed-lines`` job), each on database
+    ``md_mixed`` of namespace ``ns``, removed before and after; skips without the 3.x and 2.x ports (spec §9.1, §9.3).
+    ``SURREALDB_PORT`` is not read: the set is the same in each line's run."""
     port_3x, port_2x = os.environ.get("SURREALDB_PORT_3X"), os.environ.get("SURREALDB_PORT_2X")
     if not (port_3x and port_2x):
         pytest.skip("needs SURREALDB_PORT_3X and SURREALDB_PORT_2X (both server lines)")
     urls = {"md_3x": _ws_url_at(port_3x), "md_2x": _ws_url_at(port_2x)}
+    lines = [3, 2]
+    port_4x = os.environ.get("SURREALDB_PORT_4X")
+    if port_4x:
+        urls["md_4x"] = _ws_url_at(port_4x)
+        lines.append(4)
     try:
         sides = [await _server_side(name, url, "md_mixed") for name, url in urls.items()]
-        assert [side.line for side in sides] == [3, 2], "SURREALDB_PORT_3X and SURREALDB_PORT_2X name the two lines"
+        assert [side.line for side in sides] == lines, "SURREALDB_PORT_3X, _2X and _4X name their own lines"
         yield sides
     finally:
         for name, url in urls.items():
@@ -4692,7 +4698,8 @@ class TestMixedLinesE2E(_PerConnectionDecisions):
     """AC-10 (spec §9.3): ``md_3x`` and ``md_2x``, a SurrealDB 3.x and a 2.x server in one process — interactive
     against buffered transactions, ``as_of().fetch()`` refused on ``md_2x`` only, each line's change-feed cursor, live
     streams that receive their own events only. Runs when ``SURREALDB_PORT_3X`` and ``SURREALDB_PORT_2X`` are set
-    (the ``mixed-lines`` CI job, the team's ``test-dbs.sh test``), skips otherwise."""
+    (the ``mixed-lines`` CI job, the team's ``test-dbs.sh test``), skips otherwise; ``SURREALDB_PORT_4X`` adds an
+    ``md_4x`` side on SurrealDB 4.x (the CI job sets it)."""
 
     @staticmethod
     def _sides() -> contextlib.AbstractAsyncContextManager[list[_Side]]:

@@ -83,13 +83,18 @@ jobs:
       # tests/test_time_travel.py reads history (as_of(), SELECT ... VERSION) from a second server
       # started with versioned storage, found through SURREALDB_VERSIONED_PORT; its versioned-server
       # tests skip without it. The first server stays in memory: its tests pin the refusal (3.x) and
-      # the silent answer (2.x) of a store without history. 3.x enables history with
-      # ?versioned=true, 2.x with the surrealkv+versioned:// scheme. tmpfs: nothing outlives the job.
+      # the silent answer (2.x) of a store without history. 3.x and 4.x enable history with
+      # ?versioned=true, 2.x with the surrealkv+versioned:// scheme; a line not listed fails here rather
+      # than start a store it may not understand. tmpfs: nothing outlives the job.
       - name: Start versioned SurrealDB ${{ matrix.surrealdb-version }} (time travel)
         run: |
           case "${{ matrix.surrealdb-version }}" in
             v2.*) store="surrealkv+versioned:///data/db" ;;
-            *) store="surrealkv:///data/db?versioned=true" ;;
+            v3.* | v4.*) store="surrealkv:///data/db?versioned=true" ;;
+            *)
+              echo "No versioned store known for SurrealDB ${{ matrix.surrealdb-version }}: add its line here." >&2
+              exit 1
+              ;;
           esac
           docker run -d \
             --name surreal-versioned \
@@ -139,10 +144,11 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: false
 
-  # Both supported server lines in one process (v0.29.0 named connections): TestMixedLinesE2E puts a
-  # SurrealDB 3.x and a 2.x connection side by side, and skips without SURREALDB_PORT_3X/_2X — which
-  # the matrix above, one server per job, never sets. The images are read from the pin files after
-  # the checkout, so a version monitor's bump reaches this job with no edit here.
+  # The supported server lines in one process (v0.29.0 named connections): TestMixedLinesE2E puts a
+  # SurrealDB 3.x, a 2.x and (since v0.50.0) a 4.x connection side by side, and skips without
+  # SURREALDB_PORT_3X/_2X — which the matrix above, one server per job, never sets; SURREALDB_PORT_4X adds
+  # the 4.x side. The images are read from the pin files after the checkout, so a version monitor's bump
+  # reaches this job with no edit here.
   mixed-lines:
     name: Mixed server lines
     runs-on: ubuntu-latest
@@ -150,14 +156,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Start SurrealDB, both pinned lines
+      - name: Start SurrealDB, the three pinned lines
         run: |
           docker run -d --name surreal-3x -p 8000:8000 \
             "surrealdb/surrealdb:v$(cat .surrealdb-version)" start --user root --pass root
           docker run -d --name surreal-2x -p 8002:8000 \
             "surrealdb/surrealdb:v$(cat .surrealdb-version2x)" start --user root --pass root
+          docker run -d --name surreal-4x -p 8004:8000 \
+            "surrealdb/surrealdb:v$(cat .surrealdb-version4x)" start --user root --pass root
 
-          for server in surreal-3x:8000 surreal-2x:8002; do
+          for server in surreal-3x:8000 surreal-2x:8002 surreal-4x:8004; do
             name="${server%%:*}"
             port="${server##*:}"
             echo "Waiting for ${name} to be healthy..."
@@ -194,6 +202,7 @@ jobs:
           SURREALDB_PORT: 8000
           SURREALDB_PORT_3X: 8000
           SURREALDB_PORT_2X: 8002
+          SURREALDB_PORT_4X: 8004
         run: uv run pytest tests/test_multi_database.py -k MixedLines -v --no-cov
 
   ci-success:

@@ -72,9 +72,9 @@ jobs:
       - name: Run type checking
         run: uv run mypy src/
 
-      # Both supported lines. .surrealdb-version pins the primary (latest) line, currently
-      # 3.3.x; .surrealdb-version2x pins the legacy 2.x line (2.7.x). Both moved in v0.19.1.
-      - name: Start SurrealDB (both supported lines)
+      # The three supported lines, one pin file each: .surrealdb-version (3.x, the primary line),
+      # .surrealdb-version2x (2.x) and .surrealdb-version4x (4.x, since v0.50.0).
+      - name: Start SurrealDB (the three supported lines)
         run: |
           start_one() {
             local name="$1" tag="$2" port="$3"
@@ -99,6 +99,7 @@ jobs:
 
           start_one surrealdb-3x "$(tr -d '[:space:]' < .surrealdb-version)"   8000
           start_one surrealdb-2x "$(tr -d '[:space:]' < .surrealdb-version2x)" 8001
+          start_one surrealdb-4x "$(tr -d '[:space:]' < .surrealdb-version4x)" 8002
 
       # Primary line carries coverage, as the 3.x paths (interactive transactions) are the
       # ones the 2.x run self-skips.
@@ -118,9 +119,15 @@ jobs:
           SURREALDB_PORT: 8001
         run: uv run pytest tests/ -v --no-cov
 
+      - name: Run all tests (newest line, 4.x)
+        env:
+          SURREALDB_HOST: localhost
+          SURREALDB_PORT: 8002
+        run: uv run pytest tests/ -v --no-cov
+
       - name: Stop SurrealDB
         if: always()
-        run: docker rm -f surrealdb-2x surrealdb-3x || true
+        run: docker rm -f surrealdb-2x surrealdb-3x surrealdb-4x || true
 
       - name: Set test result
         id: test-result
