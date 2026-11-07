@@ -1757,7 +1757,7 @@ class TestConcurrencyE2E:
     """AC-14 (spec §9.3): four executors on four connections to one database run ``migrate()`` at once: one record
     per migration, every definition once; each call returns the names it applied (maybe none) or raises the
     retryable ``SurrealDbConflictError`` — never a ``MigrationStatementError``. Under load all four can meet a conflict
-    (seen on SurrealDB 4.0.0): those run again, as the error tells a caller to."""
+    (seen on SurrealDB 4.0.0): those run again, staggered, as the error tells a caller to."""
 
     async def test_four_executors_at_once(self, tmp_path: Path) -> None:
         database = _database_name()
@@ -1777,10 +1777,18 @@ class TestConcurrencyE2E:
                 SurrealDBConnectionManager.add_connection(
                     name, url=_url("ws"), user="root", password="root", namespace="ns", database=database
                 )
+
+            async def migrate(name: str, pause: float) -> list[str]:
+                await asyncio.sleep(pause)
+                return await MigrationExecutor(tmp_path, connection=name).migrate()
+
             pending = names
-            for _ in range(5):  # a conflict is retryable: the executors that met one run again, as a caller would
+            for attempt in range(5):  # a conflict is retryable: the executors that met one run again, as a caller would
+                # The first round starts all four at once. A retry is staggered, as a caller backing off would be: four
+                # retries in lockstep can keep refusing each other on SurrealDB 4.0.0 ("another index build read while
+                # this transaction awaited its own index build").
                 outcomes = await asyncio.gather(
-                    *(MigrationExecutor(tmp_path, connection=name).migrate() for name in pending), return_exceptions=True
+                    *(migrate(name, 0.1 * attempt * index) for index, name in enumerate(pending)), return_exceptions=True
                 )
                 for outcome in outcomes:
                     if isinstance(outcome, BaseException):
