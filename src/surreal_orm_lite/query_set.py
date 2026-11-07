@@ -3791,8 +3791,9 @@ class QuerySet:
 
         Every statement runs and the **list** results of every statement are concatenated in order, then hydrated
         as model instances (v0.50.0, full SurrealDB-ORM parity; before, only the first statement's rows came back,
-        with a warning). A statement whose result is not a list (``LET``, ``RETURN``) contributes nothing; a failing
-        statement raises, even when it is not the first. The rows of every ``SELECT`` are hydrated as this model:
+        with a warning). A statement whose result is not a list (``LET``, ``RETURN``) contributes nothing, nor does a
+        statement that reads a table that does not exist (SurrealDB 3.x and 4.x fail it, 2.x reads it as empty); any
+        other failing statement raises, even when it is not the first. The rows of every ``SELECT`` are hydrated as this model:
         select its own table.
 
         Returns:
@@ -3814,10 +3815,16 @@ class QuerySet:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it
             # would corrupt their string literals (issue #156).
-            results = await _client.query_all(client, query, _encoding.encode(variables or {}))
+            # SurrealDB 3.x fails a statement that reads a never-created table; the ORM contract treats a missing
+            # table as empty, per statement, so the rows of the other statements still come back (as on 2.x).
+            results = await _client.query_all_tolerant(
+                client,
+                query,
+                _encoding.encode(variables or {}),
+                empty=lambda error: _subquery.missing_table(error) is not None,
+            )
         except NotFoundError:
-            # SurrealDB 3.x raises for a never-created table; the ORM contract
-            # treats a missing table as empty.
+            # The query as a whole refused for a missing table (no per-statement envelope).
             return self.model.from_db([])
         return self.model.from_db(statement_rows(results))
 

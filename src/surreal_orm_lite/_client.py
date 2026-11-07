@@ -10,6 +10,8 @@ What changed with the official SDK 3.0, and how this module keeps the ORM's sema
 - ``query()`` resolves to one result per statement, and a failing statement raises even when it is not the first.
   ``query()`` here returns the first statement's result (``None`` for an empty result list), as the ORM's internal
   single-statement calls expect; ``query_all()`` returns them all.
+- ``query_all_tolerant()`` (v0.50.0) is ``query_all()`` where a failing statement the caller accepts (a missing table
+  read, for ``QuerySet.query()``) answers ``[]`` instead of failing the whole request, as on SurrealDB 2.x.
 - ``query_at()`` (v0.50.0) reads one statement's result of a request of several, through ``query_raw()``, and raises
   the error of the statement that failed rather than the "not executed" of the statements of its transaction: the
   form a statement whose subqueries go before it, as statements of their own, is sent on SurrealDB 4.x.
@@ -47,7 +49,7 @@ import asyncio
 import contextlib
 import copy
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 from uuid import UUID
 
@@ -57,6 +59,7 @@ from ._sdk import (
     RecordID,
     SdkAsyncWsConnection,
     SdkRange,
+    ServerError,
     SurrealSet,
     Table,
     TransportError,
@@ -78,6 +81,7 @@ __all__ = [
     "patch",
     "query",
     "query_all",
+    "query_all_tolerant",
     "query_at",
     "query_raw",
     "is_retired",
@@ -174,6 +178,49 @@ async def query_at(
     if failed:
         raise parse_query_error(next((statement for statement in failed if not _not_executed(statement)), failed[0]))
     return statements[index].get("result") if index < len(statements) else None
+
+
+async def query_all_tolerant(
+    client: Any,
+    sql: str,
+    variables: dict[str, Any] | None = None,
+    *,
+    empty: Callable[[ServerError], bool],
+    txn_id: UUID | None = None,
+) -> list[Any]:
+    """One normalised result per statement, as ``query_all()``, except that a failing statement whose error *empty*
+    accepts answers ``[]``.
+
+    One ``query_raw()`` request: SDK 3.0's ``query()`` raises for any failing statement and loses the results of the
+    others. Any other failing statement raises its SDK error, as ``query_at()`` does (the first one that failed, a
+    statement of an aborted transaction that did not run giving way to the one that failed). A statement that did not
+    run because an accepted failure aborted its transaction answers ``[]`` as well. A query the server refuses as a
+    whole raises the SDK's error for it.
+    """
+    raw = await query_raw(client, sql, variables, txn_id=txn_id)
+    if raw.get("error") is not None:
+        raise parse_rpc_error(raw["error"])
+    statements = [statement for statement in raw.get("result") or [] if isinstance(statement, dict)]
+    results: list[Any] = []
+    refused: list[ServerError] = []
+    for statement in statements:
+        if statement.get("status") != "ERR":
+            results.append(statement.get("result"))
+            continue
+        results.append([])
+        if _not_executed(statement):
+            continue
+        error = parse_query_error(statement)
+        if not empty(error):
+            refused.append(error)
+    if refused:
+        raise refused[0]
+    if not any(statement.get("status") == "ERR" and not _not_executed(statement) for statement in statements):
+        # Only "not executed" failures and nothing that failed: raise the first, as query() would.
+        failed = [statement for statement in statements if statement.get("status") == "ERR"]
+        if failed:
+            raise parse_query_error(failed[0])
+    return results
 
 
 #: What SurrealDB answers for a statement of a failed transaction that did not run (some servers give no ``details``).

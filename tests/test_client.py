@@ -168,6 +168,49 @@ class TestQuery:
         assert _only_call(client) == ("query_raw", ("RETURN NULL", None), {"txn_id": TXN})
 
 
+_MISSING = {
+    "status": "ERR",
+    "result": "The table 'gone' does not exist",
+    "kind": "NotFound",
+    "details": {"kind": "Table", "details": {"name": "gone"}},
+}
+_THROWN = {"status": "ERR", "result": "An error occurred: boom", "kind": "Thrown"}
+_NOT_RUN = {"status": "ERR", "result": "The query was not executed due to a failed transaction", "kind": "Query"}
+
+
+def _missing(error: _sdk.ServerError) -> bool:
+    return isinstance(error, _sdk.NotFoundError)
+
+
+class TestQueryAllTolerant:
+    """``query_all_tolerant()``: an accepted failing statement answers ``[]``, the others keep their results."""
+
+    async def test_an_accepted_failure_answers_an_empty_list(self) -> None:
+        client = _FakeClient(result={"result": [{"status": "OK", "result": [{"a": Null}]}, _MISSING]})
+        assert await _client.query_all_tolerant(client, "q", {"x": 1}, empty=_missing, txn_id=TXN) == [[{"a": None}], []]
+        assert _only_call(client) == ("query_raw", ("q", {"x": 1}), {"txn_id": TXN})
+
+    async def test_another_failure_raises_even_beside_an_accepted_one(self) -> None:
+        client = _FakeClient(result={"result": [_MISSING, {"status": "OK", "result": []}, _THROWN]})
+        with pytest.raises(_sdk.ServerError, match="boom") as raised:
+            await _client.query_all_tolerant(client, "q", empty=_missing)
+        assert not isinstance(raised.value, _sdk.NotFoundError)
+
+    async def test_statements_of_a_transaction_aborted_by_an_accepted_failure_are_empty(self) -> None:
+        client = _FakeClient(result={"result": [{"status": "OK", "result": None}, _NOT_RUN, _MISSING, _NOT_RUN]})
+        assert await _client.query_all_tolerant(client, "q", empty=_missing) == [None, [], [], []]
+
+    async def test_a_not_executed_failure_alone_raises(self) -> None:
+        client = _FakeClient(result={"result": [_NOT_RUN]})
+        with pytest.raises(_sdk.ServerError, match="not executed"):
+            await _client.query_all_tolerant(client, "q", empty=_missing)
+
+    async def test_a_query_refused_as_a_whole_raises(self) -> None:
+        client = _FakeClient(result={"error": {"code": -32000, "message": "There was a problem with the database"}})
+        with pytest.raises(_sdk.ServerError):
+            await _client.query_all_tolerant(client, "q", empty=lambda error: True)
+
+
 # --- CRUD -----------------------------------------------------------------------------------------
 
 

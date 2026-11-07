@@ -134,6 +134,9 @@ class TestMultiStatementRows:
             async def query(self, query: str, variables: dict) -> list:
                 return results
 
+            async def query_raw(self, query: str, variables: dict) -> dict:
+                return {"result": [{"status": "OK", "result": result} for result in results]}
+
         async def fake_get_client() -> FakeClient:
             return FakeClient()
 
@@ -209,6 +212,22 @@ class TestMultiStatementRowsE2E:
                 await MqNote.raw_query("SELECT * FROM mq_note; THROW 'boom';")
             with pytest.raises(type(first.value), match="boom"):
                 await MqNote.objects().query("SELECT * FROM mq_note; THROW 'boom';")
+
+    async def test_queryset_query_reads_a_later_missing_table_as_empty(self) -> None:
+        """A missing table contributes no rows, per statement: 3.x/4.x fail that statement alone (review of #430)."""
+        async with orm_client("mq_note", "mq_absent") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a';", {})
+            rows = await MqNote.objects().query("SELECT * FROM mq_note; SELECT * FROM mq_absent;")
+            assert [(type(row), row.id) for row in rows] == [(MqNote, "a")]
+            rows = await MqNote.objects().query("SELECT * FROM mq_absent; SELECT * FROM mq_note;")
+            assert [(type(row), row.id) for row in rows] == [(MqNote, "a")]
+            assert await MqNote.objects().query("SELECT * FROM mq_note WHERE note = 'z'; SELECT * FROM mq_absent;") == []
+
+    async def test_queryset_query_still_raises_beside_a_missing_table(self) -> None:
+        async with orm_client("mq_note", "mq_absent") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a';", {})
+            with pytest.raises(ServerError, match="boom"):
+                await MqNote.objects().query("SELECT * FROM mq_absent; SELECT * FROM mq_note; THROW 'boom';")
 
     async def test_queryset_query_returns_the_rows_of_every_select(self) -> None:
         async with orm_client("mq_note") as client:
