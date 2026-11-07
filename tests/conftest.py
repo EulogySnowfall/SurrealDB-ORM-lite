@@ -45,13 +45,19 @@ generated models, ``tests/test_table_ddl.py`` (v0.34.0), whose ORM writes cover 
 table DDL defines, ``tests/test_vector.py`` (v0.36.0), which sends a point for a ``nearby()`` next to a
 vector search, ``tests/test_factories.py`` (v0.40.0), whose factories build and save ``date``/``datetime``
 Faker values, and ``tests/test_pytest_plugin.py`` (v0.40.0), whose pytester inner sessions run in the same
-process under the outer test's guard and may write any value. A new test that needs rich values goes into one of them — never add a pre-existing
-module to that set.
+process under the outer test's guard and may write any value, and ``tests/test_sdk3_values.py`` (v0.50.0), whose
+round trips write the values SDK 3.0 reads (zero durations, sets, open ranges, nanosecond datetimes, dates). A new
+test that needs rich values goes into one of them — never add a pre-existing module to that set.
+
+**The SDK call frontier (v0.50.0) is watched at run time.** ``pytest_configure`` below registers
+``tests/_frontier_spy.py`` for the whole session: it records every SDK data call a ``surreal_orm_lite`` module makes
+without going through ``surreal_orm_lite._client`` (mode from ``ORM_FRONTIER_SPY``: ``enforce``, the default, ``report``, ``off``).
 """
 
 import asyncio
 import contextlib
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -61,12 +67,19 @@ import pytest_asyncio
 
 from surreal_orm_lite import SurrealDBConnectionManager, connection_manager, encoding
 from surreal_orm_lite.testing import embedded_database
+from tests import _frontier_spy
 from tests._retry import apply_reset
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the runtime frontier check for the session (``tests/_frontier_spy.py``)."""
+    _frontier_spy.register(config)
+
 
 #: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
 #: hook, v0.25.0's embedded engine, v0.26.0's time travel, v0.27.0's subqueries, v0.28.0's query cache,
 #: v0.30.0's schema introspection, v0.34.0's model table DDL (whose ORM writes cover every kind), v0.36.0's
-#: vector search (a ``nearby()`` point) and v0.40.0's model factories (``date``/``datetime`` Faker values) and pytest plugin (in-process pytester sessions), with their README section 41 (run on ``mem://``): the only ones whose values ``encode()`` may rewrite. Never list a module
+#: vector search (a ``nearby()`` point) and v0.40.0's model factories (``date``/``datetime`` Faker values) and pytest plugin (in-process pytester sessions), with their README section 41 (run on ``mem://``), and v0.50.0's ``first()`` order (a ``nearby()`` point): the only ones whose values ``encode()`` may rewrite. Never list a module
 #: that existed at v0.22.2 here.
 _REWRITE_MODULES = frozenset(
     {
@@ -86,6 +99,8 @@ _REWRITE_MODULES = frozenset(
         "tests.test_factories",
         "tests.test_pytest_plugin",
         "tests.test_factories_docs",
+        "tests.test_sdk3_values",
+        "tests.test_query_order",
     }
 )
 
@@ -132,6 +147,14 @@ def default_connection_class() -> type[SurrealDBConnectionManager]:
     so a test that reads or writes the default connection's private attributes does it here.
     """
     return SurrealDBConnectionManager._manager_for("default")
+
+
+async def line_major(client: Any) -> int:
+    """The major version of the engine *client* talks to (``"surrealdb-4.0.0"`` → 4; the embedded engine of SDK 3.0
+    answers 4), for the tests whose pins differ by line."""
+    match = re.search(r"(\d+)\.\d+", await client.version())
+    assert match is not None
+    return int(match.group(1))
 
 
 def _ws_url() -> str:

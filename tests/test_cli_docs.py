@@ -276,7 +276,7 @@ _EMBEDDED_ROW_39 = [
     "CLI `surreal-orm-lite` (v0.39.0)",
     "each command opens and closes the engine: `mem://` starts empty at every command (use it for `shell` and the "
     "offline commands), `surrealkv://<path>` keeps its data from one command to the next; a parse error in a shell "
-    "line is raised by the SDK and shown as one `Error:` line; the shell answers as a 2.x server",
+    "line is shown as one `Error:` line; the shell answers as a 4.x server",
     "a server keeps its data between commands; a parse error comes back as an error answer, shown the same way",
     "v0.39.0",
 ]
@@ -286,7 +286,7 @@ _ROADMAP_ROWS_39 = [
     ["v0.38.0", "Tier 3 — Migration system", "✅ Released"],
     ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "✅ Released"],
     ["v0.40.0", "Tier 3 — Test fixtures & factories", "✅ Released"],
-    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.50.0", "Official SDK 3.0 and SurrealDB 4.x", "✅ Released"],
 ]
 _COMPARISON_ROW_39 = ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"]
 #: The two sentences that promised the command line "with v0.39.0", by section: the old text, then the new one.
@@ -319,7 +319,7 @@ class TestReadmeRows39:
     def test_embedded_table_row(self) -> None:
         """One row before the final ``Everything else`` row; the table keeps its widths."""
         assert_embedded_rows([_EMBEDDED_ROW_39])
-        assert [len(cell) for cell in _EMBEDDED_ROW_39] == [32, 310, 105, 7]
+        assert [len(cell) for cell in _EMBEDDED_ROW_39] == [32, 288, 105, 7]
 
     def test_features_row(self) -> None:
         """Right after the migrations."""

@@ -17,10 +17,9 @@ classes (``geo.py``). SDK 2.0.0 exports only ``Geometry`` and ``InvalidGeometryE
 level and keeps the seven concrete classes in ``surrealdb.data.types.geometry``; they are looked up
 root first, then that submodule, so a release that exports them at the top level needs no change.
 
-#235 adds what the read hook (``decoding.py``) needs: the SDK's CBOR ``tag_decoder``, read from
-``surrealdb.data.cbor`` only like ``encode``/``decode``, and the three async connection classes,
-root first, then their SDK 2.0.0 submodules. Each is ``None`` when the installed SDK has no such
-symbol: the hook is then not installed.
+#235 adds what the read hook (``decoding.py``) needs: the three async connection classes, root first,
+then their submodules. Each is ``None`` when the installed SDK has no such symbol: the hook is then
+not installed.
 
 v0.25.0 adds the SDK's URL parser (``SdkUrl``, ``SdkUrlScheme``), so the ORM classifies a URL exactly as
 ``AsyncSurreal()`` routes it. The SDK's package root imports both but does not list them in its
@@ -32,34 +31,64 @@ v0.27.0 adds ``ThrownError`` (a top-level export of SDK 2.0.0): SurrealDB 3.1 re
 exist, read by a ``LET`` inside a block, as a ``ThrownError`` instead of a ``NotFoundError``.
 
 #279 adds ``TAG_DATETIME_COMPACT`` (a top-level export of SDK 2.0.0, like ``TAG_DURATION_COMPACT``): the read
-hook reads a datetime outside years 1-9999, which the SDK's ``tag_decoder`` refuses.
+hook reads a datetime outside years 1-9999, which the SDK's decoder refuses.
+
+v0.50.0 (SDK 3.0) moves to the official SDK 3.0 (``surrealdb[pydantic]>=3.0.0,<4.0.0``). Its package root no longer
+exports the CBOR tag numbers: they are read from ``surrealdb.data.types.constants``, the module that defines them (the
+compact datetime and duration tags, the decimal string and the seven geometry tags). New root symbols: ``Null`` and
+``NullType`` (SurrealDB's ``NULL``, distinct from ``None``, which is ``NONE``), ``SurrealSet``, ``PreciseDatetime``,
+``Table`` (the CRUD target of a whole table), ``StringRecordId``, ``Features`` (the server-version gates) and the
+transport and SDK-side errors. ``Null`` is also the plain CBOR null (``0xf6``), SurrealDB's open range bound: it
+replaces the ORM's former ``CBOR_NULL`` constant. The read hook takes the SDK's CBOR decoder class (``SdkDecoder``)
+and its tag readers (``SDK_TAG_READERS``) from ``surrealdb.data._decoder``; both are ``None`` when a later SDK moves
+them, and the hook is then not installed. The embedded engine is an optional extra (``surreal-orm-lite[embedded]``):
+``SdkAsyncEmbeddedConnection`` is ``None`` without it, and importing the ORM never needs it.
 """
 
 import importlib
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
 
 from surrealdb import (  # noqa: F401
-    TAG_DATETIME_COMPACT,
-    TAG_DECIMAL_STRING,
-    TAG_DURATION_COMPACT,
     AlreadyExistsError,
     AsyncSurreal,
+    ConnectionUnavailableError,
+    Features,
+    HttpStatusError,
     NotFoundError,
+    Null,
+    NullType,
+    PreciseDatetime,
     RecordID,
     ServerError,
+    StringRecordId,
     SurrealError,
+    SurrealSet,
+    Table,
     ThrownError,
+    TransportError,
+    TransportTimeoutError,
+    UnexpectedResponseError,
+    UnsupportedEngineError,
+    UnsupportedFeatureError,
+    UnsupportedVersionError,
 )
 from surrealdb import Duration as SdkDuration
 from surrealdb import Geometry as SdkGeometry
 from surrealdb import Range as SdkRange
 from surrealdb.cbor import CBORSimpleValue, CBORTag, undefined
-
-# The plain CBOR null (``0xf6``): SurrealDB's open range bound (protocol tag 49). ``None`` would go
-# out as tag 6, NONE. Never mutated by the ORM; recognise a CBOR null with
-# ``isinstance(x, CBORSimpleValue) and x.value == 22``, never with ``==`` (it equals the int 22).
-# SDK 3.0 (#205): this becomes the SDK's ``Null`` sentinel.
-CBOR_NULL: Final = CBORSimpleValue(22)
+from surrealdb.data.types.constants import (
+    TAG_DATETIME_COMPACT,
+    TAG_DECIMAL_STRING,
+    TAG_DURATION_COMPACT,
+    TAG_GEOMETRY_COLLECTION,
+    TAG_GEOMETRY_LINE,
+    TAG_GEOMETRY_MULTI_LINE,
+    TAG_GEOMETRY_MULTI_POINT,
+    TAG_GEOMETRY_MULTI_POLYGON,
+    TAG_GEOMETRY_POINT,
+    TAG_GEOMETRY_POLYGON,
+)
+from surrealdb.errors import parse_query_error, parse_rpc_error
 
 
 def _first_of(attr: str, *modules: str, required: bool = True) -> Any:
@@ -87,9 +116,10 @@ if TYPE_CHECKING:
     from surrealdb import AsyncWsSurrealConnection as SdkAsyncWsConnection
     from surrealdb.connections.url import Url as SdkUrl
     from surrealdb.connections.url import UrlScheme as SdkUrlScheme
+    from surrealdb.data._decoder import _TAGS as SDK_TAG_READERS
+    from surrealdb.data._decoder import Decoder as SdkDecoder
     from surrealdb.data.cbor import decode as cbor_decode
     from surrealdb.data.cbor import encode as cbor_encode
-    from surrealdb.data.cbor import tag_decoder as cbor_tag_decoder
     from surrealdb.data.types.geometry import GeometryCollection as SdkGeometryCollection
     from surrealdb.data.types.geometry import GeometryLine as SdkGeometryLine
     from surrealdb.data.types.geometry import GeometryMultiLine as SdkGeometryMultiLine
@@ -108,9 +138,11 @@ else:
     # such codec: the local zero-duration probe then answers False.
     cbor_encode = _first_of("encode", "surrealdb.data.cbor", required=False)
     cbor_decode = _first_of("decode", "surrealdb.data.cbor", required=False)
-    # SDK 3.0 (#205): the read hook (``decoding.py``) wraps this ``tag_decoder`` and the decoding
-    # method of these three classes; re-check both against the stable SDK's layout.
-    cbor_tag_decoder = _first_of("tag_decoder", "surrealdb.data.cbor", required=False)
+    # The CBOR decoder class and its tag readers (``{tag: reader}``), from the private module that defines them, and
+    # the decoding methods of these three classes: ``tests/test_decoding.py::TestSdkLayout`` pins the layout the read
+    # hook (``decoding.py``) relies on.
+    SdkDecoder = _first_of("Decoder", "surrealdb.data._decoder", required=False)
+    SDK_TAG_READERS = _first_of("_TAGS", "surrealdb.data._decoder", required=False)
     SdkAsyncWsConnection = _first_of("AsyncWsSurrealConnection", "surrealdb", "surrealdb.connections.async_ws", required=False)
     SdkAsyncHttpConnection = _first_of(
         "AsyncHttpSurrealConnection", "surrealdb", "surrealdb.connections.async_http", required=False
@@ -146,6 +178,33 @@ __all__ = [
     "NotFoundError",
     # Subqueries (v0.27.0): SurrealDB 3.1's form of the missing-table error inside a block
     "ThrownError",
+    # SDK 3.0 (v0.50.0)
+    "parse_query_error",
+    "parse_rpc_error",
+    "Null",
+    "NullType",
+    "SurrealSet",
+    "PreciseDatetime",
+    "Table",
+    "StringRecordId",
+    "Features",
+    "UnsupportedFeatureError",
+    "UnsupportedVersionError",
+    "UnexpectedResponseError",
+    "ConnectionUnavailableError",
+    "TransportError",
+    "HttpStatusError",
+    "TransportTimeoutError",
+    "UnsupportedEngineError",
+    "SdkDecoder",
+    "SDK_TAG_READERS",
+    "TAG_GEOMETRY_POINT",
+    "TAG_GEOMETRY_LINE",
+    "TAG_GEOMETRY_POLYGON",
+    "TAG_GEOMETRY_MULTI_POINT",
+    "TAG_GEOMETRY_MULTI_LINE",
+    "TAG_GEOMETRY_MULTI_POLYGON",
+    "TAG_GEOMETRY_COLLECTION",
     # Rich field types (v0.23.0)
     "SdkDuration",
     "SdkRange",
@@ -153,7 +212,6 @@ __all__ = [
     "TAG_DECIMAL_STRING",
     "CBORTag",
     "CBORSimpleValue",
-    "CBOR_NULL",
     "undefined",
     "Bound",
     "BoundIncluded",
@@ -162,7 +220,6 @@ __all__ = [
     "cbor_decode",
     "SdkInvalidDurationError",
     # Read hook (#235); a datetime outside years 1-9999 (#279)
-    "cbor_tag_decoder",
     "TAG_DATETIME_COMPACT",
     "SdkAsyncWsConnection",
     "SdkAsyncHttpConnection",

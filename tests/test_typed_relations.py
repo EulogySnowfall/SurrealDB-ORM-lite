@@ -120,6 +120,7 @@ from surreal_orm_lite import (
     SurrealDbNotFoundError,
     SurrealFunc,
     Var,
+    _client,
     computed,
     post_save,
     pre_delete,
@@ -463,7 +464,7 @@ class TestFilterByInstanceE2E:
             assert again.get_raw_id() == first.get_raw_id()
             assert await TrOrder.objects().count() == 1
 
-            stored = await client.query("SELECT VALUE customer FROM tr_order WHERE note = $note;", {"note": "n1"})
+            stored = await _client.query(client, "SELECT VALUE customer FROM tr_order WHERE note = $note;", {"note": "n1"})
             assert stored == [ALICE]
             assert isinstance(stored[0], RecordID)
 
@@ -833,27 +834,30 @@ async def _native_txn_supported() -> bool:
 
 
 class _InsertRelationSpy:
-    """Stands in for the connected SDK client's ``insert_relation()``: records each call, then forwards it."""
+    """Stands in for the frontier's ``_client.insert_relation()`` (SDK 3.0's ``insert(..., relation=True)``): records
+    each call made for *client*, then forwards it."""
 
     def __init__(self, client: Any) -> None:
         self.calls: list[tuple[Any, Any]] = []
-        self._forward = client.insert_relation
+        self._owner = id(client)
+        self._forward = _client.insert_relation
 
-    async def __call__(self, table: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
-        self.calls.append((table, data))
-        return await self._forward(table, data, *args, **kwargs)
+    async def __call__(self, client: Any, table: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
+        if id(client) == self._owner:
+            self.calls.append((table, data))
+        return await self._forward(client, table, data, *args, **kwargs)
 
 
 def _spy_insert_relation(monkeypatch: pytest.MonkeyPatch, client: Any) -> _InsertRelationSpy:
     spy = _InsertRelationSpy(client)
-    monkeypatch.setattr(client, "insert_relation", spy)
+    monkeypatch.setattr(_client, "insert_relation", spy)
     return spy
 
 
 async def _stored(client: Any, table: str) -> list[Any]:
     """Every row of ``table``, sorted by id; ``[]`` for a table never created (3.x raises, 2.x does not)."""
     try:
-        rows = await client.query(f"SELECT * FROM {table} ORDER BY id;", {})
+        rows = await _client.query(client, f"SELECT * FROM {table} ORDER BY id;", {})
     except NotFoundError:
         return []
     return rows if isinstance(rows, list) else []
@@ -873,7 +877,7 @@ class TestEdgeSaveE2E:
             assert edge.id.table_name == "tr_purchased"
             assert (edge.in_, edge.out, edge.quantity) == (ALICE_P, WIDGET, 2)
 
-            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            traversed = await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
             assert traversed == [WIDGET]
             related = await alice.get_related("tr_purchased", model_class=TrProduct)
             assert [(type(p), p.get_raw_id()) for p in related] == [(TrProduct, "widget")]
@@ -899,7 +903,7 @@ class TestEdgeSaveE2E:
             with pytest.raises(SurrealDbError, match="already exists"):
                 await TrPurchased(id="h1", in_=alice, out=widget, quantity=9).save()
 
-            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            traversed = await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
             assert traversed == [WIDGET, WIDGET]
             assert sorted(row["quantity"] for row in await _stored(client, "tr_purchased")) == [1, 3]
 
@@ -918,7 +922,7 @@ class TestEdgeSaveE2E:
             assert spy.calls == []
             assert same_table.id == RecordID("tr_purchased", "p2")
 
-            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            traversed = await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
             assert traversed == [WIDGET, WIDGET]
             assert [row["id"] for row in await _stored(client, "tr_purchased")] == [
                 RecordID("tr_purchased", "p1"),
@@ -944,7 +948,7 @@ class TestEdgeSaveE2E:
                 (RecordID("tr_purchased", "p1"), ALICE_P, WIDGET, 2)
             ]
             # …and it is a relation, not a plain record carrying `in`/`out` fields.
-            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            traversed = await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
             assert traversed == [WIDGET]
 
     @pytest.mark.asyncio
@@ -965,15 +969,15 @@ class TestEdgeSaveE2E:
                 pytest.skip(f"raw duplicate behaviour not measured on {version}")
 
             row = {"id": "raw1", "in": ALICE_P, "out": WIDGET, "quantity": 2}
-            first = await client.insert_relation("tr_purchased", row)
+            first = await _client.insert_relation(client, "tr_purchased", row)
             assert [(r["id"], r["quantity"]) for r in first] == [(RecordID("tr_purchased", "raw1"), 2)]
 
             if keeps_old:
-                again = await client.insert_relation("tr_purchased", {**row, "quantity": 5})
+                again = await _client.insert_relation(client, "tr_purchased", {**row, "quantity": 5})
                 assert [(r["id"], r["quantity"]) for r in again] == [(RecordID("tr_purchased", "raw1"), 2)]
             else:
                 with pytest.raises(AlreadyExistsError):
-                    await client.insert_relation("tr_purchased", {**row, "quantity": 5})
+                    await _client.insert_relation(client, "tr_purchased", {**row, "quantity": 5})
 
             stored = await _stored(client, "tr_purchased")
             assert [(r["id"], r["quantity"]) for r in stored] == [(RecordID("tr_purchased", "raw1"), 2)]
@@ -1159,7 +1163,7 @@ async def _stored_perm_quantities_as_root() -> list[Any]:
     await SurrealDBConnectionManager.unset_connection()
     _connect_root_ws()
     root = await SurrealDBConnectionManager.get_client()
-    rows = await root.query("SELECT VALUE quantity FROM tr_perm;", {})
+    rows = await _client.query(root, "SELECT VALUE quantity FROM tr_perm;", {})
     return rows if isinstance(rows, list) else []
 
 
@@ -1344,7 +1348,7 @@ class TestEdgeTransactionsE2E:
             assert [(row["id"], row["in"], row["out"], row["weight"]) for row in stored] == [
                 (RecordID("tr_follows", "f1"), ALICE_P, BOB_P, 3)
             ]
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
 
     @pytest.mark.asyncio
     async def test_interactive_duplicate_explicit_id_raises_in_block(self) -> None:
@@ -1390,8 +1394,8 @@ class TestEdgeTransactionsE2E:
                 (RecordID("tr_follows", "f1"), ALICE_P, BOB_P, 3)
             ]
             # Relations, not plain records carrying `in`/`out` fields.
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
 
     @pytest.mark.asyncio
     async def test_buffered_tx_rolls_back_with_failing_statement(self) -> None:
@@ -1406,7 +1410,7 @@ class TestEdgeTransactionsE2E:
                     await TrPerson(id="alice", name="Again").save(tx=tx)  # alice exists: CREATE fails at commit
 
             assert await _stored(client, "tr_purchased") == []
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == []
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == []
             assert (await TrPerson.objects().get("alice")).name == "Alice"
 
     @pytest.mark.asyncio
@@ -1770,7 +1774,7 @@ class TestRelateTypedE2E:
             assert (edge.in_, edge.out, edge.quantity, edge.price) == (ALICE_P, WIDGET, 2, 9.5)
             assert spy.calls == [("tr_purchased", {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 9.5})]
             # A relation graph traversal sees, not a plain record carrying `in`/`out`.
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
             loaded = await TrPurchased.objects().get(edge.get_raw_id())
             assert (loaded.id, loaded.in_, loaded.out, loaded.quantity, loaded.price) == (
                 edge.id,
@@ -1897,7 +1901,7 @@ class TestRelateTypedE2E:
 
             stored = await _stored(client, "tr_purchased")
             assert [(row["in"], row["out"], row["quantity"]) for row in stored] == [(ALICE_P, WIDGET, 2)]
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("transport", ["ws", "http"])
@@ -1987,14 +1991,20 @@ class _RecordingClient:
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
 
-    async def query(self, q: str, v: dict[str, Any] | None = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, q: str, v: dict[str, Any] | None = None) -> Any:
         self.calls.append((q, v))
         return []
 
-    async def insert_relation(self, table: str, data: Any) -> Any:
-        self.calls.append(("insert_relation", table, data))
+    async def insert(self, table: Any, data: Any, *, relation: bool = False) -> Any:
+        """SDK 3.0's ``insert()``; ``relation=True`` is ``INSERT RELATION``."""
+        assert relation, "an edge write is an INSERT RELATION"
+        self.calls.append(("insert_relation", str(table), data))
         rows = data if isinstance(data, list) else [data]
-        return [{**r, "id": RecordID(table, f"stub{i}")} for i, r in enumerate(rows)]
+        return [{**r, "id": RecordID(str(table), f"stub{i}")} for i, r in enumerate(rows)]
 
 
 @pytest.fixture
@@ -2369,7 +2379,7 @@ class TestGraphParityE2E:
             positional = await alice.relate(TrFollows, bob, True)
             assert (positional.in_, positional.out) == (BOB_P, ALICE_P)
             assert await alice.get_related("tr_follows", "out") == []
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:bob;", {}) == [ALICE_P] * 3
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:bob;", {}) == [ALICE_P] * 3
 
     @pytest.mark.asyncio
     async def test_remove_relation_reverse(self) -> None:
@@ -2510,7 +2520,7 @@ class TestGraphParityE2E:
             assert [(row["in"], row["out"]) for row in rows] == [(ALICE_P, odd)]
             rows = await alice.relate("tr_follows", odd, reverse=True, weight=2)
             assert [(row["in"], row["out"], row["weight"]) for row in rows] == [(odd, ALICE_P, 2)]
-            people = await client.query("SELECT VALUE id FROM tr_person ORDER BY id;", {})
+            people = await _client.query(client, "SELECT VALUE id FROM tr_person ORDER BY id;", {})
             assert people == [ALICE_P, BOB_P]  # the table name was bound, never run
 
             joe = await TrPerson(id="joe@x.com", name="Joe").save()
@@ -2544,7 +2554,7 @@ class TestGraphParityE2E:
         """A source whose own table was never created: the server diverges, the ORM does not.
 
         The graph-path ``DELETE`` raises ``NotFoundError`` ("The table … does not exist") on 3.x
-        and returns ``[]`` on 2.x. Outside a transaction the ORM keeps the v0.7.0 contract on both
+        and returns ``[]`` on 2.x and 4.x. Outside a transaction the ORM keeps the v0.7.0 contract on both
         lines: a silent no-op that removes nothing.
         """
         async with orm_client(*GRAPH_TABLES) as client:
@@ -2554,11 +2564,11 @@ class TestGraphParityE2E:
 
             statement = "DELETE $src->tr_follows WHERE out = $dst;"
             variables = {"src": RecordID("tr_ghost", "g"), "dst": BOB_P}
-            if (await _server_version())[0] >= 3:
+            if (await _server_version())[0] == 3:
                 with pytest.raises(NotFoundError, match="does not exist"):
                     await client.query(statement, variables)
             else:
-                assert await client.query(statement, variables) == []
+                assert await _client.query(client, statement, variables) == []
 
             assert await ghost.remove_relation("tr_follows", bob) is None
             assert await ghost.remove_relation("tr_follows", "bob") is None
@@ -2580,7 +2590,7 @@ class TestGraphParityE2E:
             await client.query("CREATE tr_product:7; RELATE tr_person:alice->tr_follows->tr_product:7;", {})
 
             async def outs() -> list[str]:
-                rows = await client.query("SELECT VALUE out FROM tr_follows WHERE in = $a;", {"a": ALICE_P})
+                rows = await _client.query(client, "SELECT VALUE out FROM tr_follows WHERE in = $a;", {"a": ALICE_P})
                 return sorted(map(str, rows))
 
             assert len(await outs()) == 4
@@ -2705,7 +2715,7 @@ class TestGraphParityTransactionsE2E:
             await alice.relate("tr_follows", pbob)
 
             async def count() -> int:
-                rows = await client.query("SELECT VALUE id FROM tr_follows WHERE in = $a;", {"a": ALICE_P})
+                rows = await _client.query(client, "SELECT VALUE id FROM tr_follows WHERE in = $a;", {"a": ALICE_P})
                 return len(rows)
 
             async with SurrealDBConnectionManager.transaction() as tx:
@@ -2715,7 +2725,7 @@ class TestGraphParityTransactionsE2E:
 
     @pytest.mark.asyncio
     async def test_missing_source_table_in_buffered_tx(self) -> None:
-        """Under ``tx=`` the server's divergence stands: 3.x fails the commit, 2.x commits."""
+        """Under ``tx=`` the server's divergence stands: 3.x fails the commit, 2.x and 4.x commit."""
         async with http_orm_client(*GRAPH_TABLES) as client:
             alice, bob, _widget = await _nodes()
             carol = await TrPerson(id="carol", name="Carol").save()
@@ -2730,7 +2740,7 @@ class TestGraphParityTransactionsE2E:
                     await ghost.remove_relation("tr_follows", carol, tx=tx)
                     await ghost.remove_all_relations(["tr_follows"], direction="both", tx=tx)
 
-            if (await _server_version())[0] >= 3:
+            if (await _server_version())[0] == 3:
                 with pytest.raises(SurrealDbError, match="does not exist"):
                     await remove()
                 assert _people_pairs(await _stored(client, "tr_follows")) == [
@@ -2743,7 +2753,8 @@ class TestGraphParityTransactionsE2E:
 
     @pytest.mark.asyncio
     async def test_missing_source_table_in_interactive_tx(self) -> None:
-        """3.x over WebSocket: the statement fails at once, and the transaction with it."""
+        """3.x over WebSocket: the statement fails at once, and the transaction with it; 4.x reads the missing table as
+        empty and commits."""
         async with orm_client(*GRAPH_TABLES) as client:
             if not await _native_txn_supported():
                 pytest.skip("requires SurrealDB 3.x native transactions")
@@ -2752,6 +2763,13 @@ class TestGraphParityTransactionsE2E:
             ghost = TrGhost(id="g")
 
             reached = False
+            if (await _server_version())[0] >= 4:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    await alice.remove_relation("tr_follows", bob, tx=tx)
+                    await ghost.remove_relation("tr_follows", bob, tx=tx)
+                assert _people_pairs(await _stored(client, "tr_follows")) == []
+                return
             with pytest.raises(SurrealDbError, match="does not exist"):
                 async with SurrealDBConnectionManager.transaction() as tx:
                     assert tx.is_interactive
@@ -2861,8 +2879,8 @@ class TestEdgeBulkCreateE2E:
             stored = await _stored(client, "tr_purchased")
             assert sorted(str(row["id"]) for row in stored) == sorted(str(i) for i in ids)
             # Relations, not plain records carrying `in`/`out` fields.
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET] * 2
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET] * 2
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
             related = await bob.get_related(TrPurchased, model_class=TrProduct)
             assert [(type(p), p.get_raw_id()) for p in related] == [(TrProduct, "widget")]
 
@@ -2892,8 +2910,8 @@ class TestEdgeBulkCreateE2E:
 
             stored = await _stored(client, "tr_purchased")
             assert sorted(str(row["id"]) for row in stored) == sorted(str(edge.id) for edge in created)
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET] * 2
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET] * 2
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
 
     @pytest.mark.asyncio
     async def test_bulk_create_duplicate_writes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2924,7 +2942,7 @@ class TestEdgeBulkCreateE2E:
             assert spy.calls == []
             stored = await _stored(client, "tr_purchased")
             assert [(row["id"], row["quantity"]) for row in stored] == [(RecordID("tr_purchased", "b1"), 2)]
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == []
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == []
 
     @pytest.mark.asyncio
     async def test_bulk_create_foreign_table_id_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2977,7 +2995,7 @@ class TestEdgeBulkCreateE2E:
             assert spy.calls == []  # under tx=, the guarded statement runs through tx.add()
             stored = await _stored(client, "tr_purchased")
             assert sorted(str(row["id"]) for row in stored) == sorted(str(edge.id) for edge in created)
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
 
     @pytest.mark.asyncio
     async def test_bulk_create_in_buffered_tx(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3003,7 +3021,7 @@ class TestEdgeBulkCreateE2E:
                 ("tr_person:bob", "tr_product:widget", 2),
             ]
             assert RecordID("tr_purchased", "t1") in [row["id"] for row in stored]
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
 
             # A duplicate in a buffered batch fails the commit; nothing of the batch is written.
             with pytest.raises(SurrealDbError, match="already exists"):
@@ -3246,7 +3264,7 @@ class TestEdgeWriteGuardsE2E:
 
             stored = await _stored(client, "tr_purchased")
             assert _edge_rows(stored, "quantity", "price") == [("tr_person:alice", "tr_product:widget", 5, 2.5)]
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
 
     @pytest.mark.asyncio
     async def test_patch_atomic_and_bulk_update_on_data_fields_work(self) -> None:
@@ -3273,7 +3291,7 @@ class TestEdgeWriteGuardsE2E:
 
             stored = await _stored(client, "tr_purchased")
             assert _edge_rows(stored, "quantity", "price") == [("tr_person:alice", "tr_product:widget", 5, 2.5)]
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
 
     @pytest.mark.asyncio
     async def test_update_keeps_endpoints_on_schemafull_relation(self) -> None:
@@ -3296,7 +3314,7 @@ class TestEdgeWriteGuardsE2E:
             stored = await _stored(client, "tr_rel_full")
             assert [row["id"] for row in stored] == [edge.id]
             assert _edge_rows(stored, "quantity", "price") == [("tr_person:alice", "tr_product:widget", 7, 1.5)]
-            assert await client.query("SELECT VALUE ->tr_rel_full->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await _client.query(client, "SELECT VALUE ->tr_rel_full->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
 
     @pytest.mark.asyncio
     async def test_get_or_create_is_idempotent_relate(self) -> None:
@@ -3313,7 +3331,7 @@ class TestEdgeWriteGuardsE2E:
             assert isinstance(again, TrFollows) and again.id == edge.id
 
             assert [row["id"] for row in await _stored(client, "tr_follows")] == [edge.id]
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
 
     @pytest.mark.asyncio
     async def test_get_or_create_with_string_endpoints_is_idempotent(self) -> None:
@@ -3336,7 +3354,7 @@ class TestEdgeWriteGuardsE2E:
             stored = await _stored(client, "tr_follows")
             assert [row["id"] for row in stored] == [edge.id]
             assert [(row["in"], row["out"]) for row in stored] == [(ALICE_P, BOB_P)]  # record ids, not strings
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
 
     @pytest.mark.asyncio
     async def test_get_or_create_defaults_may_name_an_endpoint(self) -> None:
@@ -3375,7 +3393,7 @@ class TestEdgeWriteGuardsE2E:
             new, created_new = await TrFollows.objects().update_or_create(in_=bob, out=alice, defaults={"weight": 2})
             assert created_new is True
             assert (new.in_, new.out, new.weight) == (BOB_P, ALICE_P, 2)
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:bob;", {}) == [ALICE_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:bob;", {}) == [ALICE_P]
             assert len(await _stored(client, "tr_follows")) == 2
 
     @pytest.mark.asyncio
@@ -3403,7 +3421,7 @@ class TestEdgeWriteGuardsE2E:
             assert (edge.in_, edge.out, edge.quantity) == (ALICE_P, WIDGET, 9)
 
             await edge.delete()
-            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == []
+            assert await _client.query(client, "SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == []
             assert await _stored(client, "tr_purchased") == []
 
 
@@ -3418,7 +3436,7 @@ class TestNativeIdempotencyE2E:
 
             edge = await TrFollows(id=RecordID("tr_follows", [ALICE_P, BOB_P]), in_=ALICE_P, out=BOB_P, weight=1).save()
             assert edge.id == pair
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
 
             # A raw INSERT RELATION would silently keep the stored edge on 2.7.0 and 3.1.5: the
             # guarded statement raises on every line.
@@ -3450,7 +3468,7 @@ class TestNativeIdempotencyE2E:
                 assert [(e.id, e.weight) for e in seen] == [(pair, 5)]
             stored = await _stored(client, "tr_follows")
             assert [(row["id"], row["in"], row["out"], row["weight"]) for row in stored] == [(pair, ALICE_P, BOB_P, 5)]
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
 
             with pytest.raises(RuntimeError, match="roll back"):
                 async with SurrealDBConnectionManager.transaction() as tx:
@@ -3462,7 +3480,7 @@ class TestNativeIdempotencyE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await edge.delete(tx=tx)
             assert await _stored(client, "tr_follows") == []
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == []
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == []
 
     @pytest.mark.asyncio
     async def test_array_id_edge_update_and_delete_in_buffered_tx(self) -> None:
@@ -3479,13 +3497,13 @@ class TestNativeIdempotencyE2E:
                 assert [row["weight"] for row in await _stored(client, "tr_follows")] == [1]  # queued, not run
             stored = await _stored(client, "tr_follows")
             assert [(row["id"], row["in"], row["out"], row["weight"]) for row in stored] == [(pair, ALICE_P, BOB_P, 5)]
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
 
             async with SurrealDBConnectionManager.transaction() as tx:
                 await edge.delete(tx=tx)
                 assert [row["id"] for row in await _stored(client, "tr_follows")] == [pair]  # queued, not run
             assert await _stored(client, "tr_follows") == []
-            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == []
+            assert await _client.query(client, "SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == []
 
     @pytest.mark.asyncio
     async def test_unique_in_out_index_second_relate_raises(self) -> None:
@@ -3503,7 +3521,7 @@ class TestNativeIdempotencyE2E:
             reverse = await bob.relate(TrFollowsUq, alice)
             stored = await _stored(client, "tr_follows_uq")
             assert sorted(str(row["id"]) for row in stored) == sorted([str(first.id), str(reverse.id)])
-            assert await client.query("SELECT VALUE ->tr_follows_uq->? FROM ONLY tr_person:bob;", {}) == [ALICE_P]
+            assert await _client.query(client, "SELECT VALUE ->tr_follows_uq->? FROM ONLY tr_person:bob;", {}) == [ALICE_P]
 
 
 # ==================== Task 9 — live queries and change feeds on edge tables (E2E, both lines) ====================

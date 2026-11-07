@@ -500,7 +500,9 @@ class SchemaState:
     ``analyzers``, ``accesses`` (database-level), ``functions`` (key ``"fn::name"``), ``params`` (key without
     ``$``), ``other`` (the ``INFO FOR DB`` sections that are not modelled, as returned — the full ORM's ``apis`` are
     ``other["apis"]``) and ``issues`` (in the order found). Table names are unescaped. ``repr`` shows each section of
-    ``other`` by its keys only (``other={'apis': {'/a': ...}}``), never a definition.
+    ``other`` by its keys only (``other={'apis': {'/a': ...}}``), never a definition. ``compatibility`` (v0.50.0) is
+    the database's compatibility level as SurrealDB 4.x's ``INFO FOR DB`` gives it (``None`` on 2.x and 3.x, which give
+    none); it is not compared.
     """
 
     tables: Mapping[str, TableState] = field(default_factory=_empty_map)
@@ -513,6 +515,7 @@ class SchemaState:
     params: Mapping[str, ParamState] = field(default_factory=_empty_map)
     other: Mapping[str, Mapping[str, str]] = field(default_factory=_empty_map)
     issues: Sequence[SchemaIssue] = ()
+    compatibility: int | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tables", _freeze(self.tables))

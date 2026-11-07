@@ -7,7 +7,9 @@ between the ORM and the server on a random local port instead:
 * :meth:`cut` aborts every connection it carries — the client sees close code 1006, exactly as
   for a network failure (measured on 2.7.0, 3.3.2 and 3.3.3: the SDK's receive task ends within 2 ms);
 * :meth:`refuse` makes new connections fail at once, as an unreachable server does, until
-  :meth:`accept` lets them through again.
+  :meth:`accept` lets them through again;
+* :attr:`log` (v0.50.0) holds, per connection it carried, the RPC requests the client sent — method and parameters,
+  read off the WebSocket frames — so a test can see under which identity each connection worked.
 
 It runs on the test's own event loop, so it must be started and closed inside the test body.
 """
@@ -17,6 +19,82 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import zlib
+from typing import Any
+
+from surreal_orm_lite._sdk import cbor_decode
+
+
+class _RequestLog:
+    """The RPC requests of one client→server WebSocket stream: ``(method, params)`` in the order they were sent.
+
+    Fed the raw bytes the client wrote: the HTTP upgrade request first, then client frames (always masked, possibly
+    fragmented, possibly ``permessage-deflate`` compressed — RSV1 on the first frame). Each complete data message is
+    decoded as CBOR; a message that does not decode is logged as ``("?", None)``. Control frames are skipped.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, Any]] = []
+        self._buffer = b""
+        self._upgraded = False
+        self._message = b""
+        self._compressed = False
+        self._inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+
+    def methods(self) -> list[str]:
+        return [method for method, _ in self.requests]
+
+    def feed(self, data: bytes) -> None:
+        self._buffer += data
+        if not self._upgraded:
+            _head, sep, rest = self._buffer.partition(b"\r\n\r\n")
+            if not sep:
+                return
+            self._upgraded, self._buffer = True, rest
+        while (frame := self._next_frame()) is not None:
+            self._on_frame(*frame)
+
+    def _next_frame(self) -> tuple[int, int, bytes] | None:
+        buf = self._buffer
+        if len(buf) < 2:
+            return None
+        first, second = buf[0], buf[1]
+        length, offset = second & 0x7F, 2
+        if length == 126:
+            if len(buf) < 4:
+                return None
+            length, offset = int.from_bytes(buf[2:4], "big"), 4
+        elif length == 127:
+            if len(buf) < 10:
+                return None
+            length, offset = int.from_bytes(buf[2:10], "big"), 10
+        mask = b""
+        if second & 0x80:
+            mask, offset = buf[offset : offset + 4], offset + 4
+        if len(buf) < offset + length:
+            return None
+        payload = buf[offset : offset + length]
+        self._buffer = buf[offset + length :]
+        if mask:
+            payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        return first, first & 0x0F, payload
+
+    def _on_frame(self, first: int, opcode: int, payload: bytes) -> None:
+        if opcode >= 0x8:  # close, ping, pong
+            return
+        if opcode != 0x0:  # the first frame of a message
+            self._message, self._compressed = b"", bool(first & 0x40)
+        self._message += payload
+        if not first & 0x80:  # FIN not set: more fragments follow
+            return
+        message = self._message
+        try:
+            if self._compressed:
+                message = self._inflater.decompress(message + b"\x00\x00\xff\xff")
+            request = cbor_decode(message)
+            self.requests.append((str(request["method"]), request.get("params")))
+        except Exception:
+            self.requests.append(("?", None))
 
 
 class CuttableProxy:
@@ -31,6 +109,8 @@ class CuttableProxy:
         self.port = 0
         #: Connections accepted so far — each one is a client the ORM opened.
         self.connections = 0
+        #: One entry per connection accepted, in order: the RPC requests its client sent (:class:`_RequestLog`).
+        self.log: list[_RequestLog] = []
 
     def url(self, scheme: str = "ws") -> str:
         suffix = "/rpc" if scheme.startswith("ws") else ""
@@ -78,17 +158,21 @@ class CuttableProxy:
             writer.transport.abort()
             return
         self.connections += 1
+        requests = _RequestLog()
+        self.log.append(requests)
         self._writers.update((writer, up_writer))
         try:
-            await asyncio.gather(self._pipe(reader, up_writer), self._pipe(up_reader, writer))
+            await asyncio.gather(self._pipe(reader, up_writer, requests), self._pipe(up_reader, writer))
         finally:
             self._writers.discard(writer)
             self._writers.discard(up_writer)
 
     @staticmethod
-    async def _pipe(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
+    async def _pipe(source: asyncio.StreamReader, sink: asyncio.StreamWriter, requests: _RequestLog | None = None) -> None:
         try:
             while data := await source.read(65536):
+                if requests is not None:
+                    requests.feed(data)
                 sink.write(data)
                 await sink.drain()
         except (OSError, asyncio.IncompleteReadError):

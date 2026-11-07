@@ -26,9 +26,12 @@ Example::
 
 It works in pytest-asyncio **strict** mode (tests marked ``@pytest.mark.asyncio``) and **auto** mode.
 
-``surreal_db`` yields ``None``, not the SDK client: pytest keeps a fixture's value until after its teardown,
-and with the surrealdb SDK 2.x an in-process engine stops only once nothing refers to its client. A test that
-needs raw SurrealQL calls ``await SurrealDBConnectionManager.get_client()``.
+``surreal_db`` yields ``None``, not the SDK client: pytest keeps a fixture's value until after its teardown, when
+the block's engine is already closed. A test that needs raw SurrealQL calls
+``await SurrealDBConnectionManager.get_client()``.
+
+The engine is the optional extra ``surreal-orm-lite[embedded]`` (v0.50.0): without it, ``surreal_db`` reports
+``SurrealDbConnectionError`` naming the extra as the test's setup error; loading the plugin never fails for it.
 """
 
 from collections.abc import AsyncIterator

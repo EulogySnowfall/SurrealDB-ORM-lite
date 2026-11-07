@@ -42,6 +42,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     Var,
+    _client,
 )
 from surreal_orm_lite._sdk import NotFoundError, ServerError
 from surreal_orm_lite.query_set import QuerySet
@@ -51,6 +52,7 @@ from surreal_orm_lite.subquery import (
     _MissingSubqueryTable,
     _same_value,
     missing_table,
+    reads_a_let,
     subquery_of,
 )
 from surreal_orm_lite.testing import embedded_database
@@ -67,6 +69,7 @@ from tests.test_embedded import _cells, _doc_part, _normalised, _subsection, _ta
 from tests.test_time_travel import (
     _SERVER_BEHAVIOUR,
     _assert_refused_by_the_server,
+    _History,
     _http_url,
     _line,
     _now,
@@ -76,6 +79,7 @@ from tests.test_time_travel import (
     _versioned_url,
     _versioned_ws_url,
     connected,
+    write_history,
 )
 
 M2020 = datetime(2020, 6, 1, tzinfo=UTC)
@@ -358,6 +362,126 @@ _SAME: list[tuple[object, object]] = [
 _SAME_IDS = ["same-object", "equal-strings", "equal-lists", "equal-nested-dicts", "equal-aware-datetimes", "none"]
 
 
+#: Two subqueries' ``LET`` s and the statement after them, for :class:`TestTopLevelForm`.
+_TL_LETS = ["LET $_sq0 = (SELECT VALUE id FROM a);", "LET $_sq1 = (SELECT VALUE id FROM b);"]
+_TL_STATEMENT = "SELECT * FROM t WHERE id IN $_sq0 AND id IN $_sq1 AND e <|2,100|> $_f0;"
+
+
+def _ok(result: Any) -> dict[str, Any]:
+    return {"status": "OK", "time": "1ms", "result": result}
+
+
+#: A statement of a failed ``BEGIN … COMMIT`` request that did not run, as SurrealDB 4.0 reports it.
+_SKIPPED = {
+    "status": "ERR",
+    "kind": "Query",
+    "result": "The query was not executed due to a failed transaction",
+    "details": {"kind": "NotExecuted"},
+}
+#: SurrealDB 4.0's missing-table error for a ``LET`` of that request.
+_LET_MISSING = {
+    "status": "ERR",
+    "kind": "NotFound",
+    "result": "The table 'sq_ghost' does not exist",
+    "details": {"kind": "Table", "details": {"name": "sq_ghost"}},
+}
+
+
+class _RawClient:
+    """A client whose ``query_raw()`` answers *envelope* and records each statement."""
+
+    def __init__(self, envelope: dict[str, Any]) -> None:
+        self.envelope = envelope
+        self.sent: list[str] = []
+
+    async def query_raw(self, statement: str, variables: Any = None, **kwargs: Any) -> Any:
+        self.sent.append(statement)
+        return self.envelope
+
+
+class TestTopLevelForm:
+    """v0.50.0 (SurrealDB 4.x): an HNSW search next to a ``LET`` sends the ``LET`` s as statements of their own —
+    ``SubqueryCompiler.wrap()`` and ``statement_index()`` — and ``_client.query_at()`` reads the statement's result
+    and the error of the statement that failed."""
+
+    def test_the_block_is_unchanged_without_top_level(self) -> None:
+        compiler = SubqueryCompiler(lets=list(_TL_LETS))
+        assert compiler.wrap(_TL_STATEMENT) == "{ " + " ".join(_TL_LETS) + f" ({_TL_STATEMENT[:-1]}) }};"
+        assert compiler.statement_index() == 0
+
+    def test_outside_a_transaction(self) -> None:
+        compiler = SubqueryCompiler(lets=list(_TL_LETS), top_level=True)
+        assert compiler.wrap(_TL_STATEMENT) == (f"BEGIN TRANSACTION; {' '.join(_TL_LETS)} {_TL_STATEMENT} COMMIT TRANSACTION;")
+        assert compiler.statement_index() == 3
+
+    def test_inside_a_transaction(self) -> None:
+        compiler = SubqueryCompiler(lets=list(_TL_LETS), top_level=True, outer_tx=object())
+        assert compiler.wrap(_TL_STATEMENT) == f"{' '.join(_TL_LETS)} {_TL_STATEMENT}"
+        assert compiler.statement_index() == 2
+
+    def test_every_let_empty_keeps_the_block(self) -> None:
+        lets = ["LET $_sq0 = <array> [];", "LET $_sq1 = <array> [];"]
+        compiler = SubqueryCompiler(lets=list(lets), top_level=True)
+        assert compiler.wrap(_TL_STATEMENT) == "{ " + " ".join(lets) + f" ({_TL_STATEMENT[:-1]}) }};"
+        assert compiler.statement_index() == 0
+        compiler.lets[1] = _TL_LETS[1]
+        assert compiler.wrap(_TL_STATEMENT).startswith("BEGIN TRANSACTION; LET $_sq0 = <array> []; LET $_sq1 = (")
+
+    def test_no_let_no_change(self) -> None:
+        compiler = SubqueryCompiler(top_level=True)
+        assert compiler.wrap(_TL_STATEMENT) == _TL_STATEMENT
+        assert compiler.statement_index() == 0
+
+    @pytest.mark.parametrize(
+        ("condition", "reads"),
+        [
+            ("id IN $_sq0", True),
+            ("$_sq12 CONTAINS id", True),
+            ("($_sq0 != [] AND score > array::first($_sq0))", True),
+            ("author IN $_sqz", False),
+            ("n > $_f0", False),
+            ("embedding <|2,100|> $_f1", False),
+        ],
+    )
+    def test_reads_a_let(self, condition: str, reads: bool) -> None:
+        assert reads_a_let(condition) is reads
+
+    async def test_query_at_reads_the_statement_s_result(self) -> None:
+        client = _RawClient({"result": [_ok(None), _ok(None), _ok(None), _ok([{"n": 1}]), _ok(None)]})
+        assert await _client.query_at(client, "…", {}, index=3) == [{"n": 1}]
+        assert await _client.query_at(client, "…", {}, index=9) is None
+
+    async def test_an_error_in_a_let_is_the_one_raised(self) -> None:
+        """The ``LET``'s missing-table error, past the statements reported as not executed: :func:`missing_table`
+        reads it as the server's own, so the ORM probes the table and sends the statement again."""
+        client = _RawClient({"result": [_ok(None), _LET_MISSING, _SKIPPED, _SKIPPED, _SKIPPED]})
+        with pytest.raises(NotFoundError) as raised:
+            await _client.query_at(client, "…", {}, index=2)
+        assert str(raised.value) == "The table 'sq_ghost' does not exist"
+        assert missing_table(raised.value) == "sq_ghost"
+
+    async def test_the_failed_statement_wins_over_the_skipped_ones(self) -> None:
+        failed = {"status": "ERR", "kind": "Internal", "result": "Incorrect vector dimension (2)."}
+        skipped_without_details = {"status": "ERR", "result": "The query was not executed due to a failed transaction"}
+        client = _RawClient({"result": [_ok(None), skipped_without_details, _SKIPPED, failed, _SKIPPED]})
+        with pytest.raises(InternalError) as raised:
+            await _client.query_at(client, "…", {}, index=3)
+        assert str(raised.value) == "Incorrect vector dimension (2)."
+
+    async def test_only_skipped_statements_raise_the_first(self) -> None:
+        conflict = {**_SKIPPED, "result": "Cannot COMMIT: Transaction conflict"}
+        client = _RawClient({"result": [_ok(None), _ok(None), _ok([]), conflict]})
+        with pytest.raises(ServerError) as raised:
+            await _client.query_at(client, "…", {}, index=2)
+        assert str(raised.value) == "Cannot COMMIT: Transaction conflict"
+
+    async def test_a_refused_query(self) -> None:
+        client = _RawClient({"error": {"code": -32000, "message": "Parse error: boom"}})
+        with pytest.raises(ServerError) as raised:
+            await _client.query_at(client, "…", {}, index=2)
+        assert "boom" in str(raised.value)
+
+
 class TestCompilerBookkeeping:
     """Spec §6.1: ``SubqueryCompiler`` builds on its own, wraps a statement, merges variables strictly (S7)."""
 
@@ -375,7 +499,7 @@ class TestCompilerBookkeeping:
     def test_mutable_fields_are_not_shared(self) -> None:
         one, two = SubqueryCompiler(), SubqueryCompiler()
         one.variables["a"] = 1
-        one.lets.append("LET $_sq0 = [];")
+        one.lets.append("LET $_sq0 = <array> [];")
         one.tables.add("t")
         one._stack.append(1)
         assert (two.variables, two.lets, two.tables, two._stack) == ({}, [], set(), [])
@@ -392,9 +516,9 @@ class TestCompilerBookkeeping:
         )
 
     def test_wrap_with_two_lets_keeps_their_order(self) -> None:
-        compiler = SubqueryCompiler(lets=["LET $_sq0 = (SELECT VALUE a FROM t);", "LET $_sq1 = [];"])
+        compiler = SubqueryCompiler(lets=["LET $_sq0 = (SELECT VALUE a FROM t);", "LET $_sq1 = <array> [];"])
         assert compiler.wrap("SELECT * FROM u WHERE x IN $_sq1;") == (
-            "{ LET $_sq0 = (SELECT VALUE a FROM t); LET $_sq1 = []; (SELECT * FROM u WHERE x IN $_sq1) };"
+            "{ LET $_sq0 = (SELECT VALUE a FROM t); LET $_sq1 = <array> []; (SELECT * FROM u WHERE x IN $_sq1) };"
         )
 
     @pytest.mark.parametrize(("a", "b"), _DIFFERENT, ids=_DIFFERENT_IDS)
@@ -715,7 +839,7 @@ class TestCompileSubquery:
     def test_c14_retry_form(self) -> None:
         qs = _with_inner(_active())
         assert qs._compile_query(subqueries=qs._subquery_compiler(frozenset({"sq_person"}))) == (
-            "{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
+            "{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
             {},
         )
 
@@ -724,7 +848,7 @@ class TestCompileSubquery:
         qs = _with_inner(SqPerson.objects().filter(id__in=Subquery(writers)))
         compiler = qs._subquery_compiler(frozenset({"sq_person"}))
         assert qs._compile_query(subqueries=compiler) == (
-            "{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
+            "{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0) };",
             {},
         )
         assert compiler.tables == {"sq_person"}
@@ -1483,7 +1607,7 @@ class TestOrderedLimitedE2E:
         """
         async with subquery_db("ws") as client:
             await _seed_ordered()
-            counts = [len(await client.query(_PIN)) for _ in range(_RUNS)]
+            counts = [len(await _client.query(client, _PIN)) for _ in range(_RUNS)]
             if _7470_FIRST <= await _server_version(client) < _7470_FIXED:
                 if min(counts) >= 10:
                     pytest.fail(_PIN_FIXED)
@@ -1503,7 +1627,7 @@ def _nested_ghost() -> Any:
     return SqPost.objects().filter(author__in=Subquery(SqPerson.objects().filter(id__not_in=_ghost())))
 
 
-_EMPTY_LET = "LET $_sq0 = [];"
+_EMPTY_LET = "LET $_sq0 = <array> [];"
 
 
 _PROBE_SQ_GHOST = (TABLE_PROBE, {"table": "sq_ghost"})
@@ -1711,7 +1835,11 @@ class _RaisingClient:
         self.probe = probe
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         self.calls.append((query, dict(variables or {})))
         if query != TABLE_PROBE:
             raise self.error
@@ -1729,7 +1857,7 @@ class _RaisingTx(_RaisingClient):
         return True
 
     async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
-        return await self.query(sql, variables)
+        return await self._answer(sql, variables)  # a transaction's read returns its rows directly
 
     async def add(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
         raise AssertionError("no write expected")
@@ -1921,13 +2049,13 @@ class TestRunCompiled:
         assert calls[0][1] == {"subquery_tables": frozenset({"sq_person", "sq_post"})}
         assert calls[1] == (
             (
-                "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM sq_person WHERE id IN $_sq0); "
+                "{ LET $_sq0 = <array> []; LET $_sq1 = (SELECT VALUE id FROM sq_person WHERE id IN $_sq0); "
                 "(SELECT * FROM sq_post WHERE author IN $_sq1) };",
                 {},
             ),
             {"subquery_tables": frozenset({"sq_person"})},
         )
-        assert calls[2] == (("{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0) };", {}), {})
+        assert calls[2] == (("{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0) };", {}), {})
 
     @pytest.mark.parametrize(
         ("read", "statement"),
@@ -1979,7 +2107,7 @@ class TestRunCompiled:
         await read(qs)
         assert [(args[0], kwargs) for args, kwargs in calls] == [
             (f"{{ {_C1_LET} ({statement}) }};", {"subquery_tables": _READS_SQ_PERSON}),
-            (f"{{ LET $_sq0 = []; ({statement}) }};", {}),
+            (f"{{ LET $_sq0 = <array> []; ({statement}) }};", {}),
         ]
 
     async def test_the_limit_of_exists_is_restored(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2097,7 +2225,7 @@ class TestSubqueryWritesE2E:
             post, created = await SqPost.objects().get_or_create(author__in=Subquery(_nobody()), title="new")
             assert created is True
             assert (post.title, post.author) == ("new", None)
-            rows = await client.query("SELECT * FROM sq_post WHERE title = 'new';")
+            rows = await _client.query(client, "SELECT * FROM sq_post WHERE title = 'new';")
             assert len(rows) == 1
             assert "author" not in rows[0], rows
 
@@ -2242,7 +2370,10 @@ class TestMissingSubqueryTableWritesE2E:
                     {"_f0": "g"},
                 ),
                 _PROBE_SQ_GHOST,
-                ("{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0 AND title = $_f0 LIMIT 2) };", {"_f0": "g"}),
+                (
+                    "{ LET $_sq0 = <array> []; (SELECT * FROM sq_post WHERE author IN $_sq0 AND title = $_f0 LIMIT 2) };",
+                    {"_f0": "g"},
+                ),
             ]
             await _assert_every_post_scored_one_and_one_created()
 
@@ -2288,7 +2419,11 @@ class _LiveClient:
         self.check = check
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         self.calls.append((query, dict(variables or {})))
         if not query.startswith("RETURN "):
             return _LIVE_ID
@@ -2514,26 +2649,27 @@ class TestSubqueryLiveE2E:
 
 # --- AC-10: time travel — every subquery reads at the outer as_of() moment ---------------------------------
 
-#: Spec AC-10's history on the embedded ``surrealkv+versioned://`` engine, one statement per ``client.query()``:
-#: in 2020 ``a`` is active and ``b`` is not, each with a post; in 2021 they swap. ``b`` is the older, so the
-#: oldest active person is ``a`` in 2020 and ``b`` since.
-_SQ_HISTORY = (
-    "CREATE sq_person:a SET name = 'Ada', active = true, age = 36 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_person:b SET name = 'Bob', active = false, age = 50 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_post:p1 SET title = 'one', author = sq_person:a, score = 5 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_post:p2 SET title = 'two', author = sq_person:b, score = 8 VERSION d'2020-01-01T00:00:00Z';",
-    "CREATE sq_person:b SET name = 'Bob', active = true, age = 50 VERSION d'2021-01-01T00:00:00Z';",
-    "CREATE sq_person:a SET name = 'Ada', active = false, age = 36 VERSION d'2021-01-01T00:00:00Z';",
+#: Spec AC-10's history on the embedded ``surrealkv+versioned://`` engine, on the database clock (spec §9), one
+#: statement per ``client.query()``: before ``t1`` ``a`` is active and ``b`` is not, each with a post; between ``t1``
+#: and ``t2`` they swap. ``b`` is the older, so the oldest active person is ``a`` at ``t1`` and ``b`` since.
+_SQ_HISTORY_T1 = (
+    "CREATE sq_person:a SET name = 'Ada', active = true, age = 36;",
+    "CREATE sq_person:b SET name = 'Bob', active = false, age = 50;",
+    "CREATE sq_post:p1 SET title = 'one', author = sq_person:a, score = 5;",
+    "CREATE sq_post:p2 SET title = 'two', author = sq_person:b, score = 8;",
+)
+_SQ_HISTORY_T2 = (
+    "UPDATE sq_person:b SET active = true;",
+    "UPDATE sq_person:a SET active = false;",
 )
 
 
 @contextlib.asynccontextmanager
-async def sq_history_db(tmp_path: Path) -> AsyncIterator[Any]:
-    """``_SQ_HISTORY`` on a fresh embedded ``surrealkv+versioned://`` database; yields its client."""
+async def sq_history_db(tmp_path: Path) -> AsyncIterator[_History]:
+    """The history on a fresh embedded ``surrealkv+versioned://`` database, nothing written after ``t2``."""
     async with embedded_database(_versioned_url(tmp_path)) as client:
-        for statement in _SQ_HISTORY:
-            await client.query(statement)
-        yield client
+        t0, t1, t2 = await write_history(client, _SQ_HISTORY_T1, _SQ_HISTORY_T2, ())
+        yield _History(client, t0, t1, t2)
 
 
 def _by_active_authors() -> Any:
@@ -2590,61 +2726,68 @@ async def _still_shows(moment: datetime, expected: _State) -> None:
 class TestSubqueryAsOfE2E:
     """AC-10: under the outer ``as_of()``, every subquery reads at the same moment, on every versioned store.
 
-    The embedded ``surrealkv+versioned://`` engine (no server) with history written at fixed past moments: like a
-    2.x server, it never applies the outer ``VERSION`` to a sub-SELECT (spec M13), so a subquery read without its
-    own ``VERSION`` would see the current state (``b`` active) and ``M2020`` would give ``p2`` instead of ``p1``.
+    The embedded ``surrealkv+versioned://`` engine (no server), its history read at moments taken from the database
+    clock between the writes: a subquery read without its own ``VERSION`` would see the current state (``b``
+    active) where it never applies the outer ``VERSION`` to a sub-SELECT (spec M13: a 2.x server, and the embedded
+    engine of SDK 2.x), and ``t1`` would give ``p2`` instead of ``p1``.
     Then the server of ``SURREALDB_PORT`` (in memory, no history: one branch per line) and a server started with
     versioned storage (``SURREALDB_VERSIONED_PORT``, skipped without it), over WebSocket and HTTP.
     """
 
     async def test_reads_at_each_moment(self, tmp_path: Path) -> None:
-        async with sq_history_db(tmp_path):
-            assert _keys_in_order(await _by_active_authors().as_of(M2020).exec()) == ["p1"]
-            assert await _by_active_authors().as_of(M2020).count() == 1
-            assert await _by_active_authors().as_of(M2020).exists() is True
-            assert await _by_active_authors().as_of(M2020).sum("score") == 5
-            grouped = await _by_active_authors().as_of(M2020).values("author").annotate(n=Count()).exec()
+        async with sq_history_db(tmp_path) as h:
+            assert _keys_in_order(await _by_active_authors().as_of(h.t1).exec()) == ["p1"]
+            assert await _by_active_authors().as_of(h.t1).count() == 1
+            assert await _by_active_authors().as_of(h.t1).exists() is True
+            assert await _by_active_authors().as_of(h.t1).sum("score") == 5
+            grouped = await _by_active_authors().as_of(h.t1).values("author").annotate(n=Count()).exec()
             assert grouped == [{"author": _person("a"), "n": 1}]
 
-            assert _keys_in_order(await _by_active_authors().as_of(M2021).exec()) == ["p2"]
-            assert await _by_active_authors().as_of(M2021).count() == 1
-            grouped = await _by_active_authors().as_of(M2021).values("author").annotate(n=Count()).exec()
+            assert _keys_in_order(await _by_active_authors().as_of(h.t2).exec()) == ["p2"]
+            assert await _by_active_authors().as_of(h.t2).count() == 1
+            grouped = await _by_active_authors().as_of(h.t2).values("author").annotate(n=Count()).exec()
             assert grouped == [{"author": _person("b"), "n": 1}]
 
             assert _keys_in_order(await _by_active_authors().exec()) == ["p2"]
             assert await _by_active_authors().count() == 1
 
     async def test_an_ordered_subquery_reads_at_the_moment(self, tmp_path: Path) -> None:
-        async with sq_history_db(tmp_path):
+        async with sq_history_db(tmp_path) as h:
             for _ in range(_RUNS):
-                assert _keys_in_order(await _by_oldest_active().as_of(M2020).exec()) == ["p1"]
-                assert _keys_in_order(await _by_oldest_active().as_of(M2021).exec()) == ["p2"]
+                assert _keys_in_order(await _by_oldest_active().as_of(h.t1).exec()) == ["p1"]
+                assert _keys_in_order(await _by_oldest_active().as_of(h.t2).exec()) == ["p2"]
                 assert _keys_in_order(await _by_oldest_active().exec()) == ["p2"]
 
     async def test_a_first_value_subquery_reads_at_the_moment(self, tmp_path: Path) -> None:
         """``exact`` with the first value: the score of the oldest active person's post, at each moment."""
         best = SqPost.objects().filter(author__in=Subquery(_active().order_by("-age").limit(1))).select("score")
-        async with sq_history_db(tmp_path):
+        async with sq_history_db(tmp_path) as h:
             for _ in range(_RUNS):
-                assert _keys_in_order(await SqPost.objects().as_of(M2020).filter(score=Subquery(best)).exec()) == ["p1"]
-                assert _keys_in_order(await SqPost.objects().as_of(M2021).filter(score=Subquery(best)).exec()) == ["p2"]
+                assert _keys_in_order(await SqPost.objects().as_of(h.t1).filter(score=Subquery(best)).exec()) == ["p1"]
+                assert _keys_in_order(await SqPost.objects().as_of(h.t2).filter(score=Subquery(best)).exec()) == ["p2"]
 
     async def test_a_subquery_of_its_own_moment_is_refused_s5(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        async with sq_history_db(tmp_path) as client:
-            calls = _record_queries(monkeypatch, client)
-            for outer in (SqPost.objects().as_of(M2020), SqPost.objects()):
+        async with sq_history_db(tmp_path) as h:
+            calls = _record_queries(monkeypatch, h.client)
+            for outer in (SqPost.objects().as_of(h.t1), SqPost.objects()):
                 with pytest.raises(SurrealDbError) as info:
-                    await outer.filter(author__in=Subquery(_active().as_of(M2021))).exec()
+                    await outer.filter(author__in=Subquery(_active().as_of(h.t2))).exec()
                 assert str(info.value) == _S5
             assert calls == []
 
     async def test_a_missing_subquery_table_reads_as_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """As without ``as_of()``: the embedded engine reads a missing subquery table as empty, in one request."""
-        async with sq_history_db(tmp_path) as client:
-            calls = _record_queries(monkeypatch, client)
-            assert _keys_in_order(await SqPost.objects().as_of(M2020).filter(author__not_in=_ghost()).exec()) == ["p1", "p2"]
-            assert await SqPost.objects().as_of(M2020).filter(author__in=_ghost()).exec() == []
-            assert len(calls) == 2
+        """A missing subquery table reads as empty at the moment too. The embedded engine of SDK 3.0 (SurrealDB 4.0)
+        versions the table definition, so the ``LET`` with its own ``VERSION`` raises the missing-table error, as a
+        3.x versioned server does: the ORM probes the table and sends the statement again with that subquery empty."""
+        async with sq_history_db(tmp_path) as h:
+            calls = _record_queries(monkeypatch, h.client)
+            assert _keys_in_order(await SqPost.objects().as_of(h.t1).filter(author__not_in=_ghost()).exec()) == ["p1", "p2"]
+            sent_not_in = list(calls)
+            calls.clear()
+            assert await SqPost.objects().as_of(h.t1).filter(author__in=_ghost()).exec() == []
+            sent_in = list(calls)
+        for sent in (sent_not_in, sent_in):
+            _assert_probed_then_sent_again(sent)
 
     @pytest.mark.parametrize("kind", ["ws", "http"])
     async def test_a_server_without_history(self, kind: str) -> None:

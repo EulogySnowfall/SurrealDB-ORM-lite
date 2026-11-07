@@ -26,6 +26,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     Computed,
     SurrealConfigDict,
+    _client,
     computed,
 )
 from surreal_orm_lite.enum import LiveAction
@@ -59,7 +60,7 @@ def _table_name_warnings(records: Any) -> list[warnings.WarningMessage]:
 
 async def _db_tables(client: Any) -> set[str]:
     """The table names ``INFO FOR DB`` reports."""
-    info = await client.query("INFO FOR DB;", {})
+    info = await _client.query(client, "INFO FOR DB;", {})
     assert isinstance(info, dict)
     return set(info["tables"])
 
@@ -261,7 +262,8 @@ class TestTableNameE2E:
 
             await holder.relate("tn_holds", item)
 
-            targets = await client.query(
+            targets = await _client.query(
+                client,
                 "SELECT VALUE ->tn_holds->? FROM ONLY $src;",
                 {"src": RecordID("tn_holder", "h")},
             )

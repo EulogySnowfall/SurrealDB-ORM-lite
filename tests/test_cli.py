@@ -50,7 +50,7 @@ from typing import Any
 import pytest
 
 import surreal_orm_lite
-from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite import SurrealDBConnectionManager, _client
 from surreal_orm_lite._sdk import RecordID
 from surreal_orm_lite.cli import commands
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
@@ -130,7 +130,7 @@ class TestParser:
         data = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         assert data["project"]["scripts"] == {"surreal-orm-lite": "surreal_orm_lite.cli.commands:main"}
         # No new runtime dependency (D1: argparse, no click).
-        assert data["project"]["dependencies"] == ["pydantic>=2.13.4", "surrealdb[pydantic]>=2.0.0,<3.0.0"]
+        assert data["project"]["dependencies"] == ["pydantic>=2.13.4", "surrealdb[pydantic]>=3.0.0,<4.0.0"]
 
     def test_exports(self) -> None:
         cli_package = importlib.import_module("surreal_orm_lite.cli")
@@ -802,7 +802,8 @@ def _admin(kind: str, database: str, sql: str, *, reset: bool = False) -> Any:
             if reset:
                 await apply_reset(client, sql)
                 return None
-            return await client.query(sql, {})
+            results = await _client.query_all(client, sql, {})  # one result per statement
+            return results[-1] if results else None
         finally:
             await SurrealDBConnectionManager.remove_connection("cli_admin")
 

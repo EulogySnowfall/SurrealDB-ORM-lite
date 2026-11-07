@@ -13,7 +13,7 @@ from typing import Annotated, Any
 import pytest
 from pydantic import BaseModel as PydanticBaseModel
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
 from surreal_orm_lite.connection_manager import _type_adapter
 from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError, SurrealDbValidationError
 from surreal_orm_lite.functions import (
@@ -270,7 +270,7 @@ class TestCallFunctionE2E:
         async with cf_client("cf_probe") as client:
             await client.query("UPSERT cf_probe:a SET n = 1;", {})
             assert await SurrealDBConnectionManager.call_function("fn::cf_greet", [hostile]) == f"hi {hostile}"
-            survivors = await client.query("SELECT * FROM cf_probe;", {})
+            survivors = await _client.query(client, "SELECT * FROM cf_probe;", {})
             assert len(survivors) == 1
 
     @pytest.mark.asyncio
@@ -505,7 +505,7 @@ class TestCallFunctionTransactionE2E:
 
     @staticmethod
     async def _counter(client: Any) -> int:
-        rows = await client.query("SELECT * FROM cf_ctr:a;", {})
+        rows = await _client.query(client, "SELECT * FROM cf_ctr:a;", {})
         return int(rows[0]["n"])
 
     @pytest.mark.asyncio
@@ -535,7 +535,7 @@ class TestCallFunctionTransactionE2E:
                 await CfCounter(id="after", n=99).save(tx=tx)
 
             assert await self._counter(client) == 5, "the function's own write was lost"
-            survivors = await client.query("SELECT * FROM CfCounter;", {})
+            survivors = await _client.query(client, "SELECT * FROM CfCounter;", {})
             assert len(survivors) == 1, "the statement queued AFTER the call never executed"
             with contextlib.suppress(Exception):
                 await client.query("REMOVE FUNCTION fn::cf_bump;", {})
@@ -625,7 +625,7 @@ class TestModelCallFunctionE2E:
             await client.query("UPSERT cf_ctr:a SET n = 0;", {})
             async with SurrealDBConnectionManager.transaction() as tx:
                 await CfCounter.call_function("fn::cf_bump", [2], tx=tx)
-            rows = await client.query("SELECT * FROM cf_ctr:a;", {})
+            rows = await _client.query(client, "SELECT * FROM cf_ctr:a;", {})
             assert rows[0]["n"] == 2
             with contextlib.suppress(Exception):
                 await client.query("REMOVE FUNCTION fn::cf_bump;", {})

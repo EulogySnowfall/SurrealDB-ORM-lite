@@ -21,7 +21,7 @@ from uuid import uuid4
 import pytest
 from pydantic import BaseModel as PydanticBaseModel
 
-from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite import SurrealDBConnectionManager, _client
 from surreal_orm_lite.auth import AuthTokens, build_auth_payload, wrap_auth_error
 from surreal_orm_lite.exceptions import (
     SurrealDbAuthenticationError,
@@ -325,7 +325,7 @@ class TestSignupE2E:
 
             assert isinstance(tokens, AuthTokens)
             assert tokens.access, "the server must issue an access token"
-            assert await client.query("RETURN $auth;", {}) is not None
+            assert await _client.query(client, "RETURN $auth;", {}) is not None
 
     @pytest.mark.asyncio
     async def test_a_plain_access_method_issues_no_refresh_token(self) -> None:
@@ -346,7 +346,7 @@ class TestSigninE2E:
             tokens = await SurrealDBConnectionManager.signin(access=AUTH_ACCESS, variables={"email": email, "pass": PASSWORD})
 
             assert tokens.access
-            assert await client.query("RETURN $auth.email;", {}) == email
+            assert await _client.query(client, "RETURN $auth.email;", {}) == email
 
     @pytest.mark.asyncio
     async def test_authenticates_a_system_user(self) -> None:
@@ -387,7 +387,7 @@ class TestSigninE2E:
 
             await SurrealDBConnectionManager.signin(username="root", password="root")
 
-            identity = await client.query("RETURN [$auth.email, $access, $session.rd];", {})
+            identity = await _client.query(client, "RETURN [$auth.email, $access, $session.rd];", {})
             reported = await SurrealDBConnectionManager.info()
             if _server_version(server) >= (3, 3):
                 assert identity == [None, None, None]
@@ -514,7 +514,7 @@ class TestInfoE2E:
         async with auth_client(permissions="NONE") as client:
             email = _unique_email()
             await _signup(email)
-            assert await client.query("RETURN $auth;", {}) is not None, "the identity is real"
+            assert await _client.query(client, "RETURN $auth;", {}) is not None, "the identity is real"
 
             assert await SurrealDBConnectionManager.info() is None
 
@@ -617,7 +617,7 @@ class TestInvalidateE2E:
 
             await SurrealDBConnectionManager.invalidate()
 
-            assert await client.query("RETURN $auth;", {}) is None
+            assert await _client.query(client, "RETURN $auth;", {}) is None
 
     @pytest.mark.asyncio
     async def test_forgets_the_session_token(self) -> None:
@@ -890,7 +890,7 @@ class TestAuthSurvivesTheTransportE2E:
 
             # Identity-agnostic on purpose: any authenticated session can evaluate this, so a
             # failure here means the *connection* is broken, not that permissions are missing.
-            assert await client.query("RETURN 1;", {}) == 1
+            assert await _client.query(client, "RETURN 1;", {}) == 1
 
     @pytest.mark.asyncio
     async def test_a_revoked_token_leaves_the_connection_usable_after_the_replay(self, scheme: str) -> None:
@@ -904,7 +904,7 @@ class TestAuthSurvivesTheTransportE2E:
 
             assert SurrealDBConnectionManager.get_session_token() is None
             recovered = await SurrealDBConnectionManager.get_client()
-            assert await recovered.query("RETURN 1;", {}) == 1
+            assert await _client.query(recovered, "RETURN 1;", {}) == 1
 
     @pytest.mark.asyncio
     async def test_the_identity_survives_a_reconnect(self, scheme: str) -> None:
@@ -931,7 +931,7 @@ class TestClearSession:
             assert SurrealDBConnectionManager.get_session_token() is None
             assert SurrealDBConnectionManager.get_refresh_token() is None
             # The live session is untouched — only the replay is forgotten.
-            assert await client.query("RETURN $auth.email;", {}) is not None
+            assert await _client.query(client, "RETURN $auth.email;", {}) is not None
 
     @pytest.mark.asyncio
     async def test_set_connection_drops_a_token_from_another_server(self) -> None:

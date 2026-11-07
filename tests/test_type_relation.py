@@ -112,6 +112,7 @@ from surreal_orm_lite import (
     SurrealORMError,
     TableType,
     Transaction,
+    _client,
     generate_models_from_db,
     is_conflict_error,
     model_generator,
@@ -1230,7 +1231,11 @@ class _GuardClient:
         self.queries: list[str] = []
         self.version_calls = 0
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if statement == _INFO:
@@ -1477,7 +1482,7 @@ async def _rel(kind: str) -> AsyncIterator[Any]:
 
 async def _tables(client: Any) -> dict[str, Any]:
     """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
-    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+    return dict((await _client.query(client, "INFO FOR DB;", {}))["tables"])
 
 
 class TestRelationDdlE2E:
@@ -1651,18 +1656,18 @@ def _sent_per_attempt(calls: list[tuple[str, tuple[object, ...]]], expected: lis
 
 async def _table_info(client: Any, table: str) -> dict[str, Any]:
     """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
-    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    info: dict[str, Any] = await _client.query(client, f"INFO FOR TABLE {table};", {})
     return info
 
 
 async def _edge_ids(client: Any) -> list[str]:
     """The ids of ``rel_likes``' edges, ordered, as ``table:id`` texts."""
-    return [str(edge) for edge in await client.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {})]
+    return [str(edge) for edge in await _client.query(client, "SELECT VALUE id FROM rel_likes ORDER BY id;", {})]
 
 
 async def _like_counts(client: Any) -> dict[str, int]:
     """The view ``rel_like_counts``: ``out`` (as a ``table:id`` text) → ``n``."""
-    return {str(row["out"]): row["n"] for row in await client.query("SELECT n, out FROM rel_like_counts;", {})}
+    return {str(row["out"]): row["n"] for row in await _client.query(client, "SELECT n, out FROM rel_like_counts;", {})}
 
 
 def _without_feed(text: str) -> str:
@@ -1731,7 +1736,7 @@ class TestDefineRelationE2E:
                 if kind != "mem":
                     # The second connection's session is open before the define (M9).
                     second = await SurrealDBConnectionManager.get_client("rel2")
-                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                    assert await _client.query(second, "SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
                         RecordID("rel_likes", "e1"),
                         RecordID("rel_likes", "e2"),
                     ]
@@ -1803,7 +1808,7 @@ class TestDefineRelationE2E:
             after = (await _tables(client))["rel_stats"]
             assert after == before
             assert parse_define_table(after).view_query is not None
-            assert await client.query("SELECT VALUE n FROM rel_stats;", {}) == [1]
+            assert await _client.query(client, "SELECT VALUE n FROM rel_stats;", {}) == [1]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_rg3_a_type_any_table_holding_an_edge(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1926,12 +1931,17 @@ class _RefusingClient:
         self.error = error
         self.calls: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         self.calls.append(statement)
         raise self.error
 
-    async def insert_relation(self, table: str, data: object) -> object:
-        self.calls.append(f"insert_relation({table!r})")
+    async def insert(self, table: object, data: object, *, relation: bool = False) -> object:
+        """SDK 3.0's ``insert()``; ``relation=True`` is ``INSERT RELATION``."""
+        self.calls.append(f"insert_relation({str(table)!r})" if relation else f"insert({str(table)!r})")
         raise self.error
 
 
@@ -2163,7 +2173,7 @@ class TestEnforcementE2E:
         async with _rel(kind) as client:
             await _enforced(client)
             await _create_edge(path, _ADA, RecordID("rel_book", "b1"))
-            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            ends = await _client.query(client, "SELECT VALUE [in, out] FROM rel_likes;", {})
             expected = [[_ADA, RecordID("rel_book", "b1")]]
             if path == "bulk_create":
                 expected.append([_ADA, _P1])
@@ -2178,7 +2188,7 @@ class TestEnforcementE2E:
                 eve = await RelPerson(id="eve").save(tx=tx)
                 await eve.relate(RelLikes, _P1, tx=tx)
                 await eve.relate("rel_likes", RecordID("rel_book", "b1"), tx=tx)
-            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            ends = await _client.query(client, "SELECT VALUE [in, out] FROM rel_likes;", {})
             eve_id = RecordID("rel_person", "eve")
             assert sorted(ends, key=str) == sorted([[eve_id, _P1], [eve_id, RecordID("rel_book", "b1")]], key=str)
 
@@ -2207,7 +2217,7 @@ class TestEnforcementE2E:
                 await ada.relate("rel_follows", bob)
             _assert_refusal(raised, SurrealDbError)
             assert "rel_follows_pair" in str(raised.value)
-            assert len(await client.query("SELECT VALUE id FROM rel_follows;", {})) == 1
+            assert len(await _client.query(client, "SELECT VALUE id FROM rel_follows;", {})) == 1
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_by_name_a_type_normal_table(self, kind: str) -> None:
@@ -2217,7 +2227,7 @@ class TestEnforcementE2E:
             with pytest.raises(SurrealDbError) as raised:
                 await RelPerson(id="ada").relate("rel_normal", _P1)
             _assert_refusal(raised, SurrealDbError)
-            assert await client.query("SELECT VALUE id FROM rel_normal;", {}) == []
+            assert await _client.query(client, "SELECT VALUE id FROM rel_normal;", {}) == []
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_by_name_in_a_transaction(self, kind: str) -> None:
@@ -2282,7 +2292,7 @@ def _field_type(info: dict[str, Any], name: str) -> str:
 
 async def _ends(client: Any) -> list[list[RecordID]]:
     """``[in, out]`` of every ``rel_likes`` edge, sorted."""
-    return sorted(await client.query("SELECT VALUE [in, out] FROM rel_likes;", {}), key=str)
+    return sorted(await _client.query(client, "SELECT VALUE [in, out] FROM rel_likes;", {}), key=str)
 
 
 #: K6, its read-back and K7 on AC-6's table without its change feed (issue #406): AC-20's E2E tests do not need it,
@@ -2366,7 +2376,7 @@ class TestRemoveConstraintE2E:
                 if kind != "mem":
                     # The second connection's session is open before the removal (M9).
                     second = await SurrealDBConnectionManager.get_client("rel2")
-                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                    assert await _client.query(second, "SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
                         RecordID("rel_likes", "e1"),
                         RecordID("rel_likes", "e2"),
                     ]
@@ -2728,7 +2738,7 @@ class TestRelationLineFactsE2E:
             refused = await _refusal(client, _alter_edge("a4", "rel_company:c"))
             assert refused is not None
             assert "rel_person" in refused
-            written = await client.query("SELECT VALUE id FROM rel_alter;", {})
+            written = await _client.query(client, "SELECT VALUE id FROM rel_alter;", {})
             expected = ["a1", "a2", "a3"] if await _major(client) >= 3 else ["a1", "a3"]
             assert sorted(str(record.id) for record in written) == expected
 
@@ -2764,17 +2774,17 @@ class TestExistingRecordsE2E:
             assert await _edge_ids(client) == ["rel_likes:dangling", "rel_likes:odd"]
 
             odd = await RelLikes.objects().get("odd")
-            stored = await client.query("SELECT * FROM rel_likes:odd;", {})
+            stored = await _client.query(client, "SELECT * FROM rel_likes:odd;", {})
             with pytest.raises(ServerError) as raised:
                 await odd.merge(stars=5)
             assert not isinstance(raised.value, SurrealORMError)
             assert "`in`" in str(raised.value)
             assert "rel_person" in str(raised.value)
-            assert await client.query("SELECT * FROM rel_likes:odd;", {}) == stored
+            assert await _client.query(client, "SELECT * FROM rel_likes:odd;", {}) == stored
 
             dangling = await RelLikes.objects().get("dangling")
             await dangling.merge(stars=4)
-            assert await client.query("SELECT VALUE stars FROM rel_likes:dangling;", {}) == [4]
+            assert await _client.query(client, "SELECT VALUE stars FROM rel_likes:dangling;", {}) == [4]
 
             assert await RelLikes.raw_query(_NONCONFORMING_EDGES) == [RecordID("rel_likes", "odd")]
             assert await RelLikes.raw_query(_DANGLING_EDGES) == [RecordID("rel_likes", "dangling")]
@@ -2836,7 +2846,7 @@ class TestChangeFeedAndLiveE2E:
             assert [event.record_id for event in events] == ["rel_likes:e1", "rel_likes:e2", str(e3.id)]
             assert all(isinstance(event.instance, RelLikes) for event in events)
 
-            entries = await client.query("SHOW CHANGES FOR TABLE rel_likes SINCE 0 LIMIT 100;", {})
+            entries = await _client.query(client, "SHOW CHANGES FOR TABLE rel_likes SINCE 0 LIMIT 100;", {})
             kinds = [change_kind for entry in entries for change in entry["changes"] for change_kind in change]
             assert kinds == ["define_table", "update", "update", "define_table", "update"]
 
@@ -2976,7 +2986,7 @@ _SECTION_23 = "## 23. Typed edges (`BaseSurrealEdge`)"
 _SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
 _SECTION_33 = "## 33. Materialized views (`view_query`, `define_view()`)"
 _SECTION_34 = "## 34. Relation constraints (`relation_in`, `define_relation()`)"
-_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x vs 3.x"
+_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"
 _EMBEDDED_BEHAVIOUR = "## ORM behaviour: the embedded engine"
 #: Spec §11.1 item 1: section 34's subsections, in order, after an untitled intro paragraph that holds example A.
 _SUBSECTIONS_34 = [
@@ -3099,9 +3109,9 @@ await Knows.define_relation()
 [old] = await Knows.objects().exec()  # the edge stays
 try:
     await old.merge(since=2020)
-except ServerError as exc:
+except ServerError as exc:  # InternalError on SurrealDB 2.x and 3.x
     print(type(exc).__name__)
-# InternalError
+# ValidationError
 
 outside = await Knows.raw_query(
     "SELECT VALUE id FROM knows WHERE record::tb(in) NOT IN ['person'] OR record::tb(out) NOT IN ['person']"
@@ -3157,7 +3167,7 @@ _INTRO_NEEDLES_34 = (
     "`define_relation()` applies the constraint",
     "SurrealDB enforces it",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
     "`mem://`",
 )
 _PART_NEEDLES_34 = {
@@ -3285,7 +3295,7 @@ _PART_NEEDLES_34 = {
         _P3_SENTENCE,
         "A raw `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced on 2.x",
         "The ORM never sends `ALTER TABLE`",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
         "(compatibility.md#orm-behaviour-the-embedded-engine)",
     ),
     "Security": (
@@ -3373,7 +3383,7 @@ _COMPARISON_ROWS_34 = [
     ["Hybrid Search (RRF)", "✅ v0.37.0 (`hybrid_search()`)", "✅"],
     ["Migrations & CLI", "✅ v0.38.0 (migrations), ✅ v0.39.0 (CLI)", "✅"],
     ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; ✅ v0.40.0 factories", "✅"],
-    ["Retry, Logging, Metrics", "v0.41.0", "✅"],
+    ["Retry, Logging, Metrics", "v0.51.0 (reconnect), v0.59.0 (logging, metrics)", "✅"],
     ["Connection Pool", "post-GA (tentative)", "✅"],
     ["Custom SDK / CBOR Protocol", "❌ never", "✅"],
 ]
@@ -3405,10 +3415,9 @@ _HEADER_SENTENCE_33 = "Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and t
 #: Spec §11.1 item 5: the row v0.33.0 adds to the embedded-engine table, cell by cell.
 _EMBEDDED_RELATION_ROW = [
     "TYPE RELATION constraints (v0.33.0)",
-    "as on a 2.x server: a raw `ALTER TABLE … TYPE` of a table already written to is not enforced (`define_relation()` "
-    "sends `DEFINE TABLE OVERWRITE`); an endpoint outside `IN`/`OUT` whose record does not exist raises "
-    "`SurrealDbNotFoundError`",
-    "`SurrealDbError` for that endpoint on 3.x",
+    "as on a 4.x server: a raw `ALTER TABLE … TYPE` is enforced at once; an endpoint outside `IN`/`OUT` raises "
+    "`SurrealDbError`",
+    "the same on 3.x and 4.x; on 2.x an endpoint without a record raises `SurrealDbNotFoundError`",
     "v0.33.0",
 ]
 
@@ -3771,7 +3780,12 @@ class TestRoadmapTableDdl:
         v0.35.0 once full-text search is released, without v0.36.0 once vector search is, without v0.37.0 once
         hybrid search is, without v0.38.0 once the migrations are, without v0.39.0 once the command line is and
         without v0.40.0 once the factories are."""
-        planned = "\n".join(part for part in _roadmap().split("\n## ") if part.startswith("Planned"))
+        # v0.50.0 adds "Planned — SDK 3.0 features", the epics of the next series: not part of this numbering.
+        planned = "\n".join(
+            part
+            for part in _roadmap().split("\n## ")
+            if part.startswith("Planned") and not part.startswith("Planned — SDK 3.0 features")
+        )
         rows = re.findall(r"^\|\s*(v\d+\.\d+\.\d+)\s*\|\s*([^|]+?)\s*\|", planned, re.MULTILINE)
         released = (
             7
@@ -3841,7 +3855,7 @@ class TestRoadmapTableDdl:
                 assert overview[planned : planned + 3] == [
                     ["v0.39.0", "Tier 3 — Command line (`surreal-orm-lite`)", "Done"],
                     ["v0.40.0", "Tier 3 — Test fixtures & factories", "Done" if _released_40() else "Planned"],
-                    ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"],
+                    ["v0.50.0", "Official SDK 3.0 and SurrealDB 4.x", "Done"],
                 ], overview
             else:
                 first = (
@@ -3862,10 +3876,11 @@ class TestRoadmapTableDdl:
                 ["v0.34.0 – v0.40.0", "Tier 3 — Advanced (DDL/search/migrations/CLI), 7 minors", "Planned"],
                 ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"],
             ], overview
-        beta = _normalised(_subsection("### Version 0.41.0 — Beta Phase (API freeze)", roadmap))
-        assert "no regression since v0.40.0" in beta, beta
-        ga = _normalised(_subsection("### Version 2.0.0 — Production / GA", roadmap))
-        assert "No breaking change since v0.41.0 (the Beta-frozen API is honored)" in ga, ga
+        # v0.50.0 (C2): the SDK 3.0 epics v0.51.0–v0.58.0 come before the Beta, now v0.59.0, and GA is v3.0.0.
+        beta = _normalised(_subsection("### Version 0.59.0 — Beta Phase (API freeze)", roadmap))
+        assert "no regression since v0.58.0" in beta, beta
+        ga = _normalised(_subsection("### Version 3.0.0 — Production / GA", roadmap))
+        assert "No breaking change since v0.59.0 (the Beta-frozen API is honored)" in ga, ga
 
     def test_sdk_and_comparison_tables(self) -> None:
         """The two tables that date every feature: the model table DDL gets its row (marked ✅ once released), the
@@ -3905,7 +3920,7 @@ class TestRoadmapTableDdl:
             ("Migrations (makemigrations/migrate)", f"{mark_38}v0.38.0"),
             ("CLI `surreal-orm-lite`", cli_39),
             ("Test fixtures & factories", factories_40),
-            ("QueryLogger / profiling", "v0.41.0 (Beta)"),
+            ("QueryLogger / profiling", "v0.59.0 (Beta)"),
         ], unlocked
         comparison = [
             cells for _, cells in _table_rows(_subsection("## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison", roadmap))
@@ -3918,7 +3933,7 @@ class TestRoadmapTableDdl:
             ["Hybrid Search (RRF)", "yes", f"{mark_37}v0.37.0"],
             ["Migrations & CLI", "yes", migrations_38],
             ["Test fixtures & factories", "yes", fixtures_40],
-            ["QueryLogger / profiling", "yes", "v0.41.0"],
+            ["QueryLogger / profiling", "yes", "v0.59.0"],
         ], comparison
 
     @pytest.mark.parametrize("heading", list(_DEFERRED_34))
@@ -3955,8 +3970,9 @@ class TestRoadmapTableDdl:
 
 #: README section 21, "Surviving a dropped connection": retrying a query in flight is the Beta's (issue #292).
 _RETRY_SENTENCE_292 = (
-    "A request that was already in flight when the socket dropped still fails — with the SDK's own `KeyError` — "
-    "because retrying arbitrary queries is planned for v0.41.0."
+    "A request that was already in flight when the socket dropped still fails — with a retryable "
+    "`SurrealDbConnectionError` since v0.50.0 (SDK 2.0 raised its own `KeyError`) — because retrying arbitrary queries "
+    "is planned for v0.51.0 (connection resilience)."
 )
 
 

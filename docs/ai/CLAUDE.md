@@ -2,7 +2,7 @@
 
 [Surreal ORM Lite](https://github.com/EulogySnowfall/SurrealDB-ORM-lite) (`pip install surreal-orm-lite`, imported as
 `surreal_orm_lite`) is an async, Django-style ORM for SurrealDB with Pydantic models, built on the official SurrealDB
-Python SDK. This file tells an AI coding assistant how to write code with it. Download it into your project and import
+Python SDK 3.0 (`surrealdb[pydantic]>=3.0.0,<4.0.0`, since v0.50.0; the SDK 2.0 line `0.40.x` is deprecated). This file tells an AI coding assistant how to write code with it. Download it into your project and import
 it from your `CLAUDE.md` with the line `@docs/surreal-orm-lite.md` (Claude Code), or paste it into your assistant's
 instructions. To match the release you installed, replace `main` in the URL with its tag (`v<version>`).
 
@@ -10,7 +10,7 @@ instructions. To match the release you installed, replace `main` in the URL with
 curl -fsSL -o docs/surreal-orm-lite.md https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ai/CLAUDE.md
 ```
 
-Every example below is run by the project's test suite, on SurrealDB 2.x, 3.x and the embedded engine, in order: a
+Every example below is run by the project's test suite, on SurrealDB 2.x, 3.x, 4.x and the embedded engine, in order: a
 later example uses the models and records of an earlier one.
 
 ## Setup and connection
@@ -145,22 +145,32 @@ assert updated == 3 and created and deleted == 3
 - Relations: `await ada.relate("wrote", book)`, `await ada.get_related("wrote")`, or typed edges with
   `BaseSurrealEdge`. Signals (`pre_save`, `post_save`, …) fire on the model's writes, not on raw SurrealQL.
 
-## SurrealDB 2.x vs 3.x
+## SurrealDB 2.x, 3.x and 4.x
 
-The same code runs on SurrealDB 2.6/2.7, 3.2/3.3 and the embedded engine (which answers as a 2.x server). Where a
-capability needs 3.x, the ORM degrades on 2.x or raises before sending anything. Do not branch on the server version;
+The same code runs on SurrealDB 2.6/2.7, 3.2/3.3, 4.0 and the embedded engine (a SurrealDB 4.0 core, which needs
+`pip install "surreal-orm-lite[embedded]"`). Where a capability needs 3.x, the ORM degrades on 2.x or raises before
+sending anything; 4.x behaves as 3.x except where the tables below say otherwise. Do not branch on the server version;
 where it matters, test the capability (`tx.is_interactive`).
 
 - **Transactions**: interactive on 3.x over WebSocket. On 2.x, or over HTTP, they are buffered and sent at commit:
   reads inside the block raise, `save(tx=)` needs an explicit id, and `bulk_update`/`bulk_delete` return `0`.
 - **3.x only**: refresh tokens (`DEFINE ACCESS … WITH REFRESH`, `with_refresh=True`; `AuthTokens.refresh` is `None`
   on 2.x), asynchronous events (`Event(async_mode=True)`), `COMPUTED` fields in migrations.
-- **Differs**: a field a `SCHEMAFULL` table does not define is dropped on 2.x and refused on 3.x; a `Decimal` keeps
-  its trailing zeros on 2.x; raw error types differ, the ORM's do not.
+- **Differs**: a field a `SCHEMAFULL` table does not define is dropped on 2.x and refused on 3.x and 4.x; a `Decimal`
+  keeps its trailing zeros on 2.x; raw error types differ, the ORM's do not.
+- **Order**: `first()` without `order_by()` returns the smallest matching id on 3.x and 4.x (`ORDER BY id`), the
+  server's first row on 2.x; `exec()`, `all()` and pages are unordered without `order_by()` (4.x really is): add
+  `order_by()` to page.
+- **Raw queries**: `raw_query()` and `QuerySet.query()` return the rows of every statement, in order (a `LET` adds
+  none); a failing statement raises. `get_client()` is the SDK 3.0 client: its `query()` returns one result per
+  statement.
+- **4.x migrations**: at compatibility level 4, narrowing a field's type, or adding a field refusing `NONE`, on a
+  populated `SCHEMAFULL` table raises `FieldChangeRefusedError`, nothing applied: write a `RawSQL` that converts the
+  rows.
 - **Embedded engine**: no live queries (use change feeds), and `as_of()` needs `surrealkv+versioned://`.
 
 Every difference is a row of the
-[ORM behaviour tables](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)
+[ORM behaviour tables](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)
 and of the
 [embedded engine table](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md#orm-behaviour-the-embedded-engine).
 
@@ -271,5 +281,7 @@ URL, so a test run cannot wipe a real database. Never put secrets or tokens in f
   [Testing](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/testing.md),
   [Compatibility](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md),
   [Contributing](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/contributing.md).
+- [Migrating to 0.50](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/migrating-to-0.50.md): the
+  SDK 3.0 changes, from 0.40.x.
 - [Changelog](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/CHANGELOG.md) and
   [runnable examples](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/tree/main/examples).

@@ -2,8 +2,9 @@
 
 The user guide of [Surreal ORM Lite](../README.md): a Django-style async ORM for SurrealDB built on the official
 SurrealDB Python SDK. Start with [Getting started](getting-started.md), then open the guide of the feature you need.
-The same code runs on SurrealDB 2.x, 3.x and the SDK's embedded engine; where they behave differently, the guide
-says so and [Compatibility](compatibility.md) lists every difference.
+The same code runs on SurrealDB 2.x, 3.x, 4.x and the SDK's embedded engine; where they behave differently, the
+guide says so and [Compatibility](compatibility.md) lists every difference. Coming from 0.40.x (SDK 2.0), read
+[Migrating to 0.50](migrating-to-0.50.md) first.
 
 ## Guides
 
@@ -74,8 +75,14 @@ says so and [Compatibility](compatibility.md) lists every difference.
 - **[Testing](testing.md)**
   - [41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin](testing.md#41-test-data-factories-modelfactory-faker-and-the-pytest-plugin)
 - **[Compatibility](compatibility.md)**
-  - [ORM behaviour: SurrealDB 2.x vs 3.x](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)
+  - [ORM behaviour: SurrealDB 2.x, 3.x and 4.x](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)
   - [ORM behaviour: the embedded engine](compatibility.md#orm-behaviour-the-embedded-engine)
+- **[Migrating to 0.50](migrating-to-0.50.md)**
+  - [Installing](migrating-to-0.50.md#installing)
+  - [The client of `get_client()`](migrating-to-0.50.md#the-client-of-get_client)
+  - [Order of `first()` and of pages](migrating-to-0.50.md#order-of-first-and-of-pages)
+  - [The embedded engine is SurrealDB 4.0](migrating-to-0.50.md#the-embedded-engine-is-surrealdb-40)
+  - [Migrations on SurrealDB 4.x](migrating-to-0.50.md#migrations-on-surrealdb-4x)
 - **[Contributing](contributing.md)**
 
 ## Sections by number
@@ -173,11 +180,21 @@ The guides keep the section numbers of the manual, so a reference such as "secti
 | v0.38.0           | Tier 3 — Migration system                            | ✅ Released |
 | v0.39.0           | Tier 3 — Command line (`surreal-orm-lite`)           | ✅ Released |
 | v0.40.0           | Tier 3 — Test fixtures & factories                   | ✅ Released |
-| v0.41.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
+| v0.50.0           | Official SDK 3.0 and SurrealDB 4.x                   | ✅ Released |
+| v0.51.0           | Connection resilience (reconnect, token renewal)     | 📋 Planned  |
+| v0.52.0           | Typed errors and per-statement results               | 📋 Planned  |
+| v0.53.0           | Sessions and transaction options                     | 📋 Planned  |
+| v0.54.0           | Streaming QuerySet iteration                         | 📋 Planned  |
+| v0.55.0           | New field types (sized numbers, calendar, regex)     | 📋 Planned  |
+| v0.56.0           | Schema evolution on 4.x (named types, row migration) | 📋 Planned  |
+| v0.57.0           | Files and buckets                                    | 📋 Planned  |
+| v0.58.0           | Server endpoints (DEFINE API, GraphQL) and export    | 📋 Planned  |
+| v0.59.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
+| v3.0.0            | Production / GA (aligned with SDK 3.0)               | 📋 Planned  |
 
-> Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
-> `query()` SurrealQL) — no custom SDK. GA is numbered **v2.0.0** to mirror SDK 2.0; the `1.x`
-> line is intentionally skipped.
+> The ORM's minor series follows the official SDK's major: `0.40.x` is the SDK 2.0 line (deprecated, security fixes
+> only), `0.50.x` and later the SDK 3.0 line, and the ORM supports the SurrealDB versions that SDK supports. Every
+> roadmap feature is implementable with the **official SDK 3.0** (native methods or `query()` SurrealQL) — no custom
+> SDK. GA is numbered **v3.0.0** to mirror SDK 3.0; the `1.x` and `2.x` lines are intentionally skipped.
 
 See [docs/ROADMAP.md](ROADMAP.md) for full details.

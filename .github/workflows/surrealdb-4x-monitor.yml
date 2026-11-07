@@ -1,0 +1,46 @@
+# SurrealDB 4.X Version Monitor — the newest supported line (since v0.50.0).
+#
+# Pinned in .surrealdb-version4x. Like the 3.x line, 4.x patches are resolved from Docker Hub:
+# it is what CI consumes, and SurrealDB has published patches as images without a matching
+# GitHub release before. See surrealdb-monitor.yml, which holds the flow; this caller only
+# names the line, its pin file and its version source.
+
+name: SurrealDB 4.X Version Monitor
+
+on:
+  schedule:
+    # Daily at 8:00 AM Montreal time (UTC-5 -> 13:00 UTC), half an hour after the 3.x
+    # monitor so the three never contend for the same branch or PR.
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      surrealdb_version:
+        description: 'SurrealDB 4.X version to test (e.g. 4.0.1, leave empty for latest v4.x)'
+        required: false
+        type: string
+      force_update:
+        description: 'Force update even if version matches'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  monitor:
+    name: SurrealDB 4.X
+    uses: ./.github/workflows/surrealdb-monitor.yml
+    secrets: inherit
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    with:
+      line: '4'
+      pin-file: .surrealdb-version4x
+      version-source: dockerhub
+      requested-version: ${{ inputs.surrealdb_version || '' }}
+      force-update: ${{ inputs.force_update || false }}

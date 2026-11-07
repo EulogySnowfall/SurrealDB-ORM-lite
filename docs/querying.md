@@ -2,6 +2,11 @@
 
 The QuerySet: filters and lookups, `Q` objects, `FETCH`, aggregations, time travel, subqueries and the query cache.
 
+> **The embedded engine since v0.50.0** is a SurrealDB 4.0 core (SDK 3.0), and the ORM treats it as a 4.x
+> server. Where a passage below groups "SurrealDB 2.x and the embedded engine", it describes the SDK 2.0 engine
+> of `0.40.x` (a 2.3.10 core); the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) lists what the
+> engine does now.
+
 ## 4. QuerySet Methods
 
 ```python
@@ -68,8 +73,35 @@ as `"10"`, a `float`, `None` — raises `TypeError`, and a negative one or one a
 (SurrealQL's largest integer) `ValueError`, naming the method and the value, when `limit()` or
 `offset()` is called, before any request; the value in place is kept. The same holds wherever the
 queryset is read: `exec()`, `first()`, `get()`, `values(…).annotate(…)`, `cache()`, `as_of()` and
-a subquery. The server may still refuse a large value when the read runs: SurrealDB 2.x and the
-embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads it.
+a subquery. The server may still refuse a large value when the read runs: SurrealDB 2.x, 4.x and
+the embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads it.
+
+### Order of `first()` and of pages
+
+```python
+oldest = await User.objects().order_by("-age").first()  # your order: kept as written
+smallest_id = await User.objects().filter(age__gt=17).first()  # 3.x and 4.x: ORDER BY id
+page = await User.objects().order_by("name").limit(10).offset(20).exec()  # a page in a stated order
+```
+
+Since v0.50.0, on SurrealDB 3.x, 4.x and the embedded engine, a `first()` whose statement has no order of its own
+ends with `ORDER BY id`: it returns the matching record with the smallest id, a filter on an indexed field or a
+`search()` included. These keep their own order: `order_by()` (a score or `_knn_distance` included), `similar_to()`
+(nearest first), `hybrid_search()` and the `values()`/`annotate()` aggregations. `filter()`, `exclude()`, `Q`,
+`nearby()`, `search()` without `order_by()`, `select()`, `fetch()`, a subquery and `as_of()` get the clause. On
+SurrealDB 2.x the statement is unchanged and `first()` returns the server's first row, as before: server order: id
+order for a plain scan, index order for an indexed filter. The two forms never share a `cache()` entry.
+
+The clause costs nothing on a table scan or on an equality filter on an index, and a sort of the matches on a range
+filter over an indexed field. Measured with the ORM on 60 000 rows (best of three; SurrealDB 3.3.5, 4.0.0 and the
+embedded engine): a scan `first()` 1.1, 1.5 and 0.9 ms; an equality on an indexed field 2.7, 1.5 and 1.0 ms; a range
+on an indexed field matching 1 000 rows 3.2, 3.3 and 4.7 ms; one matching 59 900 rows 91.9, 90.2 and 189.5 ms, against
+2.9, 1.5 and 1.5 ms with `order_by()` on the indexed field. When the indexed field's order is the one you want,
+`order_by()` on the indexed field avoids the sort.
+
+`all()`, `values()`, `exec()` and `limit()`/`offset()` pages without `order_by()` are unordered: SurrealDB 4.x returns
+rows in no fixed order without `ORDER BY`, and an indexed filter returns index order on every line. Add `order_by()`
+to page deterministically.
 
 ## Supported Filter Lookups
 
@@ -348,6 +380,22 @@ results = await User.raw_query(
 )
 ```
 
+`raw_query()` and `QuerySet.query()` run every statement of the query and return the rows of every statement, in
+order (since v0.50.0, as the full SurrealDB-ORM; before, only the first statement's rows came back, with a warning). A
+statement that returns no list (`LET`, `RETURN 5`, `DEFINE`) adds no row, so `RETURN 5` alone returns `[]`. A failing
+statement raises, even when it is not the first.
+
+```python
+rows = await User.raw_query(
+    "LET $min = 18; SELECT * FROM User WHERE age >= $min; SELECT * FROM User WHERE role = 'admin';"
+)  # the adults, then the admins
+```
+
+The rows of every statement are hydrated together, with the usual rule: model instances when every row validates,
+otherwise dicts. With `SELECT`s on **several tables**, a row of another table becomes an instance of the model when it
+validates (the model's fields optional), and a single row that does not validate makes every row a `dict`. Select the
+model's own table, or read dicts with the client of `get_client()`.
+
 ## 27. Time travel (`as_of()`)
 
 Since v0.26.0 a QuerySet can read a model's records **as they were at a moment**: `as_of()` adds
@@ -377,9 +425,9 @@ lamp = Product(id="lamp", name="Lamp", price=40.0)
 desk = Product(id="desk", name="Desk", price=250.0)
 await lamp.save()
 await desk.save()
-opening = await client.query("RETURN time::now();")  # a moment, from the database's clock
+[opening] = await client.query("RETURN time::now();")  # a moment, from the database's clock
 await lamp.merge(price=30.0)
-sale = await client.query("RETURN time::now();")
+[sale] = await client.query("RETURN time::now();")  # client.query(): one result per statement
 await desk.delete()
 
 then = await Product.objects().as_of(opening).order_by("name").exec()
@@ -579,17 +627,19 @@ reads the linked record as it was on 3.x and as it is now on 2.x.
 
 ### Writing history at a past moment
 
-The ORM writes now. A raw query can write a record at a past moment, one statement per
-`client.query()` call:
+The ORM writes now, and so history is written: read it at moments taken from the database's
+clock between the writes, as above. A raw `CREATE … VERSION` writes a record at a past moment on
+a SurrealDB 2.x server only. SurrealDB 3.x, 4.x and the embedded engine (SurrealDB 4.0) version
+the table definition too: they accept the statement, but a moment before the table existed reads
+no records, and a `CREATE` of an id that exists raises. The record reads from now on:
 
 ```python
 await client.query("CREATE Product:stool SET name = 'Stool', price = 15.0 VERSION d'2020-01-01T00:00:00Z';")
-# SurrealDB 2.x and the embedded engine: stored at that moment, readable with as_of()
-assert await Product.objects().as_of(datetime(2021, 1, 1, tzinfo=UTC)).count() == 1
+# The embedded engine: the shop's table did not exist in 2021, so that moment reads no records.
+assert await Product.objects().as_of(datetime(2021, 1, 1, tzinfo=UTC)).count() == 0
+[now] = await client.query("RETURN time::now();")
+assert (await Product.objects().as_of(now).get("stool")).price == 15.0
 ```
-
-SurrealDB 3.x accepts the statement, but the record is not readable at that moment (the table did
-not exist then), and a `CREATE` of an id that exists raises.
 
 ### Coming from the full SurrealDB-ORM
 

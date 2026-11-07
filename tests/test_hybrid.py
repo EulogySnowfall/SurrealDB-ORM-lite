@@ -94,6 +94,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     Var,
     VectorField,
+    _client,
     hybrid,
     search,
     vector,
@@ -2625,7 +2626,7 @@ async def _setup_sl(client: Any) -> None:
     compaction (measured on 3.3.4)."""
     await _setup(client, HySl)
     await _apply_ddl(client, _SL_UPDATE)
-    stored = await client.query("SELECT * FROM hy_sl;", {})
+    stored = await _client.query(client, "SELECT * FROM hy_sl;", {})
     assert len(stored) == 8
     for row in stored:
         assert {column: row.get(column) for column in _SL_STORED} == _SL_STORED, row
@@ -2932,7 +2933,7 @@ class TestHybridTransactionsE2E:
                     with pytest.raises(SurrealDbError) as read:
                         await HyDoc.objects(tx=tx).hybrid_search(**{**_ARGS, "text_field": "category"})
                     await HyDoc(id="d9", title="Go programming", embedding=[0.95, 0.05, 0.0]).save(tx=tx)
-            stored = await client.query("SELECT VALUE id FROM hy_doc;", {})
+            stored = await _client.query(client, "SELECT VALUE id FROM hy_doc;", {})
         assert read is not None
         assert type(read.value) is SurrealDbError
         assert str(read.value) == _HS1_CATEGORY
@@ -2981,7 +2982,7 @@ class TestHybridLinePinsE2E:
             rows: list[dict[str, Any]] | None = None
             refused: pytest.ExceptionInfo[Exception] | None = None
             if major >= 3:
-                rows = await client.query(_PIN_RRF, {})
+                rows = await _client.query(client, _PIN_RRF, {})
             else:
                 with pytest.raises((InternalError, RuntimeError)) as refused:
                     await client.query(_PIN_RRF, {})
@@ -3006,7 +3007,7 @@ class TestHybridLinePinsE2E:
             rows: list[dict[str, Any]] | None = None
             refused: pytest.ExceptionInfo[Exception] | None = None
             if major >= 3:
-                rows = await client.query(_PIN_RRF_FORMULA, {})
+                rows = await _client.query(client, _PIN_RRF_FORMULA, {})
             else:
                 with pytest.raises((InternalError, RuntimeError)) as refused:
                     await client.query(_PIN_RRF_FORMULA, {})
@@ -3252,7 +3253,7 @@ _BULLETS_38 = {
         "Each list is SurrealDB's own: the vector list as `similar_to()` finds it — HNSW is approximate (section 37) — "
         "and the full-text list as `search()` ranks it, with section 36's BM25 scores. Those depend on the line: a term "
         "found in more than half the documents scores `0.0` on SurrealDB 3.x and below zero on 2.x and the embedded "
-        "engine ([2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)), so the full-text list, and the fused ranking with "
+        "engine ([2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)), so the full-text list, and the fused ranking with "
         "it, can differ between lines.",
         "**An exact scan (`dist=`) returns the same vector list on every call**, on every line. SurrealDB 2.x's and the "
         "embedded engine's own scan picks among records at an equal distance at the `vector_limit`-th place in no fixed "
@@ -3352,10 +3353,9 @@ _HEADER_SENTENCE_TIES = (
 #: The row v0.37.0 adds to the embedded engine's table, cell by cell.
 _EMBEDDED_HYBRID_ROW = [
     "Hybrid search (v0.37.0)",
-    "as on a 2.x server: the ORM fuses the two lists with `search::rrf()`'s formula, which the engine does not have, "
-    "and the vector list selects the other conditions first (a `LET`); an exact scan (`dist=`) keeps the records at an "
-    "equal distance at the `vector_limit`-th place by id (since v0.37.4), as `similar_to(dist=…)` does",
-    "3.x fuses with `search::rrf()`, each list applying the conditions; its exact scan returns the same list",
+    "as on a 4.x server: `search::rrf()` fuses the two lists, each applying the conditions; an exact scan (`dist=`) "
+    "keeps the records at an equal distance at the `vector_limit`-th place by id",
+    "2.x: the ORM fuses with `search::rrf()`'s formula, the vector list selecting the conditions first",
     "v0.37.0",
 ]
 _FEATURES_ROW_38 = ["Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)", "✅"]
@@ -3570,7 +3570,7 @@ class TestReadmeSection38:
         assert links == [
             ("", _anchor(_SECTION_37.lstrip("# "))),
             ("", _anchor(_SECTION_36.lstrip("# "))),
-            ("compatibility.md", _anchor("ORM behaviour: SurrealDB 2.x vs 3.x")),
+            ("compatibility.md", _anchor("ORM behaviour: SurrealDB 2.x, 3.x and 4.x")),
         ], links
         assert_links_resolve(_section_38(), "search.md")
 
@@ -3617,7 +3617,7 @@ class TestReadmeSection38:
         """Every table v0.37.0 touches keeps one cell count per line and no escaped pipe; section 38 has no table."""
         parts = [
             _doc_part("## Features"),
-            _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"),
             _doc_part("## ORM behaviour: the embedded engine"),
             _doc_part("## Roadmap"),
             _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),

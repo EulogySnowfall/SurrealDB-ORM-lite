@@ -62,6 +62,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     TableState,
+    _client,
     generate_models_from_db,
 )
 from surreal_orm_lite import introspection as introspection_module
@@ -210,7 +211,11 @@ class _FakeClient:
         self.errors = dict(errors or {})
         self.calls: list[tuple[str, object, tuple[object, ...], dict[str, object]]] = []
 
-    async def query(self, sql: str, vars: object = None, *args: object, **kwargs: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, sql: str, vars: object = None, *args: object, **kwargs: object) -> object:
         self.calls.append((sql, vars, args, kwargs))
         if sql in self.errors:
             raise self.errors[sql]
@@ -448,6 +453,21 @@ class TestSections:
             SchemaIssue("section", "modules", None, "section 'modules' is not a mapping of names to definitions"),
             SchemaIssue("section", "params", None, "section 'params' is not a mapping of names to definitions"),
         )
+
+    async def test_the_4x_compatibility_level_and_table_migrations_are_not_sections(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # SurrealDB 4.x: INFO FOR DB holds the database's compatibility level (an int), INFO FOR TABLE the state of
+        # the table's row migrations (an object of counters): neither is a section of definitions, neither is an issue.
+        caplog.set_level(logging.DEBUG, logger=_LOGGER)
+        answer = _table(migrations={"generation": 2, "guaranteed": [], "migrations": []})
+        client = _FakeClient(_db(tables={"a": _TABLE_A}, compatibility=4), {"a": answer})
+        _install(monkeypatch, client)
+        schema = await DatabaseIntrospector().introspect()
+        assert schema.issues == ()
+        assert _issue_records(caplog) == []
+        assert "compatibility" not in schema.other
+        assert schema.tables["a"].other == {}
 
     @pytest.mark.parametrize("tables", [[], "x", None], ids=["list", "str", "missing"])
     async def test_a_tables_section_that_is_not_a_mapping(self, monkeypatch: pytest.MonkeyPatch, tables: object) -> None:
@@ -1527,7 +1547,10 @@ def _check_fixture(schema: SchemaState, major: int) -> None:
     )
     assert schema.accesses == {}
     expected_other: dict[str, dict[str, str]] = {"apis": {}, "configs": {}, "models": {}}
-    if major >= 3:
+    if major >= 4:
+        # SurrealDB 4.x: no ``modules`` section; ``extensions`` and ``types`` instead (measured on 4.0.0).
+        expected_other = {**expected_other, "buckets": {}, "extensions": {}, "sequences": {}, "types": {}}
+    elif major >= 3:
         expected_other = {**expected_other, "buckets": {}, "modules": {}, "sequences": {}}
     assert schema.other == expected_other
     assert "users" not in schema.other
@@ -2076,7 +2099,7 @@ _TOKEN = uuid.UUID("0190d3b4-0000-7000-8000-000000000000")
 
 async def _row(client: Any, record: str) -> object:
     """The stored row of *record* without ``id`` and ``created`` (the column the model does not hold)."""
-    rows = await client.query(f"SELECT * OMIT id, created FROM {record};", {})
+    rows = await _client.query(client, f"SELECT * OMIT id, created FROM {record};", {})
     assert isinstance(rows, list) and len(rows) == 1, rows
     return rows[0]
 
@@ -2150,7 +2173,7 @@ DEFINE FIELD prefs.seen ON isp_sfo TYPE option<datetime> DEFAULT time::now();
 async def _stored_at(client: Any, record: RecordID, column: str) -> list[object]:
     """``prefs.<column>`` of *record* as the SDK reads it, then as the server writes it (nanoseconds included)."""
     query = f"SELECT VALUE [prefs.{column}, <string> prefs.{column}] FROM ONLY $rid;"  # column: a constant of the test
-    values = await client.query(query, {"rid": record})
+    values = await _client.query(client, query, {"rid": record})
     assert isinstance(values, list) and len(values) == 2, values
     return values
 
@@ -2453,8 +2476,8 @@ _HEADER_SENTENCE_30 = (
 #: Spec §11.1 item 6: the row v0.30.0 adds to the embedded-engine table, cell by cell.
 _EMBEDDED_INTROSPECTION_ROW = [
     "Schema introspection (`DatabaseIntrospector`)",
-    "reads like a 2.x server (core 2.3.10): same state and same generated model types as on the servers; the anonymous "
-    "owner session may run `INFO`; `COUNT` indexes cannot be defined",
+    "reads like a 4.x server (core 4.0.0): same state and same generated model types as on the servers; the "
+    "anonymous owner session may run `INFO`",
     "need a system user (root, namespace or database user)",
     "v0.30.0",
 ]

@@ -16,7 +16,7 @@ files of a migrations directory in their dependency order, gives the state they 
 from ..introspection import DatabaseIntrospector, ModelCodeGenerator
 from .autodetect import makemigrations
 from .constants import MIGRATIONS_TABLE
-from .executor import MigrationExecutor, MigrationStatementError
+from .executor import FieldChangeRefusedError, MigrationExecutor, MigrationStatementError
 from .generator import MigrationGenerator, generate_empty_migration
 from .introspector import ModelIntrospector, introspect_models
 from .migration import Migration
@@ -53,6 +53,7 @@ __all__ = [
     "CreateIndex",
     "CreateTable",
     "DataMigration",
+    "FieldChangeRefusedError",
     "DatabaseIntrospector",
     "DefaultExpression",
     "DefineAccess",

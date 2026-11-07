@@ -27,7 +27,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
-from .. import __version__
+from .. import __version__, _client
 from ..connection_manager import SurrealDBConnectionManager
 from ..exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
 from ..introspection import generate_models_from_db, schema_diff
@@ -575,7 +575,7 @@ async def _query(manager: type[SurrealDBConnectionManager], line: str) -> Any:
     """Send *line* unchanged with ``query_raw()`` on the connection's client, taken again for each line (a dropped
     WebSocket is replaced by the manager), and return the raw envelope."""
     client = await manager.get_client()
-    return await client.query_raw(line)
+    return await _client.query_raw(client, line)
 
 
 def _cmd_shell(args: argparse.Namespace, settings: _Settings) -> int:

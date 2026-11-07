@@ -10,15 +10,18 @@ database ends up holding.
 import contextlib
 import os
 import warnings
+from typing import Any
 
 import pytest
 from pydantic import ConfigDict, Field
 from surrealdb import RecordID
 
 import surreal_orm_lite
-from surreal_orm_lite import Var
+from surreal_orm_lite import SurrealConfigDict, Var, _client
+from surreal_orm_lite._sdk import ServerError
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.utils import build_filter_condition
+from tests.conftest import orm_client
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
@@ -111,14 +114,28 @@ class TestRawSqlIsVerbatim:
         assert sent["query"] == "SELECT * FROM Issue156Model WHERE name = '$admin';"
 
 
-# ==================== #5 — multi-statement raw queries ====================
+# ==================== #5 — multi-statement raw queries (v0.50.0: rows of every statement) ====================
 
 
-class TestMultiStatementWarning:
-    async def _run(self, query: str) -> list:
+class MqNote(surreal_orm_lite.BaseSurrealModel):
+    """Every field optional: a row of another table validates as an instance (the multi-table caveat)."""
+
+    model_config = SurrealConfigDict(table_name="mq_note")
+
+    id: str | None = None
+    note: str | None = None
+
+
+class TestMultiStatementRows:
+    """``raw_query()``/``QuerySet.query()`` concatenate the list results of every statement (full-ORM parity)."""
+
+    async def _run(self, results: list, call: Any) -> Any:
         class FakeClient:
             async def query(self, query: str, variables: dict) -> list:
-                return []
+                return results
+
+            async def query_raw(self, query: str, variables: dict) -> dict:
+                return {"result": [{"status": "OK", "result": result} for result in results]}
 
         async def fake_get_client() -> FakeClient:
             return FakeClient()
@@ -126,22 +143,137 @@ class TestMultiStatementWarning:
         original = vars(surreal_orm_lite.SurrealDBConnectionManager)["get_client"]
         surreal_orm_lite.SurrealDBConnectionManager.get_client = fake_get_client  # type: ignore[assignment]
         try:
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                await Issue156Model.raw_query(query)
-            return list(caught)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                return await call()
         finally:
             surreal_orm_lite.SurrealDBConnectionManager.get_client = original  # type: ignore[assignment]
 
-    async def test_two_statements_warn(self) -> None:
-        caught = await self._run("SELECT * FROM Issue156Model; SELECT age FROM Issue156Model;")
-        assert any("only the first" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    async def test_raw_query_returns_the_list_results_of_every_statement(self) -> None:
+        rows = await self._run(
+            [None, [{"id": "a", "name": "a"}], 5, [], [{"id": "b", "name": "b"}]],
+            lambda: Issue156Model.raw_query("LET $x = 1; SELECT * FROM Issue156Model; RETURN 5; SELECT 1; SELECT 2;"),
+        )
+        assert [(type(row), row.name) for row in rows] == [(Issue156Model, "a"), (Issue156Model, "b")]
 
-    async def test_one_statement_is_silent(self) -> None:
-        assert await self._run("SELECT * FROM Issue156Model;") == []
+    async def test_raw_query_of_a_non_list_result_is_empty(self) -> None:
+        assert await self._run([5], lambda: Issue156Model.raw_query("RETURN 5;")) == []
 
-    async def test_a_semicolon_inside_a_string_is_not_a_statement(self) -> None:
-        assert await self._run("SELECT * FROM Issue156Model WHERE name = 'a;b';") == []
+    async def test_raw_query_keeps_dicts_when_one_row_does_not_validate(self) -> None:
+        rows = await self._run(
+            [[{"id": "a", "name": "a"}], [{"id": "b", "age": 3}]],
+            lambda: Issue156Model.raw_query("SELECT * FROM Issue156Model; SELECT * FROM Other;"),
+        )
+        assert rows == [{"id": "a", "name": "a"}, {"id": "b", "age": 3}]
+
+    async def test_queryset_query_returns_the_list_results_of_every_statement(self) -> None:
+        rows = await self._run(
+            [[{"id": "a", "name": "a"}], None, [{"id": "b", "name": "b"}]],
+            lambda: Issue156Model.objects().query("SELECT * FROM Issue156Model; LET $y = 2; SELECT * FROM Issue156Model;"),
+        )
+        assert [row.name for row in rows] == ["a", "b"]
+
+    async def test_a_semicolon_inside_a_string_is_one_statement(self) -> None:
+        rows = await self._run(
+            [[{"id": "a", "name": "a;b"}]],
+            lambda: Issue156Model.raw_query("SELECT * FROM Issue156Model WHERE name = 'a;b';"),
+        )
+        assert [row.name for row in rows] == ["a;b"]
+
+    def test_the_warning_helper_is_gone(self) -> None:
+        import surreal_orm_lite.utils as utils
+
+        assert not hasattr(utils, "warn_on_multiple_statements")
+
+
+class TestMultiStatementRowsE2E:
+    """On a real server: every statement's rows, in order; a later failing statement raises."""
+
+    async def test_raw_query_returns_the_rows_of_every_select(self) -> None:
+        async with orm_client("mq_note", "mq_other") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a'; CREATE mq_note:b SET note = 'b';", {})
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                rows = await MqNote.raw_query(
+                    "LET $a = 1; SELECT * FROM mq_note:a; SELECT * FROM mq_note WHERE note = $n;", {"n": "b"}
+                )
+            assert [(type(row), row.id, row.note) for row in rows] == [(MqNote, "a", "a"), (MqNote, "b", "b")]
+
+    async def test_raw_query_of_return_alone_is_empty(self) -> None:
+        async with orm_client("mq_note"):
+            assert await MqNote.raw_query("RETURN 5;") == []
+
+    async def test_a_later_failing_statement_raises_like_a_first_one(self) -> None:
+        async with orm_client("mq_note") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a';", {})
+            with pytest.raises(ServerError) as first:
+                await MqNote.raw_query("THROW 'boom';")
+            with pytest.raises(type(first.value), match="boom"):
+                await MqNote.raw_query("SELECT * FROM mq_note; THROW 'boom';")
+            with pytest.raises(type(first.value), match="boom"):
+                await MqNote.objects().query("SELECT * FROM mq_note; THROW 'boom';")
+
+    async def test_queryset_query_reads_a_later_missing_table_as_empty(self) -> None:
+        """A missing table contributes no rows, per statement: 3.x/4.x fail that statement alone (review of #430)."""
+        async with orm_client("mq_note", "mq_absent") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a';", {})
+            rows = await MqNote.objects().query("SELECT * FROM mq_note; SELECT * FROM mq_absent;")
+            assert [(type(row), row.id) for row in rows] == [(MqNote, "a")]
+            rows = await MqNote.objects().query("SELECT * FROM mq_absent; SELECT * FROM mq_note;")
+            assert [(type(row), row.id) for row in rows] == [(MqNote, "a")]
+            assert await MqNote.objects().query("SELECT * FROM mq_note WHERE note = 'z'; SELECT * FROM mq_absent;") == []
+
+    async def test_queryset_query_still_raises_beside_a_missing_table(self) -> None:
+        async with orm_client("mq_note", "mq_absent") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a';", {})
+            with pytest.raises(ServerError, match="boom"):
+                await MqNote.objects().query("SELECT * FROM mq_absent; SELECT * FROM mq_note; THROW 'boom';")
+
+    async def test_queryset_query_does_not_hide_a_cancelled_transaction(self) -> None:
+        """A missing-table read that cancels a transaction raises: the write did not run (3.x/4.x). On 2.x the missing
+        table reads as empty and the transaction commits. Gated on the server's missing-table behaviour."""
+        async with orm_client("mq_note", "mq_absent") as client:
+            try:
+                await _client.query(client, "SELECT * FROM mq_absent;", {})
+                fails_missing_table = False
+            except ServerError:
+                fails_missing_table = True
+            sql = "BEGIN; CREATE mq_note:1 SET note = 'n'; SELECT * FROM mq_note; SELECT * FROM mq_absent; COMMIT;"
+            if fails_missing_table:
+                with pytest.raises(SurrealDbError, match="transaction was cancelled") as raised:
+                    await MqNote.objects().query(sql)
+                assert "mq_absent" in str(raised.value)
+                # The CREATE did not run: mq_note was never created, which query() reads as empty outside a transaction.
+                assert await MqNote.objects().query("SELECT * FROM mq_note;") == []
+            else:
+                rows = await MqNote.objects().query(sql)
+                # The CREATE's row, then the SELECT's: every statement's list result comes back.
+                assert [(type(row), row.id) for row in rows] == [(MqNote, "1"), (MqNote, "1")]
+                assert len(await _client.query(client, "SELECT * FROM mq_note;", {})) == 1
+
+    async def test_queryset_query_returns_the_rows_of_every_select(self) -> None:
+        async with orm_client("mq_note") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a'; CREATE mq_note:b SET note = 'b';", {})
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                rows = await MqNote.objects().query(
+                    "SELECT * FROM mq_note WHERE note = 'b'; LET $x = 1; SELECT * FROM mq_note WHERE note = 'a';"
+                )
+            assert [(type(row), row.id) for row in rows] == [(MqNote, "b"), (MqNote, "a")]
+
+    async def test_rows_of_another_table_become_instances_when_they_validate(self) -> None:
+        """The documented caveat: hydration is unchanged, only more rows reach it."""
+        async with orm_client("mq_note", "mq_other") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a'; CREATE mq_other:x SET other = 1;", {})
+            rows = await MqNote.raw_query("SELECT * FROM mq_note; SELECT * FROM mq_other;")
+            assert [(type(row), row.id) for row in rows] == [(MqNote, "a"), (MqNote, "x")]
+
+    async def test_one_row_that_does_not_validate_keeps_every_row_a_dict(self) -> None:
+        async with orm_client("mq_note", "mq_other") as client:
+            await _client.query(client, "CREATE mq_note:a SET note = 'a'; CREATE mq_other:x SET note = 5;", {})
+            rows = await MqNote.raw_query("SELECT * FROM mq_note; SELECT * FROM mq_other;")
+            assert all(isinstance(row, dict) for row in rows), rows
+            assert [row["note"] for row in rows] == ["a", 5]
 
 
 # ==================== E2E ====================
@@ -219,7 +351,7 @@ class TestIssue156E2E:
             await Issue156Model.objects().update_or_create(defaults={"age": 2, "nope": "x"}, name="bob")
 
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        rows = await client.query("SELECT * FROM Issue156Model WHERE name = 'bob';")
+        rows = await _client.query(client, "SELECT * FROM Issue156Model WHERE name = 'bob';")
         assert "nope" not in rows[0], "an undeclared key must never be written to the row"
 
     async def test_get_or_create_rejects_undeclared_keys(self) -> None:
@@ -360,24 +492,6 @@ class TestWarningsReachUserCode:
         deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
         assert deprecations, [str(w.message) for w in caught]
         assert deprecations[0].filename == __file__
-
-    async def test_queryset_query_warns_on_multiple_statements(self) -> None:
-        class FakeClient:
-            async def query(self, query: str, variables: dict) -> list:
-                return []
-
-        async def fake_get_client() -> FakeClient:
-            return FakeClient()
-
-        original = vars(surreal_orm_lite.SurrealDBConnectionManager)["get_client"]
-        surreal_orm_lite.SurrealDBConnectionManager.get_client = fake_get_client  # type: ignore[assignment]
-        try:
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                await Issue156Model.objects().query("SELECT * FROM Issue156Model; SELECT age FROM Issue156Model;")
-        finally:
-            surreal_orm_lite.SurrealDBConnectionManager.get_client = original  # type: ignore[assignment]
-        assert any("only the first" in str(w.message) for w in caught), [str(w.message) for w in caught]
 
 
 class TestSplitStatementsComments:

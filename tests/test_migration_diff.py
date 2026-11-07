@@ -70,6 +70,7 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     TableType,
+    _client,
     _sdk,
     computed,
     generate_models_from_db,
@@ -2212,13 +2213,13 @@ async def _run(client: Any, statements: str) -> None:
 
 
 async def _info_table(client: Any, table: str) -> dict[str, Any]:
-    info = await client.query(f"INFO FOR TABLE `{table}`;", {})
+    info = await _client.query(client, f"INFO FOR TABLE `{table}`;", {})
     assert isinstance(info, dict)
     return info
 
 
 async def _table_text(client: Any, table: str) -> str:
-    info = await client.query("INFO FOR DB;", {})
+    info = await _client.query(client, "INFO FOR DB;", {})
     assert isinstance(info, dict)
     return str(info["tables"][table])
 
@@ -2379,7 +2380,7 @@ class TestFromDbE2E:
             # No tracking table: the file is pending, replayed over the database's definitions without error.
             assert await makemigrations("again", migrations_dir=tmp_path, models=[FdItem]) is None
             assert _files(tmp_path) == ["0001_initial"]
-            assert MIGRATIONS_TABLE not in (await client.query("INFO FOR DB;", {}))["tables"]
+            assert MIGRATIONS_TABLE not in (await _client.query(client, "INFO FOR DB;", {}))["tables"]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_pending_removal_of_a_missing_field(self, kind: str, tmp_path: Path) -> None:
@@ -2498,7 +2499,7 @@ class TestExistingTablesE2E:
             bag = (await _info_table(client, "ex_loose"))["fields"]["bag"]
             assert ("FLEXIBLE" in bag) is (line < 3)
             await _run(client, "UPDATE ex_loose:1;")  # a write: the SCHEMAFULL table re-checks the record
-            assert await client.query("SELECT VALUE bag FROM ex_loose:1;", {}) == [{"a": 1, "b": {"c": 2}}]
+            assert await _client.query(client, "SELECT VALUE bag FROM ex_loose:1;", {}) == [{"a": 1, "b": {"c": 2}}]
             # The files hold no column of ex_loose: on line 2 the table statement comes alone.
             shown = await MigrationExecutor(tmp_path).show_sql(path.stem, line=2)
             assert shown == operations[0].forwards(line=2)
@@ -2759,7 +2760,7 @@ class TestNamesE2E:
                 "Drop table 'user-events'",
             }
             assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
-            tables = set((await client.query("INFO FOR DB;", {}))["tables"])
+            tables = set((await _client.query(client, "INFO FOR DB;", {}))["tables"])
             assert not {"user-events", "2024_sales"} & tables
             assert await schema_diff(models=[NmItem]) == []
 
@@ -2810,7 +2811,7 @@ class TestDefaultsE2E:
             await _run(client, "REMOVE TABLE df_block;")
             assert await MigrationExecutor(tmp_path).migrate() == [path.stem]
             await _run(client, "CREATE df_block:1;")
-            assert await client.query("SELECT VALUE x FROM df_block:1;", {}) == [1.0]
+            assert await _client.query(client, "SELECT VALUE x FROM df_block:1;", {}) == [1.0]
 
 
 class TestAppliedMigrationsE2E:
@@ -2845,7 +2846,11 @@ class _AppliedClient:
         self.answer = answer
         self.statements: list[str] = []
 
-    async def query(self, sql: str, vars: object = None) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, sql: str, vars: object = None) -> object:
         self.statements.append(sql)
         if sql == "INFO FOR DB;":
             return {"tables": {MIGRATIONS_TABLE: f"DEFINE TABLE {MIGRATIONS_TABLE} TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"}}
@@ -2937,7 +2942,7 @@ class TestNamedConnectionE2E:
                 assert await makemigrations("again", migrations_dir=tmp_path, models=models, connection="mig_other") is None
                 assert (await DatabaseIntrospector("mig_other").introspect()).applied_migrations == (path.stem,)
                 # The default connection's database was not touched.
-                assert (await client.query("INFO FOR DB;", {}))["tables"] == {}
+                assert (await _client.query(client, "INFO FOR DB;", {}))["tables"] == {}
                 assert [operation.describe() for operation in await schema_diff(models=models)] == ["Create table nc_here"]
             finally:
                 async with SurrealDBConnectionManager.using("mig_other"):
@@ -2973,6 +2978,7 @@ class TestGenerateSkipsTrackingTableE2E:
 
 #: Spec §5.1's ``surreal_orm_lite.migrations.__all__``.
 _MIGRATIONS_ALL = {
+    "FieldChangeRefusedError",  # v0.50.0
     "Migration",
     "Operation",
     "CreateTable",
@@ -3017,7 +3023,7 @@ class TestExports:
     def test_the_migrations_package(self) -> None:
         import surreal_orm_lite.migrations as migrations
 
-        assert len(migrations.__all__) == len(set(migrations.__all__)) == 33
+        assert len(migrations.__all__) == len(set(migrations.__all__)) == 34
         assert set(migrations.__all__) == _MIGRATIONS_ALL
         for name in _MIGRATIONS_ALL:
             assert getattr(migrations, name) is not None, name

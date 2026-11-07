@@ -11,7 +11,7 @@ from uuid import UUID
 from pydantic import BaseModel
 from pydantic_core import ValidationError
 
-from . import BaseSurrealModel, SurrealDBConnectionManager
+from . import BaseSurrealModel, SurrealDBConnectionManager, _client
 from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
@@ -49,12 +49,12 @@ from .utils import (
     is_select_item,
     non_negative_int,
     parse_lookup,
+    statement_rows,
     unescape_filter_value,
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
     validate_select_item,
-    warn_on_multiple_statements,
     warn_on_variable_names,
 )
 
@@ -158,6 +158,8 @@ class QuerySet:
         self._limit: int | None = None
         self._offset: int | None = None
         self._order_by: str | None = None
+        # first()'s implicit ORDER BY id (v0.50.0): set for the duration of its own call only, as its LIMIT 1.
+        self._first_order: bool = False
         self._model_table: str = model.get_table_name()
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
@@ -1051,6 +1053,7 @@ class QuerySet:
         inline: bool = False,
         warn: bool = True,
         knn_prefilter: bool = False,
+        top_level: bool = False,
     ) -> SubqueryCompiler:
         """A compiler for the subqueries of one statement of this queryset (v0.27.0).
 
@@ -1066,6 +1069,7 @@ class QuerySet:
             warn: emit the warnings of the filter values (v0.28.1); ``False`` for a statement this read compiled once.
             knn_prefilter: compile the form below SurrealDB 3 (v0.36.0): the conditions next to a KNN selected first,
                 in a ``LET`` (:meth:`_where_parts`).
+            top_level: send the ``LET`` s as statements of their own (v0.50.0, ``SubqueryCompiler.wrap()``).
         """
         return SubqueryCompiler(
             inline=inline,
@@ -1075,6 +1079,7 @@ class QuerySet:
             variables=dict(self._variables),
             warn=warn,
             knn_prefilter=knn_prefilter,
+            top_level=top_level,
             _stack=[id(self)],
         )
 
@@ -1168,6 +1173,8 @@ class QuerySet:
             knn = self._similar.condition(variable)
             variables[variable] = list(self._similar.vector)
             counter += 1
+            if subqueries is not None and self._similar.dist is None and any(map(_subquery.reads_a_let, parts)):
+                subqueries.hnsw_let = True
             others = [part for part in parts if not _vector.id_subquery_part(part)]
             exact = self._similar.dist is not None
             if subqueries is None or not (others or exact):
@@ -1236,7 +1243,7 @@ class QuerySet:
         engine, and a range on an indexed column next to the KNN writes nothing on every engine.
 
         The ``LET`` reads the model's own table, registered in ``compiler.tables`` as a subquery's: when SurrealDB 3.x
-        confirms that table missing (``compiler.empty_tables``), the ids are bound to ``[]`` and nothing else is
+        confirms that table missing (``compiler.empty_tables``), the ids are bound to an empty array and nothing else is
         compiled, so the write reads it as empty, as it does without ``similar_to()``. A view model never gets here
         (its writes are refused first), so the write always says ``id IN``. ``limit()``, ``offset()`` and
         ``order_by()`` are not written, as for every bulk write.
@@ -1247,7 +1254,7 @@ class QuerySet:
         compiler.tables.add(table)
         if table in compiler.empty_tables:
             values: dict[str, Any] = {}
-            select = "[]"
+            select = _subquery.EMPTY
         else:
             where, values = self._build_where(subqueries=compiler)
             select = f"(SELECT VALUE id FROM {table}{where})"
@@ -1265,7 +1272,7 @@ class QuerySet:
         values are bound from *counter* on, its ``variables()`` merged into the statement's, its own subqueries
         rendered first (their ``LET`` s precede its own). Under the outer ``as_of()`` (``compiler.moment``) it
         carries the per-record guard and ``VERSION $_as_of``: the server never applies the outer ``VERSION`` to a
-        ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. Each of its ``search()`` conditions is
+        ``LET``. A table in ``compiler.empty_tables`` compiles to an empty array (``subquery.EMPTY``). Each of its ``search()`` conditions is
         recorded in ``compiler.searched`` (v0.35.0), its ``similar_to()`` in ``compiler.knn_fields`` (v0.36.0).
         ``fetch()`` is ignored, as in the full SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
 
@@ -1315,7 +1322,7 @@ class QuerySet:
             compiler.view_tables.add(table)
         compiler.merge_variables(self._variables)
         if table in compiler.empty_tables:
-            return "[]", {}, counter
+            return _subquery.EMPTY, {}, counter
         for field, search_column, _ in self._search:
             compiler.searched[(table, search_column)] = field
         if self._similar is not None:
@@ -1430,6 +1437,12 @@ class QuerySet:
             # column the projection does not read.
             if compiler.knn_prefilter and self._similar.dist is not None and self._reads_id():
                 query += ", id"
+        elif self._first_order:
+            # first() without an order of its own (v0.50.0, D22): the smallest matching id from SurrealDB 3 on, where
+            # 4.x promises no order and an indexed filter comes in index order; below 3 the statement is unchanged.
+            compiler.implicit_order = True
+            if not compiler.knn_prefilter:
+                query += " ORDER BY id"
 
         if self._limit is not None:
             query += f" LIMIT {self._limit}"
@@ -1710,6 +1723,7 @@ class QuerySet:
         subquery_tables: frozenset[str] = frozenset(),
         searched: Mapping[str, str] | None = None,
         knn_fields: Mapping[str, str] | None = None,
+        index: int = 0,
     ) -> list[dict[str, Any]]:
         """
         Execute a read query. Routes through the transaction when one is attached
@@ -1749,6 +1763,9 @@ class QuerySet:
                 its subqueries' (:meth:`_searched_columns`); ``None``: this queryset's own.
             knn_fields: the columns the statement searches with a KNN, each mapped to its field as given — this
                 queryset's and its subqueries' (:meth:`_knn_columns`); ``None``: this queryset's own.
+            index: which statement's result the rows are (v0.50.0, ``SubqueryCompiler.statement_index()``): ``0``,
+                the first, but for a statement whose subqueries are sent before it as statements of their own,
+                read with ``_client.query_at()``; an error of any of them is read as the statement's.
 
         Raises:
             _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist (caught by
@@ -1763,7 +1780,8 @@ class QuerySet:
         subject = {} if self._refusal_subject is None else {"subject": self._refusal_subject}
         if self._tx is not None:
             try:
-                return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
+                at = {"index": index} if index else {}
+                return await self._tx.run_read(query, vars_, **at)  # type: ignore[no-any-return]
             except ServerError as exc:
                 # A read the ORM answers itself (no rows, or sent again without the missing subquery table) does not
                 # fail the transaction (issue #268); an error relayed does.
@@ -1790,7 +1808,9 @@ class QuerySet:
         encoded = _encoding.encode(vars_)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
         try:
-            return await client.query(query, encoded)  # type: ignore
+            if index:
+                return await _client.query_at(client, query, encoded, index=index)  # type: ignore[no-any-return]
+            return await _client.query(client, query, encoded)  # type: ignore
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
@@ -1863,7 +1883,7 @@ class QuerySet:
                 await self._tx.run_read(_subquery.TABLE_PROBE, variables)
             else:
                 client = await self._manager().get_client()
-                await client.query(_subquery.TABLE_PROBE, _encoding.encode(variables))
+                await _client.query(client, _subquery.TABLE_PROBE, _encoding.encode(variables))
         except NotFoundError as exc:
             # The check's answer, never a failed statement of the transaction (issue #268).
             if self._tx is not None:
@@ -1909,6 +1929,7 @@ class QuerySet:
         write: bool = False,
         warn: bool = True,
         knn_prefilter: bool | None = None,
+        top_level: bool = False,
     ) -> Any:
         """The loop of :meth:`_run_compiled`, as in v0.27.0: compile, send, and on a confirmed missing subquery
         table compile again with that subquery bound to ``[]`` and send again.
@@ -1918,26 +1939,32 @@ class QuerySet:
         subqueries search are passed on (v0.35.0, ``searched=``), so a missing-index error names them, and so are the
         fields their ``similar_to()`` searches (v0.36.0, ``knn_fields=``), so a dimension error names them.
 
-        A KNN next to other conditions (v0.36.0), or an exact scan (``compiler.knn_conditions``), is compiled for the
-        line: *knn_prefilter* ``None`` decides it once, right after the first compilation — the line read once per
-        client (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is checked,
+        A KNN next to other conditions (v0.36.0), or an exact scan (``compiler.knn_conditions``), and ``first()``'s
+        implicit ``ORDER BY id`` (v0.50.0, ``compiler.implicit_order``) are compiled for the line: *knn_prefilter*
+        ``None`` decides it once, right after the first compilation and its link check — the line read once per
+        client (``time_travel.cached_major()``), the form below SurrealDB 3 compiled again before anything is keyed,
         queued or sent — and every later compilation of this read or write (a re-send for a missing subquery table
-        included) uses that decision; :meth:`_run_cached` passes the one it took."""
+        included) uses that decision; :meth:`_run_cached` passes the one it took. The same decision says whether an
+        HNSW search next to a ``LET`` (``compiler.hnsw_let``) sends the ``LET`` s as statements of their own (*top_level*,
+        SurrealDB 4.x and later, v0.50.0): its result is then read at ``compiler.statement_index()``."""
         empty: frozenset[str] = frozenset()
         while True:
-            compiler = self._subquery_compiler(empty, warn=warn, knn_prefilter=bool(knn_prefilter))
+            compiler = self._subquery_compiler(empty, warn=warn, knn_prefilter=bool(knn_prefilter), top_level=top_level)
             warn = False
             query, variables = compile_statement(compiler)
-            if knn_prefilter is None:
-                knn_prefilter = await self._below_3(compiler)
-                if knn_prefilter:
-                    continue
+            # A link to another connection is refused before the line is read (v0.50.0: first() reads it too).
             self._check_links()
+            if knn_prefilter is None:
+                knn_prefilter, top_level = await self._line_forms(compiler)
+                if knn_prefilter or top_level:
+                    continue
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
+            # The statement's result among the request's (v0.50.0): passed only for the top-level form.
+            at: dict[str, Any] = {"index": index} if (index := compiler.statement_index()) else {}
             read = frozenset(compiler.tables) - empty
             if not read:
-                return await self._execute_query(query, variables)
+                return await self._execute_query(query, variables, **at)
             # The fields the subqueries search (v0.35.0), which a missing-index error names; _execute_query() maps
             # this queryset's own. Only a subquery that searches adds the argument: the call is otherwise v0.27.0's.
             # The same for the fields their similar_to() searches (v0.36.0), which a dimension error names.
@@ -1945,7 +1972,7 @@ class QuerySet:
             if compiler.knn_fields:
                 searched["knn_fields"] = self._knn_columns(compiler)
             try:
-                return await self._execute_query(query, variables, subquery_tables=read, **searched)
+                return await self._execute_query(query, variables, subquery_tables=read, **at, **searched)
             except _subquery._MissingSubqueryTable as missing:
                 empty |= {missing.table}
 
@@ -1961,17 +1988,18 @@ class QuerySet:
         (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
         compilation gives the filter values' warnings, once per read.
 
-        A KNN next to other conditions (v0.36.0), or an exact scan, is keyed in its line's form: the line is read after
-        the first compilation and, below SurrealDB 3, the statement compiled again for the key; the decision is passed
+        A KNN next to other conditions (v0.36.0), or an exact scan, and ``first()``'s implicit ``ORDER BY id`` (v0.50.0)
+        are keyed in their line's form: the line is read after the first compilation and its link check and, below
+        SurrealDB 3, the statement compiled again for the key — the two forms never share a key; the decision is passed
         on to :meth:`_run_uncached`, so a read the compilation refuses stores nothing.
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
-        knn_prefilter = await self._below_3(compiler)
-        if knn_prefilter:
-            compiler = self._subquery_compiler(warn=False, knn_prefilter=True)
-            query, variables = compile_statement(compiler)
         self._check_links()
+        knn_prefilter, top_level = await self._line_forms(compiler)
+        if knn_prefilter or top_level:
+            compiler = self._subquery_compiler(warn=False, knn_prefilter=knn_prefilter, top_level=top_level)
+            query, variables = compile_statement(compiler)
         tables = {self._model_table, *compiler.tables}
         if self.model.__surreal_edge__ or compiler.edge_tables:
             tables.add(EDGES)
@@ -1988,18 +2016,27 @@ class QuerySet:
             variables,
             frozenset(tables),
             any_table,
-            lambda: self._run_uncached(compile_statement, warn=False, knn_prefilter=knn_prefilter),
+            lambda: self._run_uncached(compile_statement, warn=False, knn_prefilter=knn_prefilter, top_level=top_level),
         )
 
-    async def _below_3(self, compiler: SubqueryCompiler) -> bool:
-        """Whether the statement *compiler* compiled is for a line below SurrealDB 3 and needs the form with the
-        conditions next to its KNN selected first (v0.36.0), or an exact scan's nearest ranked by distance then id: only
-        when it has such conditions or such a scan (``compiler.knn_conditions``) is the line read, once per client
-        (``time_travel.cached_major()``) — on the connection's client, an interactive transaction's included. A version
-        that cannot be read counts as 3."""
-        if not compiler.knn_conditions:
-            return False
-        return await _time_travel.cached_major(await self._manager().get_client()) < 3
+    async def _line_forms(self, compiler: SubqueryCompiler) -> tuple[bool, bool]:
+        """The forms of the statement *compiler* compiled that depend on the line: ``(knn_prefilter, top_level)``.
+
+        *knn_prefilter*: the statement is for a line below SurrealDB 3 and needs the form with the conditions next to
+        its KNN selected first (v0.36.0), or an exact scan's nearest ranked by distance then id, or ``first()``'s
+        statement without its implicit ``ORDER BY id`` (v0.50.0). *top_level*: it holds an HNSW search next to a
+        condition that reads a ``LET`` (``compiler.hnsw_let``) and is for SurrealDB 4.x or later, the embedded engine of SDK 3.0 included, which answers
+        no record for an HNSW search next to the ids of a ``LET`` of a block: the ``LET`` s are sent as statements of
+        their own (v0.50.0, ``SubqueryCompiler.wrap()``). Only when the statement has such conditions or such a scan
+        (``compiler.knn_conditions``), that clause (``compiler.implicit_order``) or such a search is the line read, once
+        per client (``time_travel.cached_major()``) — on the connection's client, an interactive transaction's
+        included. A version that cannot be read counts as 3."""
+        below_3 = compiler.knn_conditions or compiler.implicit_order
+        top_level = compiler.hnsw_let and bool(compiler.lets)
+        if not (below_3 or top_level):
+            return False, False
+        major = await _time_travel.cached_major(await self._manager().get_client())
+        return below_3 and major < 3, top_level and major >= 4
 
     async def _cached_read(
         self,
@@ -2306,15 +2343,24 @@ class QuerySet:
         same queryset can be reused (or re-executed) afterwards and still yields every
         matching row.
 
+        Which row (v0.50.0): on SurrealDB 3.x, 4.x and the embedded engine, a statement without an order of its own
+        ends ``ORDER BY id``, so ``first()`` returns the matching record with the smallest id — on a range filter over
+        an indexed field this costs a sort of the matching records; ``order_by()`` on that field avoids it when its
+        order is the one wanted. ``order_by()``, ``similar_to()`` (nearest first) and a ``values()``/``annotate()``
+        aggregation keep their own order. On SurrealDB 2.x the statement is unchanged: the server's order, id order
+        for a plain table scan and index order for an indexed filter. The line is read once per client.
+
         Returns:
             The first model instance, or raises SurrealDbNotFoundError if no results.
         """
         original_limit = self._limit
         try:
             self._limit = 1
+            self._first_order = True
             results = await self.exec()
         finally:
             self._limit = original_limit
+            self._first_order = False
 
         if results:
             return results[0]
@@ -2370,7 +2416,7 @@ class QuerySet:
 
             client = await self._manager().get_client()
             try:
-                data = await client.select(record_id)
+                data = await _client.select(client, record_id)
             except NotFoundError:
                 raise SurrealDbNotFoundError("No result found.") from None
             if isinstance(data, list):
@@ -2419,7 +2465,7 @@ class QuerySet:
 
         client = await self._manager().get_client()
         try:
-            results = await client.select(self._model_table)
+            results = await _client.select(client, self._model_table)
         except NotFoundError:
             return self.model.from_db([])
         return self.model.from_db(results)
@@ -2447,7 +2493,7 @@ class QuerySet:
         async def run() -> Any:
             client = await self._manager().get_client()
             try:
-                return await client.select(target)
+                return await _client.select(client, target)
             except NotFoundError:
                 return missing
 
@@ -2470,7 +2516,7 @@ class QuerySet:
         """
         client = await self._manager().get_client()
         with contextlib.suppress(NotFoundError):
-            await client.delete(self._model_table)
+            await _client.delete(client, self._model_table)
         return True
 
     # ==================== Aggregation Methods ====================
@@ -2866,7 +2912,7 @@ class QuerySet:
 
         encoded = _encoding.encode(data_list)  # issue #325: refused before any client is asked for
         client = await self._manager().get_client()
-        results = await client.insert(self._model_table, encoded)
+        results = await _client.insert(client, self._model_table, encoded)
 
         if isinstance(results, list):
             return self.model.from_db(results)  # type: ignore
@@ -3541,7 +3587,7 @@ class QuerySet:
         async def start(client: Any) -> UUID:
             if items:
                 try:
-                    await client.query(check)
+                    await _client.query(client, check)
                 except ServerError as exc:
                     refusal = _search.missing_index_refusal(exc, fields)
                     if refusal is not None:
@@ -3551,7 +3597,7 @@ class QuerySet:
                         raise
                     raise SurrealDbNotFoundError(_subquery.live_table_missing(missing, exc)) from exc
             try:
-                live_id = await client.query(query)
+                live_id = await _client.query(client, query)
             except NotFoundError as exc:
                 raise missing_table_error(exc, table) from exc
             return live_id if isinstance(live_id, UUID) else UUID(str(live_id))
@@ -3716,13 +3762,13 @@ class QuerySet:
 
         :param since: a cursor from :attr:`ChangeModelStream.cursor`; a ``datetime`` or ISO-8601
             string (naive means UTC; exact on 3.x, at-least-once on 2.x, whose server also returns
-            some earlier changes; refused on the embedded engine of the surrealdb SDK 2.x, which
-            keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
+            some earlier changes; exact on the embedded engine too, a SurrealDB 4.0 core since v0.50.0); or
+            ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
         :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()``, ``search()`` and ``similar_to()``
             included), here; on start, for a table that does not exist or has no change feed (on the table or on its
-            database), or for a datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
+            database).
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
         self._reject_time_travel("changes()")
@@ -3743,37 +3789,48 @@ class QuerySet:
             query: The custom SQL query string to execute.
             variables: A dictionary of variables to substitute into the query.
 
+        Every statement runs and the **list** results of every statement are concatenated in order, then hydrated
+        as model instances (v0.50.0, full SurrealDB-ORM parity; before, only the first statement's rows came back,
+        with a warning). A statement whose result is not a list (``LET``, ``RETURN``) contributes nothing, nor does a
+        statement that reads a table that does not exist (SurrealDB 3.x and 4.x fail it, 2.x reads it as empty); any
+        other failing statement raises, even when it is not the first. The rows of every ``SELECT`` are hydrated as this model:
+        select its own table.
+
         Returns:
-            The result of the query, typically model instances.
+            The rows of every statement, as model instances.
 
         Raises:
             SurrealDbError: the query does not read ``FROM`` the model's table; the queryset is read
                 ``as_of()`` (v0.26.0): the custom statement would ignore the moment, so it is refused rather
                 than run on the current data; the queryset has ``cache()`` (v0.28.0): your own SurrealQL is
-                never cached — cache its result yourself with ``QueryCache.make_key()``, ``get()`` and ``set()``.
+                never cached — cache its result yourself with ``QueryCache.make_key()``, ``get()`` and ``set()``;
+                a ``BEGIN … COMMIT`` of the query was cancelled because one of its statements failed, a read of a
+                missing table included (SurrealDB 3.x and 4.x; v0.50.0): the message quotes the server's error for
+                that statement, the transaction's writes did not run, and nothing is read as empty. On 2.x the
+                missing table reads as empty and the transaction commits.
         """
         self._reject_time_travel("query()")
         if self._cache is not None:
             raise SurrealDbError(_CACHE_QUERY)
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
-        # Same silent truncation raw_query() warns about: only the first statement's results
-        # come back from the SDK (issue #156).
-        warn_on_multiple_statements(query)
         client = await self._manager().get_client()
         try:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it
             # would corrupt their string literals (issue #156).
-            results = await client.query(query, _encoding.encode(variables or {}))
+            # SurrealDB 3.x fails a statement that reads a never-created table; the ORM contract treats a missing
+            # table as empty, per statement, so the rows of the other statements still come back (as on 2.x).
+            results = await _client.query_all_tolerant(
+                client,
+                query,
+                _encoding.encode(variables or {}),
+                empty=lambda error: _subquery.missing_table(error) is not None,
+            )
         except NotFoundError:
-            # SurrealDB 3.x raises for a never-created table; the ORM contract
-            # treats a missing table as empty.
+            # The query as a whole refused for a missing table (no per-statement envelope).
             return self.model.from_db([])
-        if isinstance(results, list):
-            return self.model.from_db(results)
-        data = cast(dict, results[0])
-        return self.model.from_db(data.get("result", []))
+        return self.model.from_db(statement_rows(results))
 
 
 #: The annotations computed per record: ``GeoDistance`` (v0.24.0) and the search annotations (v0.35.0).

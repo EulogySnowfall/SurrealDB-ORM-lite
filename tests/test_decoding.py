@@ -1,12 +1,13 @@
-"""Reading what the surrealdb SDK 2.0.0 cannot decode (#235): the CBOR tag hook of ``decoding.py``.
+"""Reading what the surrealdb SDK cannot decode (#235): the read hook of ``decoding.py``.
 
-SDK 2.0.0 raises on five kinds of values SurrealDB returns: a zero duration, a SurrealDB 3.x native
-set, a 1-point (or empty) ``LineString``, a ``Polygon`` ring of fewer than 4 points and a datetime
-outside years 1-9999 (#279). The unit tests drive the hook with hand-built CBOR and an embedded
-client (no server); the classes suffixed ``E2E`` write each value with raw SurrealQL and read it back
-through the ORM, on both server lines. The native set is a 3.x value: 2.x stores ``<set>[…]`` as an
-array, so those cases skip there (capability probe). Tables are prefixed ``dc_`` and dropped before
-and after each test.
+The SDK refuses two kinds of values SurrealDB stores and returns: a degenerate geometry (a ``LineString`` of fewer
+than 2 points, a ``Polygon`` ring of fewer than 4, alone or inside another geometry) and a datetime outside years
+1-9999 (#279). The clients the ORM opens read them as in 0.40.x: a degenerate geometry as its GeoJSON ``dict``, an
+out-of-range datetime as its RFC 3339 text. Every other value is the SDK's own, a zero duration and a native set
+included. The unit tests drive the hook with hand-built CBOR and an embedded client (no server); the classes suffixed
+``E2E`` write each value with raw SurrealQL and read it back through the ORM, on every server line. The native set is
+a 3.x value: 2.x stores ``<set>[…]`` as an array, so those cases skip there (capability probe). Tables are prefixed
+``dc_`` and dropped before and after each test.
 """
 
 import asyncio
@@ -25,10 +26,12 @@ import surrealdb
 import surrealdb.connections.async_embedded
 import surrealdb.connections.async_http
 import surrealdb.connections.async_ws
+import surrealdb.connections.utils_mixin
+import surrealdb.data._decoder
 import surrealdb.data.cbor
 import surrealdb.data.types.constants
 from pydantic import ValidationError
-from surrealdb import AsyncSurreal, RecordID
+from surrealdb import AsyncSurreal, RecordID, UnexpectedResponseError
 from surrealdb.cbor import CBORTag
 
 from surreal_orm_lite import (
@@ -38,11 +41,14 @@ from surreal_orm_lite import (
     GeometryMultiLine,
     GeometryPolygon,
     SurrealConfigDict,
+    SurrealDbConnectionError,
     SurrealDBConnectionManager,
+    _client,
     _sdk,
     decoding,
     encoding,
 )
+from surreal_orm_lite.surql_literal import to_surql_literal
 from tests.test_rich_fields import _take
 
 # --- hand-built CBOR -----------------------------------------------------------------------------
@@ -61,7 +67,7 @@ def _polygon(*rings: tuple[tuple[float, float], ...]) -> CBORTag:
 
 
 _SQUARE = ((0, 0), (1, 0), (1, 1), (0, 0))  # a valid closed ring
-_THIN = ((0, 0), (1, 0), (0, 0))  # 3 points once closed: SurrealDB stores it, SDK 2.0.0 refuses it
+_THIN = ((0, 0), (1, 0), (0, 0))  # 3 points once closed: SurrealDB stores it, the SDK refuses it
 
 
 def _datetime(seconds: int, nanoseconds: int = 0) -> CBORTag:
@@ -85,9 +91,15 @@ _YEAR_9999_END = 253_402_300_799  # 9999-12-31T23:59:59Z
 
 def _hooked(value: Any) -> Any:
     """*value* encoded by the SDK's codec, then decoded the way the ORM's clients decode it."""
-    decode = decoding._hooked_decode()
-    assert decode is not None, "the read hook is unavailable with the installed SDK"
-    return decode(_sdk.cbor_encode(value))
+    return decoding.decode(_sdk.cbor_encode(value))
+
+
+#: The cached probes and clones of ``decoding.py``.
+_CACHES = (
+    decoding.sdk_decodes_degenerate_geometries,
+    decoding.sdk_decodes_out_of_range_datetimes,
+    decoding._hooked_methods,
+)
 
 
 @pytest.fixture
@@ -98,95 +110,56 @@ def fresh_caches(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ``monkeypatch`` is undone. So the codec the test swapped is restored first, then the caches are cleared: a probe
     run in between would stay cached with the fake codec's answer.
     """
-    caches = (
-        decoding.sdk_decodes_zero_duration,
-        decoding.sdk_decodes_native_sets,
-        decoding.sdk_decodes_degenerate_geometries,
-        decoding.sdk_decodes_out_of_range_datetimes,
-        decoding._hooked_decode,
-        decoding._hooked_methods,
-    )
-    for cache in caches:
+    for cache in _CACHES:
         cache.cache_clear()
     yield
     monkeypatch.undo()
-    for cache in caches:
+    for cache in _CACHES:
         cache.cache_clear()
 
 
-# --- the tag hook (unit) -------------------------------------------------------------------------
+# --- the decoder (unit) --------------------------------------------------------------------------
 
-#: Each value SDK 2.0.0 cannot decode, with the exception its own codec raises.
-_SDK_FAILURES: dict[str, tuple[Any, type[BaseException]]] = {
-    "zero-duration": (CBORTag(14, []), IndexError),
-    "native-set": (CBORTag(56, [1, 2]), BufferError),
-    "line-1-point": (_line((1, 2)), TypeError),
-    "polygon-3-point-ring": (_polygon(_THIN), surrealdb.InvalidGeometryError),
-    "datetime-year-0": (_datetime(_YEAR_0), ValueError),
-    "datetime-year-10000": (_datetime(_YEAR_10000), ValueError),
+#: Each kind of value the SDK refuses and the hook reads as in 0.40.x.
+_SDK_REFUSALS: dict[str, Any] = {
+    "line-1-point": _line((1, 2)),
+    "polygon-3-point-ring": _polygon(_THIN),
+    "datetime-year-0": _datetime(_YEAR_0),
+    "datetime-year-10000": _datetime(_YEAR_10000),
 }
 
 
-class TestReadTagHook:
-    """Every tag goes to the SDK's ``tag_decoder`` first; only its five failures get a value instead."""
+class TestReadsAsIn040:
+    """Degenerate geometries and out-of-range datetimes read as in 0.40.x; every other value is the SDK's own."""
 
-    @pytest.mark.parametrize("case", list(_SDK_FAILURES))
-    def test_the_sdk_still_fails_on_each_value(self, case: str) -> None:
-        """Canary: when the SDK reads one of these itself, its ``SDK 3.0 (#205)`` workaround can go."""
-        value, error = _SDK_FAILURES[case]
-        with pytest.raises(error):
-            _sdk.cbor_decode(_sdk.cbor_encode(value))
+    @pytest.mark.parametrize("case", list(_SDK_REFUSALS))
+    def test_the_sdk_still_refuses_each_value(self, case: str) -> None:
+        """Canary: when the SDK reads one of these itself, its ``SDK 3.0 (#205)`` fallback can go."""
+        with pytest.raises(UnexpectedResponseError):
+            _sdk.cbor_decode(_sdk.cbor_encode(_SDK_REFUSALS[case]))
 
-    def test_zero_duration_reads_as_the_sdks_zero(self) -> None:
-        for out in (_hooked(CBORTag(14, [])), _hooked({"v": [CBORTag(14, [])]})["v"][0]):
-            assert type(out) is surrealdb.Duration and out.elapsed == 0
-
-    def test_native_set_reads_as_a_set(self) -> None:
-        out = _hooked(CBORTag(56, [1, 2]))
-        assert type(out) is set and out == {1, 2}
-        empty = _hooked(CBORTag(56, []))
-        assert type(empty) is set and empty == set()
-        # The items went through the SDK first: a decimal string tag is already a ``Decimal``.
-        assert _hooked(CBORTag(56, [CBORTag(10, "1.5")])) == {Decimal("1.5")}
-
-    def test_native_set_of_unhashable_items_reads_as_a_list(self) -> None:
-        out = _hooked(CBORTag(56, [{"a": 1}, {"b": 2}]))
-        assert type(out) is list and out == [{"a": 1}, {"b": 2}]
-        records = _hooked(CBORTag(56, [CBORTag(8, ["t", 1]), CBORTag(8, ["t", 2])]))  # RecordID is unhashable
-        assert type(records) is list and records == [RecordID("t", 1), RecordID("t", 2)]
-        nested = _hooked(CBORTag(56, [CBORTag(56, [1])]))  # an inner set is unhashable too
-        assert nested == [{1}]
-
-    @pytest.mark.parametrize(
-        ("items", "expected"),
-        [
-            pytest.param([1, True], [1, True], id="1-and-true"),
-            pytest.param([0, False], [0, False], id="0-and-false"),
-            pytest.param(["a", 1, True], ["a", 1, True], id="a-1-and-true"),
-            pytest.param([1, 1.5, 1.0], [1, 1.5, 1.0], id="1-and-1.0"),
-            pytest.param([1, CBORTag(10, "1")], [1, Decimal("1")], id="1-and-decimal-1"),
-        ],
-    )
-    def test_native_set_of_items_python_finds_equal_reads_as_a_list(self, items: list[Any], expected: list[Any]) -> None:
-        """SurrealDB already deduplicated the set: items Python finds equal (``1`` and ``true``) are distinct."""
-        out = _hooked(CBORTag(56, items))
-        assert type(out) is list and out == expected, out
-        assert [type(item) for item in out] == [type(item) for item in expected], out
+    def test_the_sdk_reads_zero_durations_and_native_sets(self) -> None:
+        """The SDK reads these itself: the hook leaves them to it and has no probe for them."""
+        zero = _sdk.cbor_decode(_sdk.cbor_encode(CBORTag(14, [])))
+        assert type(zero) is surrealdb.Duration and zero.elapsed == 0
+        native = _sdk.cbor_decode(_sdk.cbor_encode(CBORTag(56, [1, 2])))
+        assert type(native) is surrealdb.SurrealSet and sorted(native) == [1, 2]
+        for value in (CBORTag(14, []), CBORTag(56, [1, 2])):
+            data = _sdk.cbor_encode(value)
+            assert type(decoding.decode(data)) is type(_sdk.cbor_decode(data))
+        assert not hasattr(decoding, "sdk_decodes_zero_duration")
+        assert not hasattr(decoding, "sdk_decodes_native_sets")
+        assert not hasattr(decoding, "TAG_SET")
 
     @pytest.mark.parametrize(
         ("value", "expected"),
         [
-            pytest.param(_line((1, 2)), {"type": "LineString", "coordinates": [[1.0, 2.0]]}, id="line-1-point"),
-            pytest.param(CBORTag(89, []), {"type": "LineString", "coordinates": []}, id="line-empty"),
-            pytest.param(
-                CBORTag(92, [_line((1, 2)), _line((3, 4), (5, 6))]),
-                {"type": "MultiLineString", "coordinates": [[[1.0, 2.0]], [[3.0, 4.0], [5.0, 6.0]]]},
-                id="multiline-with-a-1-point-line",
-            ),
+            pytest.param(_line((1, 2)), {"type": "LineString", "coordinates": [[1.0, 2.0]]}, id="89-line-1-point"),
+            pytest.param(CBORTag(89, []), {"type": "LineString", "coordinates": []}, id="89-line-empty"),
             pytest.param(
                 _polygon(_THIN),
                 {"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]]]},
-                id="polygon-3-point-ring",
+                id="90-polygon-3-point-ring",
             ),
             pytest.param(
                 _polygon(_SQUARE, ((0, 0), (0, 0))),
@@ -194,14 +167,19 @@ class TestReadTagHook:
                     "type": "Polygon",
                     "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]],
                 },
-                id="polygon-2-point-hole",
+                id="90-polygon-2-point-hole",
             ),
             pytest.param(
                 CBORTag(90, [_line((0, 0))]),
                 {"type": "Polygon", "coordinates": [[[0.0, 0.0]]]},
-                id="polygon-ring-of-1-point",
+                id="90-polygon-ring-of-1-point",
             ),
-            pytest.param(CBORTag(90, []), {"type": "Polygon", "coordinates": []}, id="polygon-without-ring"),
+            pytest.param(CBORTag(90, []), {"type": "Polygon", "coordinates": []}, id="90-polygon-without-ring"),
+            pytest.param(
+                CBORTag(92, [_line((1, 2)), _line((3, 4), (5, 6))]),
+                {"type": "MultiLineString", "coordinates": [[[1.0, 2.0]], [[3.0, 4.0], [5.0, 6.0]]]},
+                id="92-multiline-with-a-1-point-line",
+            ),
             pytest.param(
                 CBORTag(93, [_polygon(_SQUARE), _polygon(_THIN)]),
                 {
@@ -211,7 +189,12 @@ class TestReadTagHook:
                         [[[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]]],
                     ],
                 },
-                id="multipolygon-with-a-thin-polygon",
+                id="93-multipolygon-with-a-thin-polygon",
+            ),
+            pytest.param(
+                CBORTag(93, [CBORTag(90, [_line((0, 0))])]),
+                {"type": "MultiPolygon", "coordinates": [[[[0.0, 0.0]]]]},
+                id="93-multipolygon-with-a-ring-of-1-point",
             ),
             pytest.param(
                 CBORTag(94, [_point(1, 2), _line((3, 4)), CBORTag(94, [_line((5, 6), (7, 8))])]),
@@ -226,7 +209,7 @@ class TestReadTagHook:
                         },
                     ],
                 },
-                id="collection-with-a-1-point-line",
+                id="94-collection-with-a-1-point-line",
             ),
             pytest.param(
                 CBORTag(94, [_point(0, 0), CBORTag(94, [_line((1, 2))])]),
@@ -237,15 +220,49 @@ class TestReadTagHook:
                         {"type": "GeometryCollection", "geometries": [{"type": "LineString", "coordinates": [[1.0, 2.0]]}]},
                     ],
                 },
-                id="collection-in-a-collection-with-a-1-point-line",
+                id="94-collection-in-a-collection-with-a-1-point-line",
+            ),
+            pytest.param(
+                CBORTag(
+                    94,
+                    [
+                        CBORTag(91, [_point(1, 2), _point(3, 4)]),
+                        CBORTag(92, [_line((1, 2), (3, 4))]),
+                        _polygon(_SQUARE),
+                        CBORTag(93, [_polygon(_SQUARE)]),
+                        _polygon(_THIN),
+                    ],
+                ),
+                {
+                    "type": "GeometryCollection",
+                    "geometries": [
+                        {"type": "MultiPoint", "coordinates": [[1.0, 2.0], [3.0, 4.0]]},
+                        {"type": "MultiLineString", "coordinates": [[[1.0, 2.0], [3.0, 4.0]]]},
+                        {"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]},
+                        {"type": "MultiPolygon", "coordinates": [[[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]]},
+                        {"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]]]},
+                    ],
+                },
+                id="94-collection-of-every-kind-beside-a-thin-polygon",
+            ),
+            pytest.param(
+                CBORTag(94, [CBORTag(92, [_line((1, 2))]), CBORTag(93, [_polygon(_THIN)])]),
+                {
+                    "type": "GeometryCollection",
+                    "geometries": [
+                        {"type": "MultiLineString", "coordinates": [[[1.0, 2.0]]]},
+                        {"type": "MultiPolygon", "coordinates": [[[[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]]]]},
+                    ],
+                },
+                id="94-collection-of-degenerate-multi-geometries",
             ),
         ],
     )
-    def test_degenerate_geometry_reads_as_geojson(self, value: Any, expected: dict[str, Any]) -> None:
-        out = _hooked({"v": value})["v"]
-        assert type(out) is dict and out == expected
-        # Plain lists all the way down, as in GeoJSON (the SDK's ``get_coordinates()`` gives tuples).
-        assert "(" not in repr(out)
+    def test_degenerate_geometry_reads_as_geojson_as_in_040(self, value: Any, expected: dict[str, Any]) -> None:
+        for out in (_hooked(value), _hooked({"v": value})["v"], _hooked([value])[0]):
+            assert type(out) is dict and out == expected
+            # Plain lists all the way down, as in GeoJSON (the SDK's ``get_coordinates()`` gives tuples).
+            assert "(" not in repr(out)
 
     @pytest.mark.parametrize(
         ("value", "expected"),
@@ -264,9 +281,10 @@ class TestReadTagHook:
             pytest.param(_datetime(_YEAR_MINUS_1, 1), "-0001-01-01T00:00:00.000000001Z", id="one-nanosecond"),
         ],
     )
-    def test_out_of_range_datetime_reads_as_its_rfc3339_string(self, value: CBORTag, expected: str) -> None:
-        """A datetime before year 1 or after year 9999 reads as the text SurrealDB gives it (``<string>``)."""
-        for out in (_hooked(value), _hooked({"v": [value]})["v"][0]):
+    def test_out_of_range_datetime_reads_as_its_rfc3339_text_as_in_040(self, value: CBORTag, expected: str) -> None:
+        """A datetime before year 1 or after year 9999 reads as the text SurrealDB gives it (``<string>``), alone,
+        inside a dict and inside a list."""
+        for out in (_hooked(value), _hooked({"v": value})["v"], _hooked({"v": [value]})["v"][0]):
             assert type(out) is str and out == expected
 
     @pytest.mark.parametrize(
@@ -284,9 +302,11 @@ class TestReadTagHook:
     def test_in_range_datetime_reads_as_the_sdks_datetime(self, value: CBORTag, expected: datetime) -> None:
         """The two boundaries of Python's range, and a datetime before 1970, decode exactly as the SDK decodes them."""
         data = _sdk.cbor_encode(value)
-        out = decoding._hooked_decode()(data)  # type: ignore[misc]
+        out = decoding.decode(data)
         sdk = _sdk.cbor_decode(data)
-        assert type(out) is datetime and out == expected == sdk and out.tzinfo == sdk.tzinfo
+        assert type(out) is type(sdk) is surrealdb.PreciseDatetime
+        assert out == sdk and out.nanosecond == sdk.nanosecond and out.tzinfo == sdk.tzinfo
+        assert datetime.__eq__(out, expected)
 
     def test_datetime_text_matches_python_in_its_range(self) -> None:
         """The hook's calendar arithmetic gives the text of Python's own ``datetime`` wherever Python has one."""
@@ -303,6 +323,29 @@ class TestReadTagHook:
                 text = moment.replace(tzinfo=None).isoformat(timespec="seconds") + fraction + "Z"
                 assert decoding._datetime_text(seconds, nanoseconds) == text, moment
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(_datetime(1_700_000_000, 123_456_789), id="12-datetime"),
+            pytest.param(_point(1, 2), id="88-point"),
+            pytest.param(_line((1, 2), (3, 4)), id="89-line"),
+            pytest.param(_polygon(_SQUARE), id="90-polygon"),
+            pytest.param(_polygon(((0, 0), (1, 0), (1, 1))), id="90-polygon-with-an-open-ring"),
+            pytest.param(CBORTag(91, [_point(1, 2)]), id="91-multipoint"),
+            pytest.param(CBORTag(91, []), id="91-empty-multipoint"),
+            pytest.param(CBORTag(92, [_line((1, 2), (3, 4))]), id="92-multiline"),
+            pytest.param(CBORTag(93, [_polygon(_SQUARE)]), id="93-multipolygon"),
+            pytest.param(CBORTag(94, [_point(1, 2), _line((1, 2), (3, 4))]), id="94-collection"),
+            pytest.param(CBORTag(94, []), id="94-empty-collection"),
+        ],
+    )
+    def test_a_valid_value_of_each_own_tag_is_the_sdks(self, value: CBORTag) -> None:
+        """Delegation: for tags 12 and 88-94 the SDK's own reader builds every value it accepts."""
+        data = _sdk.cbor_encode({"v": value})
+        expected = _sdk.cbor_decode(data)["v"]
+        out = decoding.decode(data)["v"]
+        assert type(out) is type(expected) and out == expected and repr(out) == repr(expected)
+
     def test_values_the_sdk_decodes_come_back_unchanged(self) -> None:
         corpus: list[Any] = [
             None,
@@ -313,8 +356,11 @@ class TestReadTagHook:
             RecordID("t", 1),
             RecordID("t", ["a", 1]),
             surrealdb.Duration(5),
+            CBORTag(14, []),
             CBORTag(14, [7]),
             CBORTag(14, [7, 9]),
+            CBORTag(56, [1, 2]),
+            CBORTag(56, [{"a": 1}]),
             datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC),
             CBORTag(12, [1_700_000_000, 123_456_789]),
             _datetime(_YEAR_1),
@@ -323,74 +369,71 @@ class TestReadTagHook:
             Decimal("12.50"),
             UUID("0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11"),
             surrealdb.Range(_sdk.BoundIncluded(1), _sdk.BoundExcluded(5)),
-            _point(1, 2),
-            _line((1, 2), (3, 4)),
-            _polygon(_SQUARE),
-            CBORTag(91, [_point(1, 2)]),
-            CBORTag(92, [_line((1, 2), (3, 4))]),
-            CBORTag(93, [_polygon(_SQUARE)]),
-            CBORTag(94, [_point(1, 2), _line((1, 2), (3, 4))]),
-            CBORTag(91, []),
-            CBORTag(94, []),
+            _sdk.Null,
         ]
         for value in corpus:
             data = _sdk.cbor_encode(value)
             expected = _sdk.cbor_decode(data)
-            out = decoding._hooked_decode()(data)  # type: ignore[misc]
+            out = decoding.decode(data)
             assert type(out) is type(expected) and out == expected and repr(out) == repr(expected), value
 
+    def test_cbor2_goes_to_the_sdk(self) -> None:
+        """``v2`` reaches the SDK's decoder as it is: a sized integer reads only as ``cbor.2``, like the SDK's."""
+        data = _sdk.cbor_encode(CBORTag(surrealdb.data.types.constants.TAG_I8, 5))
+        assert decoding.decode(data, v2=True) == _sdk.cbor_decode(data, v2=True)
+        assert type(decoding.decode(data, v2=True)) is type(_sdk.cbor_decode(data, v2=True))
+        with pytest.raises(UnexpectedResponseError, match="outside cbor.2"):
+            decoding.decode(data)
+        far = _sdk.cbor_encode(_datetime(_YEAR_10000))
+        assert decoding.decode(far, v2=True) == "+10000-01-01T00:00:00Z"
+
     @pytest.mark.parametrize(
-        ("value", "error"),
+        "value",
         [
-            pytest.param(CBORTag(999, 1), BufferError, id="unknown-tag"),
-            pytest.param(CBORTag(56, 5), BufferError, id="set-tag-without-an-array"),
-            pytest.param(CBORTag(14, ["x"]), surrealdb.InvalidDurationError, id="duration-in-another-form"),
-            pytest.param(CBORTag(12, []), IndexError, id="empty-compact-datetime"),
+            pytest.param(CBORTag(999, 1), id="unknown-tag"),
+            pytest.param(CBORTag(56, 5), id="set-tag-without-an-array"),
+            pytest.param(CBORTag(14, ["x"]), id="duration-in-another-form"),
+            pytest.param(CBORTag(12, []), id="empty-compact-datetime"),
             # A datetime outside years 1-9999 reads as text only in the server's form: two integers,
             # the nanoseconds within a second. SurrealDB never sends another.
-            pytest.param(CBORTag(12, [_YEAR_0]), IndexError, id="out-of-range-datetime-without-nanoseconds"),
-            pytest.param(CBORTag(12, [_YEAR_0, 0, 0]), ValueError, id="out-of-range-datetime-with-three-parts"),
-            pytest.param(_datetime(_YEAR_0, 1_000_000_000), ValueError, id="out-of-range-datetime-with-a-second-of-ns"),
-            pytest.param(_datetime(_YEAR_0, -1), ValueError, id="out-of-range-datetime-with-negative-ns"),
-            pytest.param(CBORTag(12, [float(_YEAR_0), 0]), ValueError, id="out-of-range-datetime-in-float-seconds"),
-            pytest.param(CBORTag(12, [_YEAR_0, 0.5]), ValueError, id="out-of-range-datetime-with-float-ns"),
-            pytest.param(CBORTag(12, "0000-06-01T00:00:00Z"), TypeError, id="datetime-tag-holding-text"),
-            pytest.param(CBORTag(8, []), IndexError, id="record-id-without-parts"),
+            pytest.param(CBORTag(12, [_YEAR_0]), id="out-of-range-datetime-without-nanoseconds"),
+            pytest.param(CBORTag(12, [_YEAR_0, 0, 0]), id="out-of-range-datetime-with-three-parts"),
+            pytest.param(_datetime(_YEAR_0, 1_000_000_000), id="out-of-range-datetime-with-a-second-of-ns"),
+            pytest.param(_datetime(_YEAR_0, -1), id="out-of-range-datetime-with-negative-ns"),
+            pytest.param(CBORTag(12, [float(_YEAR_0), 0]), id="out-of-range-datetime-in-float-seconds"),
+            pytest.param(CBORTag(12, [_YEAR_0, 0.5]), id="out-of-range-datetime-with-float-ns"),
+            pytest.param(CBORTag(12, "0000-06-01T00:00:00Z"), id="datetime-tag-holding-text"),
+            pytest.param(CBORTag(8, []), id="record-id-without-parts"),
             # A point is never degenerate, and a geometry's members are geometries, never bare numbers.
-            pytest.param(CBORTag(88, [1.0]), IndexError, id="point-with-one-coordinate"),
-            pytest.param(CBORTag(89, [5]), TypeError, id="line-of-bare-numbers"),
-            pytest.param(CBORTag(92, 5), TypeError, id="multiline-without-an-array"),
-            pytest.param(CBORTag(94, 5), TypeError, id="collection-without-an-array"),
+            pytest.param(CBORTag(88, [1.0]), id="point-with-one-coordinate"),
+            pytest.param(CBORTag(89, [5]), id="line-of-bare-numbers"),
+            pytest.param(CBORTag(91, [5]), id="multipoint-of-bare-numbers"),
+            pytest.param(CBORTag(92, 5), id="multiline-without-an-array"),
+            pytest.param(CBORTag(94, 5), id="collection-without-an-array"),
         ],
     )
-    def test_other_failures_still_raise_the_sdks_error(self, value: Any, error: type[BaseException]) -> None:
+    def test_other_refusals_raise_the_sdks_error(self, value: Any) -> None:
         data = _sdk.cbor_encode({"v": value})
-        hooked = decoding._hooked_decode()
-        assert hooked is not None
-        try:
+        with pytest.raises(UnexpectedResponseError) as sdk_error:
             _sdk.cbor_decode(data)
-        except error as exc:
-            sdk_error: BaseException = exc
-        else:  # pragma: no cover - the SDK reads it: nothing to compare
-            pytest.skip(f"the installed SDK reads {value!r}")
-        with pytest.raises(type(sdk_error)) as info:
-            hooked(data)
-        assert str(info.value) == str(sdk_error)
+        with pytest.raises(UnexpectedResponseError) as info:
+            decoding.decode(data)
+        assert str(info.value) == str(sdk_error.value)
 
     @pytest.mark.parametrize(
         ("value", "message"),
         [
-            pytest.param(CBORTag(92, [_line((1, 2)), _point(3, 4)]), "not a LineString", id="multiline-holding-a-point"),
-            pytest.param(CBORTag(93, [_line((1, 2))]), "not a GeoJSON Polygon", id="multipolygon-holding-a-line"),
-            pytest.param(CBORTag(94, [_line((1, 2)), 7]), "not a geometry", id="collection-holding-a-number"),
+            pytest.param(CBORTag(92, [_line((1, 2)), _point(3, 4)]), "multiline", id="multiline-holding-a-point"),
+            pytest.param(CBORTag(93, [_line((1, 2))]), "multipolygon", id="multipolygon-holding-a-line"),
+            pytest.param(CBORTag(94, [_line((1, 2)), 7]), "collection", id="collection-holding-a-number"),
             pytest.param(
                 CBORTag(94, [_line((1, 2)), {"type": "Unknown", "coordinates": []}]),
-                "not a GeoJSON geometry this hook reads",
+                "collection",
                 id="collection-holding-an-object",
             ),
             pytest.param(
                 CBORTag(94, [_line((1, 2)), {"type": "LineString"}]),
-                "not a GeoJSON LineString",
+                "collection",
                 id="collection-holding-an-object-without-coordinates",
             ),
         ],
@@ -398,31 +441,51 @@ class TestReadTagHook:
     def test_degenerate_member_beside_a_member_of_another_kind_raises(self, value: Any, message: str) -> None:
         """A value SurrealDB never sends: the SDK refuses the degenerate line, the hook refuses the whole."""
         data = _sdk.cbor_encode({"v": value})
-        with pytest.raises(TypeError):
+        with pytest.raises(UnexpectedResponseError):
             _sdk.cbor_decode(data)
-        hooked = decoding._hooked_decode()
-        assert hooked is not None
-        with pytest.raises(TypeError, match=message):
-            hooked(data)
+        with pytest.raises(UnexpectedResponseError, match=message):
+            decoding.decode(data)
 
 
 # --- probes, layout and installation (unit) ------------------------------------------------------
 
-#: The SDK 2.0.0 connection classes and the methods that decode a response (``decode`` global).
-_DECODE_SITES = {
-    surrealdb.AsyncWsSurrealConnection: {"_recv_task"},
-    surrealdb.AsyncHttpSurrealConnection: {"_send"},
-    surrealdb.AsyncEmbeddedSurrealConnection: {"_send", "_recv_task"},  # ``_recv_task`` inherited, never started
+#: The SDK connection classes and the methods that decode a response with the module-global ``decode``, each with
+#: whether it is a static method.
+_DECODE_SITES: dict[type, dict[str, bool]] = {
+    surrealdb.AsyncWsSurrealConnection: {"_route_frame": False, "decode_response": True, "check_status_for_error": True},
+    surrealdb.AsyncHttpSurrealConnection: {"decode_response": True, "check_status_for_error": True},
+    surrealdb.AsyncEmbeddedSurrealConnection: {
+        "_route_frame": False,  # inherited from the WebSocket client, never started
+        "_send": False,
+        "decode_response": True,
+        "check_status_for_error": True,
+    },
 }
 
+#: The SDK modules whose attributes the hook must never change.
+_SDK_MODULES = (
+    surrealdb,
+    surrealdb.data.cbor,
+    surrealdb.data._decoder,
+    surrealdb.connections.async_ws,
+    surrealdb.connections.async_http,
+    surrealdb.connections.async_embedded,
+    surrealdb.connections.utils_mixin,
+)
 
-def _decode_sites(cls: type) -> set[str]:
-    """The methods of *cls* (inherited ones included) whose code reads a global named ``decode``."""
-    return {
-        name
-        for name, member in inspect.getmembers(cls, inspect.isfunction)
-        if "decode" in member.__code__.co_names and member.__globals__.get("decode") is surrealdb.data.cbor.decode
-    }
+
+def _decode_sites(cls: type) -> dict[str, bool]:
+    """The methods of *cls* (inherited ones included) whose code reads the SDK's ``decode`` as a global."""
+    sites: dict[str, bool] = {}
+    for name in dir(cls):
+        member = inspect.getattr_static(cls, name)
+        static = isinstance(member, staticmethod)
+        function = member.__func__ if static else member
+        if not isinstance(function, types.FunctionType):
+            continue
+        if "decode" in function.__code__.co_names and function.__globals__.get("decode") is surrealdb.data.cbor.decode:
+            sites[name] = static
+    return sites
 
 
 def _ws_url() -> str:
@@ -434,17 +497,16 @@ def _http_url() -> str:
 
 
 #: The capability probes of ``decoding.py``, by the name after ``sdk_decodes_``.
-_PROBES = ("zero_duration", "native_sets", "degenerate_geometries", "out_of_range_datetimes")
+_PROBES = ("degenerate_geometries", "out_of_range_datetimes")
 
 
 class TestProbes:
     """The hook is installed only when the installed SDK cannot decode these values (no version check)."""
 
-    def test_sdk_2_0_0_needs_the_hook(self) -> None:
+    def test_the_installed_sdk_needs_the_hook(self) -> None:
         for name in _PROBES:
             assert not getattr(decoding, f"sdk_decodes_{name}")(), name
         assert decoding.needed() and decoding.available() and decoding.active()
-        assert encoding.reads_zero_duration()
 
     @pytest.mark.parametrize("readable", [name.replace("_", "-") for name in _PROBES])
     def test_needed_while_one_value_is_unreadable(self, readable: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -463,16 +525,10 @@ class TestProbes:
 
     @pytest.mark.usefixtures("fresh_caches")
     def test_probes_answer_true_when_the_codec_reads_each_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        hooked = decoding._hooked_decode()  # built from the SDK's decode before the codec is swapped
-        assert hooked is not None
-        monkeypatch.setattr(_sdk, "cbor_decode", hooked)
+        monkeypatch.setattr(_sdk, "cbor_decode", decoding.decode)
         for probe in _PROBES:
             assert getattr(decoding, f"sdk_decodes_{probe}")(), probe
-
-    @pytest.mark.usefixtures("fresh_caches")
-    def test_zero_probe_answers_false_on_another_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(_sdk, "cbor_decode", lambda data: surrealdb.Duration(1))
-        assert not decoding.sdk_decodes_zero_duration()
+        assert not decoding.needed()
 
     @pytest.mark.usefixtures("fresh_caches")
     @pytest.mark.parametrize("unreadable", [_BEFORE_YEAR_1, _YEAR_10000], ids=["year-0", "year-10000"])
@@ -482,7 +538,7 @@ class TestProbes:
         def reads_one_end(data: bytes) -> Any:
             tag = surrealdb.cbor.loads(data)  # no tag hook: the datetime stays a ``CBORTag``
             if tag.value[0] == unreadable:
-                raise ValueError("year is out of range")
+                raise UnexpectedResponseError("outside the years 1 to 9999")
             return "a datetime"
 
         monkeypatch.setattr(_sdk, "cbor_decode", reads_one_end)
@@ -490,45 +546,80 @@ class TestProbes:
 
 
 class TestSdkLayout:
-    """Canary: the SDK 2.0.0 internals the hook relies on. A failure here means the SDK's layout changed:
-    re-check ``decoding.py`` (``SDK 3.0 (#205)`` comments) before anything else."""
+    """Canary: the SDK internals the hook relies on. A failure here means the SDK's layout changed: re-check
+    ``decoding.py`` (``SDK 3.0 (#205)`` comments) before anything else."""
+
+    def test_the_decoder_class(self) -> None:
+        decoder = surrealdb.data._decoder.Decoder
+        assert _sdk.SdkDecoder is decoder
+        assert _sdk.SDK_TAG_READERS is surrealdb.data._decoder._TAGS
+        for name in ("_tag", "_value", "decode"):
+            assert isinstance(inspect.getattr_static(decoder, name), types.FunctionType), name
+        assert list(inspect.signature(decoder.__init__).parameters) == ["self", "data", "v2"]
+        assert issubclass(decoding._OrmDecoder, decoder)
+        assert decoding._OrmDecoder._tag is not decoder._tag
+
+    def test_a_reader_for_each_own_tag(self) -> None:
+        constants = surrealdb.data.types.constants
+        own = {constants.TAG_DATETIME_COMPACT, *range(88, 95)}
+        assert own == decoding._OWN_TAGS
+        for tag in own:
+            assert callable(surrealdb.data._decoder._TAGS.get(tag)), tag
+
+    def test_no_own_tag_is_gated_before_its_reader(self) -> None:
+        """The SDK's ``_tag()`` checks sized numbers and ``cbor.2``-only kinds before the readers: none is ours."""
+        module = surrealdb.data._decoder
+        for tag in decoding._OWN_TAGS:
+            assert tag not in module._SIZED_INTS, tag
+            assert tag not in module._SIZED_FLOATS, tag
+            assert tag not in module._CBOR2_KINDS, tag
+            assert tag != surrealdb.data.types.constants.TAG_DURATION_COMPACT
+
+    def test_the_sdk_decode_signature(self) -> None:
+        parameters = inspect.signature(surrealdb.data.cbor.decode).parameters
+        assert list(parameters) == ["data", "v2"]
+        assert parameters["v2"].kind is inspect.Parameter.KEYWORD_ONLY and parameters["v2"].default is False
+        assert _sdk.cbor_decode is surrealdb.data.cbor.decode
+        ours = inspect.signature(decoding.decode).parameters
+        assert list(ours) == ["data", "v2"]
+        assert ours["v2"].kind is inspect.Parameter.KEYWORD_ONLY and ours["v2"].default is False
 
     @pytest.mark.parametrize("cls", list(_DECODE_SITES), ids=lambda cls: cls.__name__)
     def test_decode_sites_of_each_connection_class(self, cls: type) -> None:
         assert _decode_sites(cls) == _DECODE_SITES[cls], (
             f"{cls.__name__} decodes responses elsewhere now: update decoding._DECODING_METHODS"
         )
-        assert set(decoding._DECODING_METHODS) >= _DECODE_SITES[cls]
-
-    def test_the_sdk_decode_reads_its_tag_decoder_global(self) -> None:
-        decode = surrealdb.data.cbor.decode
-        assert _sdk.cbor_decode is decode
-        assert _sdk.cbor_tag_decoder is surrealdb.data.cbor.tag_decoder
-        assert "tag_decoder" in decode.__code__.co_names
-        assert decode.__globals__["tag_decoder"] is _sdk.cbor_tag_decoder
+        assert set(decoding._DECODING_METHODS) >= set(_DECODE_SITES[cls])
+        assert {(name, static) for name, _, static in decoding._hooked_methods(cls)} == set(_DECODE_SITES[cls].items())
 
     def test_the_connection_modules_bind_the_sdk_decode(self) -> None:
+        # The HTTP client decodes through ``UtilsMixin`` only: its module has no ``decode`` of its own.
+        assert not hasattr(surrealdb.connections.async_http, "decode")
         for module in (
             surrealdb.connections.async_ws,
-            surrealdb.connections.async_http,
             surrealdb.connections.async_embedded,
+            surrealdb.connections.utils_mixin,
         ):
             assert module.decode is surrealdb.data.cbor.decode, module.__name__
 
     def test_the_protocol_tags_match_the_sdks(self) -> None:
+        constants = surrealdb.data.types.constants
         sdk_tags = {
-            surrealdb.TAG_GEOMETRY_POINT: "Point",
-            surrealdb.TAG_GEOMETRY_LINE: "LineString",
-            surrealdb.TAG_GEOMETRY_POLYGON: "Polygon",
-            surrealdb.TAG_GEOMETRY_MULTI_POINT: "MultiPoint",
-            surrealdb.TAG_GEOMETRY_MULTI_LINE: "MultiLineString",
-            surrealdb.TAG_GEOMETRY_MULTI_POLYGON: "MultiPolygon",
-            surrealdb.TAG_GEOMETRY_COLLECTION: "GeometryCollection",
+            constants.TAG_GEOMETRY_POINT: "Point",
+            constants.TAG_GEOMETRY_LINE: "LineString",
+            constants.TAG_GEOMETRY_POLYGON: "Polygon",
+            constants.TAG_GEOMETRY_MULTI_POINT: "MultiPoint",
+            constants.TAG_GEOMETRY_MULTI_LINE: "MultiLineString",
+            constants.TAG_GEOMETRY_MULTI_POLYGON: "MultiPolygon",
+            constants.TAG_GEOMETRY_COLLECTION: "GeometryCollection",
         }
         assert sdk_tags == decoding._GEOMETRY_TYPES
-        assert decoding.TAG_SET == 56
-        assert decoding.TAG_SET not in vars(surrealdb.data.types.constants).values()  # SDK 2.0.0 has none
-        assert _sdk.TAG_DATETIME_COMPACT == surrealdb.TAG_DATETIME_COMPACT == 12
+        assert list(sdk_tags) == list(range(88, 95))
+        assert _sdk.TAG_DATETIME_COMPACT == constants.TAG_DATETIME_COMPACT == 12
+
+
+def _module_snapshot() -> list[dict[str, Any]]:
+    return [dict(vars(module)) for module in _SDK_MODULES]
 
 
 class TestInstall:
@@ -536,24 +627,42 @@ class TestInstall:
 
     @pytest.mark.parametrize("url", ["ws://localhost:1/rpc", "http://localhost:1", "mem://"])
     def test_installs_the_sdks_own_code_on_the_instance(self, url: str) -> None:
+        before = _module_snapshot()
         client = AsyncSurreal(url)
         assert decoding.install(client)
         cls = type(client)
         expected = _DECODE_SITES[cls]
-        assert expected <= set(vars(client))
-        hooked = decoding._hooked_decode()
-        for name in expected:
-            bound = vars(client)[name]
-            assert isinstance(bound, types.MethodType) and bound.__self__ is client
-            original = getattr(cls, name)
-            assert bound.__func__.__code__ is original.__code__, "not the SDK's own code"
-            assert bound.__func__.__globals__["decode"] is hooked
+        assert set(expected) <= set(vars(client))
+        for name, static in expected.items():
+            installed = vars(client)[name]
+            original = inspect.getattr_static(cls, name)
+            original = original.__func__ if static else original
+            if static:
+                assert isinstance(installed, types.FunctionType)
+                function = installed
+            else:
+                assert isinstance(installed, types.MethodType) and installed.__self__ is client
+                function = installed.__func__
+            assert function.__code__ is original.__code__, "not the SDK's own code"
+            assert function.__globals__["decode"] is decoding.decode
             # The SDK's class and module still decode with the SDK's ``decode``.
             assert original.__globals__["decode"] is surrealdb.data.cbor.decode
-        assert inspect.getmodule(cls).decode is surrealdb.data.cbor.decode  # type: ignore[union-attr]
-        assert surrealdb.data.cbor.tag_decoder is _sdk.cbor_tag_decoder
+        # No SDK module attribute changed.
+        after = _module_snapshot()
+        for module, old, new in zip(_SDK_MODULES, before, after, strict=True):
+            assert old.keys() == new.keys(), module.__name__
+            assert all(old[key] is new[key] for key in old), module.__name__
+        assert surrealdb.data.cbor.decode is _sdk.cbor_decode
         # Another client built by the application keeps the SDK's behaviour.
-        assert not expected & set(vars(AsyncSurreal(url)))
+        assert not set(expected) & set(vars(AsyncSurreal(url)))
+
+    def test_a_static_method_installed_is_called_without_the_client(self) -> None:
+        client = AsyncSurreal("http://localhost:1")
+        assert decoding.install(client)
+        body = _sdk.cbor_encode({"result": _line((1, 2))})
+        assert client.decode_response(body, "testing") == {"result": {"type": "LineString", "coordinates": [[1.0, 2.0]]}}
+        with pytest.raises(UnexpectedResponseError):
+            AsyncSurreal("http://localhost:1").decode_response(body, "testing")
 
     def test_not_installed_when_the_sdk_decodes_every_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for name in _PROBES:
@@ -561,19 +670,31 @@ class TestInstall:
         client = AsyncSurreal("http://localhost:1")
         assert not decoding.active()
         assert not decoding.install(client)
-        assert "_send" not in vars(client)
+        assert "decode_response" not in vars(client)
 
     @pytest.mark.usefixtures("fresh_caches")
-    def test_not_installed_when_the_sdk_layout_is_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(_sdk, "cbor_tag_decoder", None)
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("SdkDecoder", None),
+            ("SDK_TAG_READERS", None),
+            ("SDK_TAG_READERS", {}),
+            ("cbor_decode", None),
+            ("SdkAsyncHttpConnection", None),
+        ],
+    )
+    def test_not_installed_when_the_sdk_layout_is_unknown(self, name: str, value: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_sdk, name, value)
         client = AsyncSurreal("http://localhost:1")
-        assert decoding.needed() and not decoding.available()
+        assert not decoding.available()
         assert not decoding.install(client)
-        assert "_send" not in vars(client)
-        # Nothing reads a zero duration back then: the write refusal is back.
-        assert not encoding.reads_zero_duration()
-        with pytest.raises(ValueError, match="zero duration"):
-            encoding.encode(timedelta(0))
+        assert "decode_response" not in vars(client)
+
+    @pytest.mark.usefixtures("fresh_caches")
+    def test_installed_without_the_embedded_extra(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_sdk, "SdkAsyncEmbeddedConnection", None)
+        assert decoding.available()
+        assert decoding.install(AsyncSurreal("http://localhost:1"))
 
     @pytest.mark.usefixtures("fresh_caches")
     def test_not_installed_on_a_client_of_another_kind(self) -> None:
@@ -586,7 +707,7 @@ class TestInstall:
         assert "_send" not in vars(fake)
 
 
-#: Each value SDK 2.0.0 cannot decode, as raw SurrealQL, and whether it exists on SurrealDB 2.x.
+#: Each value the SDK refuses or reads, as raw SurrealQL, and whether it exists on SurrealDB 2.x.
 _VALUES: dict[str, tuple[str, bool]] = {
     "zero-0s": ("0s", True),
     "zero-0ns": ("0ns", True),
@@ -610,27 +731,30 @@ _UNTYPED: dict[str, Callable[[Any], bool]] = {
     "datetime-year-10000": lambda v: type(v) is str and v == "+10000-01-01T00:00:00Z",
 }
 
+#: The values the SDK refuses: the hook reads them.
+_REFUSED = ("line-1-point", "multiline-with-a-1-point-line", "polygon-3-point-ring", "datetime-year-0", "datetime-year-10000")
+
 
 class TestEmbeddedClient:
     """The embedded engine (``mem://``, no server): the hook covers the client's ``_send``."""
 
     @pytest.mark.asyncio
-    async def test_embedded_client_reads_each_value(self) -> None:
+    async def test_embedded_client_reads_each_value_as_in_040(self) -> None:
         client = AsyncSurreal("mem://")
         await client.connect()
         try:
             await client.use("ns", "db")
-            # Without the hook, the embedded client fails like the others.
-            with pytest.raises(IndexError):
-                await client.query("RETURN 0ns;", {})
+            # Without the hook, the embedded client refuses the value like the others.
+            with pytest.raises(UnexpectedResponseError):
+                await client.query(f"RETURN {_VALUES['line-1-point'][0]};", {})
             assert decoding.install(client)
             for case, (literal, _) in _VALUES.items():
-                out = await client.query(f"RETURN {literal};", {})
-                if case == "native-set":  # the embedded engine stores ``<set>[…]`` as an array, like 2.x
+                out = await _client.query(client, f"RETURN {literal};", {})
+                if case == "native-set" and type(out) is list:  # an engine that stores ``<set>[…]`` as an array
                     assert sorted(out) == [1, 2], out
                     continue
                 assert _UNTYPED[case](out), (case, out)
-            assert await client.query("RETURN 1;", {}) == 1
+            assert await _client.query(client, "RETURN 1;", {}) == 1
         finally:
             await client.close()
 
@@ -743,7 +867,7 @@ _READS: dict[str, Callable[[type[BaseSurrealModel]], Awaitable[Any]]] = {
 async def _native_sets() -> bool:
     """Whether the server stores ``<set>[…]`` as a native set (3.x) rather than an array (2.x)."""
     client = await SurrealDBConnectionManager.get_client()
-    text = await client.query("RETURN <string> <set>[1, 2];", {})  # 3.x: "{1, 2}"; 2.x: "[1, 2]"
+    text = await _client.query(client, "RETURN <string> <set>[1, 2];", {})  # 3.x: "{1, 2}"; 2.x: "[1, 2]"
     return isinstance(text, str) and text.startswith("{")
 
 
@@ -757,13 +881,13 @@ async def _orm(transport: str) -> AsyncIterator[Any]:
     url = _ws_url() if transport == "ws" else _http_url()
     SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database="db")
     client = await SurrealDBConnectionManager.get_client()
-    await client.query("REMOVE TABLE IF EXISTS dc_value;", {})
+    await _client.query(client, "REMOVE TABLE IF EXISTS dc_value;", {})
     try:
         yield client
     finally:
         with contextlib.suppress(Exception):
             cleanup = await SurrealDBConnectionManager.get_client()
-            await asyncio.wait_for(cleanup.query("REMOVE TABLE IF EXISTS dc_value;", {}), 10)
+            await asyncio.wait_for(_client.query(cleanup, "REMOVE TABLE IF EXISTS dc_value;", {}), 10)
         await SurrealDBConnectionManager.close_connection()
 
 
@@ -771,7 +895,7 @@ async def _write(client: Any, case: str) -> None:
     literal, on_2x = _VALUES[case]
     if not on_2x and not await _native_sets():
         pytest.skip("SurrealDB 2.x stores <set>[…] as an array: no native set to read")
-    await client.query(f"CREATE dc_value:one SET name = 'x', v = {literal} RETURN NONE;", {})
+    await _client.query(client, f"CREATE dc_value:one SET name = 'x', v = {literal} RETURN NONE;", {})
 
 
 async def _assert_client_keeps_working(client: Any) -> None:
@@ -779,7 +903,7 @@ async def _assert_client_keeps_working(client: Any) -> None:
     assert (await SurrealDBConnectionManager.get_client()) is client
     task = getattr(client, "recv_task", None)
     assert task is None or not task.done(), "the client stopped working after the read"
-    assert await client.query("RETURN 1;", {}) == 1
+    assert await _client.query(client, "RETURN 1;", {}) == 1
 
 
 class TestUndecodableReadsE2E:
@@ -803,7 +927,7 @@ class TestUndecodableReadsE2E:
         async with _orm("ws") as client:
             if not await _native_sets():
                 pytest.skip("SurrealDB 2.x stores <set>[…] as an array: no native set to read")
-            await client.query("CREATE dc_value:one SET name = 'x', v = <set>[1, true] RETURN NONE;", {})
+            await _client.query(client, "CREATE dc_value:one SET name = 'x', v = <set>[1, true] RETURN NONE;", {})
             row = await _READS[read](DcAny)
             assert isinstance(row, DcAny), row
             assert type(row.v) is list and sorted(row.v, key=repr) == [1, True], row.v
@@ -848,7 +972,7 @@ class TestUndecodableReadsE2E:
             async with SurrealDBConnectionManager.ephemeral_client() as anonymous:
                 await anonymous.signin({"username": "root", "password": "root"})
                 await anonymous.use("ns", "db")
-                assert _UNTYPED["zero-0ns"](await anonymous.query("SELECT VALUE v FROM ONLY dc_value:one;", {}))
+                assert _UNTYPED["zero-0ns"](await _client.query(anonymous, "SELECT VALUE v FROM ONLY dc_value:one;", {}))
                 assert not anonymous.recv_task.done()
 
 
@@ -871,10 +995,12 @@ class TestOutOfRangeDatetimeTextE2E:
     async def test_the_text_is_the_servers(self) -> None:
         async with _orm("ws") as client:
             for literal in _OUT_OF_RANGE_DATETIMES:
-                value, text = await client.query(f"RETURN [{literal}, <string> ({literal})];", {})
+                value, text = await _client.query(client, f"RETURN [{literal}, <string> ({literal})];", {})
                 assert type(value) is str and value == text, (literal, value, text)
             # In range, the SDK's datetime as before: the first and the last second Python holds.
-            first, last = await client.query("RETURN [d'0001-01-01T00:00:00Z', d'9999-12-31T23:59:59.999999999Z'];", {})
+            first, last = await _client.query(
+                client, "RETURN [d'0001-01-01T00:00:00Z', d'9999-12-31T23:59:59.999999999Z'];", {}
+            )
             assert first == datetime(1, 1, 1, tzinfo=UTC)
             assert last == datetime(9999, 12, 31, 23, 59, 59, 999_999, tzinfo=UTC)
             await _assert_client_keeps_working(client)
@@ -887,7 +1013,7 @@ async def _stored_is(client: Any, kind: str) -> bool:
     """
     version = str(await client.version()).removeprefix("surrealdb-")
     function = f"type::is::{kind}" if version.startswith("2.") else f"type::is_{kind}"
-    return await client.query(f"RETURN {function}((SELECT VALUE v FROM ONLY dc_value:one));", {}) is True
+    return await _client.query(client, f"RETURN {function}((SELECT VALUE v FROM ONLY dc_value:one));", {}) is True
 
 
 #: The values written back below, and the type the ORM's write stores them as.
@@ -942,9 +1068,9 @@ class TestUndecodableLiveE2E:
             literal, on_2x = _VALUES[case]
             if not on_2x and not await _native_sets():
                 pytest.skip("SurrealDB 2.x stores <set>[…] as an array: no native set to read")
-            await client.query("DEFINE TABLE dc_value SCHEMALESS;", {})
+            await _client.query(client, "DEFINE TABLE dc_value SCHEMALESS;", {})
             async with DcAny.objects().live() as stream:
-                await client.query(f"CREATE dc_value:one SET name = 'x', v = {literal} RETURN NONE;", {})
+                await _client.query(client, f"CREATE dc_value:one SET name = 'x', v = {literal} RETURN NONE;", {})
                 [event] = await _take(stream, 1)
             assert event.validation_error is None, event.validation_error
             assert _UNTYPED[case](event.instance.v), event.instance.v
@@ -956,30 +1082,53 @@ class TestScopeE2E:
 
     @pytest.mark.asyncio
     async def test_a_client_the_application_builds_keeps_the_sdks_behaviour(self) -> None:
+        """One request on a client built with ``AsyncSurreal``: the SDK refuses the value there."""
         async with _orm("ws") as client:
-            await _write(client, "zero-0ns")
-            assert _UNTYPED["zero-0ns"](await client.query("SELECT VALUE v FROM ONLY dc_value:one;", {}))
+            await _write(client, "line-1-point")
+            assert _UNTYPED["line-1-point"](await _client.query(client, "SELECT VALUE v FROM ONLY dc_value:one;", {}))
             own = AsyncSurreal(_http_url())
             await own.signin({"username": "root", "password": "root"})
             await own.use("ns", "db")
-            with pytest.raises(IndexError):
+            with pytest.raises(UnexpectedResponseError):
                 await own.query("SELECT VALUE v FROM ONLY dc_value:one;", {})
+            assert not set(decoding._DECODING_METHODS) & set(vars(own))
 
     @pytest.mark.asyncio
-    async def test_not_installed_the_orm_client_keeps_the_sdks_behaviour(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("transport", ["ws", "http"])
+    async def test_not_installed_an_undecodable_value_raises_surreal_db_connection_error(
+        self, transport: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(decoding, "needed", lambda: False)
-        async with _orm("http") as client:
-            assert "_send" not in vars(client)
-            await _write(client, "zero-0ns")
-            with pytest.raises(IndexError):
-                await client.query("SELECT VALUE v FROM ONLY dc_value:one;", {})
+        async with _orm(transport) as client:
+            assert not set(decoding._DECODING_METHODS) & set(vars(client))
+            await _write(client, "line-1-point")
+            with pytest.raises(SurrealDbConnectionError) as info:
+                await _client.query(client, "SELECT VALUE v FROM ONLY dc_value:one;", {})
+            assert isinstance(info.value.__cause__, UnexpectedResponseError)
 
     @pytest.mark.asyncio
     async def test_ws_concurrent_reads_all_return_the_value(self) -> None:
-        """Several concurrent reads on one WebSocket client each return the value."""
+        """Several concurrent reads on one WebSocket client each return the value as in 0.40.x."""
         async with _orm("ws") as client:
-            await _write(client, "zero-0ns")
-            reads = [client.query("SELECT VALUE v FROM ONLY dc_value:one;", {}) for _ in range(5)]
+            await _write(client, "line-1-point")
+            reads = [_client.query(client, "SELECT VALUE v FROM ONLY dc_value:one;", {}) for _ in range(5)]
             results = await asyncio.wait_for(asyncio.gather(*reads), 10)
-            assert all(_UNTYPED["zero-0ns"](value) for value in results), results
+            assert all(_UNTYPED["line-1-point"](value) for value in results), results
             await _assert_client_keeps_working(client)
+
+
+class TestZeroDurationE2E:
+    """A zero duration binds, inlines and reads back on every line: the SDK reads it, nothing refuses it."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("transport", ["ws", "http"])
+    async def test_a_zero_duration_binds_and_reads_back(self, transport: str) -> None:
+        async with _orm(transport) as client:
+            for zero in (timedelta(0), Duration(0), surrealdb.Duration(0)):
+                assert encoding.encode(zero) == surrealdb.Duration(0)
+                assert _sdk.cbor_encode(encoding.encode(zero)) == _sdk.cbor_encode(CBORTag(14, [0, 0]))
+                assert to_surql_literal(zero) == "0ns"
+                out = await _client.query(client, "RETURN [$d, $d == 0ns, 0ns];", {"d": encoding.encode(zero)})
+                assert out[1] is True, out
+                for value in (out[0], out[2]):
+                    assert type(value) is surrealdb.Duration and value.elapsed == 0, out

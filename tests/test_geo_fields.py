@@ -54,6 +54,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     Var,
+    _client,
     computed,
     constants,
     geo,
@@ -70,8 +71,9 @@ from tests._readme_tables import (
     readme,
 )
 from tests._readme_tables import doc_part as _doc_part
+from tests._readme_tables import table_rows as _shared_table_rows
 from tests._retry import retry_write
-from tests.conftest import change_feed_database, orm_client
+from tests.conftest import change_feed_database, line_major, orm_client
 from tests.test_geo_types import (
     AB_METRES,
     HOLE,
@@ -260,7 +262,7 @@ def _assert_geo(place: Any, *, nested: bool = True, **changes: Any) -> None:
 async def _raw(rid: RecordID) -> dict[str, Any]:
     """The stored row as the SDK reads it, bypassing the model."""
     client = await SurrealDBConnectionManager.get_client()
-    row = await client.query("SELECT * FROM ONLY $rid;", {"rid": rid})
+    row = await _client.query(client, "SELECT * FROM ONLY $rid;", {"rid": rid})
     assert isinstance(row, dict), row
     return row
 
@@ -300,11 +302,11 @@ async def _seed_mixed(client: Any) -> None:
     for n, key in enumerate(MIXED_KEYS, start=1):
         rid = RecordID("geo_mixed", key)
         if key == "none":
-            await client.query("CREATE $rid SET n = $n;", {"rid": rid, "n": n})
+            await _client.query(client, "CREATE $rid SET n = $n;", {"rid": rid, "n": n})
         elif key == "nullish":
-            await client.query("CREATE $rid SET n = $n, location = NULL;", {"rid": rid, "n": n})
+            await _client.query(client, "CREATE $rid SET n = $n, location = NULL;", {"rid": rid, "n": n})
         else:
-            await client.query("CREATE $rid SET n = $n, location = $v;", {"rid": rid, "n": n, "v": values[key]})
+            await _client.query(client, "CREATE $rid SET n = $n, location = $v;", {"rid": rid, "n": n, "v": values[key]})
 
 
 def _record_key(row: Any) -> str:
@@ -526,7 +528,7 @@ class TestGeoRoundTripE2E:
             await place.save()
             _assert_geo(await GeoPlace.objects().get("p1"))
             _assert_native(await _raw(rid))
-            assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
+            assert await _client.query(client, "SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
             [found] = await GeoPlace.objects().filter(n=1).exec()
             _assert_geo(found)
             _assert_geo(await GeoPlace.objects().first())
@@ -617,7 +619,7 @@ class TestGeoRoundTripE2E:
 
     async def test_buffered_transaction(self) -> None:
         root = await _http_client()
-        await root.query("REMOVE TABLE IF EXISTS geo_place;", {})
+        await _client.query(root, "REMOVE TABLE IF EXISTS geo_place;", {})
         _connect_http()
         try:
             async with SurrealDBConnectionManager.transaction() as tx:
@@ -625,7 +627,7 @@ class TestGeoRoundTripE2E:
                 await _place("bt").save(tx=tx)
             _assert_geo(await GeoPlace.objects().get("bt"))
         finally:
-            await root.query("REMOVE TABLE IF EXISTS geo_place;", {})
+            await _client.query(root, "REMOVE TABLE IF EXISTS geo_place;", {})
             await SurrealDBConnectionManager.unset_connection()
 
     async def test_interactive_transaction(self) -> None:
@@ -645,8 +647,8 @@ class TestGeoRoundTripE2E:
         square = GeometryPolygon.parse_coordinates([RING])
         async with orm_client("geo_zone") as client:
             for ddl in GeoZone.computed_field_ddl():
-                await client.query(ddl, {})
-            centroid = await client.query("RETURN geo::centroid($p);", {"p": SdkPolygon.parse_coordinates([RING])})
+                await _client.query(client, ddl, {})
+            centroid = await _client.query(client, "RETURN geo::centroid($p);", {"p": SdkPolygon.parse_coordinates([RING])})
             zone = GeoZone(id="z", area=square)
             await zone.save()
             assert type(zone.centroid) is GeometryPoint and zone.centroid == centroid
@@ -692,7 +694,7 @@ class TestGeoStreamsE2E:
 
     async def test_live_stream(self) -> None:
         async with orm_client("geo_place") as client:
-            await client.query("DEFINE TABLE geo_place SCHEMALESS;", {})
+            await _client.query(client, "DEFINE TABLE geo_place SCHEMALESS;", {})
             async with GeoPlace.objects().live() as stream:
                 await _place("l").save()
                 [event] = await _take(stream, 1)
@@ -703,7 +705,7 @@ class TestGeoStreamsE2E:
     async def test_change_feed(self) -> None:
         here = GeometryPoint(*A)
         async with change_feed_database(GEO_CF_DATABASE) as client:
-            await client.query("DEFINE TABLE geo_cf SCHEMALESS CHANGEFEED 1h;", {})
+            await _client.query(client, "DEFINE TABLE geo_cf SCHEMALESS CHANGEFEED 1h;", {})
             stream = await GeoFeed.objects().changes(poll_interval=0.05).start()
             try:
                 await retry_write(lambda: GeoFeed(id="a", location=here).save())
@@ -721,12 +723,12 @@ class TestLegacyGeoJsonE2E:
         geojson = {"type": "Point", "coordinates": list(A)}
         rid = RecordID("geo_legacy", "x")
         async with orm_client("geo_legacy") as client:
-            await client.query("CREATE $rid SET location = $map;", {"rid": rid, "map": geojson})
-            assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is False
+            await _client.query(client, "CREATE $rid SET location = $map;", {"rid": rid, "map": geojson})
+            assert await _client.query(client, "SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is False
             loaded = await GeoLegacy.objects().get("x")
             assert type(loaded.location) is GeometryPoint and loaded.location == GeometryPoint(*A)
             await loaded.update()
-            assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
+            assert await _client.query(client, "SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
             again = await GeoLegacy.objects().get("x")
             assert type(again.location) is GeometryPoint and again.location == GeometryPoint(*A)
 
@@ -736,7 +738,7 @@ class TestLegacyGeoJsonE2E:
         geojson = {"type": "Point", "coordinates": list(A)}
         rid = RecordID("geo_legacy", "s")
         async with orm_client("geo_legacy") as client:
-            await client.query("CREATE $rid SET location = $map, blob = {};", {"rid": rid, "map": geojson})
+            await _client.query(client, "CREATE $rid SET location = $map, blob = {};", {"rid": rid, "map": geojson})
             legacy = GeoLegacy(id="s")
             if call == "refresh":
                 await legacy.refresh()
@@ -748,7 +750,7 @@ class TestLegacyGeoJsonE2E:
             with warnings.catch_warnings():
                 warnings.simplefilter("error")  # the geometry serializer gets a geometry, not a dict
                 await legacy.update()
-            assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
+            assert await _client.query(client, "SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
             again = await GeoLegacy.objects().get("s")
             assert type(again.location) is GeometryPoint and again.location == GeometryPoint(*A)
 
@@ -757,9 +759,9 @@ class TestLegacyGeoJsonE2E:
         rid = RecordID("geo_legacy", "d")
         async with orm_client("geo_legacy") as client:
             await GeoLegacy(id="d", blob=geojson).save()
-            stored = await client.query("SELECT VALUE blob FROM ONLY $rid;", {"rid": rid})
+            stored = await _client.query(client, "SELECT VALUE blob FROM ONLY $rid;", {"rid": rid})
             assert type(stored) is dict and stored == geojson
-            assert await client.query("SELECT VALUE blob.is_geometry() FROM ONLY $rid;", {"rid": rid}) is False
+            assert await _client.query(client, "SELECT VALUE blob.is_geometry() FROM ONLY $rid;", {"rid": rid}) is False
             loaded = await GeoLegacy.objects().get("d")
             assert type(loaded.blob) is dict and loaded.blob == geojson
 
@@ -1038,7 +1040,7 @@ class TestNearbyLiveE2E:
     async def test_only_the_near_point_notifies(self) -> None:
         entrance = GeometryPoint(*A)
         async with orm_client("geo_place") as client:
-            await client.query("DEFINE TABLE geo_place SCHEMALESS;", {})
+            await _client.query(client, "DEFINE TABLE geo_place SCHEMALESS;", {})
             async with GeoPlace.objects().nearby("location", B, 5000).live() as stream:
                 await GeoPlace(id="far", entrance=entrance, location=GeometryPoint(*PARIS)).save()
                 await GeoPlace(id="near1", entrance=entrance, location=GeometryPoint(*A)).save()
@@ -1324,7 +1326,7 @@ class TestGeoDistanceE2E:
 
     async def test_extra_allow_keeps_the_distance_off_the_record(self) -> None:
         async with orm_client("geo_loose") as client:
-            await client.query("CREATE geo_loose:p SET location = $v, note = 'kept';", {"v": SdkPoint(*A)})
+            await _client.query(client, "CREATE geo_loose:p SET location = $v, note = 'kept';", {"v": SdkPoint(*A)})
             [loose] = await GeoLoose.objects().annotate(dist=GeoDistance("location", B)).exec()
             assert isinstance(loose, GeoLoose) and loose.dist == pytest.approx(AB_METRES, abs=1e-6)
             assert loose.model_extra == {"note": "kept"}
@@ -1367,6 +1369,16 @@ CROSSING = [(-73.993, 40.70), (-73.993, 40.76)]
 #: The sets the spatial operators give on the mixed seed, measured on 2.7.0, 3.1.5 and 3.3.4 (spec §3.4).
 INSIDE_KEYS = {"near1", "near2", "poly"}
 OUTSIDE_KEYS = {"far", "none", "nullish", "obj", "text"}
+
+
+async def _spatial_keys(client: Any) -> tuple[set[str], set[str]]:
+    """``(INSIDE_KEYS, OUTSIDE_KEYS)`` on the line *client* talks to: SurrealDB 4.x reads ``obj``'s GeoJSON object at A
+    as the point it describes, so it lies inside the zone (measured on 4.0.0); 2.x and 3.x keep it a plain object."""
+    if await line_major(client) >= 4:
+        return INSIDE_KEYS | {"obj"}, OUTSIDE_KEYS - {"obj"}
+    return INSIDE_KEYS, OUTSIDE_KEYS
+
+
 #: ``LOOKUP_OPERATORS``: the infix operators only. The spatial lookups live in a mapping of their own (v0.24.0), and
 #: so do the text lookups, which compile to string functions (#251, ``TEXT_LOOKUP_FUNCTIONS``).
 INFIX_LOOKUP_OPERATORS = {
@@ -1535,21 +1547,24 @@ class TestSpatialLookupE2E:
     async def test_inside(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, _ = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(location__inside=zone).exec()) == INSIDE_KEYS
-            assert await GeoMixed.objects().filter(location__inside=ZONE).count() == len(INSIDE_KEYS)
+                assert _ids(await GeoMixed.objects().filter(location__inside=zone).exec()) == inside
+            assert await GeoMixed.objects().filter(location__inside=ZONE).count() == len(inside)
 
     async def test_outside_includes_the_rows_without_a_geometry(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            _, outside = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(location__outside=zone).exec()) == OUTSIDE_KEYS
+                assert _ids(await GeoMixed.objects().filter(location__outside=zone).exec()) == outside
 
     async def test_intersects(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, _ = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(location__intersects=zone).exec()) == INSIDE_KEYS
+                assert _ids(await GeoMixed.objects().filter(location__intersects=zone).exec()) == inside
             for line in _forms(GeometryLine.parse_coordinates(CROSSING)):
                 assert _ids(await GeoMixed.objects().filter(location__intersects=line).exec()) == {"poly"}
 
@@ -1562,24 +1577,27 @@ class TestSpatialLookupE2E:
     async def test_q_objects(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, outside = await _spatial_keys(client)
             for zone in _forms(ZONE):
-                assert _ids(await GeoMixed.objects().filter(~Q(location__inside=zone)).exec()) == OUTSIDE_KEYS
+                assert _ids(await GeoMixed.objects().filter(~Q(location__inside=zone)).exec()) == outside
             either = Q(location__inside=ZONE) | Q(n=MIXED_KEYS.index("far") + 1)
-            assert _ids(await GeoMixed.objects().filter(either).exec()) == INSIDE_KEYS | {"far"}
+            assert _ids(await GeoMixed.objects().filter(either).exec()) == inside | {"far"}
             assert _ids(await GeoMixed.objects().filter(Q(location__inside=ZONE), n=1).exec()) == {"near1"}
 
     async def test_a_variable_reference(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
+            inside, _ = await _spatial_keys(client)
             qs = GeoMixed.objects().filter(location__inside=Var("zone")).variables(zone=ZONE)
-            assert _ids(await qs.exec()) == INSIDE_KEYS
+            assert _ids(await qs.exec()) == inside
 
     async def test_combined_with_nearby_and_bulk_update(self) -> None:
         async with orm_client("geo_mixed") as client:
             await _seed_mixed(client)
             assert _ids(await GeoMixed.objects().filter(location__inside=ZONE).nearby("location", B, 1000).exec()) == {"near2"}
-            assert await GeoMixed.objects().filter(location__intersects=ZONE).bulk_update(n=77) == len(INSIDE_KEYS)
-            assert _ids(await GeoMixed.objects().filter(n=77).exec()) == INSIDE_KEYS
+            inside, _ = await _spatial_keys(client)
+            assert await GeoMixed.objects().filter(location__intersects=ZONE).bulk_update(n=77) == len(inside)
+            assert _ids(await GeoMixed.objects().filter(n=77).exec()) == inside
 
     async def test_typed_model(self) -> None:
         async with orm_client("geo_place", "geo_zone"):
@@ -1605,7 +1623,7 @@ class TestSpatialLookupLiveE2E:
     async def test_only_the_inside_point_notifies(self) -> None:
         entrance = GeometryPoint(*A)
         async with orm_client("geo_place") as client:
-            await client.query("DEFINE TABLE geo_place SCHEMALESS;", {})
+            await _client.query(client, "DEFINE TABLE geo_place SCHEMALESS;", {})
             async with GeoPlace.objects().filter(location__inside=ZONE).live() as stream:
                 await GeoPlace(id="far", entrance=entrance, location=GeometryPoint(*PARIS)).save()
                 await GeoPlace(id="near1", entrance=entrance, location=GeometryPoint(*A)).save()
@@ -1660,16 +1678,14 @@ def _normalised(text: str) -> str:
 
 
 def _table_rows(text: str) -> list[tuple[str, list[str]]]:
-    """The body rows of the first table in ``text``: each raw line and its cells."""
-    tables = re.findall(r"(?:^\|.*\n)+", text, re.MULTILINE)
-    assert tables, "no table"
-    lines = [line.strip() for line in tables[0].splitlines()]
-    return [(line, [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip("|"))]) for line in lines[2:]]
+    """The body rows of the first table in ``text``: each raw line and its cells (the 2.x/3.x/4.x table's without its
+    4.x cell, as :func:`tests._readme_tables.table_rows` reads them)."""
+    return [(line.strip(), cells) for line, cells in _shared_table_rows(text)]
 
 
 def _v0_24_0_rows() -> list[tuple[str, list[str]]]:
     """The behaviour-table rows v0.24.0 adds: the two ``v0.24.0`` rows and the retroactive untyped-field row."""
-    rows = _table_rows(_doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"))
+    rows = _table_rows(_doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"))
     return [(line, cells) for line, cells in rows if cells[-1] in _V0_24_0_SINCE]
 
 
@@ -1717,7 +1733,9 @@ class TestReadmeGeoExamplesE2E:
                 loaded = await restaurant.objects().get(key)
                 assert type(loaded.location) is GeometryPoint, key
                 rid = loaded._record_id()
-                assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True, key
+                assert await _client.query(client, "SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True, (
+                    key
+                )
             deli = await restaurant.objects().get("deli")
             assert deli.location == GeometryPoint(-73.9969, 40.729)
             assert deli.model_dump()["location"] is deli.location
@@ -1730,7 +1748,7 @@ class TestReadmeGeoExamplesE2E:
             for found in closest:
                 # The raw client sends SDK values only: the ORM's are converted by the ORM's own calls.
                 points = {"a": SdkPoint(*times_square.get_coordinates()), "b": SdkPoint(*found.location.get_coordinates())}
-                metres = await client.query("RETURN geo::distance($a, $b);", points)
+                metres = await _client.query(client, "RETURN geo::distance($a, $b);", points)
                 assert type(found.dist) is float and found.dist == pytest.approx(metres, abs=1e-6)
             farthest_first = namespace["farthest_first"]
             assert farthest_first[0].name == "Paris Bistro"
@@ -1761,8 +1779,8 @@ class TestReadmeGeoExamplesE2E:
 
             # The migration loop left every stored location a native point.
             truck = RecordID("geo_readme_restaurant", "truck")
-            points = await client.query(
-                "SELECT VALUE location.is_point() FROM geo_readme_restaurant WHERE id != $truck;", {"truck": truck}
+            points = await _client.query(
+                client, "SELECT VALUE location.is_point() FROM geo_readme_restaurant WHERE id != $truck;", {"truck": truck}
             )
             assert len(points) == 6 and all(points), points
 

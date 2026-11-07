@@ -2,6 +2,11 @@
 
 Graph relations, typed edges and `TYPE RELATION` constraints.
 
+> **The embedded engine since v0.50.0** is a SurrealDB 4.0 core (SDK 3.0), and the ORM treats it as a 4.x
+> server. Where a passage below groups "SurrealDB 2.x and the embedded engine", it describes the SDK 2.0 engine
+> of `0.40.x` (a 2.3.10 core); the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) lists what the
+> engine does now.
+
 ## 7. Relations & Graph
 
 ```python
@@ -436,7 +441,7 @@ Since v0.33.0 an edge model ([section 23](#23-typed-edges-basesurrealedge)) decl
 and whether both ends must exist — SurrealDB's `TYPE RELATION IN … OUT … ENFORCED` — with the full SurrealDB-ORM's
 keys: `relation_in`, `relation_out`, `enforced` and `table_type=TableType.RELATION`. `define_relation()` applies the
 constraint to the table and SurrealDB enforces it on every write, the same on SurrealDB 2.x, 3.x and the embedded
-engine, except where the [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The examples assume a
+engine, except where the [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) says otherwise. The examples assume a
 configured connection: they run as written on the embedded engine (`mem://`).
 
 ```python
@@ -610,7 +615,7 @@ SurrealDB checks the writes made after `define_relation()`, not the records alre
 
 - a nonconforming edge (from or to a table outside `IN`/`OUT`) stays and is still traversed, but its `merge()`,
   `update()`, `patch()`, `atomic_*()` and `objects().bulk_update()` raise the SDK's `InternalError` (the mismatch
-  text);
+  text) on SurrealDB 2.x and 3.x, its `ValidationError` on 4.x and the embedded engine, both `ServerError`s;
 - a dangling edge (an endpoint record that no longer exists) stays and can still be updated: `ENFORCED` is checked
   when an edge is created;
 - plain records stay.
@@ -634,9 +639,9 @@ await Knows.define_relation()
 [old] = await Knows.objects().exec()  # the edge stays
 try:
     await old.merge(since=2020)
-except ServerError as exc:
+except ServerError as exc:  # InternalError on SurrealDB 2.x and 3.x
     print(type(exc).__name__)
-# InternalError
+# ValidationError
 
 outside = await Knows.raw_query(
     "SELECT VALUE id FROM knows WHERE record::tb(in) NOT IN ['person'] OR record::tb(out) NOT IN ['person']"
@@ -705,7 +710,7 @@ print(edge.in_, edge.out)
   `SurrealDbError`, so `except SurrealDbError` handles every refused edge creation the same way on both lines.
 - A raw `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced on 2.x and the embedded engine
   until a `DEFINE TABLE OVERWRITE` of the table; 3.x enforces it at once. The ORM never sends `ALTER TABLE`.
-- The [2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) and the
+- The [2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) and the
   [embedded engine's](compatibility.md#orm-behaviour-the-embedded-engine) list these rows.
 
 ### Security

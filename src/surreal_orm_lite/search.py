@@ -21,8 +21,8 @@ application configuration; ``mapper('path')`` makes the server read one of its o
 The renderers are pure — no connection, the same text for the same input. ``Analyzer.ddl()`` and ``Index.ddl()``
 render the statements a fresh database receives; ``analyzer_definition()`` renders an analyzer as ``INFO FOR DB`` does,
 with no ``OVERWRITE``/``IF NOT EXISTS`` clause and no final ``;``, the form ``parse_define_analyzer()`` reads back.
-``fulltext_keyword()`` gives the index keyword of a SurrealDB line: ``FULLTEXT`` on 3.x, ``SEARCH`` on 2.x and on the
-embedded engine of the SDK's 2.x range. ``index_statement()``, ``remove_index_statement()``,
+``fulltext_keyword()`` gives the index keyword of a SurrealDB line: ``FULLTEXT`` from 3.x on (and on the embedded
+engine, a SurrealDB 4.0 core since v0.50.0), ``SEARCH`` on 2.x. ``index_statement()``, ``remove_index_statement()``,
 ``remove_analyzer_statement()`` and ``rebuild_index_statement()`` render the rest.
 
 A model declares its indexes with ``SurrealConfigDict(indexes=[Index(...)])``: ``check_indexes_config()`` checks the
@@ -91,6 +91,7 @@ from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
 
+from . import _client
 from ._sdk import ServerError
 from .define_parser import DefineParseError, parse_define_analyzer, parse_define_index, unquote
 from .exceptions import SurrealDbError
@@ -1092,7 +1093,7 @@ async def read_database_info(
     :raises SurrealDbError: any other refusal of the ``INFO``.
     """
     try:
-        info = await client.query(_INFO_FOR_DB, {})
+        info = await _client.query(client, _INFO_FOR_DB, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _read_refused(_INFO_FOR_DB, error, what=what, kind=kind, subject=subject) from error
     analyzers = info.get("analyzers") if isinstance(info, dict) else None
@@ -1128,7 +1129,7 @@ async def _table_indexes(client: Any, table: str, *, what: str, kind: str) -> di
     SurrealDB may store in backticks (``fts-t``) —, written in backticks, escaped."""
     statement = f"INFO FOR TABLE {_identifier(table)};"
     try:
-        info = await client.query(statement, {})
+        info = await _client.query(client, statement, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _read_refused(statement, error, what=what, kind=kind, subject=f"table {table!r}") from error
     indexes = info.get("indexes") if isinstance(info, dict) else None
@@ -1509,8 +1510,9 @@ async def apply_analyzer_removal(client: Any, name: str, statement: str, *, tx: 
     """The body of ``SurrealDBConnectionManager.remove_analyzer()``, *statement* rendered (its arguments checked): apply
     it, unless an index uses the analyzer *name* on a line that would remove it; *statement* returned.
 
-    ``client.version()`` once. Below 3 (SurrealDB 2.x, the embedded engine), which accept the removal of an analyzer an
-    index uses and then refuse every write to that table: ``INFO FOR DB``, then ``INFO FOR TABLE`` of every table
+    ``client.version()`` once. Below 3 (SurrealDB 2.x), which accepts the removal of an analyzer an index uses and then
+    refuses every write to that table — not the embedded engine, a SurrealDB 4.0 core since v0.50.0 that refuses the
+    removal itself: ``INFO FOR DB``, then ``INFO FOR TABLE`` of every table
     (:func:`indexes_using`, committed state). An index ``remove_index(tx=…)`` removed earlier in *tx* is left out,
     although committed state still holds it (:func:`indexes_removed_in`, issue #323). On every line, an index
     ``define_indexes(tx=…)`` defined earlier in *tx* counts with the analyzer the block gave it, which committed state

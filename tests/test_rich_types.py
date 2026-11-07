@@ -23,7 +23,7 @@ import surrealdb
 import surrealdb.data.types.range
 from pydantic import BaseModel, PlainSerializer, ValidationError
 from pydantic_core import PydanticSerializationError
-from surrealdb import AsyncSurreal, RecordID
+from surrealdb import AsyncSurreal, PreciseDatetime, RecordID
 from surrealdb import Range as SdkRange
 from surrealdb.cbor import CBORSimpleValue, CBORTag, undefined
 
@@ -35,8 +35,8 @@ from surreal_orm_lite import (
     InvalidDurationError,
     Range,
     SurrealDBConnectionManager,
+    _client,
     _sdk,
-    decoding,
     encoding,
 )
 from surreal_orm_lite._sdk import Bound
@@ -482,7 +482,7 @@ class TestNanoseconds:
 _JAN = datetime(2026, 1, 1, tzinfo=UTC)
 _FEB = datetime(2026, 2, 1, tzinfo=UTC)
 _ASYMMETRY = "the SDK's `Range.__eq__` now defers to the ORM type: update the README and spec §5.3"
-_CBOR_NULL_MARKERS: list[Any] = [None, Bound(), undefined, CBORSimpleValue(22), _sdk.CBOR_NULL]
+_CBOR_NULL_MARKERS: list[Any] = [None, Bound(), undefined, CBORSimpleValue(22), _sdk.Null]
 _MARKER_IDS = ["None", "Bound()", "undefined", "CBORSimpleValue(22)", "CBOR_NULL"]
 
 # (range, its SurrealQL text, the range that text parses back to when the bound types differ).
@@ -607,8 +607,6 @@ class TestRange:
     @pytest.mark.parametrize(
         ("value", "text"),
         [
-            (Range(BoundIncluded(Duration(0)), BoundExcluded(Duration.parse("1h"))), "0ns..1h"),
-            (Range(None, BoundIncluded(surrealdb.Duration(0))), "..=0ns"),
             (
                 Range(BoundIncluded(Decimal("0.12345678901234567890123456789")), None),
                 "0.12345678901234567890123456789dec..",
@@ -622,16 +620,13 @@ class TestRange:
         ],
         ids=repr,
     )
-    def test_text_form_keeps_what_the_live_literal_refuses(
-        self, value: Range[Any], text: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_text_form_keeps_what_the_live_literal_refuses(self, value: Range[Any], text: str) -> None:
         """``str()`` and JSON write every bound they can read back; only live filters need the strict literal.
 
-        A zero duration (refused while nothing reads one back), a ``Decimal`` past 28 fractional
-        digits or 96 bits, a string holding ``\\x00`` and an ``int`` past 64 bits have no live-filter
-        literal, yet the text never reaches the server and reads back exactly.
+        A ``Decimal`` past 28 fractional digits or 96 bits, a string holding ``\\x00`` and an ``int``
+        past 64 bits have no live-filter literal, yet the text never reaches the server and reads back
+        exactly.
         """
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
         with pytest.raises(TypeError):
             to_surql_literal(value)
         assert str(value) == text
@@ -660,17 +655,28 @@ class TestRange:
         value = Range(BoundIncluded(bound), None)
         assert str(value) == repr(value)
 
-    def test_text_form_of_a_zero_timedelta(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            (Range(BoundIncluded(Duration(0)), BoundExcluded(Duration.parse("1h"))), "0ns..1h"),
+            (Range(None, BoundIncluded(surrealdb.Duration(0))), "..=0ns"),
+        ],
+        ids=repr,
+    )
+    def test_a_zero_duration_bound_has_a_live_literal(self, value: Range[Any], text: str) -> None:
+        """v0.50.0: the SDK reads a zero duration back, so a live filter writes it too (``0ns``)."""
+        assert to_surql_literal(value) == str(value) == text
+        assert _parse_range_text(text) == value
+
+    def test_text_form_of_a_zero_timedelta(self) -> None:
         """``Range[timedelta]`` reads ``0ns..1h`` back as timedeltas (a bare ``Range`` as ORM durations)."""
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
 
         class M(BaseModel):
             rt: Range[timedelta] | None = None
 
         m = M(rt=Range(BoundIncluded(timedelta(0)), BoundExcluded(timedelta(hours=1))))
         assert m.rt is not None
-        with pytest.raises(TypeError, match="zero duration"):
-            to_surql_literal(m.rt)
+        assert to_surql_literal(m.rt) == "0ns..1h"
         assert str(m.rt) == "0ns..1h"
         assert json.loads(m.model_dump_json()) == {"rt": "0ns..1h"}
         back = M.model_validate_json(m.model_dump_json()).rt
@@ -1026,7 +1032,7 @@ class TestOpenSides:
     def test_constructor_stores_none(self) -> None:
         assert Range(undefined, BoundExcluded(5)).begin is None  # type: ignore[arg-type]
         assert Range(BoundIncluded(1), CBORSimpleValue(22)).end is None  # type: ignore[arg-type]
-        assert Range(_sdk.CBOR_NULL, None).begin is None  # type: ignore[arg-type]
+        assert Range(_sdk.Null, None).begin is None  # type: ignore[arg-type]
         both = Range(Bound(), Bound())  # type: ignore[arg-type]
         assert both.begin is None
         assert both.end is None
@@ -1061,7 +1067,7 @@ class TestOpenSides:
         assert r is not None
         assert r.end is None
 
-    @pytest.mark.parametrize("marker", [undefined, CBORSimpleValue(22), _sdk.CBOR_NULL, Bound()], ids=repr)
+    @pytest.mark.parametrize("marker", [undefined, CBORSimpleValue(22), _sdk.Null, Bound()], ids=repr)
     def test_dump_of_a_raw_sdk_range_with_an_open_marker(self, marker: Any) -> None:
         class M(BaseModel):
             r: Range[int] | None = None
@@ -1079,7 +1085,7 @@ class TestOpenSides:
 
     def test_literal_of_sdk_ranges_with_open_markers(self) -> None:
         assert to_surql_literal(SdkRange(BoundIncluded(1), undefined)) == "1.."
-        assert to_surql_literal(SdkRange(BoundIncluded(1), _sdk.CBOR_NULL)) == "1.."
+        assert to_surql_literal(SdkRange(BoundIncluded(1), _sdk.Null)) == "1.."
         assert to_surql_literal(SdkRange(CBORSimpleValue(22), BoundExcluded(5))) == "..5"
         assert to_surql_literal(SdkRange(Bound(), BoundExcluded(5))) == "..5"
         assert to_surql_literal(SdkRange(None, None)) == ".."  # type: ignore[arg-type]
@@ -1251,11 +1257,8 @@ class TestRichLiterals:
         assert to_surql_literal(timedelta(days=9)) == "1w2d"
 
     @pytest.mark.parametrize("zero", [timedelta(0), Duration(0), surrealdb.Duration(0)], ids=repr)
-    def test_zero_duration_follows_the_probe(self, zero: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
-        with pytest.raises(TypeError, match="zero duration"):
-            to_surql_literal(zero)
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: True)
+    def test_zero_duration_is_0ns(self, zero: Any) -> None:
+        """v0.50.0: the SDK reads a zero duration back, so nothing refuses its literal."""
         assert to_surql_literal(zero) == "0ns"
 
     @pytest.mark.parametrize(
@@ -1307,7 +1310,7 @@ class TestRichLiterals:
             (Range(), ".."),
             (SdkRange(BoundIncluded(1), BoundExcluded(5)), "1..5"),
             (SdkRange(BoundIncluded(1), undefined), "1.."),
-            (SdkRange(BoundIncluded(1), _sdk.CBOR_NULL), "1.."),
+            (SdkRange(BoundIncluded(1), _sdk.Null), "1.."),
             (SdkRange(CBORSimpleValue(22), BoundExcluded(5)), "..5"),
             (SdkRange(Bound(), BoundExcluded(5)), "..5"),
             (Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))), "1m..1h"),
@@ -1415,13 +1418,14 @@ class TestRichLiterals:
 
 # Every literal of spec §3.3: (value, literal, the parameter the server must find equal). Open range
 # sides go out as the protocol's CBOR null (spec §3.9), never ``undefined``.
-_N = _sdk.CBOR_NULL
+_N = _sdk.Null
 _TAG = _sdk.TAG_DURATION_COMPACT
 _LONG = Duration.parse("1y2w3d4h5m6s7ms8us9ns")
 LIVE_LITERALS: list[tuple[Any, str, Any]] = [
     (Duration.parse("1h30m1ns"), "1h30m1ns", CBORTag(_TAG, [5400, 1])),
     (_LONG, "1y2w3d4h5m6s7ms8us9ns", CBORTag(_TAG, list(divmod(_LONG.elapsed, 10**9)))),
-    (Duration(MAX_NS), "584942417355y3w5d7h15s999ms999us999ns", CBORTag(_TAG, [2**64 - 1, 999_999_999])),
+    # SDK 3.0 refuses an int outside signed 64-bit, inside a tag too: its own ``Duration`` sends u64 seconds.
+    (Duration(MAX_NS), "584942417355y3w5d7h15s999ms999us999ns", surrealdb.Duration(MAX_NS)),
     (timedelta(hours=1, minutes=30, microseconds=1), "1h30m1us", CBORTag(_TAG, [5400, 1000])),
     (surrealdb.Duration(5400 * 10**9 + 1), "1h30m1ns", CBORTag(_TAG, [5400, 1])),
     (date(2026, 1, 2), "d'2026-01-02T00:00:00Z'", datetime(2026, 1, 2, tzinfo=UTC)),
@@ -1464,22 +1468,21 @@ class TestRichLiteralsE2E:
     async def test_literal_equals_the_bound_parameter(self, value: Any, text: str, param: Any) -> None:
         assert to_surql_literal(value) == text
         client = await _http_client()
-        assert await client.query(f"RETURN {text} == $p;", {"p": param}) is True
+        assert await _client.query(client, f"RETURN {text} == $p;", {"p": param}) is True
 
-    async def test_zero_literal_when_the_orm_reads_zero(self) -> None:
-        """The ``0ns`` the read hook allows (#235) means the compact zero (the result is a bool: nothing to decode)."""
-        assert encoding.reads_zero_duration()
+    async def test_zero_literal(self) -> None:
+        """The ``0ns`` literal means the compact zero."""
         text = to_surql_literal(Duration(0))
         client = await _http_client()
-        assert await client.query(f"RETURN {text} == $p;", {"p": CBORTag(_TAG, [0, 0])}) is True
+        assert await _client.query(client, f"RETURN {text} == $p;", {"p": CBORTag(_TAG, [0, 0])}) is True
 
     async def test_range_literal_precedence(self) -> None:
         one_to_five = to_surql_literal(Range(BoundIncluded(1), BoundExcluded(5)))
         up_to_five = to_surql_literal(Range(None, BoundIncluded(5)))
         client = await _http_client()
-        assert await client.query(f"RETURN 3 IN {one_to_five} AND 9 NOT IN {one_to_five};", {}) is True
-        assert await client.query(f"RETURN 5 IN {up_to_five} OR false;", {}) is True
-        assert await client.query(f"RETURN 7 IN {to_surql_literal(Range(BoundIncluded(5)))};", {}) is True
+        assert await _client.query(client, f"RETURN 3 IN {one_to_five} AND 9 NOT IN {one_to_five};", {}) is True
+        assert await _client.query(client, f"RETURN 5 IN {up_to_five} OR false;", {}) is True
+        assert await _client.query(client, f"RETURN 7 IN {to_surql_literal(Range(BoundIncluded(5)))};", {}) is True
 
 
 # --- encode(): what the servers store (spec §6.1; AC-9, AC-10, AC-12) -------------------------------
@@ -1507,7 +1510,8 @@ _WIRE_FORMS: list[tuple[str, Any, Any, str | None]] = [
         Decimal("79228162514264337593543950335"),
         None,
     ),
-    ("date", date(2026, 1, 2), datetime(2026, 1, 2, tzinfo=UTC), None),
+    # v0.50.0 (SDK 3.0): every datetime read from the server is a ``PreciseDatetime``.
+    ("date", date(2026, 1, 2), PreciseDatetime(2026, 1, 2, tzinfo=UTC), None),
     ("set", {"b", "a"}, ["a", "b"], None),
     ("1..5", Range(BoundIncluded(1), BoundExcluded(5)), SdkRange(BoundIncluded(1), BoundExcluded(5)), "1..5"),
     ("..5", Range(None, BoundExcluded(5)), SdkRange(None, BoundExcluded(5)), "..5"),
@@ -1534,16 +1538,19 @@ class TestWireFormsE2E:
         async with orm_client("rf_wire") as ws:
             client = ws if transport == "ws" else await _http_client()
             encoded = encoding.encode(value)
-            assert await client.query("CREATE rf_wire:1 SET v = $v RETURN NONE;", {"v": encoded}) == []
-            read = await client.query("SELECT VALUE v FROM ONLY rf_wire:1;", {})
+            assert await _client.query(client, "CREATE rf_wire:1 SET v = $v RETURN NONE;", {"v": encoded}) == []
+            read = await _client.query(client, "SELECT VALUE v FROM ONLY rf_wire:1;", {})
             assert type(read) is type(expected)
-            assert read == expected
             if isinstance(expected, SdkRange):
+                # v0.50.0: the ORM reads an open side as ``None`` (SDK 3.0 reads ``Null``; ``SdkRange(None, …)``
+                # stores ``Null``): the expected range normalised the same way.
+                expected = _client.normalize(expected)
                 assert (read.begin is None) == (expected.begin is None)
                 assert (read.end is None) == (expected.end is None)
+            assert read == expected
             if text is not None:
-                assert await client.query("RETURN <string> $v;", {"v": encoded}) == text
-            assert await client.query("RETURN 1;", {}) == 1
+                assert await _client.query(client, "RETURN <string> $v;", {"v": encoded}) == text
+            assert await _client.query(client, "RETURN 1;", {}) == 1
 
     @pytest.mark.parametrize("text", _EXPONENT_DECIMALS)
     async def test_decimal_cut_agrees_with_server(self, text: str) -> None:
@@ -1553,62 +1560,51 @@ class TestWireFormsE2E:
         assert isinstance(encoded, CBORTag)
         full = CBORTag(_sdk.TAG_DECIMAL_STRING, format(value, "f"))
         client = await _http_client()
-        ours = await client.query("RETURN <string> $v;", {"v": encoded})
-        theirs = await client.query("RETURN <string> $v;", {"v": full})
+        ours = await _client.query(client, "RETURN <string> $v;", {"v": encoded})
+        theirs = await _client.query(client, "RETURN <string> $v;", {"v": full})
         assert ours == theirs
 
 
-class TestZeroProbeE2E:
-    async def test_probe_matches_server(self) -> None:
-        """``RETURN 0ns`` fails to decode (``IndexError``) exactly when the local probe answers ``False``.
-
-        ``_http_client()`` is a client built with ``AsyncSurreal``, not by the ORM: it never gets the read
-        hook (#235), so it reads what the SDK itself reads.
-        """
+class TestZeroDurationReadE2E:
+    async def test_the_sdk_reads_a_zero_duration(self) -> None:
+        """``RETURN 0ns`` reads as the SDK's zero ``Duration`` on a client built with ``AsyncSurreal``, not by the ORM."""
         client = await _http_client()
-        if decoding.sdk_decodes_zero_duration():
-            result = await client.query("RETURN 0ns;", {})
-            assert isinstance(result, surrealdb.Duration) and result.elapsed == 0
-        else:
-            with pytest.raises(IndexError):
-                await client.query("RETURN 0ns;", {})
+        result = await _client.query(client, "RETURN 0ns;", {})
+        assert isinstance(result, surrealdb.Duration) and result.elapsed == 0
 
 
 class TestNativeSetsE2E:
     """A Python set goes out as a sorted array; what a ``TYPE set<…>`` column does with it depends on the line."""
 
-    def test_sdk_still_cannot_decode_native_sets(self) -> None:
-        assert not _sdk_decodes_native_set(), (
-            "the SDK now decodes native sets (CBOR tag 56): update README behaviour row "
-            "'TYPE set<…> columns' and section 24's array<…> advice"
-        )
+    def test_the_sdk_decodes_native_sets(self) -> None:
+        """v0.50.0 (SDK 3.0): the SDK reads a native set (CBOR tag 56) as ``SurrealSet``; the ORM reads it as a ``set``."""
+        assert _sdk_decodes_native_set()
+        read = _sdk.cbor_decode(_sdk.cbor_encode(CBORTag(56, ["b", "a"])))
+        assert isinstance(read, _sdk.SurrealSet)
+        assert _client.normalize(read) == {"a", "b"}
 
     async def test_set_column_by_line(self) -> None:
         async with orm_client("rf_set"):
             version = await _server_version()
             client = await _http_client()
-            await client.query("DEFINE FIELD tags ON rf_set TYPE set<string>;", {})
+            await _client.query(client, "DEFINE FIELD tags ON rf_set TYPE set<string>;", {})
             tags = encoding.encode({"b", "a"})
             assert tags == ["a", "b"]
             write = "CREATE rf_set:1 SET tags = $t RETURN NONE;"
             read = "SELECT VALUE tags FROM ONLY rf_set:1;"
             if version < (3, 0, 0):
-                await client.query(write, {"t": tags})
-                assert await client.query(read, {}) == ["a", "b"]
+                await _client.query(client, write, {"t": tags})
+                assert await _client.query(client, read, {}) == ["a", "b"]
             elif version < (3, 3, 0):
                 with pytest.raises(_sdk.ServerError, match=r"\bset\b"):
-                    await client.query(write, {"t": tags})
+                    await _client.query(client, write, {"t": tags})
             else:
-                await client.query(write, {"t": tags})
-                if _sdk_decodes_native_set():
-                    assert sorted(await client.query(read, {})) == ["a", "b"]
-                else:
-                    with pytest.raises(BufferError):
-                        await client.query(read, {})
+                await _client.query(client, write, {"t": tags})
+                assert await _client.query(client, read, {}) == {"a", "b"}  # the native set, read as a ``set``
 
     async def test_array_column_everywhere(self) -> None:
         async with orm_client("rf_arr"):
             client = await _http_client()
-            await client.query("DEFINE FIELD tags ON rf_arr TYPE array<string> VALUE $value.distinct();", {})
-            await client.query("CREATE rf_arr:1 SET tags = $t RETURN NONE;", {"t": encoding.encode({"b", "a"})})
-            assert await client.query("SELECT VALUE tags FROM ONLY rf_arr:1;", {}) == ["a", "b"]
+            await _client.query(client, "DEFINE FIELD tags ON rf_arr TYPE array<string> VALUE $value.distinct();", {})
+            await _client.query(client, "CREATE rf_arr:1 SET tags = $t RETURN NONE;", {"t": encoding.encode({"b", "a"})})
+            assert await _client.query(client, "SELECT VALUE tags FROM ONLY rf_arr:1;", {}) == ["a", "b"]

@@ -23,9 +23,10 @@ the only records it ever reads —, and nothing else: nothing is defined or writ
 indexes and events), ``analyzers``, ``accesses``, ``functions`` and ``params`` become the typed states of
 :mod:`surreal_orm_lite.schema_state`; ``users`` is **never read** — not parsed, stored or logged (before SurrealDB
 3.2.2 ``INFO`` shows user password hashes); every other section (``apis``, ``configs``, ``models``, 3.x ``buckets``,
-``modules``, ``sequences``, a future one) is kept as returned in ``SchemaState.other``. Of ``INFO FOR TABLE``, the
-``lives`` (running live queries) and ``tables`` (views fed by the table) sections are ignored and any other section
-goes to ``TableState.other``. Kinds, nullability, field paths, flags and names are normalised to one form on
+``modules``, ``sequences``, a future one) is kept as returned in ``SchemaState.other``; the 4.x ``compatibility``
+level is not a section and is not kept there. Of ``INFO FOR TABLE``, the ``lives`` (running live queries),
+``tables`` (views fed by the table) and 4.x ``migrations`` (row-migration counters) sections are ignored and any other
+section goes to ``TableState.other``. Kinds, nullability, field paths, flags and names are normalised to one form on
 SurrealDB 2.x, 3.x and the embedded engine; expression texts are kept as each line rendered them.
 ``SchemaState.applied_migrations`` lists the migrations the tracking table records, in the order they were applied
 (``()`` without the table), whatever ``tables=`` says: the history is the database's.
@@ -64,6 +65,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
+from . import _client
 from ._sdk import ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .define_parser import (
@@ -123,10 +125,12 @@ _CLIENT_OBJECT = (
     "(add_connection()), or call DatabaseIntrospector() inside SurrealDBConnectionManager.using(name)."
 )
 
-#: The ``INFO FOR DB`` sections that are not kept in ``SchemaState.other``: never read, or read on their own.
-_NOT_OTHER = frozenset({"users", "tables"})
-#: The ``INFO FOR TABLE`` sections that are ignored: running live queries, views fed by the table.
-_IGNORED_TABLE_SECTIONS = frozenset({"lives", "tables"})
+#: The ``INFO FOR DB`` sections that are not kept in ``SchemaState.other``: never read, or read on their own; and the
+#: 4.x ``compatibility`` key (the database's compatibility level, a number, not a section of definitions).
+_NOT_OTHER = frozenset({"users", "tables", "compatibility"})
+#: The ``INFO FOR TABLE`` sections that are ignored: running live queries, views fed by the table, and the 4.x
+#: ``migrations`` key (the state of the table's row migrations, counters rather than definitions).
+_IGNORED_TABLE_SECTIONS = frozenset({"lives", "tables", "migrations"})
 
 #: The issue texts of a ``TYPE`` kept as written and of a second definition with the same name.
 _TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written"
@@ -191,7 +195,7 @@ async def _info_for_db(client: Any, name: str) -> dict[str, Any]:
     """``INFO FOR DB`` on *client*: ``SurrealDbAuthenticationError`` when the session may not run it, ``SurrealDbError``
     when it fails otherwise or answers something other than an object; an ORM error propagates unchanged."""
     try:
-        info = await client.query("INFO FOR DB;", {})
+        info = await _client.query(client, "INFO FOR DB;", {})
     except SurrealORMError:
         raise
     except Exception as exc:
@@ -280,7 +284,7 @@ class _Reader:
             self.issue("table", name, name, f"INFO FOR TABLE failed: {exc}")
             return state
         try:
-            info = await self.client.query(info_for_table, {})
+            info = await _client.query(self.client, info_for_table, {})
         except (ServerError, RuntimeError) as exc:  # the server's answer (the embedded engine's: a RuntimeError)
             if _refused(exc):  # INFO FOR DB passed: the session lost its rights meanwhile, the table is not at fault
                 raise SurrealDbAuthenticationError(
@@ -317,7 +321,7 @@ class _Reader:
         raises ``SurrealDbAuthenticationError``; any other answer of the server that is not a list of records is an
         issue (``kind="table"``, the table's name) and ``()``; an error that is not the server's answer propagates."""
         try:
-            rows = await self.client.query(_APPLIED, {})
+            rows = await _client.query(self.client, _APPLIED, {})
         except SurrealORMError:
             raise
         except (ServerError, RuntimeError) as exc:  # the server's answer (the embedded engine's: a RuntimeError)
@@ -387,7 +391,13 @@ class _Reader:
             params=params,
             other=other,
             issues=tuple(self.issues),
+            compatibility=_compatibility(info.get("compatibility")),
         )
+
+
+def _compatibility(value: object) -> int | None:
+    """The database's compatibility level from ``INFO FOR DB``'s ``compatibility`` key (SurrealDB 4.x), else ``None``."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class DatabaseIntrospector:

@@ -28,6 +28,7 @@ from surrealdb import RecordID
 from surrealdb.connections.async_embedded import AsyncEmbeddedSurrealConnection
 
 from surreal_orm_lite import (
+    Analyzer,
     AuthenticatedUserMixin,
     AuthResult,
     AuthTokens,
@@ -40,11 +41,14 @@ from surreal_orm_lite import (
     Count,
     GeoDistance,
     GeometryPoint,
+    Index,
     PointField,
     Range,
+    SchemaMode,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
+    _client,
     _sdk,
     computed,
     connection_manager,
@@ -53,7 +57,6 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite import embedded as embedded_module
 from surreal_orm_lite.embedded import (
-    changes_since_datetime_unsupported,
     is_embedded_url,
     require_supported_url,
     url_kind,
@@ -61,8 +64,10 @@ from surreal_orm_lite.embedded import (
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError, SurrealDbError
 from surreal_orm_lite.live import require_websocket
+from surreal_orm_lite.schema import Event
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction
+from tests._clock import now as _now
 from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
 from tests._readme_tables import assert_embedded_rows, assert_guide_sections, assert_manual_order, release
 from tests._readme_tables import cells as _cells
@@ -98,6 +103,7 @@ _SDK_SCHEMES = {"http", "https", "ws", "wss", "mem", "memory", "file", "surrealk
 _EMBEDDED_URLS = [
     "mem://",
     "memory://",
+    "memory",
     "mem://x",
     "surrealkv:///tmp/x",
     "surrealkv+versioned:///tmp/x",
@@ -105,7 +111,7 @@ _EMBEDDED_URLS = [
     "surrealkv://relative",
 ]
 _SERVER_URLS = ["ws://h:1/rpc", "wss://h", "http://h:8000", "https://h"]
-_REFUSED_URLS = ["rocksdb:///x", "memory", "not a url", "htp://h"]
+_REFUSED_URLS = ["rocksdb:///x", "not a url", "htp://h"]
 
 
 def _count_constructions(monkeypatch: pytest.MonkeyPatch, *, refuse_servers: bool = False) -> list[str]:
@@ -267,7 +273,7 @@ class TestEmbeddedUrl:
     def test_embedded_urls(self, url: str) -> None:
         assert is_embedded_url(url) is True
 
-    @pytest.mark.parametrize("url", [*_SERVER_URLS, "memory", "rocksdb:///x", "", None, "not a url"])
+    @pytest.mark.parametrize("url", [*_SERVER_URLS, "rocksdb:///x", "", None, "not a url"])
     def test_not_embedded_urls(self, url: str | None) -> None:
         assert is_embedded_url(url) is False
 
@@ -338,7 +344,7 @@ class TestEmbeddedUrl:
             "see https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/233."
         )
 
-    @pytest.mark.parametrize("url", ["htp://h", "memory", "not a url", "rocksdb://[x"])
+    @pytest.mark.parametrize("url", ["htp://h", "not a url", "rocksdb://[x"])
     def test_require_supported_url_refuses_others_without_the_rocksdb_hint(self, url: str) -> None:
         """E11 without the #233 hint (``rocksdb://[x``: the URL itself cannot be split, so no hint)."""
         with pytest.raises(SurrealDbConnectionError) as info:
@@ -724,7 +730,8 @@ class TestOneEnginePerProcessE2E:
             calls = _record_calls(monkeypatch, "invalidate", "use", "close")
             SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="b")
             assert await SurrealDBConnectionManager.get_client() is client
-            assert _calls_of(calls, client) == [("invalidate", ()), ("use", ("t", "b"))]
+            # The session is still the in-process owner: only the new selection (v0.50.0, D17).
+            assert _calls_of(calls, client) == [("use", ("t", "b"))]
             assert await Person.objects().count() == 0
             SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="a")
             assert await Person.objects().count() == 1
@@ -843,7 +850,7 @@ class TestSelectionResetE2E:
             SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
             assert await SurrealDBConnectionManager.get_client() is client
             assert await SurrealDBConnectionManager.info() is None
-            rows = await client.query("SELECT email FROM user;")
+            rows = await _client.query(client, "SELECT email FROM user;")
             assert [row["email"] for row in rows] == ["a@x"]
 
     @pytest.mark.parametrize("setter", ["set_database", "set_namespace"])
@@ -942,13 +949,14 @@ class TestSelectionResetE2E:
                 await real_replay(target)
 
             monkeypatch.setattr(SurrealDBConnectionManager, "_replay_session", classmethod(replay))
-            calls = _record_calls(monkeypatch, "invalidate")
+            calls = _record_calls(monkeypatch, "invalidate", "use")
             _mark_selection_stale()
             with pytest.raises(SurrealDbConnectionError, match="restoring the session"):
                 await SurrealDBConnectionManager.get_client()
             dropped[0] = False
             assert await SurrealDBConnectionManager.get_client() is client
-            assert _calls_of(calls, client) == [("invalidate", ()), ("invalidate", ())]  # reset again: still stale
+            # Selected again: still stale. The session never stopped being the owner, so no invalidate() (v0.50.0, D17).
+            assert _calls_of(calls, client) == [("use", ("t", "t")), ("use", ("t", "t"))]
 
 
 class TestServerClientsUntouchedE2E:
@@ -975,7 +983,7 @@ class TestServerClientsUntouchedE2E:
 
             SurrealDBConnectionManager.set_connection(**settings)
             assert await SurrealDBConnectionManager.get_client() is server
-            assert await server.query("RETURN 1;") == 1
+            assert await _client.query(server, "RETURN 1;") == 1
             assert _slot_client() is engine
 
             SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
@@ -1204,7 +1212,7 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
     ``tests/test_subqueries.py`` (v0.27.0), ``tests/test_query_cache.py`` (v0.28.0),
     ``tests/test_introspection.py`` (v0.30.0), ``tests/test_table_ddl.py`` (v0.34.0), ``tests/test_vector.py``
     (v0.36.0), ``tests/test_factories.py``, ``tests/test_pytest_plugin.py`` and ``tests/test_factories_docs.py``
-    (v0.40.0), new too."""
+    (v0.40.0), and ``tests/test_sdk3_values.py`` and ``tests/test_query_order.py`` (v0.50.0), new too."""
     assert (
         frozenset(
             {
@@ -1224,6 +1232,8 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
                 "tests.test_factories",
                 "tests.test_pytest_plugin",
                 "tests.test_factories_docs",
+                "tests.test_sdk3_values",
+                "tests.test_query_order",
             }
         )
         == _REWRITE_MODULES
@@ -1327,13 +1337,15 @@ class TestCoreOrmEmbeddedE2E:
             assert [p.name for p in following] == ["Bob"]
 
     async def test_a_typed_edge_through_insert_relation(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls = _record_calls(monkeypatch, "insert_relation")
+        """SDK 3.0 has no ``insert_relation()``: the ORM sends ``insert(table, data, relation=True)``."""
+        calls = _record_calls(monkeypatch, "insert")
         async with embedded() as client:
             await Person(id="alice", name="Alice").save()
             await Person(id="bob", name="Bob").save()
             edge = await EmbFollows(in_=RecordID("person", "alice"), out=RecordID("person", "bob"), weight=3).save()
             assert isinstance(edge.id, RecordID)
-            assert [name for name, _ in _calls_of(calls, client)] == ["insert_relation"]
+            assert [name for name, _ in _calls_of(calls, client)] == ["insert"]
+            assert [kwargs for name, owner, _, kwargs in calls if owner == id(client)] == [{"relation": True}]
             [stored] = await EmbFollows.objects().exec()
             assert (stored.in_, stored.out, stored.weight) == (RecordID("person", "alice"), RecordID("person", "bob"), 3)
             followers = await Person(id="bob", name="Bob").get_related(EmbFollows, direction="in", model_class=Person)
@@ -1402,52 +1414,49 @@ class EmbReadDelta(BaseSurrealModel):
 
 def _require_read_hook() -> None:
     """Skip unless the clients the ORM opens get the read hook of ``decoding.py`` (#235): the installed SDK
-    cannot decode a zero duration, a native set or a degenerate geometry, and has the layout the hook knows."""
+    cannot decode a degenerate geometry or an out-of-range datetime, and has the layout the hook knows."""
     if not decoding.active():
         pytest.skip("the installed surrealdb SDK reads these values itself: no read hook to install")
 
 
 def _is_sdk_zero(value: Any) -> bool:
-    """Whether *value* is the SDK's ``Duration(0)``: what the read hook gives for a zero duration."""
+    """Whether *value* is the SDK's ``Duration(0)``: what the SDK reads for a zero duration."""
     return type(value) is surrealdb.Duration and value.elapsed == 0
 
 
 def _assert_read_hook_on(client: Any) -> None:
     """*client*, an embedded client the ORM opened, decodes its responses through the read hook (#235): its
-    ``_send`` is the SDK's own code, set on the instance, with the hooked ``decode`` as its module global."""
+    ``_send`` is the SDK's own code, set on the instance, with ``decoding.decode`` as its module global."""
     assert isinstance(client, AsyncEmbeddedSurrealConnection)
     bound = vars(client).get("_send")
     assert isinstance(bound, types.MethodType), "the read hook is not installed on the embedded client"
     assert bound.__self__ is client
     assert bound.__func__.__code__ is AsyncEmbeddedSurrealConnection._send.__code__, "not the SDK's own code"
-    assert bound.__func__.__globals__["decode"] is decoding._hooked_decode()
+    assert bound.__func__.__globals__["decode"] is decoding.decode
 
 
 class TestReadHookEmbeddedE2E:
     """#235 on the embedded engine, no server: the client ``get_client()`` opens on an embedded URL, and the one
-    of an ``embedded_database()`` block, read what the surrealdb SDK 2.0.0 cannot decode, as a server's do.
-
-    The embedded core of SDK 2.0.0 stores ``<set>[…]`` as an array, like a 2.x server: it produces no native
-    set, so that case is covered on the 3.x server only (``tests/test_decoding.py``).
-    """
+    of an ``embedded_database()`` block, read degenerate geometries and out-of-range datetimes as in 0.40.x, as a
+    server's do; zero durations are the SDK's own."""
 
     async def test_get_client_installs_the_hook(self) -> None:
         _require_read_hook()
         async with embedded() as client:
             _assert_read_hook_on(client)
-            assert _is_sdk_zero(await client.query("RETURN 0ns;", {}))
+            assert _is_sdk_zero(await _client.query(client, "RETURN 0ns;", {}))
 
     async def test_embedded_database_block_installs_the_hook(self) -> None:
         _require_read_hook()
         async with embedded_database() as client:
             _assert_read_hook_on(client)
-            assert _is_sdk_zero(await client.query("RETURN 0s;", {}))
+            assert _is_sdk_zero(await _client.query(client, "RETURN 0s;", {}))
 
     @pytest.mark.parametrize("literal", ["0s", "0ns"])
     async def test_zero_duration_written_raw_reads_back(self, literal: str) -> None:
         _require_read_hook()
         async with embedded() as client:
-            await client.query(f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
+            await _client.query(client, f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
             assert _is_sdk_zero((await EmbReadAny.objects().get("one")).v)
             assert (await EmbReadDelta.objects().filter(v=timedelta(0)).exec())[0].v == timedelta(0)
             assert (await EmbReadDelta.raw_query("SELECT * FROM emb_read:one;"))[0].v == timedelta(0)
@@ -1457,7 +1466,9 @@ class TestReadHookEmbeddedE2E:
         async with embedded() as client:
             await EmbReadDelta(id="zero", v=timedelta(0)).save()
             assert (await EmbReadDelta.objects().get("zero")).v == timedelta(0)
-            assert await client.query("RETURN type::is::duration((SELECT VALUE v FROM ONLY emb_read:zero));", {}) is True
+            assert (
+                await _client.query(client, "RETURN type::is_duration((SELECT VALUE v FROM ONLY emb_read:zero));", {}) is True
+            )
 
     @pytest.mark.parametrize(
         ("literal", "expected"),
@@ -1477,7 +1488,7 @@ class TestReadHookEmbeddedE2E:
     async def test_degenerate_geometry_reads_as_geojson(self, literal: str, expected: dict[str, Any]) -> None:
         _require_read_hook()
         async with embedded() as client:
-            await client.query(f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
+            await _client.query(client, f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
             assert (await EmbReadAny.objects().get("one")).v == expected
             assert (await EmbReadAny.objects().exec())[0].v == expected
 
@@ -1493,10 +1504,10 @@ class TestReadHookEmbeddedE2E:
         """#279: a datetime outside years 1-9999 reads as the server's RFC 3339 text, and the client keeps working."""
         _require_read_hook()
         async with embedded() as client:
-            await client.query(f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
+            await _client.query(client, f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
             assert (await EmbReadAny.objects().get("one")).v == expected
-            assert await client.query(f"RETURN <string> ({literal});", {}) == expected
-            assert await client.query("RETURN 1;", {}) == 1
+            assert await _client.query(client, f"RETURN <string> ({literal});", {}) == expected
+            assert await _client.query(client, "RETURN 1;", {}) == 1
 
 
 class TestTransactionsEmbeddedE2E:
@@ -1559,8 +1570,9 @@ class TestTransactionsEmbeddedE2E:
 
 
 class TestComputedEmbeddedE2E:
-    """AC-11 (D5), no server: the engine's bare ``RuntimeError`` for an unparsable expression is the ORM's
-    ``SurrealDbError``, as a server's ``InternalError``/``ValidationError`` is."""
+    """AC-11 (D5), no server: the engine's error for an unparsable expression is the ORM's ``SurrealDbError``, as a
+    server's is. SDK 3.0's engine raises the SDK's ``ValidationError``, as a server does (SDK 2.x: a bare
+    ``RuntimeError``)."""
 
     async def test_an_invalid_expression_raises_one_orm_error(self) -> None:
         class EmbBroken(BaseSurrealModel):
@@ -1572,20 +1584,7 @@ class TestComputedEmbeddedE2E:
         async with embedded():
             with pytest.raises(SurrealDbError, match="DEFINE FIELD") as info:
                 await EmbBroken.define_computed_fields()
-            assert isinstance(info.value.__cause__, RuntimeError)
-
-
-class TestEngineLineGuardE2E:
-    """D7: the change-feed code takes the engine's major from ``version()``; the bundled core must stay 2.x."""
-
-    async def test_the_bundled_engine_is_the_2x_line(self) -> None:
-        async with embedded() as client:
-            assert await client.query("RETURN type::is::string('');") is True
-            match = re.search(r"(\d+)\.", str(await client.version()))
-            assert match is not None
-            assert int(match.group(1)) == 2, (
-                "the surrealdb SDK bundles another engine line: revisit spec D7 (change-feed major from version())"
-            )
+            assert isinstance(info.value.__cause__, surrealdb.errors.ValidationError)
 
 
 class TestSurrealKvPersistenceE2E:
@@ -1753,8 +1752,8 @@ class TestUnsupportedEmbeddedE2E:
 
 
 class TestChangeFeedEmbeddedE2E:
-    """AC-9 (D6), no server: change feeds work from now and from a cursor; a datetime position is refused (E4)
-    after the one ``version()`` request, before any ``INFO``/``SHOW CHANGES``."""
+    """AC-9 (D6), no server: change feeds work from now, from a cursor and, on the 4.0 engine of SDK 3.0, from a
+    datetime."""
 
     async def test_from_now_then_from_the_cursor(self) -> None:
         async with embedded() as client:
@@ -1787,23 +1786,16 @@ class TestChangeFeedEmbeddedE2E:
             pytest.param("2026-01-01T00:00:00Z", id="iso-string"),
         ],
     )
-    async def test_a_datetime_position_is_refused_after_version_only(
-        self, monkeypatch: pytest.MonkeyPatch, since: datetime | str
-    ) -> None:
+    async def test_a_datetime_position_reads_the_feed_on_the_4x_engine(self, since: datetime | str) -> None:
+        """D23 (v0.50.0): the SDK 3.0 engine is a SurrealDB 4.0 core, which stamps its feed positions, so a datetime
+        ``since`` reads the feed from that moment as on a 3.x or 4.x server; E4 no longer applies to it."""
         async with embedded() as client:
             await client.query("DEFINE TABLE cf_item CHANGEFEED 1h;")
-            calls = _record_calls(monkeypatch, "query", "query_raw", "version")
+            await CfItem(id="a", name="first").save()
             stream = CfItem.objects().changes(since=since, poll_interval=0.05)
-            with pytest.raises(SurrealDbError, match=r"changes\(since=<datetime>\)") as info:
-                await stream.start()
-            assert str(info.value) == changes_since_datetime_unsupported()
-            assert "embedded engine" in str(info.value)
-            assert _calls_of(calls, client) == [("version", ())]
-            # The first iteration reports it too, still without reading the feed.
-            with pytest.raises(SurrealDbError, match=r"changes\(since=<datetime>\)"):
-                async with asyncio.timeout(5):
-                    await anext(stream)
-            assert [name for name, _ in _calls_of(calls, client)] == ["version", "version"]
+            [event] = await _take(stream, 1)
+            assert (event.record_id, event.instance.name) == ("cf_item:a", "first")
+            stream.stop()
 
 
 class TestKillAfterSwitchE2E:
@@ -1871,7 +1863,7 @@ class TestKillAfterSwitchE2E:
                 # The block put the server settings back, and the server client was neither closed nor replaced.
                 assert SurrealDBConnectionManager.get_connection_string() == _ws_url()
                 assert await SurrealDBConnectionManager.get_client() is server
-                assert await server.query("RETURN 1;") == 1
+                assert await _client.query(server, "RETURN 1;") == 1
         finally:
             await SurrealDBConnectionManager.unset_connection()
 
@@ -1942,11 +1934,14 @@ async def _define_locked(client: Any) -> None:
     await EmbLocked.define_access(with_table=False)
 
 
-async def _is_owner(client: Any, table: str = "secret") -> bool:
-    """Whether the shared session writes like the in-process owner: a record session cannot create a table
-    (spec M28), so the raw ``CREATE`` fails for it."""
+async def _is_owner(client: Any) -> bool:
+    """Whether the shared session reads like the in-process owner: ``INFO FOR DB`` is refused to a record session.
+
+    SurrealDB core 4.0 (SDK 3.0's engine) answers a record session's ``CREATE`` on a table it may not write with no
+    row and no error, so a write no longer tells the two apart (v0.50.0).
+    """
     try:
-        await client.query(f"CREATE {table} SET at = time::now();")
+        await client.query("INFO FOR DB;")
     except Exception:
         return False
     return True
@@ -1973,22 +1968,27 @@ class TestAuthEmbeddedE2E:
             assert me is not None
             assert me["email"] == "a@x"
 
-    async def test_invalidate_returns_to_the_owner_without_a_signin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_invalidate_returns_to_the_owner_without_the_configured_signin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The configured user is never signed in on the engine: back to the owner, SDK 3.0's engine signs in as the
+        temporary owner user defined before the signup (v0.50.0, D17-a), then selects again."""
         async with embedded(user="root", password="root") as client:
             await client.query(_ACCOUNT_DDL)
             await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
             assert not await _is_owner(client)
             calls = _record_calls(monkeypatch, "signin", "invalidate", "use", "close")
             await SurrealDBConnectionManager.invalidate()
-            assert _calls_of(calls, client) == [("invalidate", ()), ("use", ("t", "t"))]
+            recorded = _calls_of(calls, client)
+            assert [name for name, _ in recorded] == ["invalidate", "signin", "use"]
+            assert recorded[1][1][0]["username"] == _OWNER
+            assert recorded[2] == ("use", ("t", "t"))
             assert SurrealDBConnectionManager.get_session_token() is None
             assert await SurrealDBConnectionManager.info() is None
             assert await _is_owner(client)
-            rows = await client.query("SELECT email FROM user;")
+            rows = await _client.query(client, "SELECT email FROM user;")
             assert [row["email"] for row in rows] == ["a@x"]
             # Selected and stamped: the next call takes the fast path, no second reset.
             assert await SurrealDBConnectionManager.get_client() is client
-            assert len(_calls_of(calls, client)) == 2
+            assert len(_calls_of(calls, client)) == 3
 
     async def test_a_wrong_password_is_refused(self) -> None:
         async with embedded() as client:
@@ -2025,8 +2025,9 @@ class TestAuthEmbeddedE2E:
             await client.query(_ACCOUNT_DDL)
             tokens = await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
             failing = _failing(monkeypatch, "invalidate")
-            with pytest.raises(SurrealDbAuthenticationError, match="during invalidate: boom"):
+            with pytest.raises(SurrealDbConnectionError, match="to return to its owner session: boom") as info:
                 await SurrealDBConnectionManager.invalidate()
+            assert getattr(info.value, "retryable", None) is False
             failing[0] = False
             assert SurrealDBConnectionManager.get_session_token() == tokens.access
             assert await SurrealDBConnectionManager.get_client() is client
@@ -2114,7 +2115,7 @@ class TestModelAuthEmbeddedE2E:
             assert "SIGNUP ( CREATE emb_keyed SET id = $email, email = $email, " in applied[-1]
             result = await EmbKeyed.signup(email="k:x", password="p", bind=True)
             assert result.user.email == "k:x"
-            assert await client.query("SELECT VALUE id FROM emb_keyed;") == [RecordID("emb_keyed", "k:x")]
+            assert await _client.query(client, "SELECT VALUE id FROM emb_keyed;") == [RecordID("emb_keyed", "k:x")]
             signed_in = await EmbKeyed.signin(email="k:x", password="p", bind=True)
             assert signed_in.user.email == "k:x"
 
@@ -2208,7 +2209,7 @@ class TestFailedBindEmbeddedE2E:
             assert SurrealDBConnectionManager.get_session_token() is None
             assert await SurrealDBConnectionManager.info() is None
             assert await _is_owner(client)
-            rows = await client.query("SELECT email FROM emb_locked;")
+            rows = await _client.query(client, "SELECT email FROM emb_locked;")
             assert [row["email"] for row in rows] == ["l@x"]  # the signup ran: only the bind was undone
 
     async def test_a_stored_record_session_is_put_back(self) -> None:
@@ -2338,6 +2339,453 @@ class TestFailedBindEmbeddedE2E:
             assert "(nickname: missing)" in message
             assert "b@x" not in message and created.user.password not in message
             assert str(created.user.get_id()) not in message
+
+
+# ----------------------------------------------------------------------
+# v0.50.0: the SDK 3.0 engine — SurrealDB core 4.0, an optional extra, and its owner session
+# (spec §5.7, D17-a with C6, D23; AC-12, AC-20)
+# ----------------------------------------------------------------------
+
+#: The temporary owner user of an in-memory engine (D17-a), and the one statement that defines it (M28-b, C6): plain,
+#: never ``OVERWRITE`` or ``IF NOT EXISTS``. The secret is 43 URL-safe characters.
+_OWNER = "__surreal_orm_lite_owner"
+_DEFINE_OWNER = re.compile(
+    r"DEFINE USER __surreal_orm_lite_owner ON ROOT PASSWORD '[A-Za-z0-9_-]{43}' ROLES OWNER DURATION FOR SESSION NONE"
+)
+_REMOVE_OWNER = "REMOVE USER __surreal_orm_lite_owner ON ROOT"
+_SECRET = re.compile(r"PASSWORD '([A-Za-z0-9_-]{43})'")
+
+#: The fixed texts of the owner-user errors (C6): they never quote a statement, an SDK error or the secret.
+_DEFINE_FAILED = (
+    "The embedded engine could not define its temporary owner user (a user named __surreal_orm_lite_owner already "
+    "exists, or the engine refused it); the session was not changed."
+)
+_SIGNIN_FAILED = "The embedded engine could not sign back in as its temporary owner user."
+_REMOVE_FAILED = "The embedded engine could not remove its temporary owner user."
+_EXTRA_MISSING = "The embedded engine needs the optional extension: pip install 'surreal-orm-lite[embedded]'"
+
+
+def _spy_queries(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every SurrealQL text sent through the call frontier's ``_client.query()``, then sent as usual. A password literal
+    is kept as written: the tests that read it mask it themselves."""
+    sent: list[str] = []
+    real = _client.query
+
+    async def spy(client: Any, sql: str, variables: Any = None, **kwargs: Any) -> Any:
+        sent.append(sql)
+        return await real(client, sql, variables, **kwargs)
+
+    monkeypatch.setattr(_client, "query", spy)
+    return sent
+
+
+def _user_statements(sent: list[str]) -> list[str]:
+    """The ``DEFINE USER``/``REMOVE USER`` statements among *sent*, each secret masked."""
+    return [_SECRET.sub("PASSWORD '<secret>'", sql) for sql in sent if re.search(r"\b(DEFINE|REMOVE) USER\b", sql)]
+
+
+async def _root_users(client: Any) -> set[str]:
+    """The root users of the engine (``INFO FOR ROOT``): only the owner may read them."""
+    info = await _client.query(client, "INFO FOR ROOT;")
+    return set(info["users"])
+
+
+async def _assert_not_anonymous(client: Any) -> None:
+    """No path leaves an anonymous session (spec §5.7): a plain ``RETURN`` and a ``SELECT`` on a table are answered
+    (``person``: the test saved a ``Person`` first)."""
+    assert await _client.query(client, "RETURN 1;") == 1
+    await _client.query(client, "SELECT * FROM person;")
+
+
+def _run_without_the_engine(script: str, tmp_path: Path) -> Any:
+    """Run *script* in a new interpreter where ``surrealdb_embedded`` cannot be imported (the extra not installed)."""
+    import subprocess
+    import textwrap
+
+    blocker = textwrap.dedent(
+        """
+        import sys
+
+        class _Block:
+            def find_spec(self, name, path=None, target=None):
+                if name == "surrealdb_embedded" or name.startswith("surrealdb_embedded."):
+                    raise ImportError(f"blocked: {name}")
+                return None
+
+        sys.meta_path.insert(0, _Block())
+        """
+    )
+    path = tmp_path / "without_engine.py"
+    path.write_text(blocker + textwrap.dedent(script))
+    return subprocess.run([sys.executable, str(path)], capture_output=True, text=True, timeout=120, cwd=tmp_path)
+
+
+class TestEmbeddedExtra:
+    """AC-12 (spec §5.7): the engine is the optional extra ``surreal-orm-lite[embedded]``. Without it, importing the ORM
+    and its testing helpers works, and opening an embedded URL raises one clear error naming the extra."""
+
+    def test_without_the_engine_opening_names_the_extra(self, tmp_path: Path) -> None:
+        result = _run_without_the_engine(
+            f"""
+            import asyncio
+            import surreal_orm_lite.testing
+            from surreal_orm_lite import SurrealDBConnectionManager
+            from surreal_orm_lite.exceptions import SurrealDbConnectionError
+            from surreal_orm_lite.testing import embedded_database
+
+            EXPECTED = {_EXTRA_MISSING!r}
+
+            async def main():
+                for url in ("mem://", "memory", "surrealkv://{tmp_path / "kv"}"):
+                    SurrealDBConnectionManager.set_connection(url=url, namespace="t", database="t")
+                    try:
+                        await SurrealDBConnectionManager.get_client()
+                    except SurrealDbConnectionError as exc:
+                        assert str(exc) == EXPECTED, str(exc)
+                        assert exc.retryable is False
+                    else:
+                        raise AssertionError(url)
+                    finally:
+                        await SurrealDBConnectionManager.unset_connection()
+                try:
+                    async with embedded_database():
+                        raise AssertionError("opened")
+                except SurrealDbConnectionError as exc:
+                    assert str(exc) == EXPECTED, str(exc)
+                assert SurrealDBConnectionManager.get_connection_string() is None
+                print("ok")
+
+            asyncio.run(main())
+            """,
+            tmp_path,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok", result.stderr
+
+    def test_without_the_engine_the_fixture_names_the_extra(self, tmp_path: Path) -> None:
+        (tmp_path / "test_uses_the_fixture.py").write_text(
+            "async def test_it(surreal_db):\n    raise AssertionError('opened')\n"
+        )
+        result = _run_without_the_engine(
+            f"""
+            import sys
+            import pytest
+
+            sys.exit(pytest.main([
+                {str(tmp_path / "test_uses_the_fixture.py")!r}, "-p", "surreal_orm_lite.testing.pytest_plugin",
+                "-p", "no:cacheprovider", "-p", "no:randomly", "-o", "asyncio_mode=auto", "--no-cov", "-q",
+                "--rootdir", {str(tmp_path)!r}, "-c", "/dev/null",
+            ]))
+            """,
+            tmp_path,
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert _EXTRA_MISSING in result.stdout, result.stdout
+        assert "1 error" in result.stdout, result.stdout
+
+
+class EmbArticle(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="emb_article",
+        indexes=[
+            Index("emb_article_title", "title", search_analyzer=Analyzer("emb_english", ["blank"], ["lowercase"]), bm25=True)
+        ],
+    )
+
+    id: str | None = None
+    title: str
+
+
+class EmbFreeform(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_freeform", schema_mode=SchemaMode.SCHEMAFULL)
+
+    id: str | None = None
+    data: Any = None
+
+
+class EmbPost(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_post")
+
+    id: str | None = None
+    title: str
+    author: Any = None
+
+
+class TestEmbeddedEngineLineE2E:
+    """D23 (spec §5.7): the SDK 3.0 engine is SurrealDB core 4.0, so every embedded URL takes the ORM's 4.x branches."""
+
+    async def test_the_engine_is_the_4x_line(self) -> None:
+        async with embedded() as client:
+            version = str(await client.version())
+            assert re.fullmatch(r"surrealdb-4\.\d+\.\d+.*", version), version
+            assert await _client.query(client, "RETURN type::is_string('');") is True
+
+    async def test_a_fulltext_index_takes_the_fulltext_keyword(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``model_base`` (``fulltext_keyword()``): ``FULLTEXT``, which a 2.x core refused, not ``SEARCH``."""
+        async with embedded():
+            sent = _spy_queries(monkeypatch)
+            applied = await EmbArticle.define_indexes()
+            assert any("FULLTEXT ANALYZER `emb_english` BM25" in statement for statement in applied), applied
+            assert not any(" SEARCH ANALYZER" in statement for statement in [*applied, *sent])
+            await EmbArticle(id="a", title="Hello world").save()
+            assert await EmbArticle.objects().count() == 1
+
+    async def test_an_any_column_on_a_schemafull_table_is_not_flexible(self) -> None:
+        """``model_base`` (``before_3``): no ``FLEXIBLE`` on an ``any`` column, and the engine keeps an object in it."""
+        async with embedded():
+            applied = await EmbFreeform.define_table()
+            assert "SCHEMAFULL" in applied
+            assert "FLEXIBLE" not in applied, applied
+            await EmbFreeform(id="f", data={"x": 1, "y": [1, 2]}).save()
+            assert (await EmbFreeform.objects().get("f")).data == {"x": 1, "y": [1, 2]}
+
+    async def test_an_async_event_is_defined(self) -> None:
+        """``schema`` (``ensure_async_events_supported``): an ``ASYNC`` event is left to the engine, which runs it."""
+        async with embedded():
+            event = Event(
+                "emb_notify", when="$event = 'CREATE'", then="CREATE emb_outbox SET at = time::now()", async_mode=True
+            )
+            statement = await SurrealDBConnectionManager.define_event(event, "person")
+            assert " ASYNC" in statement
+
+    async def test_the_removal_of_an_analyzer_in_use_is_left_to_the_engine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``search`` (``apply_analyzer_removal``): no ``INFO`` reads before the statement; the engine refuses it."""
+        async with embedded():
+            await EmbArticle.define_indexes()
+            sent = _spy_queries(monkeypatch)
+            with pytest.raises(SurrealDbError):
+                await SurrealDBConnectionManager.remove_analyzer("emb_english")
+            assert not any(sql.lstrip().upper().startswith("INFO") for sql in sent), sent
+
+    async def test_fetch_and_version_on_a_versioned_store(self, tmp_path: Path) -> None:
+        """``query_set`` (FETCH under ``as_of()``) and ``time_travel`` (``VERSION``): no refusal below 3, the history
+        is read with the link fetched."""
+        async with embedded(f"surrealkv+versioned://{tmp_path / 'kv'}") as client:
+            await Person(id="ada", name="Ada").save()
+            await EmbPost(id="p", title="t", author=RecordID("person", "ada")).save()
+            moment = await _now(client)
+            [post] = await EmbPost.objects().fetch("author").as_of(moment).exec()
+            assert post.author == {"id": RecordID("person", "ada"), "name": "Ada", "age": 0}
+            del client
+
+    @pytest.mark.parametrize("url", ["mem://", "memory"])
+    async def test_the_in_memory_urls_open_the_engine(self, url: str) -> None:
+        assert is_embedded_url(url)
+        assert embedded_module.is_memory_url(url)
+        async with embedded(url) as client:
+            assert type(client).__name__ == "AsyncEmbeddedSurrealConnection"
+            await Person(id="ada", name="Ada").save()
+            assert (await Person.objects().get("ada")).name == "Ada"
+
+
+class TestEmbeddedOwnerE2E:
+    """AC-20 (D17-a with C6), no server unless named: the engine's session starts as the in-process owner, and the ORM
+    tracks whether it still is. A failed exchange leaves it the owner and sends no ``invalidate()``; back to the owner
+    after a successful one, an in-memory engine signs in as a temporary owner user it defined, a file-backed engine is
+    reopened. No path leaves an anonymous session."""
+
+    async def test_a_failed_bind_sends_no_invalidate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _embedded_auth() as client:
+            await Person(id="ada", name="Ada").save()
+            calls = _record_calls(monkeypatch, "invalidate", "close", "connect")
+            with pytest.raises(SurrealDbAuthenticationError):
+                await EmbUser.signin(email="nobody@x", password="p", bind=True)
+            assert _calls_of(calls, client) == []
+            assert (await Person.objects().get("ada")).name == "Ada"
+            assert await _is_owner(client)
+            await _assert_not_anonymous(client)
+
+    async def test_another_database_as_the_owner_sends_no_invalidate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with embedded() as client:
+            await Person(id="ada", name="Ada").save()
+            calls = _record_calls(monkeypatch, "invalidate", "use")
+            SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="other")
+            assert await SurrealDBConnectionManager.get_client() is client
+            assert _calls_of(calls, client) == [("use", ("t", "other"))]
+            assert await _client.query(client, "RETURN session::db();") == "other"
+            assert await Person.objects().count() == 0
+            await Person(id="bob", name="Bob").save()
+            await _assert_not_anonymous(client)
+
+    @pytest.mark.parametrize("url", ["mem://", "memory"])
+    async def test_invalidate_after_a_record_signup_returns_to_the_owner(
+        self, url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with embedded(url) as client:
+            await EmbUser.define_access()
+            await Person(id="ada", name="Ada").save()
+            sent = _spy_queries(monkeypatch)
+            await EmbUser.signup(email="b@x", password="p", bind=True)
+            assert not await _is_owner(client)
+            await SurrealDBConnectionManager.invalidate()
+            assert await _is_owner(client)
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert await SurrealDBConnectionManager.info() is None
+            assert (await Person.objects().get("ada")).name == "Ada"
+            assert [row["email"] for row in await _client.query(client, "SELECT email FROM emb_user;")] == ["b@x"]
+            assert _OWNER not in await _root_users(client)
+            statements = _user_statements(sent)
+            assert statements == [
+                "DEFINE USER __surreal_orm_lite_owner ON ROOT PASSWORD '<secret>' ROLES OWNER DURATION FOR SESSION NONE",
+                _REMOVE_OWNER,
+            ]
+            await _assert_not_anonymous(client)
+
+    async def test_the_statement_sent_is_the_plain_define(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """C6: exactly M28-b's statement, one fresh secret per definition."""
+        async with _embedded_auth():
+            sent = _spy_queries(monkeypatch)
+            await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            await EmbUser.signin(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            defines = [sql for sql in sent if sql.startswith("DEFINE USER")]
+            assert len(defines) == 2
+            assert all(_DEFINE_OWNER.fullmatch(sql) for sql in defines), defines
+            first, second = (_SECRET.search(sql) for sql in defines)
+            assert first is not None and second is not None
+            assert first.group(1) != second.group(1)
+
+    async def test_a_failed_exchange_leaves_no_owner_user(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _embedded_auth() as client:
+            await Person(id="ada", name="Ada").save()
+            sent = _spy_queries(monkeypatch)
+            with pytest.raises(SurrealDbAuthenticationError):
+                await EmbUser.signin(email="nobody@x", password="p", bind=True)
+            assert _user_statements(sent) == [
+                "DEFINE USER __surreal_orm_lite_owner ON ROOT PASSWORD '<secret>' ROLES OWNER DURATION FOR SESSION NONE",
+                _REMOVE_OWNER,
+            ]
+            assert _OWNER not in await _root_users(client)
+            assert await _is_owner(client)
+            await _assert_not_anonymous(client)
+
+    async def test_while_signed_in_the_owner_user_exists_and_a_record_cannot_read_it(self) -> None:
+        async with _embedded_auth() as client:
+            await EmbUser.signup(email="b@x", password="p", bind=True)
+            with pytest.raises(Exception):  # noqa: B017 - a record user may not read the root users
+                await _client.query(client, "INFO FOR ROOT;")
+            await SurrealDBConnectionManager.invalidate()
+            assert await _root_users(client) == set()
+
+    async def test_surrealkv_reopens_to_the_owner(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with embedded(f"surrealkv://{tmp_path / 'kv'}") as client:
+            await EmbUser.define_access()
+            await Person(id="ada", name="Ada").save()
+            sent = _spy_queries(monkeypatch)
+            calls = _record_calls(monkeypatch, "invalidate", "close", "connect", "use")
+            await EmbUser.signup(email="b@x", password="p", bind=True)
+            assert not await _is_owner(client)
+            await SurrealDBConnectionManager.invalidate()
+            assert _calls_of(calls, client) == [("close", ()), ("connect", ()), ("use", ("t", "t"))]
+            assert _user_statements(sent) == []
+            assert _slot_client() is client
+            assert await _is_owner(client)
+            assert await SurrealDBConnectionManager.info() is None
+            assert (await Person.objects().get("ada")).name == "Ada"
+            assert [row["email"] for row in await _client.query(client, "SELECT email FROM emb_user;")] == ["b@x"]
+            await _assert_not_anonymous(client)
+            del client
+
+    async def test_a_server_url_never_defines_a_user(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """C6: on a remote URL the ORM signs in itself and never defines a user."""
+        sent = _spy_queries(monkeypatch)
+        SurrealDBConnectionManager.set_connection(_ws_url(), "root", "root", "ns", "db")
+        try:
+            await SurrealDBConnectionManager.signin(username="root", password="root")
+            await SurrealDBConnectionManager.invalidate()
+            assert await _client.query(await SurrealDBConnectionManager.get_client(), "RETURN 1;") == 1
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+        assert _user_statements(sent) == []
+
+    async def test_a_user_the_application_defined_is_left_intact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """C6: the name is taken: the exchange raises before any sign-in is sent, and that user is never removed."""
+        async with _embedded_auth() as client:
+            await Person(id="ada", name="Ada").save()
+            await _client.query(client, f"DEFINE USER {_OWNER} ON ROOT PASSWORD 'app-password' ROLES OWNER;")
+            sent = _spy_queries(monkeypatch)
+            calls = _record_calls(monkeypatch, "signin", "signup", "authenticate", "invalidate")
+            for call in (
+                lambda: EmbUser.signup(email="b@x", password="p", bind=True),
+                lambda: SurrealDBConnectionManager.signin(username="anyone", password="p"),
+            ):
+                with pytest.raises(SurrealDbConnectionError) as info:
+                    await call()
+                exc = info.value
+                assert str(exc) == _DEFINE_FAILED
+                assert exc.__cause__ is None
+                assert exc.__context__ is None
+                assert getattr(exc, "retryable", None) is False
+            assert _calls_of(calls, client) == []
+            assert not any(sql.startswith("REMOVE USER") for sql in sent)
+            assert await _is_owner(client)
+            await _assert_not_anonymous(client)
+            assert _OWNER in await _root_users(client)
+            await client.signin({"username": _OWNER, "password": "app-password"})  # still its own password
+
+    @pytest.mark.parametrize("step", ["define", "signin", "remove"])
+    async def test_a_forced_failure_never_shows_the_secret(
+        self, step: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """C6: an SDK error quoting the secret, at ``DEFINE USER``, the owner ``signin`` or ``REMOVE USER``, becomes a
+        fixed-text error with neither ``__cause__`` nor ``__context__``, and nothing is logged with the secret."""
+        secrets_seen: list[str] = []
+        real_query = _client.query
+        real_signin = AsyncEmbeddedSurrealConnection.signin
+        armed = [False]
+
+        def leak(text: str) -> Exception:
+            return surrealdb.errors.InternalError("Internal", f"refused: {text}")
+
+        async def query(client: Any, sql: str, variables: Any = None, **kwargs: Any) -> Any:
+            found = _SECRET.search(sql)
+            if found:
+                secrets_seen.append(found.group(1))
+            if armed[0] and step == "define" and sql.startswith("DEFINE USER"):
+                raise leak(sql)
+            if armed[0] and step == "remove" and sql.startswith("REMOVE USER"):
+                raise leak(f"{sql} {secrets_seen[-1]}")
+            return await real_query(client, sql, variables, **kwargs)
+
+        async def signin(self: Any, credentials: Any) -> Any:
+            if armed[0] and step == "signin" and credentials.get("username") == _OWNER:
+                raise surrealdb.errors.ValidationError("Validation", f"bad {credentials['password']}")
+            return await real_signin(self, credentials)
+
+        monkeypatch.setattr(_client, "query", query)
+        monkeypatch.setattr(AsyncEmbeddedSurrealConnection, "signin", signin)
+        with caplog.at_level(logging.DEBUG, logger="surreal_orm_lite"):
+            async with _embedded_auth() as client:
+                await Person(id="ada", name="Ada").save()
+                if step == "define":
+                    armed[0] = True
+                    with pytest.raises(SurrealDbConnectionError) as info:
+                        await EmbUser.signup(email="b@x", password="p", bind=True)
+                    expected = _DEFINE_FAILED
+                else:
+                    await EmbUser.signup(email="b@x", password="p", bind=True)
+                    armed[0] = True
+                    with pytest.raises(SurrealDbConnectionError) as info:
+                        await SurrealDBConnectionManager.invalidate()
+                    expected = _SIGNIN_FAILED if step == "signin" else _REMOVE_FAILED
+                armed[0] = False
+                exc = info.value
+                assert str(exc) == expected
+                assert exc.__cause__ is None
+                assert exc.__context__ is None
+                assert getattr(exc, "retryable", None) is False
+                assert secrets_seen
+                for secret in secrets_seen:
+                    for text in (str(exc), repr(exc), repr(exc.__cause__), repr(exc.__context__), caplog.text):
+                        assert secret not in text
+                # The next call retries the same path: never an anonymous session, the data intact, no user left.
+                again = await SurrealDBConnectionManager.get_client()
+                assert again is client
+                await _assert_not_anonymous(client)
+                assert await _is_owner(client)
+                assert (await Person.objects().get("ada")).name == "Ada"
+                assert _OWNER not in await _root_users(client)
 
 
 def _slow_info(monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> asyncio.Event:
@@ -2623,7 +3071,7 @@ class TestReadmeEmbeddedWording:
             "In-process databases",
             "One engine per process",
             "What the embedded engine does not do",
-            "Its SurrealQL is the 2.x line",
+            "Its SurrealQL is the 4.x line",
             "Identity on the embedded engine",
             "Test fixtures",
             "Coming from the full SurrealDB-ORM",
@@ -2634,7 +3082,7 @@ class TestReadmeEmbeddedWording:
         firsts = [cells[0] for _, cells in rows]
         for scheme in ("mem://", "memory://", "surrealkv://", "surrealkv+versioned://", "file://", "rocksdb://"):
             assert any(scheme in first for first in firsts), scheme
-        assert "`memory`" not in firsts, "a bare memory is refused by SDK 2.0.0"
+        assert "`mem://`, `memory://`, `memory`" in firsts, "a bare memory is accepted by SDK 3.0 (v0.50.0)"
         [file_row] = [cells for _, cells in rows if "file://" in cells[0]]
         assert "SurrealKV" in file_row[1], file_row
         [rocksdb] = [cells for _, cells in rows if "rocksdb://" in cells[0]]
@@ -2643,7 +3091,7 @@ class TestReadmeEmbeddedWording:
         assert all(cells[1].startswith("✅") for _, cells in rows if cells is not rocksdb), rows
         assert all(cells[2].startswith("❌") for _, cells in rows), "the full SurrealDB-ORM has no embedded engine"
         sentence = _normalised(_section_26())
-        assert "A bare `memory` (no `://`) is refused by SDK 2.0.0 and accepted by the SDK 3.0 line" in sentence
+        assert "A bare `memory` (no `://`) is accepted too (SDK 2.0.0 refused it)" in sentence
         assert "keeps no list of embedded schemes" in sentence
 
     def test_section_26_tables_have_no_raw_pipe_in_a_cell(self) -> None:
@@ -2656,7 +3104,7 @@ class TestReadmeEmbeddedWording:
     def test_closed_client_rule_and_concurrency_advice(self) -> None:
         section = _section_26()
         engine = _normalised(_subsection("### One engine per process", section))
-        assert "closing does not stop an in-process engine" in engine and "`del client`" in engine
+        assert "Since v0.50.0 (SDK 3.0) closing stops the engine" in engine and "`del client`" in engine
         assert "Never open one path from two processes" in engine
         fixtures = _normalised(_subsection("### Test fixtures", section))
         assert "`DEFINE TABLE`" in fixtures and "@retry_on_conflict()" in fixtures, fixtures
@@ -2696,7 +3144,12 @@ class TestReadmeEmbeddedWording:
         that keeps its widths and its catch-all last row (later releases add their rows in version order)."""
         part = _doc_part(_EMBEDDED_BEHAVIOUR)
         [lines] = _tables(part)
-        assert _cells(lines[0]) == ["ORM capability", "Embedded engine (SDK 2.0.0)", "Servers (2.x and 3.x)", "Since"]
+        assert _cells(lines[0]) == [
+            "ORM capability",
+            "Embedded engine (SDK 3.0, SurrealDB 4.0 core)",
+            "Servers (2.x, 3.x and 4.x)",
+            "Since",
+        ]
         rows = [cells for _, cells in _table_rows(part)]
         assert all(len(cells) == 4 for cells in rows), rows
         assert release(rows[0][3]) == (0, 25, 0), rows[0]
@@ -2719,7 +3172,7 @@ class TestReadmeEmbeddedWording:
             assert row in firsts, row
 
     def test_behaviour_tables_point_to_each_other(self) -> None:
-        header = _normalised(_doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
+        header = _normalised(_doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x").split("\n|", 1)[0])
         assert "(#orm-behaviour-the-embedded-engine)" in header, header
         assert "(embedded.md#26-embedded-engine-and-test-fixtures)" in _doc_part(_EMBEDDED_BEHAVIOUR)
 
@@ -2729,7 +3182,11 @@ class TestReadmeEmbeddedWording:
         requirements = [cells for _, cells in _table_rows(_doc_part("## Requirements"))]
         assert any(cells[0] == "SurrealDB" and "the SDK's embedded engine" in cells[1] for cells in requirements)
         compatibility = [cells for _, cells in _table_rows(_doc_part("# Compatibility"))]
-        assert ["Embedded engine (SDK 2.0.0: SurrealDB 2.3.10 core)", "2.0", "✅ Tested (in-process)"] in compatibility
+        assert [
+            "Embedded engine (SDK 3.0.0: SurrealDB 4.0.0 core)",
+            "3.0",
+            "✅ Tested (in-process, `[embedded]`)",
+        ] in compatibility
         features = [cells for _, cells in _table_rows(_doc_part("## Features"))]
         assert ["Embedded engine (mem://, surrealkv://) & test fixtures", "✅"] in features, features
         roadmap = [cells for _, cells in _table_rows(_doc_part("## Roadmap"))]
@@ -2778,7 +3235,7 @@ class TestReadmeEmbeddedWording:
         raw_note = roadmap.split("\n### Embedded URLs\n", 1)[1].split("\n## ", 1)[0]
         note = _normalised(raw_note)
         assert "The full SurrealDB-ORM has no embedded engine (HTTP/WebSocket only)" in note
-        assert "SurrealDB core 2.3.10 with SDK 2.0.0" in note
+        assert "SurrealDB core 4.0.0 with SDK 3.0.0" in note and "SurrealDB core 2.3.10 with SDK 2.0.0" in note
         assert (_RELEASED_FIXTURES_NOTE_40 if released_40 else _PLANNED_FIXTURES_NOTE_40) in note, note
         rows = _table_rows(raw_note, "Embedded URL")
         firsts = [cells[0] for _, cells in rows]

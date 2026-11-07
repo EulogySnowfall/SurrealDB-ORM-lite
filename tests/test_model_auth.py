@@ -36,6 +36,7 @@ from surreal_orm_lite import (
     SurrealDbConnectionError,
     SurrealDBConnectionManager,
     SurrealDbError,
+    _client,
 )
 from surreal_orm_lite._sdk import RecordID, SurrealError
 from surreal_orm_lite.define_parser import parse_define_access
@@ -101,8 +102,8 @@ class TestEphemeralClient:
                 async with SurrealDBConnectionManager.ephemeral_client() as client:
                     captured.append(client)
                     raise RuntimeError("boom")
-            # A closed client refuses further use.
-            with pytest.raises(SurrealError):
+            # A closed client refuses further use, without opening a socket (v0.50.0: it is retired).
+            with pytest.raises(SurrealDbConnectionError, match=r"ephemeral_client\(\) block ended"):
                 await captured[0].info()
         finally:
             await SurrealDBConnectionManager.unset_connection()
@@ -316,7 +317,7 @@ class TestDefineAccessE2E:
     async def test_the_access_method_really_exists_on_the_server(self) -> None:
         async with auth_model() as model:
             client = await SurrealDBConnectionManager.get_client()
-            info = await client.query("INFO FOR DB;", {})
+            info = await _client.query(client, "INFO FOR DB;", {})
             assert model.get_access_name() in str(info)
 
     @pytest.mark.asyncio
@@ -391,7 +392,7 @@ class TestPrimaryKeyAccessE2E:
     async def test_define_access_succeeds(self) -> None:
         async with auth_model(KeyedUser) as model:  # define_access() raised on SurrealDB 3.x before #338
             client = await SurrealDBConnectionManager.get_client()
-            info = await client.query("INFO FOR DB;", {})
+            info = await _client.query(client, "INFO FOR DB;", {})
             assert model.get_access_name() in info["accesses"]
 
     @pytest.mark.asyncio
@@ -412,7 +413,7 @@ class TestPrimaryKeyAccessE2E:
             assert (created.user.email, created.user.name) == (email, "Ada")
             assert (signed_in.user.email, me.email) == (email, email)
             client = await SurrealDBConnectionManager.get_client()
-            assert await client.query("SELECT VALUE id FROM KeyedUser;", {}) == [RecordID("KeyedUser", email)]
+            assert await _client.query(client, "SELECT VALUE id FROM KeyedUser;", {}) == [RecordID("KeyedUser", email)]
             # The rest of the ORM addresses the record SIGNUP wrote by its key.
             found = await model.objects().get(email)
             assert (found.email, found.name) == (email, "Ada")
@@ -422,7 +423,7 @@ class TestPrimaryKeyAccessE2E:
         """``define_parser`` reads the SIGNUP target as the table, and every ``SET`` item — ``id`` included."""
         async with auth_model(KeyedUser) as model:
             client = await SurrealDBConnectionManager.get_client()
-            info = await client.query("INFO FOR DB;", {})
+            info = await _client.query(client, "INFO FOR DB;", {})
             state = parse_define_access(info["accesses"][model.get_access_name()])
             assert state.table == "KeyedUser"
             assert dict(state.signup_fields) == {
@@ -442,7 +443,7 @@ class TestPrimaryKeyAccessE2E:
             signed_in = await model.signin(email=email, password=AUTH_PASSWORD)
             assert (created.user.email, signed_in.user.email) == (email, email)
             client = await SurrealDBConnectionManager.get_client()
-            assert await client.query("SELECT VALUE id FROM KeyedFullUser;", {}) == [RecordID("KeyedFullUser", email)]
+            assert await _client.query(client, "SELECT VALUE id FROM KeyedFullUser;", {}) == [RecordID("KeyedFullUser", email)]
 
     @pytest.mark.asyncio
     async def test_declared_permissions(self) -> None:
@@ -490,12 +491,12 @@ class TestPrimaryKeyAccessE2E:
             with pytest.raises(ValueError, match=r"requires slug="):
                 await model.signup(slug=None, email=_unique_email(), password=AUTH_PASSWORD)
             client = await SurrealDBConnectionManager.get_client()
-            assert await client.query("SELECT VALUE id FROM KeyedSlugUser;", {}) == []
+            assert await _client.query(client, "SELECT VALUE id FROM KeyedSlugUser;", {}) == []
 
             email = _unique_email()
             created = await model.signup(slug="ada", email=email, password=AUTH_PASSWORD)
             assert (created.user.slug, created.user.email) == ("ada", email)
-            assert await client.query("SELECT VALUE id FROM KeyedSlugUser;", {}) == [RecordID("KeyedSlugUser", "ada")]
+            assert await _client.query(client, "SELECT VALUE id FROM KeyedSlugUser;", {}) == [RecordID("KeyedSlugUser", "ada")]
 
 
 class FloatKeyUser(AuthenticatedUserMixin, BaseSurrealModel):
@@ -545,7 +546,7 @@ class TestFloatPrimaryKeyE2E:
                 with pytest.raises(ValueError, match=r"got code=.*primary key"):
                     await model.signup(code=key, email=_unique_email(), password=AUTH_PASSWORD)
             client = await SurrealDBConnectionManager.get_client()
-            assert await client.query("SELECT VALUE id FROM FloatKeyUser;", {}) == []
+            assert await _client.query(client, "SELECT VALUE id FROM FloatKeyUser;", {}) == []
 
     @pytest.mark.asyncio
     async def test_integral_float_integer_and_string_keys_still_sign_up(self) -> None:
@@ -560,9 +561,9 @@ class TestFloatPrimaryKeyE2E:
                 created = await FloatKeyUser.signup(code=key, email=email, password=AUTH_PASSWORD)
                 signed_in = await FloatKeyUser.signin(email=email, password=AUTH_PASSWORD)
                 assert (created.user.code, created.user.email, signed_in.user.email) == (key, email, email)
-                ids = await client.query("SELECT VALUE id FROM FloatKeyUser;", {})
+                ids = await _client.query(client, "SELECT VALUE id FROM FloatKeyUser;", {})
                 assert RecordID("FloatKeyUser", record_key) in ids
-            assert len(await client.query("SELECT VALUE id FROM FloatKeyUser;", {})) == len(cases)
+            assert len(await _client.query(client, "SELECT VALUE id FROM FloatKeyUser;", {})) == len(cases)
         finally:
             with contextlib.suppress(Exception):
                 client = await SurrealDBConnectionManager.get_client()
@@ -972,7 +973,7 @@ class TestExcludedSignupFieldWriteE2E:
             )
 
             async def stored_hash() -> Any:
-                return await client.query("SELECT VALUE password FROM ONLY sg1_hash_keeper:ada;", {})
+                return await _client.query(client, "SELECT VALUE password FROM ONLY sg1_hash_keeper:ada;", {})
 
             stored = await stored_hash()
             assert isinstance(stored, str) and stored.startswith("$argon2")
@@ -1022,8 +1023,8 @@ class TestRefusedWriteInTransactionE2E:
                     await getattr(me, call)(tx=tx)
                 written = (tx._records_written(), tx._cache_written())
                 applied = await IndexedKeeper.define_indexes(tx=tx)
-            info = await client.query("INFO FOR TABLE sg1_indexed_keeper;", {})
-            rows = await client.query("SELECT * FROM sg1_indexed_keeper;", {})
+            info = await _client.query(client, "INFO FOR TABLE sg1_indexed_keeper;", {})
+            rows = await _client.query(client, "SELECT * FROM sg1_indexed_keeper;", {})
         if refusal == "signup":
             assert type(raised.value) is TypeError
             assert str(raised.value) == signup_excluded_refused("IndexedKeeper", ["password"])
@@ -1606,7 +1607,7 @@ class TestReviewRegressions:
                 await model.signup(email=email, password=AUTH_PASSWORD)
 
             client = await SurrealDBConnectionManager.get_client()
-            rows = await client.query(f"SELECT email FROM {model.get_table_name()};", {})
+            rows = await _client.query(client, f"SELECT email FROM {model.get_table_name()};", {})
             assert not rows, "signup created a record despite refusing the call"
 
     def test_the_refresh_hint_follows_the_flag_not_the_ddl_text(self) -> None:

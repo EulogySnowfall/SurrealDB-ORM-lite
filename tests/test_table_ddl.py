@@ -219,6 +219,7 @@ from surreal_orm_lite import (
     SurrealDbNotFoundError,
     TableType,
     Transaction,
+    _client,
     computed,
     generate_models_from_db,
     model_ddl,
@@ -3209,7 +3210,11 @@ class _InfoClient:
         self.error = error
         self.queries: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if self.error is not None:
@@ -3570,7 +3575,11 @@ class _TableClient:
         self.version_calls = 0
         self.version_at: int | None = None
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if statement == _INFO:
@@ -4203,7 +4212,7 @@ async def _tdl(kind: str) -> AsyncIterator[Any]:
 
 async def _tables(client: Any) -> dict[str, Any]:
     """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
-    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+    return dict((await _client.query(client, "INFO FOR DB;", {}))["tables"])
 
 
 async def _line(client: Any) -> tuple[int, int]:
@@ -4221,7 +4230,7 @@ async def _major(client: Any) -> int:
 
 async def _table_info(client: Any, table: str) -> dict[str, Any]:
     """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
-    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    info: dict[str, Any] = await _client.query(client, f"INFO FOR TABLE {table};", {})
     return info
 
 
@@ -4686,7 +4695,7 @@ def _clauses(state: TableState) -> tuple[object, ...]:
 
 async def _define_table_entries(client: Any, table: str) -> int:
     """How many ``define_table`` entries the change feed of *table* holds."""
-    entries = await client.query(f"SHOW CHANGES FOR TABLE {table} SINCE 0 LIMIT 100;", {})
+    entries = await _client.query(client, f"SHOW CHANGES FOR TABLE {table} SINCE 0 LIMIT 100;", {})
     return [kind for entry in entries for change in entry["changes"] for kind in change].count("define_table")
 
 
@@ -4780,7 +4789,7 @@ async def _tune_note(client: Any) -> TdlNoteTuned:
     record ``n1`` read through the model."""
     await _apply_ddl(client, _AC9_FIXTURE)
     assert (await _tables(client))["tdl_note"] == _STORED_NOTE
-    assert await client.query("SELECT VALUE n FROM tdl_note_count;", {}) == [1]
+    assert await _client.query(client, "SELECT VALUE n FROM tdl_note_count;", {}) == [1]
     return await TdlNoteTuned.objects().get("n1")
 
 
@@ -4840,7 +4849,7 @@ class TestExistingTableE2E:
                 assert (await TdlNoteTuned.objects().get("n1")).model_dump() == n1.model_dump()
                 assert parse_define_table(tables["tdl_note_count"]).view_query is not None
                 await TdlNoteTuned(id="n2", body="c").save()
-                assert await client.query("SELECT VALUE n FROM tdl_note_count;", {}) == [2]
+                assert await _client.query(client, "SELECT VALUE n FROM tdl_note_count;", {}) == [2]
             finally:
                 if live_id is not None:
                     with contextlib.suppress(Exception):
@@ -4870,7 +4879,7 @@ class TestExistingTableE2E:
             status = _field_states(await _table_info(client, "tdl_note"))[("status",)]
             assert status.default == "'new'"
             await TdlNoteStatus(id="s1", body="b").save()
-            assert await client.query("SELECT VALUE status FROM tdl_note:s1;", {}) == ["new"]
+            assert await _client.query(client, "SELECT VALUE status FROM tdl_note:s1;", {}) == ["new"]
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize("always", [True, False], ids=["default-always", "default"])
@@ -4920,7 +4929,7 @@ _CART_FIXTURE = (
 
 async def _total(client: Any) -> list[Any]:
     """``total`` of the record ``tdl_cart:c1``."""
-    total: list[Any] = await client.query("SELECT VALUE total FROM tdl_cart:c1;", {})
+    total: list[Any] = await _client.query(client, "SELECT VALUE total FROM tdl_cart:c1;", {})
     return total
 
 
@@ -4970,7 +4979,7 @@ class TestComputedE2E:
             age = _field_states(await _table_info(client, "tdl_note"))[("age",)]
             assert (age.computed, age.default) == ("18", None)
             await _apply_ddl(client, "CREATE tdl_note:a1;")
-            assert await client.query("SELECT VALUE age FROM tdl_note:a1;", {}) == [18]
+            assert await _client.query(client, "SELECT VALUE age FROM tdl_note:a1;", {}) == [18]
 
 
 class TdlStatsNode(BaseSurrealModel):
@@ -5001,7 +5010,7 @@ class TestTableGuardE2E:
                 _tg1("TdlStatsNode", "define_table", "tdl_stats"),
             )
             assert (await _tables(client))["tdl_stats"] == before
-            assert await client.query("SELECT VALUE n FROM tdl_stats;", {}) == [1]
+            assert await _client.query(client, "SELECT VALUE n FROM tdl_stats;", {}) == [1]
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
@@ -5549,7 +5558,7 @@ class TestEdgeAndViewE2E:
 
             edge = await TdlPersonNode(id="p1").relate(TdlLikes, RecordID("tdl_note", "n1"), stars=3)
             assert edge.stars == 3
-            assert await client.query("SELECT VALUE stars FROM tdl_likes;", {}) == [3]
+            assert await _client.query(client, "SELECT VALUE stars FROM tdl_likes;", {}) == [3]
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
@@ -5634,7 +5643,7 @@ class TestEdgeAndViewE2E:
             assert (type(raised.value), str(raised.value)) == (SurrealDbError, _g1("TdlStats", "tdl_stats"))
             assert _sent(calls) == [_INFO, "SELECT id FROM `tdl_stats` LIMIT 1;"]
             assert (await _tables(client))["tdl_stats"] == before
-            assert await client.query("SELECT VALUE a FROM tdl_stats;", {}) == [1]
+            assert await _client.query(client, "SELECT VALUE a FROM tdl_stats;", {}) == [1]
 
 
 # --- the line facts define_table() is built around -------------------------------------------------------------------
@@ -5713,6 +5722,9 @@ _UNTYPED_CASES: list[tuple[tuple[tuple[str, str], ...], str, object, object, obj
         _NOT_FLEXIBLE,
     ),
 ]
+#: Where SurrealDB 4.x (server and embedded engine, measured on 4.0.0) differs from the last column: a ``TYPE array``
+#: without an item definition keeps an object item, as an optional array does from 3.2.
+_UNTYPED_4X: dict[tuple[tuple[str, str], ...], object] = {(("v", "TYPE array"),): [{"k": 1}]}
 _UNTYPED_IDS = [
     "any-object",
     "any-array",
@@ -5817,6 +5829,8 @@ class TestLineFactsE2E:
         async with _tdl(kind) as client:
             line = await _line(client)
             expected = before_3 if line[0] < 3 else line_3_1 if line == (3, 1) else line_3
+            if line[0] >= 4:
+                expected = _UNTYPED_4X.get(definitions, expected)
             ddl = "DEFINE TABLE tdl_raw SCHEMAFULL; " + " ".join(
                 f"DEFINE FIELD OVERWRITE {path} ON tdl_raw {clauses};" for path, clauses in definitions
             )
@@ -5828,10 +5842,10 @@ class TestLineFactsE2E:
             refused = await _refusal(client, f"CREATE tdl_raw:1 SET v = {value} RETURN NONE;")
             if isinstance(expected, _Refused):
                 assert refused is not None and expected.reason in refused, _UNTYPED_CHANGED
-                assert await client.query("SELECT VALUE v FROM tdl_raw;", {}) == [], _UNTYPED_CHANGED
+                assert await _client.query(client, "SELECT VALUE v FROM tdl_raw;", {}) == [], _UNTYPED_CHANGED
                 return
             assert refused is None, f"{_UNTYPED_CHANGED}: {refused}"
-            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [expected], _UNTYPED_CHANGED
+            assert await _client.query(client, "SELECT VALUE v FROM tdl_raw:1;", {}) == [expected], _UNTYPED_CHANGED
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_write_naming_an_undeclared_field(self, kind: str) -> None:
@@ -5842,20 +5856,38 @@ class TestLineFactsE2E:
         async with _tdl(kind) as client:
             major = await _major(client)
             await _apply_ddl(client, "CREATE tdl_note:n1 SET body = 'b', extra = {k: 1}, gone = 'g' RETURN NONE;")
-            before = await client.query("SELECT * FROM tdl_note:n1;", {})
+            before = await _client.query(client, "SELECT * FROM tdl_note:n1;", {})
+            if major >= 4:
+                # SurrealDB 4.x (compatibility level 4): a field refusing NONE cannot be defined on a populated
+                # SCHEMAFULL table; define_table() relays the server's refusal (D25), the record is unchanged.
+                with pytest.raises(SurrealDbError) as raised:
+                    await TdlNoteStrict.define_table()
+                assert type(raised.value) is SurrealDbError
+                assert str(raised.value).startswith("Can't apply field definition: 'body' on table 'tdl_note' -> ")
+                assert "compatibility level 4 and has rows" in str(raised.value)
+                assert await _client.query(client, "SELECT * FROM tdl_note:n1;", {}) == before
+                await _client.query(client, "DELETE tdl_note;", {})
+                await TdlNoteStrict.define_table()
+                fresh = TdlNoteStrict(id="n2", body="x")
+                await fresh.save()
+                with pytest.raises(InternalError, match="no such field exists"):
+                    await fresh.merge(nope=1)
+                n2 = [{"id": RecordID("tdl_note", "n2"), "body": "x"}]
+                assert await _client.query(client, "SELECT * FROM tdl_note:n2;", {}) == n2, _UNDECLARED_CHANGED
+                return
             await TdlNoteStrict.define_table()
-            assert await client.query("SELECT * FROM tdl_note:n1;", {}) == before
+            assert await _client.query(client, "SELECT * FROM tdl_note:n1;", {}) == before
 
             note = await TdlNoteStrict.objects().get("n1")
             if major >= 3:
                 with pytest.raises(InternalError, match="no such field exists") as refused:
                     await note.merge(body="c")
                 assert type(refused.value) is InternalError, _UNDECLARED_CHANGED
-                assert await client.query("SELECT * FROM tdl_note:n1;", {}) == before, _UNDECLARED_CHANGED
+                assert await _client.query(client, "SELECT * FROM tdl_note:n1;", {}) == before, _UNDECLARED_CHANGED
             else:
                 await note.merge(body="c")
                 n1 = [{"id": RecordID("tdl_note", "n1"), "body": "c"}]
-                assert await client.query("SELECT * FROM tdl_note:n1;", {}) == n1, _UNDECLARED_CHANGED
+                assert await _client.query(client, "SELECT * FROM tdl_note:n1;", {}) == n1, _UNDECLARED_CHANGED
 
             fresh = TdlNoteStrict(id="n2", body="x")
             await fresh.save()
@@ -5866,7 +5898,7 @@ class TestLineFactsE2E:
             else:
                 await fresh.merge(nope=1)
             n2 = [{"id": RecordID("tdl_note", "n2"), "body": "x"}]
-            assert await client.query("SELECT * FROM tdl_note:n2;", {}) == n2, _UNDECLARED_CHANGED
+            assert await _client.query(client, "SELECT * FROM tdl_note:n2;", {}) == n2, _UNDECLARED_CHANGED
 
 
 #: The failure of the list-of-sub-models pins once a SurrealDB line changes.
@@ -5996,7 +6028,7 @@ class TestSubModelListsE2E:
             await _apply_ddl(client, "CREATE tdl_raw:1 SET v = [{n: 'a', m: {k: {j: [1]}}}] RETURN NONE;")
             kept = flexible or major >= 3
             stored = [{"n": "a", "m": {"k": {"j": [1]}}}] if kept else [{"n": "a"}]
-            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
+            assert await _client.query(client, "SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
             refused = await _refusal(client, "UPDATE tdl_raw:1 MERGE {} RETURN NONE;")
             if kept:
                 assert refused is None, f"{_LISTS_CHANGED}: {refused}"
@@ -6004,7 +6036,7 @@ class TestSubModelListsE2E:
                 assert refused is not None and "Found NONE for field" in refused, _LISTS_CHANGED
             refused = await _refusal(client, "UPDATE tdl_raw:1 SET v = [{n: 1, m: {}}] RETURN NONE;")
             assert refused is not None and "n`" in refused, _LISTS_CHANGED
-            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
+            assert await _client.query(client, "SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize("flexible", [False, True], ids=["array", "array-flexible"])
@@ -6039,34 +6071,53 @@ class TestSubModelListsE2E:
                 "DEFINE FIELD y.*.n ON tdl_raw TYPE option<string>; "
                 "DEFINE FIELD y.*.s ON tdl_raw TYPE option<object>;",
             )
+            if major >= 4:
+                # SurrealDB 4.x (server and embedded engine) applies FLEXIBLE as documented: only the items of a
+                # FLEXIBLE array keep the key; an object inside an item, a sub-object and the items of any other
+                # array refuse it.
+                writes = [
+                    ("v", "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;"),
+                    ("z", "CREATE tdl_raw:4 SET v = [], z = [{s: {k: 1, stray: 1}}] RETURN NONE;"),
+                    ("o", "CREATE tdl_raw:2 SET v = [], o = {n: 'a', stray: 1} RETURN NONE;"),
+                    ("w", "CREATE tdl_raw:3 SET v = [], w = [{stray: 1}] RETURN NONE;"),
+                    ("y", "CREATE tdl_raw:5 SET v = [], y = [{n: 'a', s: {stray: 1}}] RETURN NONE;"),
+                ]
+                refusals = {name: await _refusal(client, write) for name, write in writes}
+                kept_v = await _client.query(client, "SELECT VALUE v FROM tdl_raw:1;", {})
+                assert all((refusal is None) == (name == "v" and flexible) for name, refusal in refusals.items()), (
+                    f"{_UNDECLARED_CHANGED}: {refusals}"
+                )
+                assert all("no such field exists" in refusal for refusal in refusals.values() if refusal is not None)
+                assert kept_v == ([[{"n": "a", "stray": {"deep": 1}}]] if flexible else []), _UNDECLARED_CHANGED
+                return
             refused = await _refusal(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
             assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
             kept = flexible or major >= 3
             stored = [{"n": "a", "stray": {"deep": 1}}] if kept else [{"n": "a"}]
-            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _UNDECLARED_CHANGED
+            assert await _client.query(client, "SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _UNDECLARED_CHANGED
             refused = await _refusal(client, "CREATE tdl_raw:4 SET v = [], z = [{s: {k: 1, stray: 1}}] RETURN NONE;")
             assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
             stored = [{"s": {"k": 1, "stray": 1}}] if kept else [{"s": {"k": 1}}]
-            assert await client.query("SELECT VALUE z FROM tdl_raw:4;", {}) == [stored], _UNDECLARED_CHANGED
+            assert await _client.query(client, "SELECT VALUE z FROM tdl_raw:4;", {}) == [stored], _UNDECLARED_CHANGED
             refused = await _refusal(client, "CREATE tdl_raw:2 SET v = [], o = {n: 'a', stray: 1} RETURN NONE;")
             if major >= 3:
                 assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
             else:
                 assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
-                assert await client.query("SELECT VALUE o FROM tdl_raw:2;", {}) == [{"n": "a"}], _UNDECLARED_CHANGED
+                assert await _client.query(client, "SELECT VALUE o FROM tdl_raw:2;", {}) == [{"n": "a"}], _UNDECLARED_CHANGED
             refused = await _refusal(client, "CREATE tdl_raw:3 SET v = [], w = [{stray: 1}] RETURN NONE;")
             if major >= 3:
                 assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
             else:
                 assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
-                assert await client.query("SELECT VALUE w FROM tdl_raw:3;", {}) == [[{}]], _UNDECLARED_CHANGED
+                assert await _client.query(client, "SELECT VALUE w FROM tdl_raw:3;", {}) == [[{}]], _UNDECLARED_CHANGED
             refused = await _refusal(client, "CREATE tdl_raw:5 SET v = [], y = [{n: 'a', s: {stray: 1}}] RETURN NONE;")
             if major >= 3:
                 assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
             else:
                 assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
                 stored = [{"n": "a", "s": {}}]
-                assert await client.query("SELECT VALUE y FROM tdl_raw:5;", {}) == [stored], _UNDECLARED_CHANGED
+                assert await _client.query(client, "SELECT VALUE y FROM tdl_raw:5;", {}) == [stored], _UNDECLARED_CHANGED
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_an_undeclared_key_in_an_item_after_define_table(self, kind: str) -> None:
@@ -6077,8 +6128,12 @@ class TestSubModelListsE2E:
         async with _tdl(kind) as client:
             await TdlOrderPlain.define_table()
             refused = await _refusal(client, "CREATE tdl_order:p1 SET tags = [{label: 'a', meta: {}, stray: 1}] RETURN NONE;")
+            if await _major(client) >= 4:
+                # SurrealDB 4.x refuses the key: the array is not FLEXIBLE (the ORM never sends such a key).
+                assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
+                return
             assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
-            tags = await client.query("SELECT VALUE tags FROM tdl_order:p1;", {})
+            tags = await _client.query(client, "SELECT VALUE tags FROM tdl_order:p1;", {})
             assert tags == [[{"label": "a", "meta": {}, "stray": 1}]], _UNDECLARED_CHANGED
 
 
@@ -6790,13 +6845,13 @@ async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> Any:
     signed_in = await model.signin(email=_TDL_EMAIL, password=_TDL_PASSWORD)
     assert signed_in.user.get_id() == created.user.get_id()
     assert signed_in.user.email == _TDL_EMAIL
-    assert await client.query("SELECT VALUE email FROM tdl_user;", {}) == [_TDL_EMAIL]
+    assert await _client.query(client, "SELECT VALUE email FROM tdl_user;", {}) == [_TDL_EMAIL]
     return signed_in.user
 
 
 async def _stored_hash(client: Any) -> str:
     """The one password hash stored in ``tdl_user`` (an argon2 hash, never the password)."""
-    [stored] = await client.query("SELECT VALUE password FROM tdl_user;", {})
+    [stored] = await _client.query(client, "SELECT VALUE password FROM tdl_user;", {})
     assert isinstance(stored, str)
     assert stored.startswith("$argon2")
     return stored
@@ -6819,7 +6874,7 @@ async def _update_keeps_the_hash(model: type[TdlAuthUser], client: Any, *, metho
 async def _auth_refused(model: type[TdlAuthHidden], client: Any) -> None:
     """``signup()`` and ``signin()`` of *model*, whose access is defined, are refused (SG1) and write nothing: the
     records of ``tdl_user`` are the same afterwards."""
-    before = await client.query("SELECT * FROM tdl_user;", {})
+    before = await _client.query(client, "SELECT * FROM tdl_user;", {})
     for call in (
         lambda: model.signup(email="eve@example.test", password=_TDL_PASSWORD),
         lambda: model.signin(email=_TDL_EMAIL, password=_TDL_PASSWORD),
@@ -6827,7 +6882,7 @@ async def _auth_refused(model: type[TdlAuthHidden], client: Any) -> None:
         with pytest.raises(TypeError) as raised:
             await call()
         assert str(raised.value) == _sg1(model.__name__, "'password'")
-    assert await client.query("SELECT * FROM tdl_user;", {}) == before
+    assert await _client.query(client, "SELECT * FROM tdl_user;", {}) == before
 
 
 async def _user_table(client: Any) -> tuple[Any, dict[str, Any]]:
@@ -6857,7 +6912,7 @@ class TestAccessE2E:
                 ("email",): ("string", False),
                 ("password",): ("string", False),
             }
-            assert "tdl_user_access" in (await client.query("INFO FOR DB;", {}))["accesses"]
+            assert "tdl_user_access" in (await _client.query(client, "INFO FOR DB;", {}))["accesses"]
             await _signup_and_signin(TdlAuthUser, client)
 
     async def test_define_access_then_define_table_changes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6901,7 +6956,7 @@ class TestAccessE2E:
                 _tg1("TdlAuthUser", "define_access", "tdl_user"),
             )
             assert (await _tables(client))["tdl_user"] == before
-            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+            assert "tdl_user_access" not in (await _client.query(client, "INFO FOR DB;", {}))["accesses"]
 
     @pytest.mark.parametrize("model", [TdlAuthHidden, TdlAuthHiddenOptional], ids=lambda model: model.__name__)
     async def test_sg1_a_signup_field_the_table_would_leave_out(
@@ -6920,7 +6975,7 @@ class TestAccessE2E:
             monkeypatch.undo()
             assert str(raised.value) == _sg1(model.__name__, "'password'")
             assert "tdl_user" not in await _tables(client)
-            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+            assert "tdl_user_access" not in (await _client.query(client, "INFO FOR DB;", {}))["accesses"]
 
     @pytest.mark.parametrize("model", [TdlAuthHidden, TdlAuthHiddenOptional], ids=lambda model: model.__name__)
     async def test_sg1_define_table_then_define_access_without_table(
@@ -6941,7 +6996,7 @@ class TestAccessE2E:
             monkeypatch.undo()
             assert str(raised.value) == _sg1(model.__name__, "'password'")
             assert "tdl_user" not in await _tables(client)
-            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+            assert "tdl_user_access" not in (await _client.query(client, "INFO FOR DB;", {}))["accesses"]
 
     @pytest.mark.parametrize("kind", ["string", "option<string>"], ids=["required", "optional"])
     async def test_sg1_with_table_false_over_a_table_defined_by_hand(self, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
@@ -6963,7 +7018,7 @@ class TestAccessE2E:
             assert _sent(calls) == []
             monkeypatch.undo()
             assert str(raised.value) == _sg1("TdlAuthHidden", "'password'")
-            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+            assert "tdl_user_access" not in (await _client.query(client, "INFO FOR DB;", {}))["accesses"]
             await _apply_ddl(client, _A_ACCESS)
             await _auth_refused(TdlAuthHidden, client)
 
@@ -6985,7 +7040,7 @@ class TestAccessE2E:
             assert _sent(calls) == []
             monkeypatch.undo()
             assert "tdl_user" not in await _tables(client)
-            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+            assert "tdl_user_access" not in (await _client.query(client, "INFO FOR DB;", {}))["accesses"]
 
             assert await TdlAuthPlain.define_access() == [_A0, _A_ACCESS]
             await _signup_and_signin(TdlAuthPlain, client)
@@ -7207,10 +7262,10 @@ class TestRoundTripE2E:
                     after[field_path].computed,
                     after[field_path].assertion,
                 ) == kept, field_path
-            assert await client.query("SELECT VALUE v FROM tdl_rt:1;", {}) == [2]
+            assert await _client.query(client, "SELECT VALUE v FROM tdl_rt:1;", {}) == [2]
             if has_computed:
                 assert (after[("c",)].computed, after[("c",)].value) == ("a + 1", None)
-                assert await client.query("SELECT VALUE c FROM tdl_rt:1;", {}) == [2]
+                assert await _client.query(client, "SELECT VALUE c FROM tdl_rt:1;", {}) == [2]
 
 
 # === README: section 35, the sections it changes, the tables ========================================================
@@ -7221,7 +7276,7 @@ _SECTION_31 = "## 31. Schema introspection (`DatabaseIntrospector`, `generate_mo
 _SECTION_33 = "## 33. Materialized views (`view_query`, `define_view()`)"
 _SECTION_34 = "## 34. Relation constraints (`relation_in`, `define_relation()`)"
 _SECTION_35 = "## 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
-_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x vs 3.x"
+_SERVER_BEHAVIOUR = "## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"
 _EMBEDDED_BEHAVIOUR = "## ORM behaviour: the embedded engine"
 #: Section 35's anchor, as the sections that point to it write it.
 _LINK_35 = "(#35-model-table-ddl-define_table-schema_mode-permissions)"
@@ -7500,7 +7555,7 @@ _INTRO_NEEDLES_35 = (
     "one `DEFINE FIELD` per column from the annotations",
     "keeping what the model does not declare",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
     "`mem://`",
 )
 _PART_NEEDLES_35 = {
@@ -7636,7 +7691,7 @@ _PART_NEEDLES_35 = {
         "sub-models `define_table()` writes), on 2.x and the embedded engine of a list `define_table()` writes "
         "`FLEXIBLE`. The 3.x exception is a gap fixed in SurrealDB 3.4 (nightly at the time of writing).",
         "`COMPUTED` fields are SurrealDB 3.x's",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
         "(compatibility.md#orm-behaviour-the-embedded-engine)",
     ),
     "Transactions, connections and the cache": (
@@ -7785,14 +7840,13 @@ _HEADER_SENTENCE_34 = (
     "Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it "
     "refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`."
 )
-#: The row v0.34.0 adds to the embedded engine's table, cell by cell: the list-item exception in the words of the
+#: The row v0.34.0 adds to the embedded engine's table, cell by cell, re-measured in v0.50.0 (a 4.0 core): the 3.x list-item exception in the words of the
 #: 2.x/3.x row ``_UNDECLARED_ROW``, with its 3.4 note (#321).
 _EMBEDDED_TABLE_DDL_ROW = [
     _EMBEDDED_TABLE_DDL_FIRST,
-    "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and "
-    "to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops "
-    "that field, except in the items of a list `define_table()` writes `FLEXIBLE`, which keep it",
-    "3.x keeps them without `FLEXIBLE`, refuses that write except in list items defining a field, a gap fixed in 3.4",
+    "as on a 4.x server: no `FLEXIBLE` on `Any` and untyped columns; a write naming a field the table does not define "
+    "is refused, in the items of a list too unless the list is `FLEXIBLE`",
+    "2.x drops such a field; 3.x keeps it in list items defining a field, a gap fixed in 3.4",
     "v0.34.0",
 ]
 #: The v0.7.0 row of the 2.x/3.x table on the same writes, cell by cell: the list-item exception in the words of the

@@ -10,10 +10,11 @@ from typing import Any
 import pytest
 from pydantic import Field
 
-from surreal_orm_lite import BaseSurrealModel, Q, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, Q, SurrealDBConnectionManager, _client
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import Computed, SurrealFunc, computed
 from surreal_orm_lite.model_base import _ALIAS_MAPS, SurrealConfigDict
+from tests import _sdk_calls
 from tests.conftest import orm_client
 
 # ==================== Models ====================
@@ -154,7 +155,7 @@ class TestServerFields:
 
 async def _raw_row(client: Any, table: str, record: str) -> dict[str, Any]:
     """Read a row as the *server* stores it, bypassing the ORM's hydration."""
-    rows = await client.query(f"SELECT * FROM {table}:{record};", {})
+    rows = await _client.query(client, f"SELECT * FROM {table}:{record};", {})
     if isinstance(rows, list):
         return dict(rows[0]) if rows else {}
     return dict(rows) if isinstance(rows, dict) else {}
@@ -235,7 +236,7 @@ class TestWritePayloadE2E:
         """The point of ``server_fields``: the client never volunteers the column, so the
         server's ``DEFAULT`` applies instead of being overwritten with the model's ``None``."""
         async with orm_client("Stamped2") as client:
-            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
+            await _client.query(client, "DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
             await Stamped2(id="a", title="first").save()
             row = await _raw_row(client, "Stamped2", "a")
             assert row["created_at"] is not None
@@ -245,7 +246,7 @@ class TestWritePayloadE2E:
         """``update()``/``upsert()`` are REPLACE: the stamp is carried in the payload rather
         than omitted, because omitting it would delete the column outright."""
         async with orm_client("Stamped2") as client:
-            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
+            await _client.query(client, "DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
             instance = await Stamped2(id="a", title="first").save()
             stamped = (await _raw_row(client, "Stamped2", "a"))["created_at"]
             assert stamped is not None
@@ -268,7 +269,7 @@ class TestWritePayloadE2E:
         ("Found NONE for field …"), on 2.6.x and 3.x alike. Keeping it in the payload is what
         makes ``update()`` usable on such a model at all."""
         async with orm_client("Stamped2") as client:
-            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE datetime DEFAULT time::now();", {})
+            await _client.query(client, "DEFINE FIELD created_at ON Stamped2 TYPE datetime DEFAULT time::now();", {})
             instance = await Stamped2(id="a", title="first").save()
             instance.title = "second"
             await instance.update()
@@ -314,14 +315,14 @@ class TestHydrationE2E:
     async def test_refresh_hydrates_the_python_attribute(self) -> None:
         async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
-            await client.query("UPDATE Aliased:ada SET password_hash = 'rotated';", {})
+            await _client.query(client, "UPDATE Aliased:ada SET password_hash = 'rotated';", {})
             await instance.refresh()
             assert instance.password == "rotated"
 
     @pytest.mark.asyncio
     async def test_server_field_is_hydrated_after_save(self) -> None:
         async with orm_client("Stamped2") as client:
-            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
+            await _client.query(client, "DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
             instance = await Stamped2(id="a", title="first").save()
             assert instance.created_at is not None
 
@@ -478,10 +479,10 @@ class TestQuerySetAliasesE2E:
 
 class TestMergeRefreshE2E:
     @pytest.mark.asyncio
-    async def test_default_resyncs_from_the_returned_row(self) -> None:
+    async def test_default_resyncs_from_the_returned_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
-            merges = _spy(client, "merge")
+            merges = _sdk_calls.record(monkeypatch, client, "merge")  # SDK 3.0 has no client.merge()
             await instance.merge(password="rotated")
             assert len(merges) == 1
             assert instance.password == "rotated"
@@ -895,7 +896,7 @@ class TestOrCreateHonoursExplicitServerFields:
     @pytest.mark.asyncio
     async def test_get_or_create_converges_on_a_server_field(self) -> None:
         async with orm_client("Regioned") as client:
-            await client.query("DEFINE FIELD region ON Regioned TYPE option<string> DEFAULT 'eu';", {})
+            await _client.query(client, "DEFINE FIELD region ON Regioned TYPE option<string> DEFAULT 'eu';", {})
             _, created = await Regioned.objects().get_or_create(owner="bob", region="us")
             assert created is True
             _, created = await Regioned.objects().get_or_create(owner="bob", region="us")
@@ -905,7 +906,7 @@ class TestOrCreateHonoursExplicitServerFields:
     @pytest.mark.asyncio
     async def test_the_default_still_applies_when_unnamed(self) -> None:
         async with orm_client("Regioned") as client:
-            await client.query("DEFINE FIELD region ON Regioned TYPE option<string> DEFAULT 'eu';", {})
+            await _client.query(client, "DEFINE FIELD region ON Regioned TYPE option<string> DEFAULT 'eu';", {})
             obj, _ = await Regioned.objects().get_or_create(id="x", owner="bob")
             assert obj.region == "eu"
 
@@ -955,7 +956,7 @@ class TestGroupedResultKeys:
             required: int
 
         async with orm_client("Strict") as client:
-            await client.query("CREATE Strict:a SET label_col = 'x', required = 1;", {})
+            await _client.query(client, "CREATE Strict:a SET label_col = 'x', required = 1;", {})
             rows = await Strict.objects().select("label").exec()
             assert rows == [{"label": "x"}]
 
@@ -976,7 +977,8 @@ class TestMergeUsesTheReturnedRow:
     @pytest.mark.asyncio
     async def test_default_merge_hydrates_server_side_changes(self) -> None:
         async with orm_client("Stamped2") as client:
-            await client.query(
+            await _client.query(
+                client,
                 "DEFINE FIELD title ON Stamped2 TYPE string VALUE string::uppercase($value);",
                 {},
             )
@@ -993,14 +995,14 @@ class TestMergeUsesTheReturnedRow:
             await Aliased(id="real").save()
             with pytest.raises(SurrealDbError, match="no record found"):
                 await ghost.merge(password="x")  # table exists, record does not
-            assert await client.query("SELECT * FROM Aliased:ghost;", {}) == []
+            assert await _client.query(client, "SELECT * FROM Aliased:ghost;", {}) == []
 
     @pytest.mark.asyncio
-    async def test_refresh_false_asks_for_no_row(self) -> None:
+    async def test_refresh_false_asks_for_no_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             queries = _spy(client, "query")
-            merges = _spy(client, "merge")
+            merges = _sdk_calls.record(monkeypatch, client, "merge")  # SDK 3.0 has no client.merge()
             await instance.merge(password="rotated", refresh=False)
             assert merges == []
             assert any("RETURN NONE" in call[0][0] for call in queries if call[0])
@@ -1022,4 +1024,4 @@ class TestMergeUsesTheReturnedRow:
                 assert error is not None and "no record found" in str(error)
             else:
                 assert error is None
-            assert await client.query("SELECT * FROM Aliased:ghost;", {}) == []
+            assert await _client.query(client, "SELECT * FROM Aliased:ghost;", {}) == []

@@ -1,9 +1,9 @@
 """``encoding.encode()``: the value-driven boundary between the ORM and the SDK (v0.23.0).
 
 Unit tests, no database: one test per row of ``encode`` with its edges, the properties the hand-off
-relies on (identity on every value v0.22.2 could send, idempotence, no mutation of the input) and
-the zero-duration probe the refusal of a zero duration depends on (``decoding.py`` since #235). The raw-SDK round trips of the encoded forms, over WebSocket and
-HTTP on both server lines, live in ``tests/test_rich_types.py``.
+relies on (identity on every value v0.22.2 could send, idempotence, no mutation of the input). The
+raw-SDK round trips of the encoded forms, over WebSocket and HTTP on every server line, live in
+``tests/test_rich_types.py``.
 
 The hand-off itself — every SDK call of ``src/`` given ``_encoding.encode(…)`` of its payload, and
 never inside a ``try`` that would re-wrap the ``ValueError`` of a refused value — is checked here
@@ -49,7 +49,6 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     _sdk,
-    decoding,
     encoding,
 )
 from surreal_orm_lite._sdk import Bound
@@ -57,8 +56,16 @@ from tests.test_rich_types import _DECIMAL_FIXED, _decimal_corpus
 
 MAX_NS = Duration.MAX_NANOSECONDS
 _DUR = _sdk.TAG_DURATION_COMPACT
+
+
+def _dur(pair: list[int]) -> Any:
+    """What ``encode`` gives for a duration of ``[seconds, nanoseconds]``: the SDK's ``Duration`` (v0.50.0, SDK 3.0)."""
+    seconds, nanoseconds = pair
+    return surrealdb.Duration(seconds * 10**9 + nanoseconds)
+
+
 _DEC = _sdk.TAG_DECIMAL_STRING
-_NULL = _sdk.CBOR_NULL
+_NULL = _sdk.Null
 _ZEROS_29 = "0." + "0" * 29
 _UUID = UUID("0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11")
 _AT = datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
@@ -146,6 +153,23 @@ class TestEncodeRows:
     def test_fast_path_unchanged(self, value: Any) -> None:
         assert type(value) in encoding._PASSTHROUGH
         assert _encode(value) is value
+
+    def test_a_precise_datetime_keeps_its_nanoseconds(self) -> None:
+        value = surreal_orm_lite._sdk.PreciseDatetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC, nanosecond=789)
+        assert _encode(value) is value
+
+    @pytest.mark.parametrize("tz", [UTC, timezone(timedelta(hours=2)), None], ids=repr)
+    def test_a_precise_datetime_without_its_nanosecond_goes_out_to_the_microsecond(self, tz: Any) -> None:
+        """On Python 3.11, ``PreciseDatetime.replace()`` returns one whose ``nanosecond`` was never set: the SDK's
+        encoder reads that attribute and fails. ``datetime.__new__`` builds that value on every Python version."""
+        value = datetime.__new__(surreal_orm_lite._sdk.PreciseDatetime, 2026, 1, 2, 3, 4, 5, 123456, tz, fold=1)
+        assert not hasattr(value, "nanosecond")
+        got = _encode(value)
+        assert type(got) is surreal_orm_lite._sdk.PreciseDatetime and got.nanosecond == 0
+        assert got == value and got.tzinfo is value.tzinfo and got.fold == 1
+        assert not hasattr(value, "nanosecond"), "the value passed in is untouched"
+        assert _encode(got) is got
+        assert _encode({"at": [value]})["at"][0].nanosecond == 0
 
     @pytest.mark.parametrize("value", [0, 1, -1, 2**63 - 1, -(2**63), True, _Level.HIGH], ids=repr)
     def test_int64(self, value: Any) -> None:
@@ -293,9 +317,15 @@ class TestEncodeRows:
         ids=repr,
     )
     def test_duration_rows(self, value: Any, expected: list[int]) -> None:
+        """v0.50.0: the SDK's ``Duration``, which SDK 3.0 writes as tag 14 ``[seconds, nanoseconds]`` exactly."""
         out = _encode(value)
-        assert type(out) is CBORTag
-        assert out == CBORTag(_DUR, expected)
+        assert type(out) is surrealdb.Duration
+        assert out == _dur(expected)
+        seconds, nanoseconds = expected
+        assert _sdk.cbor_encode(out) == _sdk.cbor_encode(surrealdb.Duration(seconds * 10**9 + nanoseconds))
+        assert _sdk.cbor_decode(_sdk.cbor_encode(out)) == out  # u64 seconds included
+        if type(value) is surrealdb.Duration:
+            assert out is value  # already the SDK's form
 
     @pytest.mark.parametrize(
         ("value", "match"),
@@ -318,24 +348,11 @@ class TestEncodeRows:
         assert type(info.value) is ValueError
 
     @pytest.mark.parametrize("zero", [timedelta(0), Duration(0), surrealdb.Duration(0)], ids=repr)
-    @pytest.mark.parametrize("readable", [True, False])
-    def test_zero_duration_follows_reads_zero_duration(
-        self, zero: Any, readable: bool, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """#235: a zero duration goes out while the ORM reads one back, and is refused otherwise."""
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: readable)
-        if readable:
-            assert _encode(zero) == CBORTag(_DUR, [0, 0])
-            return
-        with pytest.raises(ValueError, match="zero duration") as info:
-            _encode(zero)
-        assert type(info.value) is ValueError
-
-    @pytest.mark.parametrize("zero", [timedelta(0), Duration(0), surrealdb.Duration(0)], ids=repr)
-    def test_zero_duration_goes_out_with_the_installed_sdk(self, zero: Any) -> None:
-        """#235: SDK 2.0.0 cannot read a zero duration, but the clients the ORM opens do (read hook)."""
-        assert encoding.reads_zero_duration()
-        assert _encode(zero) == CBORTag(_DUR, [0, 0])
+    def test_zero_duration_goes_out(self, zero: Any) -> None:
+        """v0.50.0: the SDK reads a zero duration back, so it goes out like any other; nothing refuses it."""
+        assert not hasattr(encoding, "reads_zero_duration")
+        assert _encode(zero) == _dur([0, 0])
+        assert _sdk.cbor_decode(_sdk.cbor_encode(_encode(zero))) == surrealdb.Duration(0)
 
     def test_date_rows(self) -> None:
         out = _encode(date(2026, 1, 2))
@@ -353,7 +370,7 @@ class TestEncodeRows:
     def test_set_rows(self) -> None:
         assert _encode({"b", "a"}) == ["a", "b"]
         assert _encode(frozenset({2, 1})) == [1, 2]
-        assert _encode({timedelta(hours=2), timedelta(hours=1)}) == [CBORTag(_DUR, [3600, 0]), CBORTag(_DUR, [7200, 0])]
+        assert _encode({timedelta(hours=2), timedelta(hours=1)}) == [_dur([3600, 0]), _dur([7200, 0])]
         mixed = _encode({1, "a"})
         assert type(mixed) is list
         assert sorted(mixed, key=repr) == sorted([1, "a"], key=repr)
@@ -401,7 +418,7 @@ class TestEncodeRows:
         assert out.begin is low
         assert out.end is high
 
-    @pytest.mark.parametrize("marker", [None, Bound(), undefined], ids=["None", "Bound()", "undefined"])
+    @pytest.mark.parametrize("marker", [Bound(), undefined], ids=["Bound()", "undefined"])
     def test_range_rows_sdk_open_markers_become_the_cbor_null(self, marker: Any) -> None:
         end = BoundExcluded(5)
         value = SdkRange(marker, end)
@@ -413,6 +430,13 @@ class TestEncodeRows:
         assert _assert_open_side_bytes(out) == _OPEN_TO_FIVE
         assert value.begin is marker  # the input is never mutated
         assert _encode(out) is out
+
+    def test_range_rows_sdk_none_side_is_already_the_cbor_null(self) -> None:
+        """v0.50.0: SDK 3.0's ``Range`` stores a ``None`` side as ``Null``, so the range goes out as it is."""
+        value = SdkRange(None, BoundExcluded(5))
+        assert value.begin is _NULL
+        assert _encode(value) is value
+        assert _assert_open_side_bytes(value) == _OPEN_TO_FIVE
 
     def test_range_rows_sdk_unchanged_is_kept(self) -> None:
         open_begin = SdkRange(_NULL, BoundExcluded(5))
@@ -432,11 +456,11 @@ class TestEncodeRows:
         value = SdkRange(BoundIncluded(timedelta(hours=1)), undefined)
         out = _encode(value)
         assert type(out.begin) is BoundIncluded
-        assert out.begin.value == CBORTag(_DUR, [3600, 0])
+        assert out.begin.value == _dur([3600, 0])
         assert out.end is _NULL
         assert type(value.begin.value) is timedelta  # untouched
         orm = _encode(Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))))
-        assert orm == SdkRange(BoundIncluded(CBORTag(_DUR, [60, 0])), BoundExcluded(CBORTag(_DUR, [3600, 0])))
+        assert orm == SdkRange(BoundIncluded(_dur([60, 0])), BoundExcluded(_dur([3600, 0])))
         dates = _encode(Range(BoundIncluded(date(2026, 1, 2)), BoundExcluded(_SubDate(2026, 2, 1))))
         assert type(dates.begin.value) is datetime and dates.begin.value == _MIDNIGHT
         assert type(dates.end) is BoundExcluded and dates.end.value == datetime(2026, 2, 1, tzinfo=UTC)
@@ -477,7 +501,7 @@ class TestEncodeRows:
         assert out["b"] is not inner
         assert type(out["b"]) is list
         assert out["b"][0] is untouched
-        assert out["b"][1]["c"] == CBORTag(_DUR, [3600, 0])
+        assert out["b"][1]["c"] == _dur([3600, 0])
         assert value["b"][1]["c"] == timedelta(hours=1)  # input untouched
         same = {"a": [1, {"b": (2, "c")}], "d": None}
         assert _encode(same) is same
@@ -493,7 +517,7 @@ class TestEncodeRows:
         unchanged_sub = _SubDict(z=1)
         assert _encode(unchanged_sub) is unchanged_sub
         sub_list = _encode(_SubList([timedelta(seconds=1)]))
-        assert type(sub_list) is list and sub_list == [CBORTag(_DUR, [1, 0])]
+        assert type(sub_list) is list and sub_list == [_dur([1, 0])]
         assert _encode([]) == [] and _encode({}) == {} and _encode(()) == ()
 
     @pytest.mark.parametrize(
@@ -523,7 +547,7 @@ class TestEncodeRows:
         with pytest.raises(ValueError, match="Range bound"):
             _encode(SdkRange(other, BoundExcluded(5)))
 
-    def test_messages(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_messages(self) -> None:
         """The refusal texts, verbatim."""
         cases: list[tuple[Any, str]] = [
             (
@@ -558,14 +582,6 @@ class TestEncodeRows:
             with pytest.raises(ValueError) as info:
                 _encode(value)
             assert str(info.value) == message
-        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
-        with pytest.raises(ValueError) as info:
-            _encode(Duration(0))
-        assert str(info.value) == (
-            "Cannot send a zero duration (Duration(elapsed=0)): the installed surrealdb SDK cannot read a zero "
-            "duration back. Store None instead, or filter with __gte=Duration(1)."
-        )
-        assert "connection" not in str(info.value)
 
     def test_constants(self) -> None:
         assert encoding.INT64_MIN == -(2**63)
@@ -574,7 +590,7 @@ class TestEncodeRows:
         assert encoding.DURATION_SECONDS_LIMIT == 2**64
         assert encoding.DECIMAL_TEXT_SCALE == 29
         assert encoding.DECIMAL_TEXT_STEP.as_tuple() == (0, (1,), -29)
-        assert encoding.__all__ == ["encode", "reads_zero_duration"]
+        assert encoding.__all__ == ["encode"]
 
 
 # --- properties ---------------------------------------------------------------------------------
@@ -614,7 +630,7 @@ def _v0_22_2_corpus() -> list[Any]:
         RecordID("t", [1, "a"]),
         RecordID("t", {"a": 1}),
         CBORTag(_DEC, "1.5"),
-        CBORTag(_DUR, [5400, 1]),
+        _dur([5400, 1]),
         CBORSimpleValue(22),
         _NULL,
         undefined,
@@ -746,79 +762,32 @@ class TestEncodeProperties:
         assert type(value["list"][1]["inner"]) is set
 
 
-# --- the local zero-duration probe (``decoding.py`` since #235) ------------------------------------
-
-
-class TestReadsZeroDuration:
-    """#235: a zero duration is readable when the SDK decodes one or the read hook is active."""
-
-    @pytest.mark.parametrize(
-        ("sdk", "hook", "expected"), [(True, False, True), (False, True, True), (False, False, False), (True, True, True)]
-    )
-    def test_sdk_or_hook(self, sdk: bool, hook: bool, expected: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(decoding, "sdk_decodes_zero_duration", lambda: sdk)
-        monkeypatch.setattr(decoding, "active", lambda: hook)
-        assert encoding.reads_zero_duration() is expected
-
-
-class TestZeroProbe:
-    def test_cached(self) -> None:
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            first = probe()
-            second = probe()
-            info = probe.cache_info()
-            assert (info.misses, info.hits) == (1, 1)
-            assert first is second
-            assert isinstance(first, bool)
-        finally:
-            probe.cache_clear()
-
-    @pytest.mark.parametrize("name", ["cbor_decode", "cbor_encode"])
-    def test_false_without_codec(self, name: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            monkeypatch.setattr(_sdk, name, None)
-            assert probe() is False
-        finally:
-            monkeypatch.undo()
-            probe.cache_clear()
-
-    def test_false_when_decode_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def boom(data: bytes) -> Any:
-            raise RuntimeError("cannot decode")
-
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            monkeypatch.setattr(_sdk, "cbor_decode", boom)
-            assert probe() is False
-        finally:
-            monkeypatch.undo()
-            probe.cache_clear()
-
-    def test_true_when_the_codec_reads_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        probe = decoding.sdk_decodes_zero_duration
-        probe.cache_clear()
-        try:
-            monkeypatch.setattr(_sdk, "cbor_decode", lambda data: surrealdb.Duration(0))
-            assert probe() is True
-        finally:
-            monkeypatch.undo()
-            probe.cache_clear()
-
-
 # --- the hand-off: every SDK call of src/ goes through encode() (spec §6.2) ----------------------
 
 #: SDK client methods that carry data to the server.
 _SDK_METHODS = frozenset(
-    {"query", "query_raw", "create", "update", "upsert", "merge", "patch", "insert", "insert_relation"}
+    {
+        "query",
+        "query_all",
+        "query_all_tolerant",
+        "query_raw",
+        "create",
+        "update",
+        "upsert",
+        "merge",
+        "patch",
+        "insert",
+        "insert_relation",
+    }
     | {"signin", "signup", "run", "let"}
 )
+#: The keywords a data call may pass: none of them carries data to the server.
+_CALL_KEYWORDS = frozenset({"txn_id", "empty"})
 #: Their payload is the first positional argument; for every other method, the second.
 _AUTH_METHODS = frozenset({"signin", "signup"})
+#: The SDK call frontier (v0.50.0): ``_client.<m>(client, …)`` takes the client first, so its payload is one argument
+#: further. The module itself only forwards what its callers encoded, and is not scanned.
+_FRONTIER = "_client"
 #: Receivers that call one of those names but are not SDK clients, reviewed at ``cc2cfa3``: dict
 #: ``.update()`` calls (``collected``, ``all_variables``, ``self._variables``, ``variables``,
 #: ``self._annotations``) and ``obj.merge()`` on a model instance (``QuerySet.bulk_update``).
@@ -956,10 +925,13 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
     1. A *data call* is ``<R>.<m>(…)`` with ``m`` in ``_SDK_METHODS`` and ``R`` ending in
        ``client`` (payload: 1st argument for ``signin``/``signup``, else the 2nd), or
        ``getattr(<R>, …)(…)`` with ``R`` ending in ``client`` (every positional argument). It
-       passes no ``*args`` and no keyword but ``txn_id=``.
+       passes no ``*args`` and no keyword but ``txn_id=`` (and ``query_all_tolerant()``'s ``empty=``, a predicate
+       that carries no data). Through the SDK call frontier,
+       ``_client.<m>(client, …)``, the payload is one argument further (v0.50.0).
     2. Each payload is **bare** (absent, or ``{}``), **inline** (``_encoding.encode(…)``) or an
        **encoded name** (a name whose last binding before the call, in the same function, is
-       ``name = _encoding.encode(…)``).
+       ``name = _encoding.encode(…)``; for a name a nested function never binds, its enclosing function's last
+       binding before the nested ``def``, with none after it).
     3. No ``_encoding.encode(…)`` sits in the body of a ``try`` catching ``ValueError`` (bare
        ``except:``, ``Exception``, ``BaseException``, ``ValueError``) or of a ``with suppress(…)``
        naming one of them: the refusal would be re-wrapped.
@@ -985,7 +957,20 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
         if not isinstance(arg, ast.Name):
             return False
         at = (call.lineno, call.col_offset)
-        before = [binding for binding in _bindings(scope_of(call), arg.id) if binding[0] <= at]
+        scope = scope_of(call)
+        bindings = _bindings(scope, arg.id)
+        # A closure (v0.50.0): a name the nested function never binds is its enclosing function's, read when the call
+        # runs. It counts only when the enclosing function binds it last before the nested ``def`` and never after.
+        while not bindings and isinstance(scope, _SCOPES):
+            outer = scope_of(scope)
+            if not isinstance(outer, _SCOPES):
+                return False
+            at = (scope.lineno, scope.col_offset)
+            bindings = _bindings(outer, arg.id)
+            if any(position > at for position, _ in bindings):
+                return False
+            scope = outer
+        before = [binding for binding in bindings if binding[0] <= at]
         if not before:
             return False
         last = max(before, key=lambda binding: binding[0])[1]
@@ -997,8 +982,8 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
             offend(call, f"shape: {what} passes *args")
             ok = False
         for keyword in call.keywords:
-            if keyword.arg != "txn_id":
-                offend(call, f"shape: {what} passes the keyword {keyword.arg or '**'}= (only txn_id= is allowed)")
+            if keyword.arg not in _CALL_KEYWORDS:
+                offend(call, f"shape: {what} passes the keyword {keyword.arg or '**'}= (only txn_id= and empty= are allowed)")
                 ok = False
         return ok
 
@@ -1036,7 +1021,7 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
                     if receiver not in _NON_SDK_RECEIVERS:
                         offend(node, f"guard: {what} is on a receiver that is not a client nor a reviewed non-SDK receiver")
                 elif well_formed(node, what):
-                    index = 0 if func.attr in _AUTH_METHODS else 1
+                    index = (0 if func.attr in _AUTH_METHODS else 1) + (receiver == _FRONTIER)
                     check_payload(node, node.args[index] if len(node.args) > index else None, what)
             elif func.attr in {"add", "run_read"} and _TX.search(receiver) and _guard_around(node, parents) is not None:
                 given = [kw.value for kw in node.keywords if kw.arg == "variables"]
@@ -1058,9 +1043,13 @@ def _boundary_report(source: str, filename: str) -> _BoundaryReport:
 
 
 def _package_modules() -> list[pathlib.Path]:
-    """The modules the boundary covers: ``src/surreal_orm_lite/*.py`` and the migrations package's (v0.38.0)."""
+    """The modules the boundary covers: ``src/surreal_orm_lite/*.py`` and the migrations package's (v0.38.0).
+
+    ``_client.py``, the SDK call frontier (v0.50.0), forwards the payloads its callers encoded: they are checked at
+    those callers' ``_client.<m>(client, …)`` calls.
+    """
     package = pathlib.Path(surreal_orm_lite.__file__).parent
-    return sorted([*package.glob("*.py"), *package.glob("migrations/*.py")])
+    return sorted(path for path in [*package.glob("*.py"), *package.glob("migrations/*.py")] if path.name != "_client.py")
 
 
 def _package_report() -> _BoundaryReport:
@@ -1158,6 +1147,20 @@ _REJECTED = {
         """,
         "shape",
     ),
+    "an unencoded payload through the frontier": (
+        """
+        async def f(client, v):
+            await _client.query(client, "q", v)
+        """,
+        "payload",
+    ),
+    "a frontier call with another keyword": (
+        """
+        async def f(client, v):
+            await _client.insert(client, "t", _encoding.encode(v), relation=True)
+        """,
+        "shape",
+    ),
     "an unwrapped signin payload": (
         """
         async def f(client):
@@ -1174,6 +1177,34 @@ _REJECTED = {
                 raise RuntimeError() from exc
         """,
         "transaction",
+    ),
+    "a closure over an unencoded name": (
+        """
+        async def f(client, payload):
+            async def exchange():
+                return await client.signin(payload)
+            return await exchange()
+        """,
+        "payload",
+    ),
+    "a closure over a name rebound after its def": (
+        """
+        async def f(client, v, w):
+            payload = _encoding.encode(v)
+            async def exchange():
+                return await client.signin(payload)
+            payload = w
+            return await exchange()
+        """,
+        "payload",
+    ),
+    "a closure over a module-level name": (
+        """
+        payload = _encoding.encode(V)
+        async def f(client):
+            return await client.signin(payload)
+        """,
+        "payload",
     ),
 }
 
@@ -1253,12 +1284,36 @@ _ACCEPTED = {
         """,
         (0, 0, 0),
     ),
+    "through the frontier": (
+        """
+        async def f(self, client, s, rid, v):
+            payload = _encoding.encode(v)
+            await _client.query(client, s, _encoding.encode(v), txn_id=self._txn_id)
+            await _client.update(client, rid, payload)
+            await _client.query(client, "INFO FOR DB;", {})
+        """,
+        (1, 1, 1),
+    ),
     "a dict update": (
         """
         def f(collected, x):
             collected.update(x)
         """,
         (0, 0, 0),
+    ),
+    "a closure over an encoded name (v0.50.0)": (
+        """
+        async def f(client, action, payload):
+            payload = _encoding.encode(payload)
+            async with lock():
+                async def exchange():
+                    try:
+                        return await getattr(client, action)(payload)
+                    except Exception as exc:
+                        raise RuntimeError() from exc
+                return await exchange()
+        """,
+        (0, 1, 0),
     ),
 }
 
@@ -1430,7 +1485,7 @@ class TestHandOff:
     async def test_buffered_add_encodes_at_entry(self) -> None:
         tx = BufferedTransaction(client=None)
         await tx.add("UPDATE $rid SET v = $v;", {"rid": RecordID("t", 1), "v": timedelta(hours=1)})
-        assert tx.variables["t0_v"] == CBORTag(_DUR, [3600, 0])
+        assert tx.variables["t0_v"] == _dur([3600, 0])
         assert tx.variables["t0_rid"] == RecordID("t", 1)
 
         with pytest.raises(ValueError, match="negative duration") as excinfo:

@@ -2,6 +2,11 @@
 
 The `surreal-orm-lite` command line: migrations, introspection and a SurrealQL shell.
 
+> **The embedded engine since v0.50.0** is a SurrealDB 4.0 core (SDK 3.0), and the ORM treats it as a 4.x
+> server. Where a passage below groups "SurrealDB 2.x and the embedded engine", it describes the SDK 2.0 engine
+> of `0.40.x` (a 2.3.10 core); the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) lists what the
+> engine does now.
+
 ## 40. Command line (`surreal-orm-lite`)
 
 Since v0.39.0 the package installs a `surreal-orm-lite` console script, also run as `python -m surreal_orm_lite.cli`,
@@ -157,7 +162,7 @@ transaction answers one entry for `BEGIN` and one for `COMMIT`, on 2.x and the e
 inside it; a `SELECT` on a missing table is an `Error:` line on 3.x and `(empty result)` on 2.x. On the embedded
 engine each command opens and closes the database: `mem://` starts empty at every command (use it for the shell and
 the offline commands), while `surrealkv://<path>` keeps its data from one command to the next. The
-[2.x/3.x table](compatibility.md#orm-behaviour-surrealdb-2x-vs-3x) and the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) list
+[2.x/3.x/4.x table](compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x) and the [embedded table](compatibility.md#orm-behaviour-the-embedded-engine) list
 the differences.
 
 ### Coming from the full SurrealDB-ORM

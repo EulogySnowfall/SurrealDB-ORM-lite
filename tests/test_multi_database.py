@@ -10,7 +10,6 @@ import ast
 import asyncio
 import contextlib
 import dataclasses
-import functools
 import inspect
 import logging
 import os
@@ -46,6 +45,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     Transaction,
+    _client,
     cache,
     connection_manager,
     embedded,
@@ -60,6 +60,7 @@ from surreal_orm_lite import (
     time_travel,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
+from tests import _sdk_calls
 from tests._proxy import CuttableProxy
 from tests._readme_tables import (
     assert_embedded_rows,
@@ -82,7 +83,7 @@ from tests.test_embedded import (
     _tables,
 )
 from tests.test_query_cache import _bullets
-from tests.test_time_travel import _SERVER_BEHAVIOUR, _forbidden_client
+from tests.test_time_travel import _SERVER_BEHAVIOUR, _forbidden_client, write_history
 
 #: The prefix of the manager's name-mangled private attributes.
 _P = "_SurrealDBConnectionManager__"
@@ -379,7 +380,12 @@ class TestLiveReadersByOwner:
         b = live.register_subscriber(client, "u-b", owner="md_b")
         d = live.register_subscriber(client, "u-d")
         assert live._bucket() == {"u-a": [a], "u-b": [b], "u-d": [d]}
-        assert client.live_queues == {"u-a": [a], "u-b": [b], "u-d": [d]}
+        # SDK side: a feed per reader, wrapping its queue (v0.50.0).
+        assert {key: [feed.queue for feed in feeds] for key, feeds in client.live_queues.items()} == {
+            "u-a": [a],
+            "u-b": [b],
+            "u-d": [d],
+        }
         assert live.owner_of("u-a") == "md_a"
         assert live.owner_of("u-b") == "md_b"
         assert live.owner_of("u-d") == "default"
@@ -689,10 +695,10 @@ async def _root(database: str, url: str | None = None) -> AsyncIterator[Any]:
 
 async def _rows_of(client: Any, table: str) -> list[Any]:
     """The rows of *table* — none when it does not exist (SurrealDB 3.x refuses to select a missing table)."""
-    info = await client.query("INFO FOR DB;", {})
+    info = await _client.query(client, "INFO FOR DB;", {})
     if table not in (info.get("tables") or {}):
         return []
-    return list(await client.query(f"SELECT * FROM {table};", {}))
+    return list(await _client.query(client, f"SELECT * FROM {table};", {}))
 
 
 async def _root_rows(database: str, table: str, url: str | None = None) -> list[Any]:
@@ -703,9 +709,16 @@ async def _root_rows(database: str, table: str, url: str | None = None) -> list[
 
 
 async def _engine_rows(client: Any, database: str, table: str) -> list[Any]:
-    """The rows of *table* in *database* of an embedded engine, through a request-scoped ``USE DB`` (spec M5)."""
+    """The rows of *table* in *database* of an embedded engine, through a request-scoped ``USE DB`` (spec M5).
+
+    SurrealDB core 4.0 (the SDK 3.0 engine) answers a ``SELECT`` on a table nobody wrote with an error, "The table
+    '<table>' does not exist": no rows (v0.50.0)."""
     raw = await client.query_raw(f"USE DB {database}; SELECT * FROM {table};", {})
-    return list(raw["result"][-1]["result"])
+    answer = raw["result"][-1]
+    if answer.get("status") == "ERR":
+        assert f"The table '{table}' does not exist" in str(answer["result"]), answer
+        return []
+    return list(answer["result"])
 
 
 def _values(rows: list[Any]) -> list[Any]:
@@ -739,21 +752,10 @@ async def _databases(kind: str, *names: str) -> AsyncIterator[None]:
 
 
 def _record_raw(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
-    """Record the statement of each ``query_raw()`` *client* sends from now on (the batch of a buffered commit,
-    the writes of an interactive transaction). Patched on the client's class and keyed on ``id(client)``, as
-    ``tests.test_time_travel._record_queries`` does."""
-    sent: list[str] = []
-    cls = type(client)
-    real = cls.query_raw
-    owner = id(client)
-
-    async def recording(self: Any, query: str, *args: Any, **kwargs: Any) -> Any:
-        if id(self) == owner:
-            sent.append(query)
-        return await real(self, query, *args, **kwargs)
-
-    monkeypatch.setattr(cls, "query_raw", recording)
-    return sent
+    """Record the statement of each statement request the ORM sends for *client* from now on (the batch of a buffered
+    commit, the writes of an interactive transaction), through any of the frontier's ``QUERIES``
+    (``tests/_sdk_calls.py``)."""
+    return _sdk_calls.record(monkeypatch, client, *_sdk_calls.QUERIES, entry=lambda call: call.target)
 
 
 class _FakeSocket:
@@ -769,7 +771,8 @@ class _FakeSocket:
 
 
 class _FakeServerClient:
-    """A WebSocket-like server client: a transport, a live-query table and a ``close()`` that counts its calls."""
+    """A WebSocket-like server client: a transport, a live-query table and a ``close()`` that counts its calls and,
+    as SDK 3.0's does, closes the transport."""
 
     def __init__(self) -> None:
         self.socket = _FakeSocket()
@@ -778,6 +781,7 @@ class _FakeServerClient:
 
     async def close(self) -> None:
         self.close_calls += 1
+        await self.socket.close()
 
 
 class _HttpLikeClient:
@@ -1080,8 +1084,10 @@ class TestReRegistration:
         assert result["closed"] is True
         assert there.socket.closed_on == [result["loop"]]
         assert gone.socket.closed_on == []
-        # The transport only: a client the application kept fails on its next request instead of reopening.
-        assert here.close_calls == there.close_calls == gone.close_calls == 0
+        # v0.50.0: each client is retired — closed on its own loop (an SDK WebSocket client also refuses every further
+        # request, tests/test_identity_sdk3.py); a closed loop's client is only dropped.
+        assert here.close_calls == there.close_calls == 1
+        assert gone.close_calls == 0
 
     async def test_from_a_thread_with_no_running_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1599,7 +1605,9 @@ class TestReRegistrationE2E:
             await _drain_background()
             if kind == "ws":
                 # Its transport was closed: its receive task ends, its next request fails.
-                await asyncio.wait({c1.recv_task}, timeout=10)
+                receiving = live.recv_task_of(c1)  # None once the SDK dropped it with the transport
+                if receiving is not None:
+                    await asyncio.wait({receiving}, timeout=10)
                 assert live.is_dead(c1)
                 with pytest.raises(Exception):  # noqa: B017 - the SDK's own error for a closed socket
                     await c1.query("RETURN 1;", {})
@@ -1804,7 +1812,7 @@ class TestSessionsPerConnectionE2E:
                 assert str(info.value).startswith("The SurrealDB connection 'md_a' on this event loop dropped")
             # The default is served, as its configured user.
             default_client = await router.get_client()
-            assert await default_client.query("RETURN 1;", {}) == 1
+            assert await _client.query(default_client, "RETURN 1;", {}) == 1
             assert await router.info() is None
             async with router.using("md_a"):
                 with pytest.raises(SurrealDbAuthenticationError, match="'md_a'"):
@@ -2124,9 +2132,12 @@ class TestRoutedModelsE2E:
             "md_a", url=f"surrealkv+versioned://{tmp_path / 'kv'}", namespace="ns", database="md_a"
         )
         client = await SurrealDBConnectionManager.get_client("md_a")
-        await client.query("CREATE md_event:a SET title = 'old', n = 1 VERSION d'2020-01-01T00:00:00Z';")
-        await client.query("CREATE md_event:a SET title = 'new', n = 2 VERSION d'2021-01-01T00:00:00Z';")
-        [old] = await MdEvent.objects().as_of(datetime(2020, 6, 1, tzinfo=UTC)).exec()
+        # History on the database clock (spec §9): SDK 3.0's embedded engine (SurrealDB 4.0) writes no past moment.
+        [before, then] = await write_history(
+            client, ["CREATE md_event:a SET title = 'old', n = 1;"], ["UPDATE md_event:a SET title = 'new', n = 2;"]
+        )
+        assert await MdEvent.objects().as_of(before).exec() == []
+        [old] = await MdEvent.objects().as_of(then).exec()
         assert (old.title, old.n) == ("old", 1)
         [current] = await MdEvent.objects().exec()
         assert (current.title, current.n) == ("new", 2)
@@ -2635,7 +2646,7 @@ async def _create(connection: str, table: str, key: str) -> None:
 async def _lives(database: str, table: str) -> list[str]:
     """The uuids of the live queries the server runs on *table* of *database*, read by a root client of its own."""
     async with _root(database) as root:
-        info = await root.query(f"INFO FOR TABLE {table};", {})
+        info = await _client.query(root, f"INFO FOR TABLE {table};", {})
     return sorted(str(key) for key in (info.get("lives") or {}))
 
 
@@ -3934,7 +3945,7 @@ def _r11_kept(name: str) -> str:
 
 async def _session_database(client: Any) -> Any:
     """The database the embedded session is on."""
-    return await client.query("RETURN session::db();", {})
+    return await _client.query(client, "RETURN session::db();", {})
 
 
 class _GuardSpy:
@@ -4474,27 +4485,9 @@ _MOMENT = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def _record_requests(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
-    """The statement of each ``query()`` and the target of each ``select()`` *client* sends from now on.
-
-    Patched on the client's class and keyed on ``id(client)``, as ``tests.test_time_travel._record_queries`` does; each
-    wrapper keeps the signature it wraps (``functools.wraps``), so the wrappers of two clients of one class stack.
-    """
-    sent: list[str] = []
-    cls = type(client)
-    owner = id(client)
-
-    def wrap(real: Any) -> Any:
-        @functools.wraps(real)
-        async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if id(self) == owner:
-                sent.append(str(args[0] if args else next(iter(kwargs.values()), "")))
-            return await real(self, *args, **kwargs)
-
-        return recording
-
-    for method in ("query", "select"):
-        monkeypatch.setattr(cls, method, wrap(getattr(cls, method)))
-    return sent
+    """The statement of each ``query()`` and the target of each ``select()`` the ORM sends for *client* from now on
+    (``tests/_sdk_calls.py``; the recordings of two clients stack)."""
+    return _sdk_calls.record(monkeypatch, client, "query", "query_all", "select", entry=lambda call: str(call.target))
 
 
 async def _line_of(name: str) -> int:
@@ -4530,16 +4523,22 @@ async def _remove_server_database(url: str, database: str) -> None:
 
 @contextlib.asynccontextmanager
 async def _mixed_lines() -> AsyncIterator[list[_Side]]:
-    """``md_3x`` on ``SURREALDB_PORT_3X`` and ``md_2x`` on ``SURREALDB_PORT_2X`` (same ``SURREALDB_HOST``), each on
-    database ``md_mixed`` of namespace ``ns``, removed before and after; skips without both ports (spec §9.1, §9.3).
-    ``SURREALDB_PORT`` is not read: the pair is the same in each line's run."""
+    """``md_3x`` on ``SURREALDB_PORT_3X`` and ``md_2x`` on ``SURREALDB_PORT_2X`` (same ``SURREALDB_HOST``), plus
+    ``md_4x`` on ``SURREALDB_PORT_4X`` when it is set (v0.50.0, the CI ``mixed-lines`` job), each on database
+    ``md_mixed`` of namespace ``ns``, removed before and after; skips without the 3.x and 2.x ports (spec §9.1, §9.3).
+    ``SURREALDB_PORT`` is not read: the set is the same in each line's run."""
     port_3x, port_2x = os.environ.get("SURREALDB_PORT_3X"), os.environ.get("SURREALDB_PORT_2X")
     if not (port_3x and port_2x):
         pytest.skip("needs SURREALDB_PORT_3X and SURREALDB_PORT_2X (both server lines)")
     urls = {"md_3x": _ws_url_at(port_3x), "md_2x": _ws_url_at(port_2x)}
+    lines = [3, 2]
+    port_4x = os.environ.get("SURREALDB_PORT_4X")
+    if port_4x:
+        urls["md_4x"] = _ws_url_at(port_4x)
+        lines.append(4)
     try:
         sides = [await _server_side(name, url, "md_mixed") for name, url in urls.items()]
-        assert [side.line for side in sides] == [3, 2], "SURREALDB_PORT_3X and SURREALDB_PORT_2X name the two lines"
+        assert [side.line for side in sides] == lines, "SURREALDB_PORT_3X, _2X and _4X name their own lines"
         yield sides
     finally:
         for name, url in urls.items():
@@ -4699,7 +4698,8 @@ class TestMixedLinesE2E(_PerConnectionDecisions):
     """AC-10 (spec §9.3): ``md_3x`` and ``md_2x``, a SurrealDB 3.x and a 2.x server in one process — interactive
     against buffered transactions, ``as_of().fetch()`` refused on ``md_2x`` only, each line's change-feed cursor, live
     streams that receive their own events only. Runs when ``SURREALDB_PORT_3X`` and ``SURREALDB_PORT_2X`` are set
-    (the ``mixed-lines`` CI job, the team's ``test-dbs.sh test``), skips otherwise."""
+    (the ``mixed-lines`` CI job, the team's ``test-dbs.sh test``), skips otherwise; ``SURREALDB_PORT_4X`` adds an
+    ``md_4x`` side on SurrealDB 4.x (the CI job sets it)."""
 
     @staticmethod
     def _sides() -> contextlib.AbstractAsyncContextManager[list[_Side]]:
@@ -4853,7 +4853,7 @@ class TestRemoveConnectionE2E:
 
                 async def on_another_loop() -> None:
                     client = await router.get_client("md_a")
-                    assert await client.query("RETURN 1;", {}) == 1
+                    assert await _client.query(client, "RETURN 1;", {}) == 1
                     receiving = live.recv_task_of(client)
                     assert receiving is not None
                     outcome["client"] = client
@@ -4876,9 +4876,9 @@ class TestRemoveConnectionE2E:
                     await _read_one(stream)
                 assert stream.is_active is False
                 await _drain_background()
-                here_receiving = live.recv_task_of(here)
-                assert here_receiving is not None
-                await asyncio.wait({here_receiving}, timeout=10)
+                here_receiving = live.recv_task_of(here)  # None once the SDK dropped it with the transport
+                if here_receiving is not None:
+                    await asyncio.wait({here_receiving}, timeout=10)
                 assert live.is_dead(here)
                 await asyncio.to_thread(thread.join, 30)
                 assert not thread.is_alive()

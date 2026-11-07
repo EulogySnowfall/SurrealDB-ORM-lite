@@ -73,7 +73,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, NoReturn
 
-from . import _sdk
+from . import _client, _sdk
 from . import cache as _cache
 from . import encoding as _encoding
 from .exceptions import SurrealDbConflictError, SurrealDbError
@@ -453,8 +453,9 @@ class Transaction(ABC):
         ...
 
     @abstractmethod
-    async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
-        """Run a read and return rows. Buffered: raises (reads need WS + SurrealDB 3.x)."""
+    async def run_read(self, statement: str, variables: dict[str, Any] | None = None, *, index: int = 0) -> Any:
+        """Run a read and return rows: the result of statement *index* of *statement* (v0.50.0: a statement whose
+        subqueries go before it as statements of their own). Buffered: raises (reads need WS + SurrealDB 3.x)."""
         ...
 
     @abstractmethod
@@ -555,7 +556,7 @@ class BufferedTransaction(Transaction):
         self._counter += 1
         return None
 
-    async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+    async def run_read(self, statement: str, variables: dict[str, Any] | None = None, *, index: int = 0) -> Any:
         raise SurrealDbError(
             "Reads inside a transaction require a WebSocket connection to SurrealDB 3.x "
             "(native interactive transactions); the current transaction is buffered "
@@ -618,7 +619,7 @@ class BufferedTransaction(Transaction):
                 variables = _encoding.encode(self.variables)
                 _cache.reaching()  # issue #325: from here, the commit's outcome is unknown
                 try:
-                    raw = await self._client.query_raw(query, variables)
+                    raw = await _client.query_raw(self._client, query, variables)
                 except RuntimeError as exc:
                     # The embedded engine raises a bare RuntimeError for a query it refuses as a whole (issue
                     # #278): the same error as a server's envelope, the engine's error kept as the suppressed
@@ -673,7 +674,7 @@ class InteractiveTransaction(Transaction):
         _cache.reaching()  # issue #325: the statement is sent
         try:
             try:
-                raw = await self._client.query_raw(statement, payload, txn_id=self._txn_id)
+                raw = await _client.query_raw(self._client, statement, payload, txn_id=self._txn_id)
             except Exception as exc:
                 raise _as_conflict(exc) from exc
             self.raise_for_status(raw)
@@ -683,8 +684,9 @@ class InteractiveTransaction(Transaction):
         statements = raw["result"]
         return statements[-1]["result"] if statements else []
 
-    async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
-        """Run a read inside the transaction and return rows directly.
+    async def run_read(self, statement: str, variables: dict[str, Any] | None = None, *, index: int = 0) -> Any:
+        """Run a read inside the transaction and return rows directly: statement *index*'s (``_client.query_at()``,
+        v0.50.0), the first's when ``0``.
 
         A failure is recorded before it raises (issue #268); the ORM forgets it when it reads the
         error as an answer (:meth:`_absorb_failure`).
@@ -693,7 +695,9 @@ class InteractiveTransaction(Transaction):
         _cache.reaching()  # issue #325: the statement is sent
         try:
             try:
-                return await self._client.query(statement, payload, txn_id=self._txn_id)
+                if index:
+                    return await _client.query_at(self._client, statement, payload, index=index, txn_id=self._txn_id)
+                return await _client.query(self._client, statement, payload, txn_id=self._txn_id)
             except Exception as exc:
                 raise _as_conflict(exc) from exc
         except BaseException as failure:

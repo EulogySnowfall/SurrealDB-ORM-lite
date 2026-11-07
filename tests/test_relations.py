@@ -11,6 +11,7 @@ from pydantic import Field
 from surrealdb import NotFoundError, RecordID
 
 import surreal_orm_lite
+from surreal_orm_lite import _client
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.utils import validate_edge_name, validate_graph_path
 
@@ -221,9 +222,9 @@ class TestRelationsE2E:
         await Product.objects().delete_table()
         for edge in ("follows", "purchased", "never_edge"):
             with contextlib.suppress(NotFoundError):
-                await client.query(f"DELETE {edge};", {})
+                await _client.query(client, f"DELETE {edge};", {})
         with contextlib.suppress(NotFoundError):
-            await client.query("DELETE Post;", {})
+            await _client.query(client, "DELETE Post;", {})
 
         await Person(id="alice", name="Alice", age=30).save()
         await Person(id="bob", name="Bob", age=25).save()
@@ -250,7 +251,7 @@ class TestRelationsE2E:
         assert len(result) > 0
 
         # Verify data on the edge
-        edges = await client.query("SELECT * FROM purchased;", {})
+        edges = await _client.query(client, "SELECT * FROM purchased;", {})
         assert len(edges) > 0
         edge = edges[0]
         assert edge["quantity"] == 2
@@ -359,13 +360,15 @@ class TestRelationsE2E:
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
 
         # Create a post-like structure using raw queries
-        await client.query(
+        await _client.query(
+            client,
             "CREATE Post:1 SET title = 'Hello', author = Person:alice;",
             {},
         )
 
         # Verify FETCH works by executing raw query with FETCH
-        results = await client.query(
+        results = await _client.query(
+            client,
             "SELECT * FROM Post FETCH author;",
             {},
         )
@@ -377,7 +380,7 @@ class TestRelationsE2E:
 
         # Clean up
         with contextlib.suppress(NotFoundError):
-            await client.query("DELETE Post;", {})
+            await _client.query(client, "DELETE Post;", {})
 
     async def test_remove_relation_missing_is_noop(self) -> None:
         alice = Person(id="rm_alice", name="Alice", age=30)

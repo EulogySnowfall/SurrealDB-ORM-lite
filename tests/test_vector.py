@@ -236,6 +236,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     Vector,
     VectorField,
+    _client,
     model_base,
     model_ddl,
     search,
@@ -248,7 +249,7 @@ from surreal_orm_lite.subquery import TABLE_PROBE, SubqueryCompiler, _MissingSub
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import user_namespace, validate_field_name
 from surreal_orm_lite.vector import get_vector_info, is_vector_field
-from tests import _compaction
+from tests import _compaction, _sdk_calls
 from tests._readme_tables import DOCS as _DOCS
 from tests._readme_tables import (
     assert_embedded_rows,
@@ -3185,7 +3186,7 @@ async def _keyword_line(client: Any) -> Literal[2, 3]:
 
 async def _table_info(client: Any, table: str) -> dict[str, Any]:
     """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
-    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    info: dict[str, Any] = await _client.query(client, f"INFO FOR TABLE {table};", {})
     return info
 
 
@@ -3223,6 +3224,22 @@ def _calls(calls: list[tuple[str, tuple[object, ...]]]) -> list[tuple[str, objec
 def _query(statement: str) -> list[tuple[str, object]]:
     """The calls of one ``client.query(statement, {})``: the SDK's ``query()`` sends it through ``query_raw()``."""
     return [("query", statement), ("query_raw", statement)]
+
+
+def _top_level(block: str, *, in_tx: bool = False) -> str:
+    """*block* (``{ LET …; (<statement>) };``) in the form SurrealDB 4.x and later are sent it (v0.50.0,
+    ``SubqueryCompiler.wrap()``): its ``LET`` s as statements of their own, then the statement, in ``BEGIN … COMMIT``
+    outside a transaction."""
+    assert block.startswith("{ LET ") and block.endswith(") };"), block
+    end = block.rindex(";", 0, len(block) - len(" };"))
+    sent = f"{block[2 : end + 1]} {block[end + 3 : -len(') };')]};"
+    return sent if in_tx else f"BEGIN TRANSACTION; {sent} COMMIT TRANSACTION;"
+
+
+def _query_on(major: int, block: str) -> list[tuple[str, object]]:
+    """The calls of an HNSW search next to ``LET`` s (*block*) on line *major*: from SurrealDB 4 one ``query_raw()`` of
+    its top-level form (``_client.query_at()``), below 4 the block as :func:`_query` sends it."""
+    return [("query_raw", _top_level(block))] if major >= 4 else _query(block)
 
 
 def _sent(statements: Sequence[str]) -> list[tuple[str, object]]:
@@ -3337,7 +3354,7 @@ class TestDefineTableE2E:
             await _apply_ddl(
                 client, "CREATE vec_doc:d1 SET title = 'Cats and dogs', embedding = [1, 0, 0], summary = [0, 1, 0];"
             )
-            rows = await client.query("SELECT embedding, summary FROM vec_doc:d1;", {})
+            rows = await _client.query(client, "SELECT embedding, summary FROM vec_doc:d1;", {})
             assert rows == [{"embedding": [1.0, 0.0, 0.0], "summary": [0.0, 1.0, 0.0]}]
             assert {type(item) for row in rows for value in row.values() for item in value} == {float}
             doc = await VecDoc.objects().get("d1")
@@ -3349,7 +3366,7 @@ class TestDefineTableE2E:
                 await _apply_ddl(client, statement)
             assert await _refused(client, "CREATE vec_doc:d4 SET title = 'Short', embedding = [1.0, 0.0];")
             assert await _refused(client, "CREATE vec_doc:d5 SET title = 'Short', summary = [1.0, 0.0];")
-            assert await client.query("SELECT VALUE record::id(id) FROM vec_doc;", {}) == ["d1"]
+            assert await _client.query(client, "SELECT VALUE record::id(id) FROM vec_doc;", {}) == ["d1"]
 
 
 # === define_indexes() and remove_index(): the vector indexes on every engine ========================================
@@ -3437,11 +3454,11 @@ async def _indexes(client: Any, table: str) -> dict[str, IndexState | None]:
     return await search.read_table_indexes(client, table, what="index", kind="definition")
 
 
-async def _refusals(client: Any, query: str) -> list[str]:
-    """Run *query* raw: the text of every statement SurrealDB refused, ``[]`` when it accepts them all (a parse error
-    refuses the whole query; the embedded engine raises it)."""
+async def _refusals(client: Any, query: str, **variables: Any) -> list[str]:
+    """Run *query* raw, with *variables*: the text of every statement SurrealDB refused, ``[]`` when it accepts them all
+    (a parse error refuses the whole query; the embedded engine raises it)."""
     try:
-        response = await client.query_raw(query, {})
+        response = await client.query_raw(query, variables)
     except RuntimeError as error:
         return [str(error)]
     if "error" in response:
@@ -3732,10 +3749,6 @@ _PIN_BARE_SERVER = (
     "DEFINE INDEX vec_pin_t ON vec_pin FIELDS embedding HNSW DIMENSION 3 DIST EUCLIDEAN TYPE F32 EFC 150 M 12 M0 24 "
     "LM 0.40242960438184466f"
 )
-_PIN_BARE_EMBEDDED = (
-    "DEFINE INDEX vec_pin_t ON vec_pin FIELDS embedding HNSW DIMENSION 3 DIST EUCLIDEAN TYPE F64 EFC 150 M 12 M0 24 "
-    "LM 0.40242960438184466f"
-)
 
 _PIN_MTREE = "DEFINE INDEX vec_pin_m ON vec_pin FIELDS embedding MTREE DIMENSION 3;"
 _PIN_MTREE_STORED = (
@@ -3763,14 +3776,10 @@ class TestVectorDdlPinsE2E:
             await _apply_ddl(client, _PIN_ORM.ddl("vec_pin"))
             info = await _table_info(client, "vec_pin")
         stored = info["indexes"]
-        if kind == "mem":
-            assert stored["vec_pin_t"] == _PIN_BARE_EMBEDDED, (
-                "README section 37, _S37_TYPE: the embedded engine stores F64 vectors for an index without TYPE"
-            )
-        else:
-            assert stored["vec_pin_t"] == _PIN_BARE_SERVER, (
-                "README section 37, _S37_TYPE: a SurrealDB server stores F32 vectors for an index without TYPE"
-            )
+        # The embedded engine's 4.0 core (SDK 3.0) stores F32 as the servers do; its 2.x core stored F64.
+        assert stored["vec_pin_t"] == _PIN_BARE_SERVER, (
+            "README section 37, _S37_TYPE: SurrealDB stores F32 vectors for an index without TYPE"
+        )
         written = parse_define_index(stored["vec_pin_o"])
         assert written.vector_type == "F32", "README section 37, _S37_TYPE: the ORM writes TYPE on every engine"
         assert search.index_matches(_PIN_ORM, ["embedding"], written)
@@ -3792,7 +3801,16 @@ class TestVectorDdlPinsE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_hnsw_unique_stores_a_plain_unique_index(self, kind: str) -> None:
+        """Below 4 SurrealDB keeps a plain ``UNIQUE`` index and drops ``HNSW``; 4.x refuses the statement ("Cannot
+        combine UNIQUE with HNSW", a parse error). The ORM refuses ``Index(hnsw=True, unique=True)`` on every line."""
         async with _vec(kind) as client:
+            major = await _major(client)
+            if major >= 4:
+                refusals = await _refusals(client, _PIN_UNIQUE)
+                info = await _table_info(client, "vec_pin")
+                assert len(refusals) == 1 and "Cannot combine UNIQUE with HNSW" in refusals[0], "4.x refuses it"
+                assert info["indexes"] == {}
+                return
             await _apply_ddl(client, _PIN_UNIQUE)
             info = await _table_info(client, "vec_pin")
         message = "Index(hnsw=True, unique=True) is refused: SurrealDB keeps a plain UNIQUE index and drops HNSW"
@@ -4545,11 +4563,11 @@ class TestSimilarToE2E:
             doc.loc = None
             doc.n = 20
             await doc.update()
-            updated = await client.query("SELECT * FROM vec_doc:d2;", {})
+            updated = await _client.query(client, "SELECT * FROM vec_doc:d2;", {})
             await doc.delete()
             await _compaction.wait_for_model_indexes(client, VecDoc)
             await doc.save()
-            saved = await client.query("SELECT * FROM vec_doc:d2;", {})
+            saved = await _client.query(client, "SELECT * FROM vec_doc:d2;", {})
         for stored in (updated, saved):
             assert (stored[0]["n"], stored[0]["embedding"]) == (20, [0.9, 0.1, 0.0])
             assert "_knn_distance" not in stored[0]
@@ -4570,11 +4588,11 @@ class TestSimilarToE2E:
             first = docs[0]
             first.title = "Cats and dogs, again"
             await first.update()
-            updated = await client.query("SELECT * FROM vec_extra:d1;", {})
+            updated = await _client.query(client, "SELECT * FROM vec_extra:d1;", {})
             await first.delete()
             await _compaction.wait_for_model_indexes(client, VecExtra)
             await first.save()
-            saved = await client.query("SELECT * FROM vec_extra:d1;", {})
+            saved = await _client.query(client, "SELECT * FROM vec_extra:d1;", {})
         for stored in (updated, saved):
             assert stored[0]["title"] == "Cats and dogs, again"
             assert sorted(stored[0]) == ["category", "embedding", "id", "title"]
@@ -4783,6 +4801,13 @@ _K9 = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); (SELECT *, vector::distance::knn() AS "
     "_knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f1 ORDER BY _knn_distance) };"
 )
+#: K9 on SurrealDB 4.x and later (v0.50.0): the ``LET`` as a statement of its own, before the statement, in one
+#: transaction — 4.0 answers no record for an HNSW search next to the ids of a ``LET`` of a block.
+_K9_TOP_LEVEL = (
+    "BEGIN TRANSACTION; LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); SELECT *, "
+    "vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f1 ORDER BY "
+    "_knn_distance; COMMIT TRANSACTION;"
+)
 #: K10: a comparison and a function lookup next to the KNN, in the form for SurrealDB 3.x.
 _K10 = (
     "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE category = $_f0 AND ((title).is_string() AND "
@@ -4880,7 +4905,7 @@ _MISSING_FIRST = (
     "$_sq1 AND embedding <|2,100|> $_f2 ORDER BY _knn_distance) };"
 )
 _MISSING_AGAIN = (
-    "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, "
+    "{ LET $_sq0 = <array> []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE category = $_f0); (SELECT *, "
     "vector::distance::knn() AS _knn_distance FROM vec_doc WHERE id IN $_sq0 AND id IN $_sq1 AND embedding <|2,100|> "
     "$_f1 ORDER BY _knn_distance) };"
 )
@@ -5251,10 +5276,33 @@ class TestPrefilter:
 
     async def test_no_line_without_a_condition(self, monkeypatch: pytest.MonkeyPatch) -> None:
         reads = _line_answers(monkeypatch, 2)
-        for queryset in (VecDoc.objects().similar_to("embedding", _Q, 2), _k9(), VecDoc.objects().filter(category="x")):
+        exact_k9 = VecDoc.objects().filter(id__in=Subquery(VecDoc.objects().search(title="cats")))
+        for queryset in (VecDoc.objects().similar_to("embedding", _Q, 2), VecDoc.objects().filter(category="x"), exact_k9):
             _executed(monkeypatch, queryset)
             await queryset.exec()
         assert reads == []
+
+    @pytest.mark.parametrize(("major", "sent"), [(2, _K9), (3, _K9), (4, _K9_TOP_LEVEL), (5, _K9_TOP_LEVEL)])
+    async def test_an_hnsw_search_next_to_a_subquery_reads_the_line(
+        self, monkeypatch: pytest.MonkeyPatch, major: int, sent: str
+    ) -> None:
+        """v0.50.0: an HNSW search next to ``LET`` s reads the line once; from SurrealDB 4 the ``LET`` s are sent as
+        statements of their own, in ``BEGIN … COMMIT``, and the rows are the statement's, the third result."""
+        reads = _line_answers(monkeypatch, major)
+        queryset = _k9()
+        indexes: list[int] = []
+
+        async def execute(query: str, variables: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+            indexes.append(kwargs.get("index", 0))
+            executed.append((query, dict(variables or {})))
+            return []
+
+        executed: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(queryset, "_execute_query", execute)
+        assert await queryset.exec() == []
+        assert executed == [(sent, {"_f0": "cats", "_f1": [1.0, 0.0, 0.0]})]
+        assert indexes == [2 if major >= 4 else 0]
+        assert len(reads) == 1
 
 
 def _scored(*annotations: tuple[str, Any], annotate_first: bool = False) -> Any:
@@ -5462,7 +5510,7 @@ class TestPrefilterE2E:
     """``similar_to()`` next to every kind of condition, on every engine: the same records on every line — SurrealDB
     3.x gets the conditions inline, SurrealDB 2.x and the embedded engine the ``LET`` form (the spy shows each), an exact
     scan's ``LET`` ranking its nearest by distance then id —, the line read once per client and only for a statement
-    with such a condition or an exact scan."""
+    with such a condition, an exact scan or an HNSW search next to a subquery's ids (v0.50.0)."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize(
@@ -5526,7 +5574,11 @@ class TestPrefilterE2E:
             tech = await VecDoc.objects().filter(category="tech").similar_to("embedding", _Q, 2).exec()
             count = await VecDoc.objects().filter(title__startswith="Cats").similar_to("embedding", _Q, 2).count()
             versions = [call for call in _calls(calls) if call[0] == "version"]
-        assert before == [*_query("SELECT * FROM vec_doc WHERE category = $_f0;"), *_query(_K1), *_query(_K9)]
+            major = await _major(client)
+        plain_and_alone = [*_query("SELECT * FROM vec_doc WHERE category = $_f0;"), *_query(_K1)]
+        # An HNSW search next to a LET reads the line too (v0.50.0); from SurrealDB 4 the LET goes first, on its own.
+        by_ids_sent = [("version", None), ("query_raw", _K9_TOP_LEVEL)] if major >= 4 else [("version", None), *_query(_K9)]
+        assert before == [*plain_and_alone, *by_ids_sent]
         assert sorted(_ids(plain)) == ["d3", "d4"]
         assert _ids(alone) == ["d1", "d2"]
         assert _ids(by_ids) == ["d1", "d2"]
@@ -5689,14 +5741,14 @@ _K12C = (
     "id IN $_sq0 AND embedding <|1,100|> $_f1); (UPDATE vec_doc PATCH $_ops WHERE id IN $_sq1) };"
 )
 #: K12d: K12's write once SurrealDB 3.x confirmed that the table does not exist.
-_K12D = "{ LET $_sq0 = []; (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq0) };"
+_K12D = "{ LET $_sq0 = <array> []; (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq0) };"
 #: An id subquery next to the KNN: its ``LET`` first, then the ids of the nearest; with its table missing, ``[]``.
 _K12_BY_SUBQUERY = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE n > $_f0); LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id "
     "IN $_sq0 AND embedding <|2,100|> $_f1); (UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq1) };"
 )
 _K12_BY_EMPTY_SUBQUERY = (
-    "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f0); "
+    "{ LET $_sq0 = <array> []; LET $_sq1 = (SELECT VALUE id FROM vec_doc WHERE id IN $_sq0 AND embedding <|2,100|> $_f0); "
     "(UPDATE vec_doc SET n = $_v0 WHERE id IN $_sq1) };"
 )
 
@@ -5744,7 +5796,7 @@ _UPDATE_NEAREST = (
     "{ LET $_sq0 = (SELECT VALUE id FROM vec_ranked WHERE embedding <|2,100|> $_f0); (UPDATE vec_ranked SET hit = $_v0 "
     "WHERE id IN $_sq0) };"
 )
-_UPDATE_NONE = "{ LET $_sq0 = []; (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq0) };"
+_UPDATE_NONE = "{ LET $_sq0 = <array> []; (UPDATE vec_ranked SET hit = $_v0 WHERE id IN $_sq0) };"
 
 #: The variables of ``VecRanked``'s range writes.
 _RANGE_VARIABLES = {"_f0": 2, "_f1": [1.0, 0.0, 0.0], "_v0": True}
@@ -5794,13 +5846,13 @@ def _ranged(dist: str | None = None) -> Any:
 
 async def _hits(client: Any) -> list[str]:
     """The keys of the ``vec_ranked`` records whose ``hit`` is true, sorted."""
-    rows = await client.query("SELECT VALUE id FROM vec_ranked WHERE hit = true;", {})
+    rows = await _client.query(client, "SELECT VALUE id FROM vec_ranked WHERE hit = true;", {})
     return sorted(str(row.id) for row in rows)
 
 
 async def _ranked_left(client: Any) -> list[str]:
     """The keys of the ``vec_ranked`` records, sorted."""
-    rows = await client.query("SELECT VALUE id FROM vec_ranked;", {})
+    rows = await _client.query(client, "SELECT VALUE id FROM vec_ranked;", {})
     return sorted(str(row.id) for row in rows)
 
 
@@ -5822,7 +5874,8 @@ class TestWriteByIds:
     the KNN ``SELECT`` returns, bound in a ``LET`` of the statement's block — the other conditions' ``LET`` s first,
     below SurrealDB 3 the pre-filter's too —, so the write itself never carries the KNN operator; the ``LET`` reads the
     model's table, so a table SurrealDB 3.x confirms missing binds it to ``[]``. The line is read once per write, and
-    only for a KNN next to another condition or an exact scan; a transaction queues the block of its line."""
+    only for a KNN next to another condition, an exact scan or a subquery's ids (v0.50.0: from SurrealDB 4 the ``LET`` s
+    then go first, on their own); a transaction queues the block of its line."""
 
     @pytest.mark.parametrize("knn_prefilter", [False, True])
     async def test_k12_similar_to_alone(self, knn_prefilter: bool, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5928,12 +5981,36 @@ class TestWriteByIds:
             lambda: alone.bulk_update(hit=True),
             lambda: alone.bulk_delete(),
             lambda: alone.patch(_HIT),
-            lambda: by_ids.similar_to("embedding", _Q, 2).bulk_update(hit=True),
+            lambda: by_ids.bulk_update(hit=True),
         ):
             for queryset in (alone, by_ids):
                 _executed(monkeypatch, queryset, [])
             await call()
         assert reads == []
+
+    @pytest.mark.parametrize("major", [2, 3, 4])
+    async def test_a_write_by_the_nearest_of_a_subquery_reads_the_line(
+        self, major: int, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.50.0: the KNN ``SELECT`` of the ids next to a subquery's ``LET`` reads the line; from SurrealDB 4 the
+        ``LET`` s are sent on their own, in ``BEGIN … COMMIT``: a ``LET`` that fails leaves the write undone."""
+        reads = _line_answers(monkeypatch, major)
+        queryset = VecRanked.objects().filter(id__in=Subquery(VecRanked.objects().filter(n__gt=2)))
+        nearest = queryset.similar_to("embedding", _Q, 2)
+        indexes: list[int] = []
+        sent: list[str] = []
+
+        async def execute(query: str, variables: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+            sent.append(query)
+            indexes.append(kwargs.get("index", 0))
+            return []
+
+        monkeypatch.setattr(nearest, "_execute_query", execute)
+        assert await nearest.bulk_update(hit=True) == 0
+        [statement] = sent
+        assert statement.startswith("BEGIN TRANSACTION; LET $_sq0 = " if major >= 4 else "{ LET $_sq0 = "), statement
+        assert indexes == [3 if major >= 4 else 0]
+        assert len(reads) == 1
 
     async def test_a_transaction_queues_the_block_of_its_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
         reads = _line_answers(monkeypatch, 2)
@@ -6049,6 +6126,118 @@ class TestWriteByIdsTxE2E:
         assert hits == ["d4", "d6"]
 
 
+def _ghost_ids() -> Any:
+    """``VecDoc``'s nearest next to a subquery of ``VecRanked``, a table the test never writes: it does not exist."""
+    return VecDoc.objects().filter(id__not_in=Subquery(VecRanked.objects())).similar_to("embedding", _Q, 2)
+
+
+def _cats_nearest(tx: Any = None) -> Any:
+    """K9's queryset (the nearest among the matches of ``"cats"``), in *tx* when given."""
+    matches = Subquery(VecDoc.objects(tx=tx).search(title="cats"))
+    return VecDoc.objects(tx=tx).filter(id__in=matches).similar_to("embedding", _Q, 2)
+
+
+async def _ids_where(client: Any, condition: str = "true") -> list[str]:
+    """The keys of ``vec_doc``'s records matching *condition* (the test's own text), in id order."""
+    rows = await _client.query(client, f"SELECT VALUE id FROM vec_doc WHERE {condition} ORDER BY id;")
+    return [str(record.id) for record in rows]
+
+
+class TestHnswNextToALetE2E:
+    """v0.50.0: an HNSW search next to the ids of a subquery's ``LET``, on every engine. SurrealDB 4.0 answers no
+    record for it inside a block, so from SurrealDB 4 the ORM sends the ``LET`` s as statements of their own before the
+    statement, in ``BEGIN … COMMIT`` (one request): the nearest records on every line, a ``LET`` that fails leaving the
+    statement without effect, the server's errors read as before."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_missing_subquery_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The missing-table contract: the table reads as empty — on 3.x and 4.x through the probe and the statement
+        sent again with the subquery empty, which keeps the block (no ``LET`` holds a ``SELECT`` there)."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            kept = await _ghost_ids().exec()
+            sent = [statement for method, statement in _calls(calls) if method == "query_raw"]  # each request once
+            none = await VecDoc.objects().filter(id__in=Subquery(VecRanked.objects())).similar_to("embedding", _Q, 2).exec()
+        assert _ids(kept) == ["d1", "d2"]
+        assert none == []
+        if major >= 4:
+            first, probe, again = sent
+            assert first.startswith("BEGIN TRANSACTION; LET $_sq0 = (SELECT VALUE id FROM vec_ranked"), first
+            assert first.endswith("; COMMIT TRANSACTION;"), first
+            assert probe == TABLE_PROBE
+            assert again.startswith("{ LET $_sq0 = <array> []; (SELECT "), again
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_next_to_a_missing_subquery_table_runs_once(self, kind: str) -> None:
+        """The write that met the missing table is never applied: the statement sent again deletes the two nearest
+        records, and only them."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            deleted = await _ghost_ids().bulk_delete()
+            left = await _ids_where(client)
+        assert deleted == 2
+        assert left == ["d3", "d4", "d5", "d6"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_failing_let_leaves_the_write_undone(self, kind: str) -> None:
+        """A ``LET`` whose ``SELECT`` fails (a search on a field without a full-text index) raises the ORM's error, as
+        the same subquery does without ``similar_to()``, and writes no record."""
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            if await _major(client) < 3:
+                pytest.skip("SurrealDB 3.x and later refuse a search on a field without a full-text index")
+            searched = Subquery(VecDoc.objects().search(category="pets"))
+            with pytest.raises(SurrealDbError, match="category") as plain:
+                await VecDoc.objects().filter(id__in=searched).bulk_update(featured=True)
+            with pytest.raises(SurrealDbError, match="category") as raised:
+                await VecDoc.objects().filter(id__in=searched).similar_to("embedding", _Q, 2).bulk_update(featured=True)
+            featured = await _ids_where(client, "featured = true")
+        assert str(raised.value) == str(plain.value)
+        assert featured == []
+
+    async def test_an_interactive_transaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """In an interactive transaction (WebSocket, SurrealDB 3.x and later) the form joins the transaction's request,
+        without ``BEGIN``/``COMMIT``; its ``LET`` reaches neither the transaction's next request nor the session's."""
+        async with _vec_models("ws") as client:
+            await _seed(client)
+            major = await _major(client)
+            if major < 3:
+                pytest.skip("SurrealDB 3.x and later: 2.x has no interactive transaction")
+            async with SurrealDBConnectionManager.transaction("vec") as tx:
+                assert tx.is_interactive
+                sent = _sdk_calls.record(monkeypatch, tx._client, *_sdk_calls.QUERIES, entry=lambda call: call.target)
+                nearest = await _cats_nearest(tx).exec()
+                written = await _cats_nearest(tx).bulk_update(featured=True)
+                in_tx = await _client.query(tx._client, "RETURN $_sq0;", txn_id=tx._txn_id)
+            in_session = await _client.query(tx._client, "RETURN $_sq0;")
+            featured = await _ids_where(client, "featured = true")
+        assert _ids(nearest) == ["d1", "d2"]
+        assert written == 2
+        assert (in_tx, in_session) == (None, None)
+        assert featured == ["d1", "d2"]
+        if major >= 4:
+            read, write = sent[:2]
+            assert read == _top_level(_K9, in_tx=True), read
+            assert write.startswith("LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE title @0@ $_f0); LET $_sq1 = "), write
+
+    async def test_the_raw_block_still_answers_no_record_on_4_0(self) -> None:
+        """The server's answer the ORM works around (README row "``similar_to()`` next to a subquery"): inside a block,
+        an HNSW search next to the ids of a ``LET`` holding a ``SELECT`` answers no record on SurrealDB 4.0; the same
+        ``LET`` sent as a statement of its own, the nearest. When a 4.x release answers the records, this test fails:
+        the ORM's top-level form (``SubqueryCompiler.top_level``) can then be dropped for that release."""
+        async with _vec_models("ws") as client:
+            await _seed(client)
+            if await _major(client) < 4:
+                pytest.skip("SurrealDB 4.x only: the earlier lines answer the records in the block")
+            variables = {"_f0": "cats", "_f1": list(_Q)}
+            block = await _client.query(client, _K9, variables)
+            top_level = (await _client.query_all(client, _top_level(_K9), variables))[2]
+        assert block == [], "SurrealDB 4.x answers the records in the block now: drop the ORM's top-level form there"
+        assert [str(row["id"].id) for row in top_level] == ["d1", "d2"]
+
+
 #: SurrealDB's refusal of a query vector of two numbers for a vector index of dimension 3, the same on every engine.
 _DIMENSION_ERROR = "Incorrect vector dimension (2). Expected a vector of 3 dimension."
 #: The ORM's error for that refusal on the field ``embedding``.
@@ -6126,7 +6315,7 @@ def _tied_nearest(dist: str = "cosine", limit: int = 3) -> Any:
 
 async def _tied_keys(client: Any, condition: str = "true") -> list[str]:
     """The keys of the ``vec_tied`` records matching *condition* (a constant of these tests), sorted."""
-    rows = await client.query(f"SELECT VALUE id FROM vec_tied WHERE {condition};", {})
+    rows = await _client.query(client, f"SELECT VALUE id FROM vec_tied WHERE {condition};", {})
     return sorted(str(row.id) for row in rows)
 
 
@@ -6144,7 +6333,7 @@ class TestExactScanRankingE2E:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _TIE_CORPUS)
             major = await _major(client)
-            every = await client.query(_PIN_EVERY_DISTANCE.format(dist=dist), {"q": _Q})
+            every = await _client.query(client, _PIN_EVERY_DISTANCE.format(dist=dist), {"q": _Q})
             answers = [await _tied_nearest(dist).exec() for _ in range(_TIE_CALLS)]
         own = {str(row["id"].id): row["d"] for row in every}
         orders = {tuple(_ids(records)) for records in answers}
@@ -6165,7 +6354,7 @@ class TestExactScanRankingE2E:
     async def test_without_a_tie_the_answer_is_the_exact_scan_s(self, kind: str, dist: str) -> None:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _SPREAD_CORPUS)
-            raw = await client.query(_PIN_TWO_NEAREST.format(dist=dist), {"q": _Q})
+            raw = await _client.query(client, _PIN_TWO_NEAREST.format(dist=dist), {"q": _Q})
             records = await _tied_nearest(dist, 2).exec()
         assert [str(row["id"].id) for row in raw] == (["s4", "s1"] if dist == "HAMMING" else ["s1", "s4"])
         assert list(zip(_ids(records), _distances(records), strict=True)) == [(str(row["id"].id), row["d"]) for row in raw]
@@ -6175,8 +6364,15 @@ class TestExactScanRankingE2E:
     async def test_a_zero_vector_under_cosine(self, kind: str) -> None:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _ZERO_CORPUS)
-            raw = await client.query(_PIN_TWO_NEAREST.format(dist="COSINE"), {"q": _Q})
+            major = await _major(client)
+            raw = await _client.query(client, _PIN_TWO_NEAREST.format(dist="COSINE"), {"q": _Q})
             records = await _tied_nearest("cosine", 2).exec()
+        if major >= 4:
+            # SurrealDB 4.x ranks the zero vector's NaN distance after every number: the two nearest are z1 and z2.
+            assert [str(row["id"].id) for row in raw] == _ids(records) == ["z1", "z2"]
+            assert records[0]._knn_distance == raw[0]["d"] == 0.0
+            assert records[1]._knn_distance == raw[1]["d"] == pytest.approx(0.4)
+            return
         assert [str(row["id"].id) for row in raw] == _ids(records) == ["z0", "z1"]
         assert math.isnan(records[0]._knn_distance) and math.isnan(raw[0]["d"])
         assert records[1]._knn_distance == raw[1]["d"] == 0.0
@@ -6233,23 +6429,41 @@ async def _seed_loose(client: Any) -> None:
 
 
 class _DimensionClient:
-    """A client whose every query fails with SurrealDB's dimension error: records what it was sent."""
+    """A client whose every query fails with SurrealDB's dimension error: records what it was sent. Its ``version()``
+    answers *version*, ``None`` failing the test; its ``query_raw()`` answers a ``BEGIN … COMMIT`` request of
+    *statements* statements (v0.50.0's top-level form) with the error on the one before ``COMMIT``, every other
+    statement after ``BEGIN`` reported as not executed."""
 
-    def __init__(self) -> None:
+    def __init__(self, version: str | None = None, statements: int = 4) -> None:
         self.error = InternalError("Internal", _DIMENSION_ERROR)
         self.sent: list[str] = []
+        self.answer = version
+        self.statements = statements
 
     async def query(self, statement: str, variables: Any = None) -> Any:
         self.sent.append(statement)
         raise self.error
 
+    async def query_raw(self, statement: str, variables: Any = None) -> Any:
+        self.sent.append(statement)
+        skipped = {"status": "ERR", "kind": "Query", "result": _NOT_EXECUTED, "details": {"kind": "NotExecuted"}}
+        failed = {"status": "ERR", "kind": "Internal", "result": _DIMENSION_ERROR}
+        middle = [skipped] * (self.statements - 3)
+        return {"result": [{"status": "OK", "result": None}, *middle, failed, skipped]}
+
     async def version(self) -> str:
-        pytest.fail("a statement without another condition reads no line")
+        if self.answer is None:
+            pytest.fail("a statement without another condition reads no line")
+        return self.answer
 
 
-def _dimension_client(monkeypatch: pytest.MonkeyPatch) -> _DimensionClient:
+#: SurrealDB's text for a statement of a failed transaction that did not run.
+_NOT_EXECUTED = "The query was not executed due to a failed transaction"
+
+
+def _dimension_client(monkeypatch: pytest.MonkeyPatch, version: str | None = None) -> _DimensionClient:
     """Every read acquires one :class:`_DimensionClient`, returned."""
-    client = _DimensionClient()
+    client = _DimensionClient(version)
 
     async def get_client(*args: Any, **kwargs: Any) -> Any:
         return client
@@ -6340,8 +6554,11 @@ class TestDimensionRefusal:
         assert raised.value.__cause__ is client.error
         assert len(client.sent) == 1
 
-    async def test_its_own_and_a_subquery_s_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = _dimension_client(monkeypatch)
+    @pytest.mark.parametrize("version", ["surrealdb-2.7.0", "surrealdb-3.3.5", "surrealdb-4.0.0"])
+    async def test_its_own_and_a_subquery_s_fields(self, monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+        """An HNSW search next to a subquery reads the line (v0.50.0); from SurrealDB 4 its ``LET`` goes first, on
+        its own, and the error of the statement that failed is read past the statements reported as not executed."""
+        client = _dimension_client(monkeypatch, version)
         inner = VecDoc.objects().similar_to("summary_vec", [1.0, 0.0, 0.0], 2)
         queryset = VecLoose.objects().filter(id__in=Subquery(inner)).similar_to("embedding", _SHORT)
         with pytest.raises(SurrealDbError) as raised:
@@ -6350,7 +6567,14 @@ class TestDimensionRefusal:
             "similar_to(): the vector has 2 dimensions; the vector index on one of the fields 'embedding', "
             "'summary_vec' expects 3."
         )
-        assert raised.value.__cause__ is client.error
+        [sent] = client.sent
+        if version.startswith("surrealdb-4"):
+            assert sent.startswith("BEGIN TRANSACTION; LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE "), sent
+            assert type(raised.value.__cause__) is InternalError
+            assert str(raised.value.__cause__) == str(client.error)
+        else:
+            assert sent.startswith("{ LET $_sq0 = "), sent
+            assert raised.value.__cause__ is client.error
 
     async def test_a_write_by_the_ids_of_the_nearest(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _dimension_client(monkeypatch)
@@ -6405,7 +6629,7 @@ class TestDimensionE2E:
             line = await _line(client)
             with pytest.raises((SurrealDbError, ServerError)) as raised:
                 await VecLoose.objects().similar_to("embedding", _SHORT).bulk_update(hit=True)
-            hits = await client.query("SELECT VALUE id FROM vec_loose WHERE hit = true;", {})
+            hits = await _client.query(client, "SELECT VALUE id FROM vec_loose WHERE hit = true;", {})
         assert hits == []
         if line == (3, 1):
             assert isinstance(raised.value, ServerError)
@@ -6505,16 +6729,16 @@ class TestTransactionsE2E:
 
 class _InfoClient:
     """A client whose ``query()`` answers each ``INFO FOR INDEX`` with the next of *answers* (the last one again once
-    they run out): records what it was sent."""
+    they run out), as SDK 3.0 does: one result per statement: records what it was sent."""
 
     def __init__(self, *answers: Any) -> None:
         self.answers = answers
         self.sent: list[str] = []
 
-    async def query(self, statement: str, variables: dict[str, Any]) -> Any:
+    async def query(self, statement: str, variables: dict[str, Any] | None) -> Any:
         assert variables == {}
         self.sent.append(statement)
-        return self.answers[min(len(self.sent), len(self.answers)) - 1]
+        return [self.answers[min(len(self.sent), len(self.answers)) - 1]]
 
 
 #: ``INFO FOR INDEX``'s answer for an HNSW index of six records, measured on each engine: SurrealDB 3.3.4 while its
@@ -6523,6 +6747,19 @@ _COMPACTING = {"building": {"compacting": True, "initial": 0, "pending": 0, "sta
 _COMPACTED = {"building": {"compacting": False, "initial": 0, "pending": 0, "status": "ready", "updated": 0}}
 _NO_COMPACTION = {"building": {"initial": 0, "pending": 0, "status": "ready", "updated": 0}}
 _EMBEDDED_READY = {"building": {"status": "ready"}}
+#: The embedded engine's answer from its 4.0 core: a compaction queued after the seed, never started.
+_EMBEDDED_QUEUED = {
+    "building": {
+        "active": False,
+        "armed_shards": 2,
+        "compacting": True,
+        "initial": 0,
+        "pending": 0,
+        "queued": True,
+        "status": "ready",
+        "updated": 0,
+    }
+}
 
 
 @pytest.fixture
@@ -6540,13 +6777,25 @@ def recorded_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 class TestCompactionWait:
     """``tests/_compaction.py``, the wait every seed of a vector index makes before the test writes to its table (issue
     #344): it reads ``INFO FOR INDEX`` until ``building.compacting`` is no longer true, returns after one read when
-    the engine reports no such key (SurrealDB 2.x, 3.1, the embedded engine), and fails with a clear message — never
-    passes silently — when the compaction outlasts its timeout or the answer holds no ``building`` state. A model's
-    wait reads its vector indexes from ``get_indexes()``; hand-written statements give theirs."""
+    the engine reports no such key (SurrealDB 2.x, 3.1) or never runs the compaction (the embedded engine), and fails
+    with a clear message — never passes silently — when the compaction outlasts its timeout or the answer holds no
+    ``building`` state. A model's wait reads its vector indexes from ``get_indexes()``; hand-written statements give
+    theirs."""
 
     @pytest.mark.parametrize("answer", [_NO_COMPACTION, _EMBEDDED_READY, _COMPACTED], ids=["2x-31", "embedded", "33-idle"])
     async def test_no_compaction_running_returns_after_one_read(self, answer: Any, recorded_sleeps: list[float]) -> None:
         client = _InfoClient(answer)
+        await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc")
+        assert client.sent == ["INFO FOR INDEX vec_doc_embedding ON vec_doc;"]
+        assert recorded_sleeps == []
+
+    async def test_the_embedded_engine_is_read_once(
+        self, recorded_sleeps: list[float], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The embedded engine (4.0 core) reports ``compacting = true`` after a seed and never runs the compaction (no
+        background task, measured on SDK 3.0.0): the wait reads once and returns, as there is nothing to wait for."""
+        client = _InfoClient(_EMBEDDED_QUEUED)
+        monkeypatch.setattr(_compaction, "EMBEDDED_CLIENTS", (_InfoClient,))
         await _compaction.wait_for_compaction(client, "vec_doc_embedding", "vec_doc")
         assert client.sent == ["INFO FOR INDEX vec_doc_embedding ON vec_doc;"]
         assert recorded_sleeps == []
@@ -6619,9 +6868,9 @@ class TestCompactionWait:
 
 class TestCompactionWaitE2E:
     """The wait after a seed on every engine (the line under test over WebSocket and HTTP, and the embedded engine):
-    SurrealDB 3.3 reports ``building.compacting`` and the wait returns once it is false; SurrealDB 2.x, 3.1 and the
-    embedded engine report no such key and the wait sends one ``INFO FOR INDEX`` per vector index, no other query, and
-    fails none."""
+    SurrealDB 3.3 and 4.0 report ``building.compacting`` and the wait returns once it is false; SurrealDB 2.x and 3.1
+    report no such key, and the embedded engine (4.0 core) queues the compaction without ever running it: there the
+    wait sends one ``INFO FOR INDEX`` per vector index, no other query, and fails none."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_the_wait_returns_once_the_compaction_is_over(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6634,8 +6883,12 @@ class TestCompactionWaitE2E:
             await _compaction.wait_for_model_indexes(client, VecDoc)
             sent = _calls(calls)
             monkeypatch.undo()
-            states = [(await client.query(read, {}))["building"] for read in reads]
-        if line >= (3, 3):
+            states = [(await _client.query(client, read, {}))["building"] for read in reads]
+        if kind == "mem":
+            # The embedded engine (4.0 core) queues the compaction and never runs it: one read, no wait.
+            assert [(state["compacting"], state["active"]) for state in states] == [(True, False), (True, False)]
+            assert sent == _sent(reads), "one read per vector index"
+        elif line >= (3, 3):
             assert [state["compacting"] for state in states] == [False, False]
             assert sent[:2] == _query(reads[0]) and sent[-2:] == _query(reads[1])
             assert set(sent) == {*_query(reads[0]), *_query(reads[1])}, "INFO FOR INDEX only"
@@ -6711,7 +6964,7 @@ _SIX = ["d1", "d2", "d3", "d4", "d5", "d6"]
 
 async def _keys(client: Any, statement: str, **variables: Any) -> list[str]:
     """The keys of the record ids *statement* (a ``SELECT VALUE id`` constant of these pins) answers, sorted."""
-    rows = await client.query(statement, variables)
+    rows = await _client.query(client, statement, variables)
     return sorted(str(row.id) for row in rows)
 
 
@@ -6805,6 +7058,12 @@ class TestLinePinsE2E:
         async with _vec_models(kind) as client:
             await _seed(client)
             major = await _major(client)
+            if major >= 4:
+                refusals = await _refusals(client, _PIN_TWO_KNN, q=_Q, p=_Q2)
+                assert len(refusals) == 1 and "supports a single KNN operator" in refusals[0], (
+                    f"{_ROW_CONDITIONS}: SurrealDB 4.x refuses a second KNN operator"
+                )
+                return
             keys = await _keys(client, _PIN_TWO_KNN, q=_Q, p=_Q2)
         if major >= 3:
             assert keys == ["d1", "d2"], f"{_ROW_CONDITIONS}: SurrealDB 3.x returns the first operator's neighbours"
@@ -6819,7 +7078,7 @@ class TestLinePinsE2E:
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _seed_statements("vec_loose"))
             line = await _line(client)
-            raw = await client.query(_PIN_NO_INDEX, {"q": _Q})
+            raw = await _client.query(client, _PIN_NO_INDEX, {"q": _Q})
             docs = await VecLoose.objects().similar_to("embedding", _Q, 2).exec()
             exact = await VecLoose.objects().similar_to("embedding", _Q, 2, dist="cosine").exec()
         if line == (3, 1):
@@ -6861,10 +7120,10 @@ class TestLinePinsE2E:
             await _seed_ranked(client)
             major = await _major(client)
             ranged = await _keys(client, _PIN_RANGE, a=2, q=_Q)
-            counted = await client.query(_PIN_RANGE_COUNT, {"a": 2, "q": _Q})
+            counted = await _client.query(client, _PIN_RANGE_COUNT, {"a": 2, "q": _Q})
             exact = await _keys(client, _PIN_EQUAL_EXACT, c="tech", q=_Q)
             ranged_first = await _keys(client, _PIN_RANGE_LET, a=2, q=_Q)
-            counted_first = await client.query(_PIN_RANGE_COUNT_LET, {"a": 2, "q": _Q})
+            counted_first = await _client.query(client, _PIN_RANGE_COUNT_LET, {"a": 2, "q": _Q})
             exact_first = await _keys(client, _PIN_EQUAL_EXACT_LET, c="tech", q=_Q)
         if major >= 3:
             assert (ranged, counted, exact) == (["d4", "d6"], [{"count": 2}], ["d3", "d4"]), (
@@ -6874,6 +7133,13 @@ class TestLinePinsE2E:
             assert ranged == [], f"{_ROW_CONDITIONS}: 2.x answers no record next to a range on an indexed field"
             assert counted == [{"count": 4}], f"{_ROW_CONDITIONS}: 2.x counts more records than K there"
             assert exact == [], f"{_ROW_CONDITIONS}: 2.x's exact scan answers no record next to an indexed field"
+        if major >= 4:
+            # SurrealDB 4.0.0: inside a block, an HNSW search next to `id IN $s`, $s a LET of the block holding a
+            # SELECT, answers no record (the exact scan is right).
+            assert (ranged_first, counted_first, exact_first) == ([], [{"count": 0}], ["d3", "d4"]), (
+                f"{_ROW_CONDITIONS}: 4.0.0 answers no record for an HNSW search next to a LET's ids"
+            )
+            return
         assert (ranged_first, counted_first, exact_first) == (["d4", "d6"], [{"count": 2}], ["d3", "d4"]), (
             f"{_ROW_CONDITIONS}: the records selected first in a LET, right on every engine"
         )
@@ -6905,9 +7171,23 @@ class TestLinePinsE2E:
             await _apply_ddl(client, _seed_statements("vec_pin_r", numbered=True))
             await _compaction.wait_for_defined_indexes(client, _PIN_WRITE_DDL)
             major = await _major(client)
-            returned = await client.query(_PIN_W_UPDATE, {"q": _Q})
+            if major >= 4:
+                refused = [
+                    await _refusals(client, _PIN_W_UPDATE, q=_Q),
+                    await _refusals(client, _PIN_R_UPDATE, a=2, q=_Q),
+                ]
+                written = await _keys(client, _PIN_W_HITS)
+                ranged_written = await _keys(client, _PIN_R_HITS)
+                selected = await _keys(client, _PIN_R_SELECT, a=2, q=_Q)
+                # SurrealDB 4.x refuses a KNN operator in the WHERE of an UPDATE (the ORM's writes select the ids first).
+                assert [len(texts) for texts in refused] == [1, 1], f"{_ROW_WRITES}: 4.x refuses both writes"
+                assert all("in the WHERE of an UPDATE or DELETE" in texts[0] for texts in refused), refused
+                assert (written, ranged_written) == ([], []), f"{_ROW_WRITES}: 4.x writes nothing"
+                assert selected == ["d4", "d6"], f"{_ROW_WRITES}: SurrealDB 4.x selects the K nearest of the range"
+                return
+            returned = await _client.query(client, _PIN_W_UPDATE, {"q": _Q})
             written = await _keys(client, _PIN_W_HITS)
-            ranged = await client.query(_PIN_R_UPDATE, {"a": 2, "q": _Q})
+            ranged = await _client.query(client, _PIN_R_UPDATE, {"a": 2, "q": _Q})
             ranged_written = await _keys(client, _PIN_R_HITS)
             selected = await _keys(client, _PIN_R_SELECT, a=2, q=_Q)
         assert sorted(str(row["id"].id) for row in returned) == ["d1", "d2"], f"{_ROW_WRITES}: the K nearest returned"
@@ -6931,7 +7211,7 @@ class TestLinePinsE2E:
         async with _vec_models(kind) as client:
             await _seed(client)
             line = await _line(client)
-            indexed = await client.query(_PIN_MATCH, {"t": "cats", "q": _Q2})
+            indexed = await _client.query(client, _PIN_MATCH, {"t": "cats", "q": _Q2})
             exact = await _keys(client, _PIN_MATCH_EXACT, t="cats", q=_Q2)
             matched_first = await _keys(client, _PIN_MATCH_LET, t="cats", q=_Q2)
         found = {str(row["id"].id): row["d"] for row in indexed}
@@ -6947,7 +7227,11 @@ class TestLinePinsE2E:
             assert exact == ["d2", "d6"], f"{_ROW_SEARCH}: SurrealDB 3.x keeps the match next to the exact scan"
         else:
             assert exact == [], f"{_ROW_SEARCH}: 2.x and the embedded engine answer no record next to a full-text match"
-        assert matched_first == ["d2", "d6"], f"{_ROW_SEARCH}: the matches selected first in a LET, right everywhere"
+        if line[0] >= 4:
+            # SurrealDB 4.0.0: an HNSW search next to the ids of a LET of the block answers no record.
+            assert matched_first == [], f"{_ROW_SEARCH}: 4.0.0 answers no record for an HNSW search next to a LET"
+        else:
+            assert matched_first == ["d2", "d6"], f"{_ROW_SEARCH}: the matches selected first in a LET, right everywhere"
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_search_score_in_the_let_form(self, kind: str) -> None:
@@ -6965,7 +7249,7 @@ class TestLinePinsE2E:
                 with pytest.raises(ServerError) as refused:
                     await client.query(_PIN_SCORE_LET, {"t": "programming", "q": _Q2})
             else:
-                scores = await client.query(_PIN_SCORE_LET, {"t": "programming", "q": _Q2})
+                scores = await _client.query(client, _PIN_SCORE_LET, {"t": "programming", "q": _Q2})
         if major >= 3:
             assert refused is not None
             assert "no MATCHES clause found in WHERE condition" in str(refused.value), (
@@ -6982,8 +7266,8 @@ class TestLinePinsE2E:
         WebSocket, on every server line (the embedded engine has no live queries)."""
         async with _vec_models("ws") as client:
             await _seed(client)
-            nearest_id = await client.query(_LIVE_KNN, {})
-            every_id = await client.query(_LIVE_ALL, {})
+            nearest_id = await _client.query(client, _LIVE_KNN, {})
+            every_id = await _client.query(client, _LIVE_ALL, {})
             try:
                 nearest = SurrealDBConnectionManager.subscribe_live(nearest_id)
                 every = SurrealDBConnectionManager.subscribe_live(every_id)
@@ -7049,12 +7333,12 @@ _S37_FILTERS = (
     "them in a `LET` first, which is slower: upgrade to SurrealDB 3.x for large tables."
 )
 _S37_SCORES = (
-    "On SurrealDB 3.x, search annotations (`SearchScore`, `SearchHighlight`, `SearchOffsets`) give each of the "
-    "nearest matches the score, highlight and offsets that the same `search()` gives it without `similar_to()`. "
-    "On SurrealDB 2.x and the embedded engine the ORM refuses them before the statement is sent, since there it "
+    "On SurrealDB 3.x, 4.x and the embedded engine, search annotations (`SearchScore`, `SearchHighlight`, "
+    "`SearchOffsets`) give each of the nearest matches the score, highlight and offsets that the same `search()` gives "
+    "it without `similar_to()`. On SurrealDB 2.x the ORM refuses them before the statement is sent, since there it "
     "selects the matches first and the vector search holds no match to score, highlight or locate; `count()`, "
     "`exists()` and the aggregations, which return no annotation, still answer. The examples run on the embedded "
-    "engine, which is why this one prints the refusal."
+    "engine, a SurrealDB 4.0 core since v0.50.0, so this one prints the annotations; on 2.x it prints the refusal."
 )
 _S37_APPROX = (
     "HNSW is approximate: with a condition that keeps few records, a search can return fewer than `limit` "
@@ -7106,7 +7390,7 @@ _PART_NEEDLES_37 = {
         "`Index(hnsw=True)`",
         "binds the query vector",
         "SurrealDB 2.x, 3.x and the embedded engine",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
         "`mem://`",
     ),
     "Declare and apply": (
@@ -7231,7 +7515,7 @@ _COMING_FROM_PHRASES_37 = (
     "does not write `VectorField` yet",
 )
 #: The search annotations' block (*With other conditions*): run on the embedded engine, it prints the ORM's refusal.
-_ANNOTATED_EXCEPT = "except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server"
+_ANNOTATED_EXCEPT = "except SurrealDbError as exc:  # SurrealDB 2.x: the ORM refuses the annotations"
 #: The term that block searches: found in fewer than half the section's documents, so its BM25 score is not 0.
 _ANNOTATED_TERM = "programming"
 _HEADER_SENTENCE_36 = (
@@ -7297,11 +7581,9 @@ _VECTOR_ROWS = [
 #: The row v0.36.0 adds to the embedded engine's table, cell by cell.
 _EMBEDDED_VECTOR_ROW = [
     "Vector search (v0.36.0)",
-    "as on a 2.x server: `MTREE` accepted, at most `ef` records returned (the ORM raises `ef` to `limit`), other "
-    "conditions selected first in a `LET` (search annotations refused), writes made by the ids of the nearest, "
-    "fewer records with a selective condition; an index without `TYPE` is `F64` (servers: `F32`), so the ORM "
-    "always writes `TYPE`",
-    "3.x refuses `MTREE`, applies the conditions during the index search and keeps search annotations",
+    "as on a 4.x server: `MTREE` refused, the conditions applied during the index search (next to a subquery's ids, "
+    "its `LET`s sent first), search annotations kept; an index without `TYPE` is `F32`",
+    "2.x accepts `MTREE` and selects the other conditions first",
     "v0.36.0",
 ]
 _FEATURES_ROW_37 = ["Vector search (`similar_to()`, KNN, HNSW indexes)", "✅"]
@@ -7428,13 +7710,14 @@ class TestReadmeSection37:
 
     def test_the_search_annotations_block(self) -> None:
         """*With other conditions*: one block annotates a ``SearchScore`` and a ``SearchHighlight`` next to
-        ``similar_to()`` inside ``try``, catching ``SurrealDbError`` on the embedded engine; what it prints is the
-        ORM's refusal for ``SearchScore``. The section's full-text index declares ``highlights=True``."""
+        ``similar_to()`` inside ``try``, catching ``SurrealDbError`` on SurrealDB 2.x; on the embedded engine (a 4.0
+        core since v0.50.0) it prints the annotated matches. The section's full-text index declares
+        ``highlights=True``."""
         [block] = [code for code in _readme_blocks(_part_37("With other conditions")) if "SearchScore(" in code]
         assert "similar_to(" in block and 'SearchHighlight("<b>", "</b>", 0)' in block, block
         assert f'search(title="{_ANNOTATED_TERM}")' in block, block
         assert re.search(rf"^{re.escape(_ANNOTATED_EXCEPT)}$", block, re.MULTILINE), block
-        assert _readme_printed(block)[0] == _VS1.format("SearchScore"), _readme_printed(block)
+        assert _readme_printed(block)[0].startswith("Rust programming Rust <b>programming</b> "), _readme_printed(block)
         assert "highlights=True" in "".join(_readme_blocks(_part_37("Declare and apply")))
 
     def test_limit_and_ef_within_the_range(self) -> None:
@@ -7498,7 +7781,7 @@ class TestReadmeSection37:
         """Every table v0.36.0 touches keeps one cell count per line and no escaped pipe; section 37 has no table."""
         parts = [
             _doc_part("## Features"),
-            _doc_part("## ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _doc_part("## ORM behaviour: SurrealDB 2.x, 3.x and 4.x"),
             _doc_part("## ORM behaviour: the embedded engine"),
             _doc_part("## Roadmap"),
             _doc_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),

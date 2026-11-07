@@ -32,6 +32,9 @@ from tests._readme_tables import (
     readme,
     unresolved_links,
 )
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import part as doc_part_of
+from tests._readme_tables import table_rows as _table_rows
 
 #: The README stays a front page: about 300 lines at most.
 README_MAX_LINES = 300
@@ -188,7 +191,7 @@ class TestAiGuideAndLlmsTxt:
         assert _broken(links) == []
         linked = {link.removeprefix(f"{GITHUB_BLOB}docs/").partition("#")[0] for link in links}
         assert set(guide_order()) | {"README.md"} <= linked, sorted(set(guide_order()) - linked)
-        assert f"{GITHUB_BLOB}docs/compatibility.md#orm-behaviour-surrealdb-2x-vs-3x" in links
+        assert f"{GITHUB_BLOB}docs/compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x" in links
 
     def test_llms_txt_shape(self) -> None:
         """The llms.txt convention: a ``#`` title, a ``>`` summary, then ``##`` sections of ``- [name](url): notes``
@@ -220,3 +223,171 @@ class TestAiGuideAndLlmsTxt:
     def test_index_links_the_ai_guide(self) -> None:
         """The documentation index lists the AI guide among its other documents."""
         assert "(ai/CLAUDE.md)" in doc_part("## Other documents")
+
+
+# --- v0.50.0: official SDK 3.0, SurrealDB 4.x and the migration note (spec §11, AC-15, C3) -------------------------
+
+#: The release-line table of the README's "Supported versions", its two rows exactly.
+_RELEASE_LINES = [
+    ["`0.50.x`", "`surrealdb[pydantic]>=3.0.0,<4.0.0`", "2.x, 3.x, 4.x", "current"],
+    ["`0.40.x`", "`surrealdb[pydantic]>=2.0.0,<3.0.0`", "2.x, 3.x", "deprecated, security fixes only"],
+]
+#: The rule that follows it, one sentence.
+_RELEASE_RULE = (
+    "The ORM's minor series follows the SDK major, and the ORM supports exactly the SurrealDB versions the SDK "
+    "supports, from the ORM version that adopts that SDK."
+)
+_MIGRATION_NOTE = "migrating-to-0.50.md"
+_STAY_ON_SDK_2 = 'pip install "surreal-orm-lite<0.50"'
+#: What the migration note and the compatibility guide say of the SDK 2.0 line.
+_DEPRECATED = "The SDK 2.0 line (`0.40.x`) is deprecated and receives security fixes only; move to `0.50.x`"
+#: P5: how every public text describes the 4.x migration refusal.
+_P5 = "refused inside the migration's transaction, before the field change runs; nothing is applied"
+_OWNER_USER = "__surreal_orm_lite_owner"
+
+
+def _security() -> str:
+    return (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+
+
+class TestV050Readme:
+    """AC-15 (a), (b): the README's supported versions, its SDK mentions and its requirements (C3)."""
+
+    def test_release_line_table_and_rule(self) -> None:
+        part = doc_part("## Supported versions")
+        rows = [cells for _, cells in _table_rows(part, "ORM version")]
+        assert rows == _RELEASE_LINES, rows
+        table_end = part.index(_RELEASE_LINES[-1][-1])
+        assert _normalised(part[table_end:]).count(_RELEASE_RULE) == 1, part
+
+    def test_upgrading_paragraph(self) -> None:
+        part = doc_part("## Supported versions")
+        [paragraph] = [p for p in part.split("\n\n") if p.startswith("**Upgrading from 0.40.x**")]
+        assert f"{GITHUB_BLOB}docs/{_MIGRATION_NOTE}" in paragraph, paragraph
+        assert f"`{_STAY_ON_SDK_2}`" in paragraph, paragraph
+        assert "SDK 3.0" in paragraph, paragraph
+
+    def test_tested_versions_sentence(self) -> None:
+        assert "It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.0**" in _normalised(readme())
+
+    def test_no_sdk_2_mention_left(self) -> None:
+        text = readme()
+        for gone in ("Official%202.0", "Two server lines", "official SDK 2.0"):
+            assert gone not in text, gone
+        table = "\n".join(line for line in text.splitlines() if line.startswith("| `0.40.x`"))
+        assert text.count(">=2.0.0,<3.0.0") == table.count(">=2.0.0,<3.0.0") == 1
+
+    def test_badges(self) -> None:
+        text = readme()
+        assert "![SDK](https://img.shields.io/badge/SDK-Official%203.0-green)" in text
+        assert "badge/SurrealDB-2.7.0%20%7C%203.3.5%20%7C%204.0.0-purple" in text
+
+    def test_requirements_table(self) -> None:
+        rows = {cells[0]: cells[1] for _, cells in _table_rows(doc_part_of("## Installation", readme()), "Dependency")}
+        assert "surrealdb[pydantic]>=3.0.0,<4.0.0" in rows["Official SDK"], rows
+        for line in ("2.x", "3.x", "4.x", "[embedded]"):
+            assert line in rows["SurrealDB"], rows
+
+    def test_three_server_lines_bullet(self) -> None:
+        assert "- **Three server lines**: the same code runs on SurrealDB **2.x, 3.x and 4.x**" in readme()
+
+    def test_features_line_links_the_migration_note(self) -> None:
+        features = _table_rows(doc_part("## Features"), "Feature")
+        [row] = [cells for _, cells in features if "SDK 3.0" in cells[0]]
+        assert f"{GITHUB_BLOB}docs/{_MIGRATION_NOTE}" in row[0] and row[1] == "✅", row
+
+    def test_project_status(self) -> None:
+        status = _normalised(doc_part("## Project status"))
+        for needle in ("SDK 3.0", "v0.51.0", "v0.58.0", "v0.59.0", "3.0.0"):
+            assert needle in status, needle
+        assert "v2.0.0" not in status and "v0.41.0" not in status, status
+
+
+class TestV050Guides:
+    """AC-15 (c), (d); D25, P5, spec §6 n°3 and n°7: the migration note, the compatibility guide and the guides."""
+
+    def test_the_index_lists_the_migration_note(self) -> None:
+        assert _MIGRATION_NOTE in guide_order()
+
+    def test_migration_note_deprecates_the_sdk_2_line(self) -> None:
+        text = _normalised(guide(_MIGRATION_NOTE))
+        assert f"{_DEPRECATED}, or pin `{_STAY_ON_SDK_2}` if you must stay on SDK 2.0." in text, text[:400]
+
+    def test_compatibility_deprecates_the_sdk_2_line(self) -> None:
+        intro = _normalised(guide("compatibility.md").split("\n## ", 1)[0])
+        assert _DEPRECATED in intro, intro
+        assert "surrealdb[pydantic]>=3.0.0,<4.0.0" in intro, intro
+
+    def test_compatibility_tested_versions(self) -> None:
+        rows = [cells for _, cells in _table_rows(guide("compatibility.md"), "SurrealDB Version")]
+        tested = [cells[0] for cells in rows if cells[2] == "✅ Tested" and cells[1] == "3.0"]
+        assert tested == ["4.0.0", "3.3.5", "2.7.0"], rows
+
+    @pytest.mark.parametrize("name", [_MIGRATION_NOTE, "compatibility.md", "migrations.md"])
+    def test_p5_wording(self, name: str) -> None:
+        """P5: the 4.x refusal is described as refused inside the migration's transaction, never "before sending"."""
+        text = _normalised(guide(name))
+        assert _P5 in text, name
+        assert "before sending" not in text, name
+
+    @pytest.mark.parametrize("name", [_MIGRATION_NOTE, "authentication.md"])
+    def test_the_owner_user_name_is_reserved_on_in_memory_engines(self, name: str) -> None:
+        """Spec §6 n°3: ``__surreal_orm_lite_owner`` is reserved on in-memory embedded engines only."""
+        text = _normalised(guide(name))
+        assert f"`{_OWNER_USER}` is reserved on in-memory embedded engines only" in text, name
+
+    def test_querying_records_the_first_order_and_its_cost(self) -> None:
+        """Spec §6 n°7, M35: the ``first()`` order rule, its measured cost on 60 000 rows and the ``order_by()`` advice."""
+        text = _normalised(guide("querying.md"))
+        for needle in (
+            "60 000 rows",
+            "ORDER BY id",
+            "server order: id order for a plain scan, index order for an indexed filter",
+            "Add `order_by()` to page deterministically",
+            "`order_by()` on the indexed field",
+        ):
+            assert needle in text, needle
+        assert re.search(r"\b\d+(\.\d)? ms\b", text), "no measured figure"
+
+    def test_ai_guide_and_llms_txt_name_sdk_3_and_three_lines(self) -> None:
+        for text in (AI_GUIDE.read_text(encoding="utf-8"), LLMS_TXT.read_text(encoding="utf-8")):
+            assert "SDK 3.0" in text and "4.x" in text
+            assert "SDK 2.0" not in text.replace("SDK 2.0 line", "")
+
+
+class TestV050Security:
+    """AC-15 (c): ``SECURITY.md``'s supported versions."""
+
+    def test_supported_versions(self) -> None:
+        """``0.50.x`` supported, ``0.40.x`` deprecated with security fixes only, ``< 0.40`` not supported."""
+        rows = {cells[0]: cells[1] for _, cells in _table_rows(doc_part_of("## Supported Versions", _security()))}
+        assert list(rows) == ["0.50.x", "0.40.x", "< 0.40"], rows
+        assert rows["0.50.x"] == ":white_check_mark:", rows
+        assert "deprecated, security fixes only" in rows["0.40.x"].lower(), rows
+        assert rows["< 0.40"] == ":x:", rows
+
+
+class TestMigrationNoteExamplesE2E:
+    """The migration note's ``python`` blocks run as written, in order and in one namespace, on ``mem://`` (inside
+    ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines."""
+
+    async def test_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from surreal_orm_lite.testing import embedded_database
+
+        blocks = re.findall(r"^```python\n(.*?)^```$", guide(_MIGRATION_NOTE), re.MULTILINE | re.DOTALL)
+        assert len(blocks) >= 4, blocks
+        fences = re.findall(r"^```(\S*)$", guide(_MIGRATION_NOTE), re.MULTILINE)
+        assert fences == ["python", ""] * len(blocks), fences
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "migrating_to_0_50"}
+        try:
+            async with embedded_database():
+                for code in blocks:
+                    compiled = compile(code, "<migrating-to-0.50.md>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own guide (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == re.findall(r"^# (.*)$", code, re.MULTILINE), code
+        finally:
+            namespace.clear()

@@ -104,6 +104,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     Transaction,
+    _client,
     computed,
     define_parser,
     generate_models_from_db,
@@ -129,6 +130,7 @@ from surreal_orm_lite.schema import (
 from surreal_orm_lite.subquery import SubqueryCompiler
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import apply_ddl_statements
+from tests import _sdk_calls
 from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
 from tests._readme_tables import SERVER_BEHAVIOUR as _SERVER_BEHAVIOUR
 from tests._readme_tables import (
@@ -1713,7 +1715,11 @@ class _RefusingClient:
         self.error = error
         self.queries: list[str] = []
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         self.queries.append(statement)
         raise self.error
 
@@ -1871,7 +1877,11 @@ class _GuardClient:
         self.queries: list[str] = []
         self.version_calls = 0
 
-    async def query(self, statement: str, variables: object) -> object:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, statement: str, variables: object) -> object:
         assert variables == {}
         self.queries.append(statement)
         if statement == _INFO:
@@ -3121,19 +3131,8 @@ _M6 = (
 )
 
 #: The SDK methods a refused write must reach none of (AC-6).
-_SDK_METHODS = (
-    "query",
-    "query_raw",
-    "create",
-    "insert",
-    "insert_relation",
-    "update",
-    "merge",
-    "patch",
-    "upsert",
-    "delete",
-    "select",
-)
+#: Every request function of the SDK 3.0 frontier (``surreal_orm_lite._client``).
+_SDK_METHODS = (*_sdk_calls.QUERIES, *_sdk_calls.CRUD)
 
 
 class MvOrder(BaseSurrealModel):
@@ -3210,26 +3209,13 @@ async def _line(client: Any) -> tuple[int, int]:
 
 async def _rows(client: Any, table: str) -> list[dict[str, Any]]:
     """Every record of *table* (a constant name of these tests), ordered by id, read raw."""
-    rows: list[dict[str, Any]] = await client.query(f"SELECT * FROM {table} ORDER BY id;", {})
+    rows: list[dict[str, Any]] = await _client.query(client, f"SELECT * FROM {table} ORDER BY id;", {})
     return rows
 
 
 def _spy_sdk(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
-    """Record the name of every SDK method of :data:`_SDK_METHODS` *client* is called with (and let it through)."""
-    calls: list[str] = []
-
-    def recording(method: str) -> Any:
-        real = getattr(client, method)
-
-        async def call(*args: object, **kwargs: object) -> object:
-            calls.append(method)
-            return await real(*args, **kwargs)
-
-        return call
-
-    for method in _SDK_METHODS:
-        monkeypatch.setattr(client, method, recording(method))
-    return calls
+    """Record the name of every frontier request of :data:`_SDK_METHODS` made for *client* (and let it through)."""
+    return _sdk_calls.record(monkeypatch, client, *_SDK_METHODS, entry=lambda call: call.name)
 
 
 class TestViewWritesE2E:
@@ -3273,10 +3259,10 @@ class TestViewWritesE2E:
             ends = (order_id, view_id) if reverse else (view_id, order_id)
             rows = await stats.relate("mv_watches", order, reverse=reverse)
             assert [(row["in"], row["out"]) for row in rows] == [ends]
-            edges = await client.query("SELECT in, out FROM mv_watches;", {})
+            edges = await _client.query(client, "SELECT in, out FROM mv_watches;", {})
             assert [(edge["in"], edge["out"]) for edge in edges] == [ends]
             await stats.remove_relation("mv_watches", order, reverse=reverse)
-            assert await client.query("SELECT * FROM mv_watches;", {}) == []
+            assert await _client.query(client, "SELECT * FROM mv_watches;", {}) == []
             assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3433,12 +3419,12 @@ def _sent(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
 
 async def _tables(client: Any) -> dict[str, Any]:
     """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
-    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+    return dict((await _client.query(client, "INFO FOR DB;", {}))["tables"])
 
 
 async def _events_info(client: Any, table: str) -> dict[str, Any]:
     """The ``events`` of ``INFO FOR TABLE`` *table* (a constant name of these tests)."""
-    return dict((await client.query(f"INFO FOR TABLE {table};", {}))["events"])
+    return dict((await _client.query(client, f"INFO FOR TABLE {table};", {}))["events"])
 
 
 @contextlib.asynccontextmanager
@@ -3595,7 +3581,7 @@ class TestDefineViewE2E:
         """AC-10 (M10, D14): ``define_view()`` then ``define_events()`` puts the event on the view; the next
         ``define_view()`` (``OVERWRITE``) drops it, the next ``define_events()`` restores it, and it fires on a source
         write. Measured with orders saved (``filled``), over WebSocket and HTTP: on 3.3 the event fires once per group
-        the ``OVERWRITE`` recomputes, then is dropped; 2.x and the embedded engine drop it first; 3.1 refuses
+        the ``OVERWRITE`` recomputes, then is dropped; 2.x and 4.x (the embedded engine too) drop it first; 3.1 refuses
         ``OVERWRITE`` on a view that holds records (S3: the view and its event are kept) and drops the event of an
         empty view as every line does."""
         async with _mv(kind) as client:
@@ -3620,7 +3606,7 @@ class TestDefineViewE2E:
             else:
                 assert await MvStatsEvents.define_view() == MvStatsEvents.view_ddl()
                 assert await _events_info(client, "mv_order_stats") == {}
-                fired = 2 if filled and line[0] >= 3 else 0
+                fired = 2 if filled and line[0] == 3 else 0
             assert len(await _rows(client, "mv_log")) == fired
             assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
             assert await _groups() == ({"new": (1, 1.0), "paid": (2, 15.5)} if filled else {})
@@ -3674,9 +3660,15 @@ class TestViewGuardE2E:
             assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
             assert "mv_seen" not in await _events_info(client, "mv_order_stats")
             # Measured: on 3.x the event, defined before the OVERWRITE, fired once per group the view was filled
-            # with, and was dropped after; 2.x and the embedded engine dropped it first.
-            assert len(await _rows(client, "mv_log")) == (2 if await _major(client) >= 3 else 0)
-            logged = len(await _rows(client, "mv_log"))
+            # with, and was dropped after; 2.x and 4.x (the embedded engine too) dropped it first. 4.x reads the
+            # table the event never created as missing.
+            major = await _major(client)
+            if major >= 4:
+                assert "mv_log" not in await _tables(client)
+                logged = 0
+            else:
+                assert len(await _rows(client, "mv_log")) == (2 if major == 3 else 0)
+                logged = len(await _rows(client, "mv_log"))
             await MvStatsEvents.define_events()
             assert list(await _events_info(client, "mv_order_stats")) == ["mv_seen"]
             await MvOrder(id="o4", status="paid", amount=1.0).save()
@@ -3909,14 +3901,15 @@ class TestViewLinesE2E:
             await _apply_ddl(client, _MV_INTEGER_ORDERS)
             await MvStats.define_view()
             major = await _major(client)
-            [raw] = await client.query("SELECT revenue FROM mv_order_stats:['paid'];", {})
-            assert (type(raw["revenue"]), raw["revenue"]) == ((float, 20.0) if major >= 3 else (int, 20))
+            [raw] = await _client.query(client, "SELECT revenue FROM mv_order_stats:['paid'];", {})
+            # ``math::sum()`` of integers: an int on 2.x and 4.x, a float on 3.x (M5, measured on 4.0.0).
+            assert (type(raw["revenue"]), raw["revenue"]) == ((float, 20.0) if major == 3 else (int, 20))
             stats = await MvStats.objects().get(RecordID("mv_order_stats", ["paid"]))
             assert (type(stats.revenue), stats.revenue) == (float, 20.0)
             await _apply_ddl(
                 client, "DEFINE TABLE mv_means AS SELECT status, math::mean(amount) AS mean FROM mv_orders GROUP BY status;"
             )
-            [mean] = await client.query("SELECT mean FROM mv_means:['paid'];", {})
+            [mean] = await _client.query(client, "SELECT mean FROM mv_means:['paid'];", {})
             assert (type(mean["mean"]), mean["mean"]) == ((float, 10.0) if major >= 3 else (Decimal, Decimal("10")))
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -3978,10 +3971,16 @@ class TestViewLinesE2E:
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_m8_a_source_write_without_the_aggregated_field(self, kind: str) -> None:
-        """M8 (surrealdb#7447), every line: with ``math::sum(amount)`` in a view, a source write without ``amount`` is
-        refused by the server, unchanged by the ORM; ``math::sum(amount ?? 0)`` lets it through."""
+        """M8 (surrealdb#7447), 2.x and 3.x: with ``math::sum(amount)`` in a view, a source write without ``amount``
+        is refused by the server, unchanged by the ORM; ``math::sum(amount ?? 0)`` lets it through. SurrealDB 4.x
+        accepts the write and sums the missing field as ``0``."""
         async with _mv(kind) as client:
             await MvStats.define_view()
+            if await _major(client) >= 4:
+                await MvOrder(id="x", status="paid").save()
+                stats = await _client.query(client, "SELECT revenue, total FROM mv_order_stats:['paid'];", {})
+                assert stats == [{"revenue": 0, "total": 1}], "4.x sums a missing field as 0"
+                return
             with pytest.raises(InternalError) as raised:
                 await MvOrder(id="x", status="paid").save()
             assert "math::sum()" in str(raised.value)
@@ -4503,12 +4502,13 @@ class TestViewReadsE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_raw_id_in_on_a_view_per_line(self, kind: str) -> None:
         """The raw ``id IN`` the ORM avoids on a view table: no record on SurrealDB 3.x (3.1 and 3.3 measured), both
-        on 2.x and the embedded engine. Fails on purpose when a 3.x release answers it again."""
+        on 2.x and 4.x (surrealdb/surrealdb#7608 fixed there; the embedded engine's 4.0 core too). Fails on purpose
+        when a 3.x release answers it again."""
         async with _mv(kind) as client:
             await _save_orders()
             await MvStats.define_view()
-            answer = await client.query("SELECT VALUE id FROM mv_order_stats WHERE id IN $ids", {"ids": [_PAID, _NEW]})
-            if await _major(client) >= 3:
+            answer = await _client.query(client, "SELECT VALUE id FROM mv_order_stats WHERE id IN $ids", {"ids": [_PAID, _NEW]})
+            if await _major(client) == 3:
                 if answer != []:
                     pytest.fail(_ID_IN_FIXED)
             else:
@@ -5026,7 +5026,7 @@ _INTRO_NEEDLES_33 = (
     "idempotently",
     "every write of the model is refused",
     "SurrealDB 2.x, 3.x and the embedded engine",
-    "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+    "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
     "`mem://`",
 )
 _PART_NEEDLES_33 = {
@@ -5168,7 +5168,7 @@ _PART_NEEDLES_33 = {
         "keeping their last records",
         "surrealdb#7447",
         "`math::sum(amount ?? 0)`",
-        "(compatibility.md#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(compatibility.md#orm-behaviour-surrealdb-2x-3x-and-4x)",
     ),
     "Security": (
         "identifier",
@@ -5275,10 +5275,9 @@ _HEADER_SENTENCE_32 = (
 #: Spec §11.1 item 6: the row v0.32.0 adds to the embedded-engine table, cell by cell.
 _EMBEDDED_VIEWS_ROW = [
     "Materialized views (v0.32.0)",
-    "as on a 2.x server: `int` sums and `Decimal` means; in a grouped view, `math::stddev()`/`math::variance()`, an "
-    "expression around an aggregate, a field outside `GROUP BY` and a `GROUP BY` on an alias raise `SurrealDbError` "
-    "before any DDL; writes to a view refused by the ORM (the engine would accept them); no live queries",
-    "`float` sums and means on 3.x",
+    "as on a 4.x server: a sum of integers is an `int`; the grouped forms 3.x accepts are accepted; writes to a view "
+    "refused by the ORM; no live queries",
+    "`float` sums on 3.x; `int` sums of integers on 2.x and 4.x",
     "v0.32.0",
 ]
 #: Spec §11.1 item 7: section 31's generated-models bullet, whitespace normalised (v0.34.0's text: the table keys are

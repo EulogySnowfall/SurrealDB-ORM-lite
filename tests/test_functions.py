@@ -12,6 +12,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    _client,
     around_save,
     around_update,
     post_save,
@@ -311,7 +312,7 @@ class TestFunctionEnumsE2E:
             for member, args in ENUM_SAMPLE_ARGS.items():
                 expr = SurrealFunc.call(member, *args).expression
                 # Raises if the server does not know the function / signature.
-                result = await client.query(f"RETURN {expr};", {})
+                result = await _client.query(client, f"RETURN {expr};", {})
                 if member is SurrealRandFunction.TIME:
                     assert isinstance(result, datetime) and 2000 <= result.year <= 2030, result
         finally:
@@ -345,12 +346,12 @@ async def sv_client():
     _connect()
     client = await SurrealDBConnectionManager.get_client()
     with contextlib.suppress(Exception):
-        await client.query("REMOVE TABLE SvUser;", {})
+        await _client.query(client, "REMOVE TABLE SvUser;", {})
     try:
         yield client
     finally:
         with contextlib.suppress(Exception):
-            await client.query("REMOVE TABLE SvUser;", {})
+            await _client.query(client, "REMOVE TABLE SvUser;", {})
         await SurrealDBConnectionManager.close_connection()
 
 
@@ -364,7 +365,7 @@ class TestSaveServerValuesE2E:
             # The instance is synced with the row the server returned…
             assert isinstance(user.joined_at, datetime)
             # …and the stored value is a real datetime, not the literal expression string.
-            rows = await client.query("SELECT * FROM SvUser:alice;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:alice;", {})
             assert isinstance(rows[0]["joined_at"], datetime)
             assert rows[0]["name"] == "Alice"
 
@@ -395,13 +396,14 @@ class TestSaveServerValuesE2E:
             assert user.password_hash.startswith("$argon2")
 
             # The hash verifies server-side against the original password…
-            ok = await client.query(
+            ok = await _client.query(
+                client,
                 "RETURN crypto::argon2::compare($h, $p);",
                 {"h": user.password_hash, "p": raw_password},
             )
             assert ok is True
             # …and the raw password was never stored.
-            rows = await client.query("SELECT * FROM SvUser:bob;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:bob;", {})
             assert raw_password not in str(rows[0])
 
     @pytest.mark.asyncio
@@ -411,7 +413,7 @@ class TestSaveServerValuesE2E:
             user = SvUser(id="evil", name="E", bio=evil)
             await user.save(server_values={"joined_at": SurrealFunc("time::now()")})
 
-            rows = await client.query("SELECT * FROM SvUser:evil;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:evil;", {})
             assert rows[0]["bio"] == evil  # stored verbatim, table intact
 
     @pytest.mark.asyncio
@@ -456,7 +458,7 @@ class TestMergeServerValuesE2E:
             assert user.plan == "pro"
             assert isinstance(user.updated_at, datetime)
             # …and the unlisted field survived (MERGE semantics, not REPLACE).
-            rows = await client.query("SELECT * FROM SvUser:carol;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:carol;", {})
             assert rows[0]["plan"] == "pro"
             assert rows[0]["bio"] == "hello"
             assert rows[0]["name"] == "Carol"
@@ -472,7 +474,7 @@ class TestMergeServerValuesE2E:
                 updated_at="literal-string",
                 server_values={"updated_at": SurrealFunc("time::now()")},
             )
-            rows = await client.query("SELECT * FROM SvUser:dave;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:dave;", {})
             assert isinstance(rows[0]["updated_at"], datetime)  # the func won
 
     @pytest.mark.asyncio
@@ -482,7 +484,7 @@ class TestMergeServerValuesE2E:
             await user.save()
 
             await user.merge(server_values={"updated_at": SurrealFunc("time::now()")})
-            rows = await client.query("SELECT * FROM SvUser:erin;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:erin;", {})
             assert isinstance(rows[0]["updated_at"], datetime)
             assert rows[0]["name"] == "Erin"
 
@@ -498,7 +500,8 @@ class TestMergeServerValuesE2E:
                 extra_vars={"password": raw_password},
             )
             assert user.password_hash.startswith("$argon2")
-            ok = await client.query(
+            ok = await _client.query(
+                client,
                 "RETURN crypto::argon2::compare($h, $p);",
                 {"h": user.password_hash, "p": raw_password},
             )
@@ -579,7 +582,7 @@ class TestServerValuesTransactionE2E:
                     # Buffered: the statement has not run yet — the field stays stale.
                     assert user.joined_at is None
 
-            rows = await client.query("SELECT * FROM SvUser:txa;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:txa;", {})
             assert isinstance(rows[0]["joined_at"], datetime)  # same DB state either way
             assert rows[0]["name"] == "TxA"
 
@@ -610,7 +613,7 @@ class TestServerValuesTransactionE2E:
                 if not tx.is_interactive:
                     assert user.updated_at is None  # computed value unknown until commit
 
-            rows = await client.query("SELECT * FROM SvUser:txm;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:txm;", {})
             assert rows[0]["plan"] == "pro"
             assert isinstance(rows[0]["updated_at"], datetime)
             assert rows[0]["name"] == "TxM"  # untouched field preserved
@@ -633,7 +636,7 @@ class TestServerValuesTransactionE2E:
                     # exists nowhere. Stale (None) is correct; "literal-never-written" is not.
                     assert user.updated_at is None
 
-            rows = await client.query("SELECT * FROM SvUser:txov;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:txov;", {})
             assert isinstance(rows[0]["updated_at"], datetime)
 
     @pytest.mark.asyncio
@@ -678,9 +681,10 @@ class TestServerValuesTransactionE2E:
                     extra_vars={"password": raw_password},
                 )
 
-            rows = await client.query("SELECT * FROM SvUser:txev;", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser:txev;", {})
             assert rows[0]["password_hash"].startswith("$argon2")
-            ok = await client.query(
+            ok = await _client.query(
+                client,
                 "RETURN crypto::argon2::compare($h, $p);",
                 {"h": rows[0]["password_hash"], "p": raw_password},
             )
@@ -719,7 +723,7 @@ class TestServerValuesTransactionE2E:
                     with pytest.raises(SurrealDbError, match="explicit id"):
                         await user.save(tx=tx, server_values={"joined_at": SurrealFunc("time::now()")})
 
-            rows = await client.query("SELECT * FROM SvUser WHERE name = 'TxAuto';", {})
+            rows = await _client.query(client, "SELECT * FROM SvUser WHERE name = 'TxAuto';", {})
             assert len(rows) == (1 if user.id is not None else 0)
 
 

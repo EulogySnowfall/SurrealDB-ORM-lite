@@ -9,7 +9,7 @@ from typing import Annotated, Any, get_args, get_origin
 import pytest
 from pydantic import BaseModel as PydanticBaseModel
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import Computed, SurrealFunc, _ComputedDefault, _ComputedMarker, computed
 
@@ -194,7 +194,7 @@ async def cf_client(*tables: str):
 
 
 async def _field_definitions(client: Any, table: str) -> dict[str, str]:
-    info = await client.query(f"INFO FOR TABLE {table};", {})
+    info = await _client.query(client, f"INFO FOR TABLE {table};", {})
     return dict(info["fields"]) if isinstance(info, dict) else {}
 
 
@@ -339,7 +339,7 @@ class TestComputedLifecycleE2E:
         async with cf_client() as client:
             await CfPlayer.define_computed_fields()
             await client.query("CREATE CfPlayer:evil CONTENT {first_name: 'Cy', last_name: 'N', full_name: 'HACKED'};", {})
-            rows = await client.query("SELECT * FROM CfPlayer:evil;", {})
+            rows = await _client.query(client, "SELECT * FROM CfPlayer:evil;", {})
             assert rows[0]["full_name"] == "Cy N"
 
     @pytest.mark.asyncio

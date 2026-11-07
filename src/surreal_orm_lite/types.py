@@ -28,7 +28,7 @@ from pydantic import GetCoreSchemaHandler, GetJsonSchemaHandler, TypeAdapter
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import PydanticSerializationUnexpectedValue, core_schema
 
-from ._sdk import Bound, BoundExcluded, BoundIncluded, CBORSimpleValue, SdkDuration, SdkRange, undefined
+from ._sdk import Bound, BoundExcluded, BoundIncluded, CBORSimpleValue, Null, SdkDuration, SdkRange, undefined
 from .exceptions import InvalidDurationError
 
 __all__ = ["Duration", "Range", "SchemaMode", "TableType"]
@@ -409,12 +409,19 @@ def _duration_from_sdk(value: Any) -> Any:
 def _is_open_side(side: object) -> bool:
     """Whether ``side`` marks an open range side — the one rule every ``Range`` path uses.
 
-    Four markers mean "open": ``None``, a bare SDK ``Bound()`` (the SDK docs' spelling),
-    ``surrealdb.cbor.undefined`` and a CBOR null (``CBORSimpleValue(22)``: the protocol's open bound,
-    the form the ORM sends). A CBOR null is recognised by type and value, never with ``==``:
-    ``CBORSimpleValue(22) == 22`` is true, and the int ``22`` is not an open side.
+    Five markers mean "open": ``None``, the SDK's ``Null`` (the protocol's open bound: the form the
+    ORM sends, and what SDK 3.0 reads back), a bare SDK ``Bound()`` (the SDK docs' spelling),
+    ``surrealdb.cbor.undefined`` and a raw CBOR null (``CBORSimpleValue(22)``). A raw CBOR null is
+    recognised by type and value, never with ``==``: ``CBORSimpleValue(22) == 22`` is true, and the
+    int ``22`` is not an open side.
     """
-    return side is None or type(side) is Bound or side is undefined or (isinstance(side, CBORSimpleValue) and side.value == 22)
+    return (
+        side is None
+        or side is Null
+        or type(side) is Bound
+        or side is undefined
+        or (isinstance(side, CBORSimpleValue) and side.value == 22)
+    )
 
 
 def _side(value: object, name: str) -> BoundIncluded | BoundExcluded | None:

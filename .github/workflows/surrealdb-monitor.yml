@@ -1,6 +1,6 @@
 # Reusable SurrealDB version monitor — one supported server line per caller.
 #
-# The project supports two lines at once (2.6.x and 3.2.x), each with its own pin file and
+# The project supports three lines at once (2.x, 3.x and 4.x), each with its own pin file and
 # its own upstream source of truth. Rather than duplicating ~400 lines of monitor logic per
 # line — and every future fix to it — the callers are thin and this file holds the flow:
 #
@@ -12,7 +12,7 @@
 #      "chore(release): bump version to X" PR, so ci.yml's auto-tag publishes the release
 #   6. Tests fail -> GitHub issue for investigation
 #
-# Callers: surrealdb-security.yml (2.x), surrealdb-3x-monitor.yml (3.x).
+# Callers: surrealdb-security.yml (2.x), surrealdb-3x-monitor.yml (3.x), surrealdb-4x-monitor.yml (4.x).
 
 name: SurrealDB Version Monitor (reusable)
 
@@ -20,7 +20,7 @@ on:
   workflow_call:
     inputs:
       line:
-        description: 'Major version line this run monitors ("2" or "3")'
+        description: 'Major version line this run monitors ("2", "3" or "4")'
         required: true
         type: string
       pin-file:
@@ -44,8 +44,8 @@ on:
         type: boolean
         default: false
 
-# One monitor at a time, across both lines. Each line's auto-update branches off main and
-# rewrites the SAME ci.yml matrix line, so a 2.x and a 3.x update in flight together produce
+# One monitor at a time, across every line. Each line's auto-update branches off main and
+# rewrites the SAME ci.yml matrix line, so two lines' updates in flight together produce
 # two PRs that conflict on merge — and auto-merge then wedges on both. Serialising the whole
 # monitor is enough: the second line simply picks up the first's result on its next run.
 concurrency:

@@ -23,12 +23,12 @@ reasons only.
 import asyncio
 import logging
 import os
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .. import _sdk
+from .. import _client, _sdk
 from .. import cache as _cache
 from .. import encoding as _encoding
 from ..concurrency import is_conflict_error
@@ -36,7 +36,7 @@ from ..connection_manager import SurrealDBConnectionManager
 from ..exceptions import SurrealDbConflictError, SurrealDbError
 from ..introspection import DatabaseIntrospector
 from ..routing import check_name
-from ..schema_state import SchemaIssue, SchemaState
+from ..schema_state import FieldState, SchemaIssue, SchemaState
 from ..search import checked_line
 from ..time_travel import cached_major
 from ..transaction import _is_pure_filler, _server_reason
@@ -61,7 +61,7 @@ from .operations import (
     _makes_schemafull,
 )
 
-__all__ = ["MigrationExecutor", "MigrationStatementError"]
+__all__ = ["FieldChangeRefusedError", "MigrationExecutor", "MigrationStatementError"]
 
 logger = logging.getLogger("surreal_orm_lite.migrations")
 
@@ -84,6 +84,13 @@ _CANCELLED_FILLER = "The query was not executed due to a cancelled transaction"
 _ENSURE_ATTEMPTS = 3
 #: The compensation sentence (spec §7), appended after a space.
 _RESTORED = "The analyzer definitions it committed first were restored."
+
+#: The guard's fixed text (v0.50.0, spec §5.10): a field change on a populated SCHEMAFULL table at compatibility level 4.
+_POPULATED = "surreal-orm-lite: populated SCHEMAFULL table"
+#: The guard written right before such a change, its table bound to ``$_orm_populated_<position>`` (never inlined).
+_GUARD = 'IF (SELECT id FROM type::table(${variable}) LIMIT 1) {{ THROW "' + _POPULATED + '" }};'
+#: The two phrases of SurrealDB 4.x's own refusal of such a change (M34), both in its reason.
+_LEVEL_4_PHRASES = ("compatibility level 4", "MIGRATE EXISTING ROWS")
 
 #: The refusal of a client object as ``connection=`` (v0.30.0's rule).
 _CLIENT_OBJECT = (
@@ -147,6 +154,78 @@ class MigrationStatementError(SurrealDbError, RuntimeError):
         return _rebuild_statement_error, arguments, self.__dict__
 
 
+def _rebuild_field_change_error(
+    cls: type["FieldChangeRefusedError"],
+    message: str,
+    migration: str,
+    operation: int | None,
+    description: str | None,
+    analyzers_restored: bool | None,
+    table: str,
+    field: str,
+) -> "FieldChangeRefusedError":
+    """Rebuild a pickled :class:`FieldChangeRefusedError`."""
+    return cls(
+        message,
+        migration=migration,
+        operation=operation,
+        description=description,
+        analyzers_restored=analyzers_restored,
+        table=table,
+        field=field,
+    )
+
+
+class FieldChangeRefusedError(MigrationStatementError):
+    """SurrealDB 4.x refused, or would refuse, a field change of a migration (v0.50.0): at compatibility level 4 a
+    field of a populated SCHEMAFULL table may only be redefined with a type that accepts every value the old type
+    accepted, and a new field on such a table must accept NONE. Nothing of the migration's transaction was applied.
+
+    Caught by ``except MigrationStatementError``, ``except SurrealDbError`` and ``except RuntimeError``.
+
+    Raised inside the migration's transaction, before the field change runs; nothing is applied.
+
+    Attributes (besides MigrationStatementError's migration, operation, description, analyzers_restored):
+        table: The table's name (always a str).
+        field: The field's name (its dotted path for a nested field; always a str).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        migration: str,
+        operation: int | None = None,
+        description: str | None = None,
+        analyzers_restored: bool | None = None,
+        table: str,
+        field: str,
+    ) -> None:
+        super().__init__(
+            message,
+            migration=migration,
+            operation=operation,
+            description=description,
+            analyzers_restored=analyzers_restored,
+        )
+        self.table = table
+        self.field = field
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickle with the keyword-only arguments, ``table`` and ``field`` included."""
+        arguments = (
+            type(self),
+            self.args[0],
+            self.migration,
+            self.operation,
+            self.description,
+            self.analyzers_restored,
+            self.table,
+            self.field,
+        )
+        return _rebuild_field_change_error, arguments, self.__dict__
+
+
 # --- the batches and their answers (spec §5.6.1) ------------------------------------------------------------------
 
 
@@ -166,13 +245,17 @@ class _Batch:
         owners: The operation of each text.
         counts: The statements of each text, as SurrealDB answers them (``render.check_statements()``: an empty
             statement has no entry, M2).
+        variables: The values the texts bind, besides the tracking statement's name (v0.50.0: the guards' tables).
     """
 
-    __slots__ = ("counts", "owners", "statements")
+    __slots__ = ("counts", "owners", "statements", "variables")
 
-    def __init__(self, statements: Sequence[str], owners: Sequence[int | None]) -> None:
+    def __init__(
+        self, statements: Sequence[str], owners: Sequence[int | None], variables: dict[str, Any] | None = None
+    ) -> None:
         self.statements = tuple(_terminated(statement) for statement in statements)
         self.owners = tuple(owners)
+        self.variables: dict[str, Any] = dict(variables or {})
         self.counts = tuple(render.check_statements(statement, what="Migration") for statement in self.statements)
 
     @property
@@ -305,10 +388,10 @@ async def _send(client: Any, batch: _Batch, line: int, name: str | None) -> _Fai
     The embedded engine's ``RuntimeError`` is its refusal of the whole batch (``transaction.py``'s rule); any other
     error — a server client's ``RuntimeError`` included — is a transport error and propagates.
     """
-    variables = _encoding.encode({} if name is None else {"surreal_orm_migration": name})
+    variables = _encoding.encode({**batch.variables, **({} if name is None else {"surreal_orm_migration": name})})
     async with _cache.writing(None):
         try:
-            answer = await client.query_raw(batch.text(), variables)
+            answer = await _client.query_raw(client, batch.text(), variables)
         except RuntimeError as error:
             embedded = _sdk.SdkAsyncEmbeddedConnection
             if embedded is None or not isinstance(client, embedded):
@@ -396,12 +479,42 @@ def _statement_error(
     operation = migration.operations[failure.owner]
     description = operation.describe()
     position = failure.owner + 1
+    if isinstance(operation, AddField | AlterField) and _level_4_refusal(failure.reason):
+        subject = "Migration" if way is _APPLYING else "Rollback of migration"
+        message = f"{subject} '{name}', operation {position} ({description}): {_level_4_text(operation.table)}{tail}"
+        return FieldChangeRefusedError(
+            message,
+            migration=name,
+            operation=position,
+            description=description,
+            analyzers_restored=restored,
+            table=operation.table,
+            field=operation.name,
+        )
     message = (
         f"{way.failed.format(name=name)} at operation {position} of {len(migration.operations)} ({description}): "
         f"{failure.reason}{tail}"
     )
     return MigrationStatementError(
         message, migration=name, operation=position, description=description, analyzers_restored=restored
+    )
+
+
+def _level_4_refusal(reason: str) -> bool:
+    """Whether the server's *reason* refuses a field change by the compatibility-level-4 rule (v0.50.0): the guard's
+    fixed text, or SurrealDB 4.x's own refusal (both its phrases, M34)."""
+    return _POPULATED in reason or all(phrase in reason for phrase in _LEVEL_4_PHRASES)
+
+
+def _level_4_text(table: str) -> str:
+    """:class:`FieldChangeRefusedError`'s explanation for *table* (spec §5.10): never a statement."""
+    return (
+        f"SurrealDB 4.x refuses this change because table '{table}' is SCHEMAFULL, holds rows, and its database is at "
+        "compatibility level 4. On such a table a field can only be redefined with a type that accepts every value of "
+        "the old one, and a new field must accept NONE. Nothing was applied. Write the change as a RawSQL operation "
+        "that converts the existing rows (SurrealDB 4.x: `DEFINE FIELD … MIGRATE EXISTING ROWS AS <name> USING "
+        "<expression> FALLBACK <value>`), with `state_operations=[…]` describing the result; a MigrateRows operation "
+        "is planned for v0.56.0."
     )
 
 
@@ -523,17 +636,52 @@ def _blinded_table(operation: Operation, issues: Sequence[SchemaIssue], *, backw
     return operation.table if unread else None
 
 
+def _kind_of(field: FieldState) -> str:
+    """The kind *field* holds, ``NONE`` included when it is nullable, as :func:`render.kind_accepts` compares it."""
+    return f"none | {field.field_type}" if field.nullable else field.field_type
+
+
+def _level_4_subject(operation: Operation, state: SchemaState, *, backwards: bool) -> str | None:
+    """The table SurrealDB 4.x's compatibility-level-4 rule (spec §5.10) may refuse *operation* — as it will be sent,
+    its backwards with *backwards* — on, when that table holds rows; ``None`` when the rule cannot refuse it or the ORM
+    cannot tell (the server judges then, and its refusal is read as a :class:`FieldChangeRefusedError` too).
+
+    Subject: an ``AddField``, or an ``AlterField`` or its backwards, on a table *state* holds as ``SCHEMAFULL``, that
+    (a) redefines a field *state* holds with a kind that does not accept every value of the old one, or (b) defines a
+    field *state* does not hold with a kind that does not accept ``NONE`` (``render.kind_accepts()`` ``False``). A
+    field path through an item ``[*]`` is left to the server (not measured); names, ``.`` and ``.*`` are decided (M37).
+    A ``RawSQL``'s ``state_operations`` are never sent, an ``AlterTable``'s ``FLEXIBLE`` redefinitions keep each type.
+    """
+    if not isinstance(operation, AddField | AlterField) or (backwards and isinstance(operation, AddField)):
+        return None
+    if any("[" in segment for segment in operation.path):
+        return None
+    table = state.tables.get(operation.table)
+    if table is None or table.schema_mode != "SCHEMAFULL":
+        return None
+    held = table.fields.get(operation.name)
+    if held is not None and isinstance(operation, AddField) and not operation.overwrite:
+        return None  # a plain DEFINE FIELD of a field that exists: refused for that, whatever the rows
+    written = _kind_of(render.field_state(operation, previous=backwards))
+    accepted = render.kind_accepts(written, "none" if held is None else _kind_of(held))
+    return operation.table if accepted is False else None
+
+
 class _Refusals:
     """The refusals of the pre-pass that read one operation and the state before it (spec §5.6 step 3 and
     ``rollback()``, §6.4): the line refusals (E-D1–E-D3), the state guards (``state.guard()``, E-G1, E-G2) and, on line
-    2, the read's issues under a ``FLEXIBLE`` choice (E-I1) — handed to ``state.advance()``/``state.rewind()`` as their
+    2, the read's issues under a ``FLEXIBLE`` choice (E-I1) — and, with *level_4* (SurrealDB 4.x at compatibility level
+    4, v0.50.0), the operations the guard of :func:`_level_4_subject` precedes (:attr:`guards`) — handed to ``state.advance()``/``state.rewind()`` as their
     *check*, migration by migration, in the plan's order (the undo order for a rollback). It keeps the tables the
     operations before placed (E-I1's (b))."""
 
-    def __init__(self, line: Literal[2, 3], *, backwards: bool) -> None:
+    def __init__(self, line: Literal[2, 3], *, backwards: bool, level_4: bool = False) -> None:
         self._line = line
         self._backwards = backwards
         self._defined: set[str] = set()
+        self._level_4 = level_4
+        #: Per migration, the operations (indexes) the compatibility-level-4 guard precedes, each with its table.
+        self.guards: dict[str, dict[int, str]] = {}
 
     def of(self, migration: Migration) -> _state.Check:
         """The check of *migration*'s operations."""
@@ -554,6 +702,8 @@ class _Refusals:
                         "and the embedded engine the FLEXIBLE clauses of this operation are chosen from that reading; "
                         "nothing was applied. DatabaseIntrospector().introspect().issues lists what could not be read."
                     )
+            if self._level_4 and (table := _level_4_subject(operation, state, backwards=self._backwards)) is not None:
+                self.guards.setdefault(migration.name, {})[position - 1] = table
             self._defined |= set(_defined_tables(operation, backwards=self._backwards))
 
         return check
@@ -643,7 +793,13 @@ def _restores_analyzer(operation: object) -> bool:
 
 
 def _prepared(
-    migration: Migration, *, line: Literal[2, 3], before: SchemaState, after: SchemaState, backwards: bool = False
+    migration: Migration,
+    *,
+    line: Literal[2, 3],
+    before: SchemaState,
+    after: SchemaState,
+    backwards: bool = False,
+    guards: Mapping[int, str] | None = None,
 ) -> _Prepared:
     """*migration* rendered for *line* (``migration._statements()``: an ``AlterTable`` given ``skip_fields``).
 
@@ -653,8 +809,13 @@ def _prepared(
     *before*, the state the migration is undone to; those that define an analyzer in phase A; the rest — a
     ``DataMigration``'s ``backwards_sql`` in its position — in phase B after the record's ``DELETE``; phase A's
     compensation from *after*, the state with the migration applied.
+
+    *guards* (v0.50.0, SurrealDB 4.x at compatibility level 4): each operation (index) whose text the guard precedes in
+    phase B, as part of that operation's entries, and its table, bound to ``$_orm_populated_<position>``: a table that
+    holds a row makes the batch fail with :data:`_POPULATED`, before the field change runs.
     """
     analyzers: list[str] = []
+    variables: dict[str, Any] = {}
     analyzer_owners: list[int] = []
     main = [_UNRECORD if backwards else _RECORD]
     main_owners: list[int | None] = [None]
@@ -667,13 +828,18 @@ def _prepared(
             analyzers.append(text)
             analyzer_owners.append(index)
         else:
+            if guards and index in guards:
+                variable = f"_orm_populated_{index + 1}"
+                main.append(_GUARD.format(variable=variable))
+                main_owners.append(index)
+                variables[variable] = guards[index]
             main.append(text)
             main_owners.append(index)
     if not analyzers:
-        return _Prepared(migration, None, _Batch(main, main_owners))
+        return _Prepared(migration, None, _Batch(main, main_owners, variables))
     compensation, restored, rebuilds = _compensation(migration, after if backwards else before, analyzer_owners)
     phase_a = _Batch(analyzers, analyzer_owners)
-    return _Prepared(migration, phase_a, _Batch(main, main_owners), compensation, restored, rebuilds)
+    return _Prepared(migration, phase_a, _Batch(main, main_owners, variables), compensation, restored, rebuilds)
 
 
 def _plan(migrations: Sequence[Migration], applied: Sequence[str], target: str | None) -> list[Migration]:
@@ -766,7 +932,7 @@ class MigrationExecutor:
         """
         await self.ensure_migrations_table()
         client = await self._client()
-        rows = await client.query(_APPLIED, {})
+        rows = await _client.query(client, _APPLIED, {})
         if not isinstance(rows, list):
             raise SurrealDbError(f"The tracking table {MIGRATIONS_TABLE} could not be read: unexpected answer.")
         return [row["name"] for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)]
@@ -892,11 +1058,13 @@ class MigrationExecutor:
         if not plan:
             logger.info("No migrations to apply.")
             return []
-        line = await _line(await self._client())
+        client = await self._client()
+        line = await _line(client)
         if fake:
             prepared = [_Prepared(migration, None, _Batch([_RECORD], [None])) for migration in plan]
         else:
-            prepared = await self._prepare(plan, line, backwards=False)
+            level_4 = await cached_major(client) >= 4  # the line read once per client: no request here
+            prepared = await self._prepare(plan, line, backwards=False, level_4=level_4)
         done: list[str] = []
         for item in prepared:
             if not await self._apply(item, line, _APPLYING):
@@ -959,9 +1127,11 @@ class MigrationExecutor:
         if not undo:
             logger.info("No migrations to rollback.")
             return []
-        line = await _line(await self._client())
+        client = await self._client()
+        line = await _line(client)
+        level_4 = await cached_major(client) >= 4  # the line read once per client: no request here
         done: list[str] = []
-        for item in await self._prepare(undo, line, backwards=True):
+        for item in await self._prepare(undo, line, backwards=True, level_4=level_4):
             if not await self._apply(item, line, _ROLLING_BACK):
                 continue
             for operation in reversed(item.migration.data_operations):
@@ -1042,7 +1212,9 @@ class MigrationExecutor:
         mode = loader.HISTORY[caller]
         loader.check_history(migrations, applied, self.migrations_dir, dependency=mode.dependency, unknown=mode.unknown)
 
-    async def _prepare(self, plan: Sequence[Migration], line: Literal[2, 3], *, backwards: bool) -> list[_Prepared]:
+    async def _prepare(
+        self, plan: Sequence[Migration], line: Literal[2, 3], *, backwards: bool, level_4: bool = False
+    ) -> list[_Prepared]:
         """The pre-pass of ``migrate()`` and ``rollback()`` (spec §5.6, §6.4): the one read of the database's schema,
         then each migration of *plan* rendered, before anything is sent.
 
@@ -1051,19 +1223,24 @@ class MigrationExecutor:
         state with each migration applied is the read rewound through the migrations undone before it, and its
         backwards render from that state rewound through it (``state.rewind()``), its compensation from the state with
         it applied. Each operation is checked on the state before it (``_Refusals``: E-D1–E-D3, E-G1, E-G2, E-I1), and
-        each compensation rendered (E-I2), all before the first batch is sent.
+        each compensation rendered (E-I2), all before the first batch is sent. With *level_4* (SurrealDB 4.x and later,
+        v0.50.0) and the database at compatibility level 4 or more (``SchemaState.compatibility`` of the read), the
+        field changes the server would refuse on a populated table get the guard (:func:`_level_4_subject`).
         """
         current = await DatabaseIntrospector(self._connection).introspect()
-        refusals = _Refusals(line, backwards=backwards)
+        rule = level_4 and current.compatibility is not None and current.compatibility >= 4
+        refusals = _Refusals(line, backwards=backwards, level_4=rule)
         prepared: list[_Prepared] = []
         for migration in plan:
             if backwards:
                 before = _state.rewind(migration, current, check=refusals.of(migration))
-                prepared.append(_prepared(migration, line=line, before=before, after=current, backwards=True))
+                guards = refusals.guards.get(migration.name)
+                prepared.append(_prepared(migration, line=line, before=before, after=current, backwards=True, guards=guards))
                 current = before
             else:
                 after = _state.advance(migration, current, strict=True, check=refusals.of(migration))
-                prepared.append(_prepared(migration, line=line, before=current, after=after))
+                guards = refusals.guards.get(migration.name)
+                prepared.append(_prepared(migration, line=line, before=current, after=after, guards=guards))
                 current = after
         return prepared
 

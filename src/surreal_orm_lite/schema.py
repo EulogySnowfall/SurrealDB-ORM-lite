@@ -106,6 +106,7 @@ from dataclasses import KW_ONLY, dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Literal
 
+from . import _client
 from ._sdk import ServerError
 from .define_parser import (
     _DURATION,
@@ -582,9 +583,8 @@ async def ensure_async_events_supported(client: Any, events: Iterable[Event], *,
     that cannot be read counts as 3.x and the server decides. *embedded* says the connection is the embedded engine,
     named so in the message.
 
-    On the embedded engine ``version()`` answers the SDK's version (``surrealdb-2.0.0``), not its bundled core's
-    (2.3.10); both are 2.x today. Should an SDK release ship a 3.x core under a 2.x version, this check would refuse
-    an ``ASYNC`` event that core could run — an accepted, documented limit while the SDK bundles a 2.x core.
+    Since v0.50.0 the embedded engine is the SDK 3.0 engine, a SurrealDB 4.0 core whose ``version()`` answers
+    ``surrealdb-4.x``: it takes the 3.x-and-later branch, and the engine decides.
 
     :param client: the SDK client of the connection the events are applied on (outside any transaction:
         ``version()`` takes none).
@@ -1080,7 +1080,7 @@ async def read_table_definitions(client: Any, table: str, *, kind: str, what: st
     :raises SurrealDbError: any other refusal of the ``INFO``.
     """
     try:
-        info = await client.query(_INFO_FOR_DB, {})
+        info = await _client.query(client, _INFO_FOR_DB, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _guard_read_refused(_INFO_FOR_DB, error, kind=kind, table=table, what=what) from error
     tables = info.get("tables") if isinstance(info, dict) else None
@@ -1115,7 +1115,7 @@ async def table_holds_records(client: Any, table: str, *, kind: str) -> bool:
     """
     statement = f"SELECT id FROM {_identifier(_identifier_name(table, what='Table'))} LIMIT 1;"
     try:
-        rows = await client.query(statement, {})
+        rows = await _client.query(client, statement, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _guard_read_refused("SELECT", error, kind=kind, table=table) from error
     return isinstance(rows, list) and len(rows) > 0
@@ -1222,7 +1222,8 @@ async def ensure_view_query_supported(client: Any, query: str, *, model: str, em
 
     What the reading cannot see — a sub-select or a graph path in an element, a backquoted field name, a field read
     through a parameter, a field's type — is left to the server. On the embedded engine ``version()`` answers the
-    SDK's version (``surrealdb-2.0.0``), whose bundled core is 2.x too; *embedded* names it so in the message.
+    engine's version (``surrealdb-4.x`` since v0.50.0), so it takes the 3.x-and-later branch; *embedded* names an
+    engine answering below 3 in the message.
 
     :param client: the SDK client of the model's connection (outside any transaction: ``version()`` takes none).
     :param model: the class name the message starts with.
@@ -1323,8 +1324,8 @@ async def ensure_view_removable(client: Any, table: str, dependents: Sequence[st
     read.
     Else the line is read from ``client.version()`` with the lite's rule (``time_travel.line_major()``): on 3.x — or a
     version that cannot be read — the removal goes on and the server refuses it; before 3.x, G5 names the dependent
-    views, sorted. On the embedded engine ``version()`` answers the SDK's version (``surrealdb-2.0.0``), whose bundled
-    core is 2.x too; *embedded* names it so in the message.
+    views, sorted. On the embedded engine ``version()`` answers the engine's version (``surrealdb-4.x`` since v0.50.0),
+    so the engine refuses the removal itself; *embedded* names an engine answering below 3 in the message.
 
     :param client: the SDK client of the model's connection (outside any transaction: ``version()`` takes none).
     :param model: the class name the message starts with.
@@ -1949,7 +1950,7 @@ async def read_table_fields(client: Any, table: str, *, kind: str) -> dict[tuple
     """
     statement = f"INFO FOR TABLE {_identifier(_identifier_name(table, what='Table'))};"
     try:
-        info = await client.query(statement, {})
+        info = await _client.query(client, statement, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
         raise _guard_read_refused(statement, error, kind=kind, table=table, what="table") from error
     fields = info.get("fields") if isinstance(info, dict) else None

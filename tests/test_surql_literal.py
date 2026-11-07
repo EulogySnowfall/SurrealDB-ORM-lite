@@ -15,6 +15,7 @@ from uuid import UUID
 
 import pytest
 
+from surreal_orm_lite import _client
 from surreal_orm_lite._sdk import RecordID
 from surreal_orm_lite.surql_literal import inline_variables, to_surql_literal
 from tests.conftest import orm_client
@@ -222,14 +223,14 @@ class TestRoundTripE2E:
         this datetime wrongly (3.x drops the offset's seconds; 2.x loses the connection)."""
         value = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=5, minutes=30, seconds=15)))
         async with orm_client() as client:
-            result = await client.query(f"RETURN time::unix({to_surql_literal(value)});", {})
+            result = await _client.query(client, f"RETURN time::unix({to_surql_literal(value)});", {})
         assert result == int(value.timestamp())
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("value", ROUND_TRIP, ids=repr)
     async def test_literal_equals_the_bound_parameter(self, value: Any) -> None:
         async with orm_client() as client:
-            result = await client.query(f"RETURN {to_surql_literal(value)} == $p;", {"p": value})
+            result = await _client.query(client, f"RETURN {to_surql_literal(value)} == $p;", {"p": value})
         assert result is True
 
 

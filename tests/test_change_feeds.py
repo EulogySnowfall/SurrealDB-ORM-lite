@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
 from surreal_orm_lite.changefeed import ChangeModelStream, feed_events, next_cursor, since_sql
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbError
@@ -337,7 +337,7 @@ class TestChangesE2E:
         async with feed_client() as client:
             await _write(lambda: Fed(id="early").save())
             await asyncio.sleep(0.2)
-            moment = await client.query("RETURN time::now();", {})
+            moment = await _client.query(client, "RETURN time::now();", {})
             await asyncio.sleep(0.2)
             await _write(lambda: Fed(id="late").save())
 
@@ -592,7 +592,7 @@ def _at_ms(ms: int) -> datetime:
 
 async def _server_ms(client: Any) -> int:
     """The server clock's millisecond, the clock SurrealDB 3.x stamps its change feeds with."""
-    now = await client.query("RETURN time::now();", {})
+    now = await _client.query(client, "RETURN time::now();", {})
     if not isinstance(now, datetime):
         now = datetime.fromisoformat(str(now))
     if now.tzinfo is None:
@@ -621,7 +621,7 @@ async def _stamps_since(client: Any, ms: int, *ids: str) -> list[int]:
     on a long-running server ``SINCE 0`` is other runs' history, not this test's writes. Entries are
     matched by record, not by position; a second of slack before *ms* absorbs a clock step.
     """
-    feed = await client.query(f"SHOW CHANGES FOR TABLE {TABLE} SINCE {(ms - 1000) << 16} LIMIT 1000;", {})
+    feed = await _client.query(client, f"SHOW CHANGES FOR TABLE {TABLE} SINCE {(ms - 1000) << 16} LIMIT 1000;", {})
     stamps: dict[str, int] = {}
     for entry in feed:
         for event in feed_events(Fed, entry):
@@ -709,7 +709,11 @@ class _FakeServer3x:
     async def version(self) -> str:
         return "surrealdb-3.3.3"
 
-    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, sql: str, variables: dict[str, Any]) -> Any:
         await asyncio.sleep(0)
         if sql.startswith("INFO FOR DB"):
             return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}
@@ -841,7 +845,11 @@ class _CancelRaceClient:
     async def version(self) -> str:
         return "surrealdb-2.7.0"
 
-    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+    async def query(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """SDK 3.0's ``query()``: one result per statement (the statement's answer below)."""
+        return [await self._answer(*args, **kwargs)]
+
+    async def _answer(self, sql: str, variables: dict[str, Any]) -> Any:
         await asyncio.sleep(0)
         if sql.startswith("INFO FOR DB"):
             return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}

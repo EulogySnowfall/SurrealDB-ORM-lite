@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
 from surreal_orm_lite.exceptions import SurrealDbConnectionError
 from surreal_orm_lite.live import is_dead, recv_task_of
 from tests._proxy import CuttableProxy
@@ -205,7 +205,7 @@ class TestDeadClientReplacementE2E:
 
         async with proxied() as proxy:
             client = await SurrealDBConnectionManager.get_client()
-            live_id = await client.query(f"LIVE SELECT * FROM {TABLE};", {})
+            live_id = await _client.query(client, f"LIVE SELECT * FROM {TABLE};", {})
             proxy.cut()
             await _wait_dead(client)
 
@@ -353,7 +353,7 @@ async def _direct_lives(table: str = TABLE) -> dict[str, Any]:
     try:
         await client.signin({"username": "root", "password": "root"})
         await client.use("ns", "db")
-        info = await client.query(f"INFO FOR TABLE {table};", {})
+        info = await _client.query(client, f"INFO FOR TABLE {table};", {})
         return dict(info.get("lives") or {})
     finally:
         await client.close()
@@ -837,7 +837,7 @@ async def record_user(*, store: bool) -> AsyncIterator[str]:
         await SurrealDBConnectionManager.signup(
             access=OWNED_ACCESS, variables={"email": f"{uuid4().hex}@example.test"}, store=store
         )
-        user_id = await root.query("RETURN <string> $auth.id;", {})
+        user_id = await _client.query(root, "RETURN <string> $auth.id;", {})
         yield str(user_id)
     finally:
         SurrealDBConnectionManager.clear_session()
@@ -848,6 +848,12 @@ async def record_user(*, store: bool) -> AsyncIterator[str]:
                 await cleanup.query(statement, {})
 
 
+def _plain_id(record_id: Any) -> str:
+    """*record_id* as text without the ``⟨…⟩``/backtick escaping: SDK 3.0 escapes a key that starts with a digit,
+    SurrealDB 2.x's ``<string>`` does not, so the same record may print either way."""
+    return str(record_id).translate({ord(c): None for c in "⟨⟩`"})
+
+
 async def _direct_query(sql: str) -> Any:
     from surrealdb import AsyncSurreal
 
@@ -856,7 +862,7 @@ async def _direct_query(sql: str) -> Any:
     try:
         await client.signin({"username": "root", "password": "root"})
         await client.use("ns", "db")
-        return await client.query(sql, {})
+        return await _client.query(client, sql, {})
     finally:
         await client.close()
 
@@ -1068,7 +1074,7 @@ class TestOpenClientFailuresE2E:
         closed: list[bool] = []
 
         class _SlowSurreal:
-            def __init__(self, url: str) -> None:
+            def __init__(self, url: str, **options: Any) -> None:
                 pass
 
             async def connect(self, url: str) -> None:
@@ -1266,7 +1272,7 @@ class TestLostIdentityE2E:
             await _wait_dead(client)
 
             info = await SurrealDBConnectionManager.info()
-            assert info is not None and str(info["id"]) == user_id
+            assert info is not None and _plain_id(info["id"]) == _plain_id(user_id)
 
     @pytest.mark.asyncio
     async def test_a_store_false_signin_on_a_streams_connection_ends_the_stream_on_a_drop(self) -> None:

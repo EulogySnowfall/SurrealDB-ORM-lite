@@ -30,6 +30,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealFunc,
+    _client,
     post_save,
     pre_save,
 )
@@ -1474,13 +1475,13 @@ def _rid(user: FxUser) -> RecordID:
 
 async def _edge_count(client: Any) -> int:
     """The rows of ``fx_knows``, counted by the server (``0`` for an absent table)."""
-    rows = await client.query("SELECT count() FROM fx_knows GROUP ALL;", {})
+    rows = await _client.query(client, "SELECT count() FROM fx_knows GROUP ALL;", {})
     return int(rows[0]["count"]) if rows else 0
 
 
 async def _tables(client: Any) -> set[str]:
     """The tables of the current database (``INFO FOR DB``)."""
-    info = await client.query("INFO FOR DB;", {})
+    info = await _client.query(client, "INFO FOR DB;", {})
     return set(info.get("tables", {}))
 
 
@@ -1498,7 +1499,7 @@ class TestEdgeFactoryE2E:
                 assert isinstance(edge.since, int)
                 assert edge.in_ == _rid(a)
             assert (first.out, second.out) == (_rid(b), _rid(c))
-            rows = await client.query("SELECT ->fx_knows->fx_user AS friends FROM fx_user:a;", {})
+            rows = await _client.query(client, "SELECT ->fx_knows->fx_user AS friends FROM fx_user:a;", {})
             assert {_key(friend) for friend in rows[0]["friends"]} == {"b", "c"}
             assert await _edge_count(client) == 2
 
@@ -1554,7 +1555,7 @@ class TestFactoryRoutingE2E:
                         assert fetched.name == f"routed-{run}"
                         assert await FxUser.objects().count() == 1
                     assert await FxUser.objects().count() == 0
-            remaining = await client.query("INFO FOR NS;", {})
+            remaining = await _client.query(client, "INFO FOR NS;", {})
             assert _OTHER_DATABASE not in remaining.get("databases", {})
 
     async def test_view_factory_builds_but_create_is_refused(self) -> None:

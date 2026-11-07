@@ -22,7 +22,7 @@ from surrealdb import RecordID
 from surrealdb.connections.async_embedded import AsyncEmbeddedSurrealConnection
 
 import surreal_orm_lite
-from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, testing
+from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, _client, testing
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError, SurrealDbError
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from tests.conftest import default_connection_class, orm_client
@@ -148,7 +148,7 @@ class TestEmbeddedDatabaseE2E:
                 "database": "test",
             }
             assert await SurrealDBConnectionManager.get_client() is client
-            assert await client.query("RETURN 1;") == 1
+            assert await _client.query(client, "RETURN 1;") == 1
 
     async def test_each_block_is_a_fresh_database(self) -> None:
         async with _unset_after():

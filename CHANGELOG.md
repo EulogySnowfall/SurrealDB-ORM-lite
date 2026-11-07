@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] - 2026-11-07
+
+Official SDK 3.0 and SurrealDB 4.x. The ORM's minor series now follows the SDK's major: `0.50.x` is the SDK 3.0
+line, `0.40.x` the SDK 2.0 line (deprecated, security fixes only). The ORM supports the SurrealDB versions the SDK
+supports. See [the migration note](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/migrating-to-0.50.md).
+
+### Added
+
+- **SurrealDB 4.x support**, next to 2.x and 3.x (tested on 2.7.0, 3.3.5 and 4.0.0); CI runs the three lines and
+  watches the 4.x line daily. A server outside the SDK's range is refused at connect time with
+  `SurrealDbConnectionError`.
+- **`surreal-orm-lite[embedded]`**, the optional extra that brings the SDK 3.0 in-process engine (a SurrealDB 4.0
+  core) for `mem://` and `surrealkv://`.
+- **`FieldChangeRefusedError`** and `SchemaState.compatibility`: migrations refuse a field change that SurrealDB
+  4.x rejects on a populated `SCHEMAFULL` table, and point to a `RawSQL` replacement.
+- Native sets read as `set`, zero durations read natively and datetimes keep their nanoseconds
+  (`PreciseDatetime`).
+
+### Changed
+
+- **BREAKING: depends on `surrealdb[pydantic]>=3.0.0,<4.0.0`** (it was `>=2.0.0,<3.0.0`). Every SDK call goes
+  through one internal frontier that normalises NULL to `None`, sets, datetimes and results.
+- **BREAKING: `raw_query()` and `QuerySet.query()` return the rows of every statement**, in order, as the full
+  SurrealDB-ORM does. A failing later statement now raises; the multi-statement `UserWarning` is gone.
+- **`first()` returns the smallest matching id** on SurrealDB 3.x and 4.x (`ORDER BY id`).
+- The embedded engine moved to the SDK 3.0 engine (SurrealDB 4.0 core) behind the `embedded` extra; without it,
+  opening `mem://` raises `SurrealDbConnectionError` naming the extra.
+- Live queries follow SDK 3.0's `subscribe_live()` and hide its queue sentinels behind the ORM feed.
+
+### Fixed
+
+- `QuerySet.query()` no longer hides a cancelled transaction: on SurrealDB 3.x and 4.x a `BEGIN … COMMIT` whose
+  statement reads a missing table raises `SurrealDbError` (the server cancelled it, its writes did not run) instead
+  of returning `[]`; 2.x reads the missing table as empty and commits.
+- A retired client refuses its next request instead of reconnecting anonymously.
+- An HTTP refusal is the server's answer, not a lost connection.
+- Introspection reads the SurrealDB 4.x `INFO` shapes; an HNSW search next to a subquery sends its `LET`s first on
+  4.x; the embedded owner's sign-in payload is encoded at the boundary; a `datetime.replace()` built on Python 3.11
+  is sent to the microsecond.
+
+### Notes
+
+- Staying on the SDK 2.0 for now? Pin the deprecated `0.40.x` line, which receives security fixes only, with
+  `pip install "surreal-orm-lite<0.50"`, and plan the move to `0.50.x` with the migration note.
+- Behaviour that differs between 2.x, 3.x and 4.x is listed in the
+  [compatibility guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md).
+- Not in this version: the SDK's own reconnection and token handling (v0.51.0, #422) and `MigrateRows` (v0.56.0,
+  #427).
+
 ## [0.40.2] - 2026-11-03
 
 Follow-up of the review of the model factories (v0.40.0). No new public API.
