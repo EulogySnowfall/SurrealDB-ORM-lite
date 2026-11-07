@@ -19,7 +19,8 @@ sides are the protocol's CBOR null; and a ``Decimal`` in exponent form to its fi
 refuses with a plain ``ValueError``, before anything is sent: an ``int`` outside signed 64-bit, a
 ``Decimal`` whose rounded integer part exceeds ``2**96 - 1``, a negative or too long duration, and
 a range side that is neither a bound nor an open side. A zero duration goes out like any other
-(v0.50.0: the SDK reads one back). Anything else comes back unchanged: the SDK decides, as in v0.22.2.
+(v0.50.0: the SDK reads one back). A ``PreciseDatetime`` that lacks its ``nanosecond`` (what ``replace()``
+returns on Python 3.11) goes out to the microsecond. Anything else comes back unchanged: the SDK decides, as in v0.22.2.
 
 Geometries (v0.24.0) take two rows. An ORM geometry (``surreal_orm_lite.geo``) becomes the equal
 SDK geometry — built without any SDK constructor — and then takes the SDK row. An SDK geometry
@@ -145,7 +146,30 @@ def _encode(value: Any) -> Any:
         except (TypeError, ArithmeticError):  # unorderable items; a ``Decimal`` NaN raises InvalidOperation
             items = list(value)
         return [_encode(item) for item in items]
+    if isinstance(value, _sdk.PreciseDatetime) and not hasattr(value, "nanosecond"):
+        return _whole_microseconds(value)
     return value
+
+
+def _whole_microseconds(value: datetime) -> Any:
+    """A copy of the ``PreciseDatetime`` *value* with ``nanosecond`` 0.
+
+    On Python 3.11, ``replace()`` on a ``PreciseDatetime`` returns one whose ``nanosecond`` was never set (later
+    versions set it to 0), and the SDK's encoder reads that attribute. Such a value goes out to the microsecond, as
+    ``replace()`` gives on Python 3.12 and later.
+    """
+    return _sdk.PreciseDatetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        value.tzinfo,
+        fold=value.fold,
+        nanosecond=0,
+    )
 
 
 def _encode_decimal(value: Decimal) -> Any:

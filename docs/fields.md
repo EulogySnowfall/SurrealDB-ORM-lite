@@ -215,7 +215,8 @@ both lines.
   the same microsecond. A `datetime` you build in Python is sent to the microsecond, as before.
   A field validator may convert it: `value.astimezone(UTC)` on a UTC value keeps the nanoseconds,
   while `astimezone()` to another zone and `replace()` return a value to the microsecond
-  (`.nanosecond == 0`); the model accepts either. `update()` and `upsert()` rewrite the whole
+  (`.nanosecond == 0`; on Python 3.11 `replace()` returns one without `.nanosecond`, which the
+  ORM writes to the microsecond too); the model accepts either. `update()` and `upsert()` rewrite the whole
   record, but a top-level `datetime` that still floors to the stored value keeps the stored
   nanoseconds, so such a validator does not change what is stored
   ([#261](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/261), up to 32 top-level

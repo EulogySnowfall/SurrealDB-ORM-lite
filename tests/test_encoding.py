@@ -154,6 +154,23 @@ class TestEncodeRows:
         assert type(value) in encoding._PASSTHROUGH
         assert _encode(value) is value
 
+    def test_a_precise_datetime_keeps_its_nanoseconds(self) -> None:
+        value = surreal_orm_lite._sdk.PreciseDatetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC, nanosecond=789)
+        assert _encode(value) is value
+
+    @pytest.mark.parametrize("tz", [UTC, timezone(timedelta(hours=2)), None], ids=repr)
+    def test_a_precise_datetime_without_its_nanosecond_goes_out_to_the_microsecond(self, tz: Any) -> None:
+        """On Python 3.11, ``PreciseDatetime.replace()`` returns one whose ``nanosecond`` was never set: the SDK's
+        encoder reads that attribute and fails. ``datetime.__new__`` builds that value on every Python version."""
+        value = datetime.__new__(surreal_orm_lite._sdk.PreciseDatetime, 2026, 1, 2, 3, 4, 5, 123456, tz, fold=1)
+        assert not hasattr(value, "nanosecond")
+        got = _encode(value)
+        assert type(got) is surreal_orm_lite._sdk.PreciseDatetime and got.nanosecond == 0
+        assert got == value and got.tzinfo is value.tzinfo and got.fold == 1
+        assert not hasattr(value, "nanosecond"), "the value passed in is untouched"
+        assert _encode(got) is got
+        assert _encode({"at": [value]})["at"][0].nanosecond == 0
+
     @pytest.mark.parametrize("value", [0, 1, -1, 2**63 - 1, -(2**63), True, _Level.HIGH], ids=repr)
     def test_int64(self, value: Any) -> None:
         assert _encode(value) is value

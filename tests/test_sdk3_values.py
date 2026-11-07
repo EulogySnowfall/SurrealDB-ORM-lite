@@ -13,6 +13,7 @@ round-trip, and a ``date`` is stored as a ``datetime`` (never SurrealDB 4.x's ``
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
 
@@ -432,7 +433,10 @@ class TestValidatorsOnPreciseDatetimesE2E:
                 assert isinstance(value, datetime) and value == datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
             assert got.utc.nanosecond == 789
             assert got.shifted.utcoffset() == timedelta(hours=2) and got.shifted.nanosecond == 0
-            assert got.replaced.nanosecond == 0
+            if sys.version_info >= (3, 12):
+                assert got.replaced.nanosecond == 0
+            else:  # Python 3.11's replace() leaves the SDK's slot unset; the ORM sends the value to the microsecond
+                assert not hasattr(got.replaced, "nanosecond")
 
             await got.update()
             stored = await _client.query(
