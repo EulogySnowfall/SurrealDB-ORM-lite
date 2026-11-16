@@ -539,8 +539,8 @@ print([document.id for document in await page.exec()])
 ORM writes it raised to `limit`, so without other conditions every line returns `limit` records when the table holds
 them.
 
-`similar_to()` reads the field's HNSW index: on a field without one it finds no record. Pass `dist=` for an exact scan
-that needs no index.
+`similar_to()` reads the field's HNSW index: on a field without one it finds no record, and SurrealDB 4.0.1 and later
+refuse the search instead. Pass `dist=` for an exact scan that needs no index.
 
 ```python
 print([document.id for document in await Document.objects().similar_to("embedding", query, 3, ef=40).exec()])

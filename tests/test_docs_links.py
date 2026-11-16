@@ -268,7 +268,7 @@ class TestV050Readme:
         assert "SDK 3.0" in paragraph, paragraph
 
     def test_tested_versions_sentence(self) -> None:
-        assert "It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.0**" in _normalised(readme())
+        assert "It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.1**" in _normalised(readme())
 
     def test_no_sdk_2_mention_left(self) -> None:
         text = readme()
@@ -280,7 +280,7 @@ class TestV050Readme:
     def test_badges(self) -> None:
         text = readme()
         assert "![SDK](https://img.shields.io/badge/SDK-Official%203.0-green)" in text
-        assert "badge/SurrealDB-2.7.0%20%7C%203.3.5%20%7C%204.0.0-purple" in text
+        assert "badge/SurrealDB-2.7.0%20%7C%203.3.5%20%7C%204.0.1-purple" in text
 
     def test_requirements_table(self) -> None:
         rows = {cells[0]: cells[1] for _, cells in _table_rows(doc_part_of("## Installation", readme()), "Dependency")}
@@ -321,7 +321,7 @@ class TestV050Guides:
     def test_compatibility_tested_versions(self) -> None:
         rows = [cells for _, cells in _table_rows(guide("compatibility.md"), "SurrealDB Version")]
         tested = [cells[0] for cells in rows if cells[2] == "✅ Tested" and cells[1] == "3.0"]
-        assert tested == ["4.0.0", "3.3.5", "2.7.0"], rows
+        assert tested == ["4.0.1", "3.3.5", "2.7.0"], rows
 
     @pytest.mark.parametrize("name", [_MIGRATION_NOTE, "compatibility.md", "migrations.md"])
     def test_p5_wording(self, name: str) -> None:

@@ -3179,6 +3179,14 @@ async def _major(client: Any) -> int:
     return (await _line(client))[0]
 
 
+async def _release(client: Any) -> tuple[int, int, int]:
+    """``(major, minor, patch)`` of the engine *client* talks to: ``"surrealdb-4.0.1"`` → ``(4, 0, 1)``; ``mem://`` →
+    the SDK's version, whose core is 2.x."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
 async def _keyword_line(client: Any) -> Literal[2, 3]:
     """The ``line=`` of the renderers for the engine *client* talks to: 3 from SurrealDB 3.x on, else 2."""
     return 3 if await _major(client) >= 3 else 2
@@ -6907,6 +6915,13 @@ _ROW_WRITES = "README row '`bulk_update()`, `bulk_delete()`, `patch()` with `sim
 _ROW_LINKED = "README row '`similar_to(dist=…)` with a condition on a linked record's field'"
 _ROW_NO_INDEX = "README row '`similar_to()` on a field without a vector index'"
 
+#: The first SurrealDB release that refuses a ``<|K,EF|>`` search on a field without a vector index, and its words.
+_KNN_NEEDS_AN_INDEX_FROM = (4, 0, 1)
+_KNN_NEEDS_AN_INDEX = (
+    "The KNN operator `<|2,100|>` needs an HNSW or DiskANN index on `embedding`; define one, or name a distance to "
+    "search without an index, as in `<|2,EUCLIDEAN|>`."
+)
+
 #: The raw statements of the pins, each a literal string, every value bound (``$q`` the query vector).
 _PIN_K_ONLY = "SELECT VALUE id FROM vec_doc WHERE embedding <|2|> $q;"
 _PIN_EF_BELOW_K = "SELECT VALUE id FROM vec_doc WHERE embedding <|4,3|> $q;"
@@ -7073,14 +7088,35 @@ class TestLinePinsE2E:
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_field_without_a_vector_index(self, kind: str) -> None:
         """README row "``similar_to()`` on a field without a vector index" and section 37's ``_S37_NO_INDEX``: no
-        record and no error on SurrealDB 3.3, 2.x and the embedded engine, through the ORM too; 3.1 answers every
-        record, with no distance. ``dist=`` is an exact scan that needs no index: the two nearest on every line."""
+        record and no error on SurrealDB 4.0.0, 3.3, 2.x and the embedded engine, through the ORM too; 3.1 answers
+        every record, with no distance; from 4.0.1 the server refuses the search, raw and through the ORM, naming the
+        two ways out. ``dist=`` is an exact scan that needs no index: the two nearest on every line."""
         async with _vec_models(kind) as client:
             await _apply_ddl(client, _seed_statements("vec_loose"))
             line = await _line(client)
-            raw = await _client.query(client, _PIN_NO_INDEX, {"q": _Q})
-            docs = await VecLoose.objects().similar_to("embedding", _Q, 2).exec()
+            refuses = await _release(client) >= _KNN_NEEDS_AN_INDEX_FROM
+            raw: Any = None
+            docs: list[Any] = []
+            refusals: list[pytest.ExceptionInfo[ServerError]] = []
+            if refuses:
+                with pytest.raises(ServerError) as raw_refused:
+                    await _client.query(client, _PIN_NO_INDEX, {"q": _Q})
+                with pytest.raises(ServerError) as orm_refused:
+                    await VecLoose.objects().similar_to("embedding", _Q, 2).exec()
+                refusals = [raw_refused, orm_refused]
+            else:
+                raw = await _client.query(client, _PIN_NO_INDEX, {"q": _Q})
+                docs = await VecLoose.objects().similar_to("embedding", _Q, 2).exec()
             exact = await VecLoose.objects().similar_to("embedding", _Q, 2, dist="cosine").exec()
+        assert _ids(exact) == ["d1", "d2"], "README section 37, _S37_NO_INDEX: dist= needs no index"
+        if refuses:
+            assert [type(refused.value) for refused in refusals] == [InternalError, InternalError], (
+                f"{_ROW_NO_INDEX}: the ORM passes SurrealDB 4.0.1's refusal through"
+            )
+            assert [_KNN_NEEDS_AN_INDEX in str(refused.value) for refused in refusals] == [True, True], (
+                f"{_ROW_NO_INDEX}: SurrealDB 4.0.1 refuses a KNN search without a vector index"
+            )
+            return
         if line == (3, 1):
             assert {str(row["id"].id): row["d"] for row in raw} == dict.fromkeys(_SIX), (
                 f"{_ROW_NO_INDEX}: 3.1 answers every record, with no distance"
@@ -7090,7 +7126,6 @@ class TestLinePinsE2E:
         else:
             assert raw == [], f"{_ROW_NO_INDEX}: no record, no error"
             assert docs == [], f"{_ROW_NO_INDEX}: no record, no error"
-        assert _ids(exact) == ["d1", "d2"], "README section 37, _S37_NO_INDEX: dist= needs no index"
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_function_call_next_to_the_knn(self, kind: str) -> None:
@@ -7323,8 +7358,8 @@ _S37_EF = (
     "when the table holds them."
 )
 _S37_NO_INDEX = (
-    "`similar_to()` reads the field's HNSW index: on a field without one it finds no record. Pass `dist=` for an "
-    "exact scan that needs no index."
+    "`similar_to()` reads the field's HNSW index: on a field without one it finds no record, and SurrealDB 4.0.1 and "
+    "later refuse the search instead. Pass `dist=` for an exact scan that needs no index."
 )
 _S37_FILTERS = (
     "Other conditions select the records first, then `similar_to()` keeps the nearest among them: SurrealDB 3.x "

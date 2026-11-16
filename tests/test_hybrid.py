@@ -2123,6 +2123,14 @@ async def _major(client: Any) -> int:
     return (await _line(client))[0]
 
 
+async def _release(client: Any) -> tuple[int, int, int]:
+    """``(major, minor, patch)`` of the engine *client* talks to: ``"surrealdb-4.0.1"`` → ``(4, 0, 1)``; ``mem://`` →
+    the SDK's version, whose core is 2.x."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
 def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
     """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
     through) — v0.31.0's spy."""
@@ -2271,8 +2279,14 @@ async def _references_of(make: Callable[[], QuerySet], args: dict[str, Any]) -> 
     """The distance ``similar_to()`` and the score ``search()`` of ``title`` with ``SearchScore(0)`` give each record of
     the queryset *make* builds, for the vector, the text and the distance of *args*, on the same engine, by id."""
     near = await make().similar_to("embedding", args["vector"], 8, dist=args.get("dist")).exec()
+    return {doc.id: doc._knn_distance for doc in near}, await _text_scores_of(make, args)
+
+
+async def _text_scores_of(make: Callable[[], QuerySet], args: dict[str, Any]) -> dict[str, Any]:
+    """The score ``search()`` of ``title`` with ``SearchScore(0)`` gives each record of the queryset *make* builds, for
+    the text of *args*, by id."""
     found = await make().search(title=args["text_query"]).annotate(score=SearchScore(0)).exec()
-    return {doc.id: doc._knn_distance for doc in near}, {doc.id: doc.score for doc in found}
+    return {doc.id: doc.score for doc in found}
 
 
 def _ranking(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
@@ -2564,9 +2578,14 @@ _ABOVE_3 = [
     ("d8", 1 / 64, True, False),
 ]
 
-#: C8 — ``HyNov``, C2's call — on SurrealDB 3.3, 2.x and the embedded engine: the vector search finds nothing without
-#: its index, so the full-text ranking alone is fused.
+#: C8 — ``HyNov``, C2's call — on SurrealDB 4.0.0, 3.3, 2.x and the embedded engine: the vector search finds nothing
+#: without its index, so the full-text ranking alone is fused.
 _C8_NO_VECTOR_LIST = [("d3", 1 / 61, False, True), ("d4", 1 / 62, False, True), ("d7", 1 / 63, False, True)]
+
+#: C8 from SurrealDB 4.0.1: ``hybrid_search()`` still fuses the full-text ranking alone (``_C8_NO_VECTOR_LIST``), but
+#: ``similar_to()`` on the field is refused, the server naming the two ways out.
+_C8_REFUSED_FROM = (4, 0, 1)
+_C8_REFUSAL = "needs an HNSW or DiskANN index on `embedding`; define one, or name a distance to search without an index"
 
 #: C8 on SurrealDB 3.1 and 3.2: the vector list holds the first three records by id, with no distance.
 _C8_NO_DISTANCE = [
@@ -2862,10 +2881,21 @@ class TestHybridErrorsE2E:
         async with _hy_models(kind) as client:
             await _setup(client, HyNov)
             line = await _line(client)
+            refuses = await _release(client) >= _C8_REFUSED_FROM
             rows = await _run_case("C2", HyNov)
-            _, scores = await _references("C2", HyNov)
+            refused: pytest.ExceptionInfo[ServerError] | None = None
+            if refuses:
+                with pytest.raises(ServerError) as refused:
+                    await _references("C2", HyNov)
+                scores = await _text_scores_of(lambda: _case_queryset("C2", HyNov, paged=False), _E2E_CASES["C2"][3])
+            else:
+                _, scores = await _references("C2", HyNov)
         expected = _C8_NO_DISTANCE if _is_31_or_32(line) else _C8_NO_VECTOR_LIST
         _check_answer("C8", rows, expected, {}, scores, table="hy_nov")
+        if refuses:
+            assert refused is not None
+            assert type(refused.value) is InternalError, "C8: similar_to() passes SurrealDB 4.0.1's refusal through"
+            assert _C8_REFUSAL in str(refused.value), "C8: SurrealDB 4.0.1 refuses similar_to() without its index"
 
 
 class TestHybridTransactionsE2E:
