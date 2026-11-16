@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.6] - 2026-11-15
+
+### Changed
+
+- The 4.x test line moved to SurrealDB 4.0.1 (`.surrealdb-version4x`, the CI matrix, the README and the compatibility guide).
+
+### Fixed
+
+- A KNN vector search on a field without a vector index is refused by SurrealDB 4.0.1 and later with an
+  `InternalError` carrying the server's message; the vector and hybrid tests now expect it on those servers and keep
+  expecting an empty result on 4.0.0, 3.x, 2.x and the embedded engine. No library code changed.
+
 ## [0.50.0] - 2026-11-07
 
 Official SDK 3.0 and SurrealDB 4.x. The ORM's minor series now follows the SDK's major: `0.50.x` is the SDK 3.0
