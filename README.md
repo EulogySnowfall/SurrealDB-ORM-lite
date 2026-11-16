@@ -1,7 +1,7 @@
 # Surreal ORM Lite
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![SurrealDB](https://img.shields.io/badge/SurrealDB-2.7.0%20%7C%203.3.5%20%7C%204.0.0-purple)
+![SurrealDB](https://img.shields.io/badge/SurrealDB-2.7.0%20%7C%203.3.5%20%7C%204.0.1-purple)
 ![SDK](https://img.shields.io/badge/SDK-Official%203.0-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![codecov](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite/graph/badge.svg)](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite)
@@ -185,7 +185,7 @@ find every guide listed there.
 | `0.40.x`    | `surrealdb[pydantic]>=2.0.0,<3.0.0` | 2.x, 3.x        | deprecated, security fixes only |
 
 The ORM's minor series follows the SDK major, and the ORM supports exactly the SurrealDB versions the SDK supports,
-from the ORM version that adopts that SDK. It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.0**, and
+from the ORM version that adopts that SDK. It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.1**, and
 on the SDK's in-process engine (a SurrealDB 4.0 core); SurrealDB 3.1.5 is run as a backward-compatibility check. A
 few capabilities rely on server features introduced in SurrealDB 3.x: on 2.x the ORM degrades gracefully or says so
 before sending anything. The [compatibility guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md) lists every tested version and every
