@@ -3383,6 +3383,8 @@ class BaseSurrealModel(BaseModel):
         - **Computed fields** are excluded always. ``DEFINE FIELD … VALUE`` re-evaluates on
           every write, create and replace alike, so sending one is at best wasted bytes and at
           worst — if the definition has not been applied yet — a ``None`` that nulls the column.
+          On SurrealDB 2.x a replace writes them back as their stored value in the statement
+          instead (:meth:`_replace_stored_columns`, #267), never the instance's value.
         - **``server_fields``** are excluded from a **create** only. There, omitting the column
           is precisely how the server's ``DEFAULT`` gets to apply. In a **replace**
           (``UPDATE``/``UPSERT … CONTENT``) omission does not mean "server, fill this in": a
@@ -3405,6 +3407,26 @@ class BaseSurrealModel(BaseModel):
         if not replace:
             excluded |= self.get_server_fields() - set(keep)
         return self._columns_for(self.model_dump(exclude=excluded))
+
+    @classmethod
+    async def _replace_stored_columns(cls) -> tuple[str, ...]:
+        """The columns a full replace (``update()``, ``upsert()``) writes back as their stored value (#267).
+
+        The computed columns, on SurrealDB 2.x only (the line read once per client, ``time_travel.cached_major()``).
+        2.x checks a column's ``TYPE`` against the value a replace gives it **before** its ``VALUE`` clause runs: a
+        computed column left out of ``CONTENT`` is ``NONE``, which a non-optional ``TYPE`` refuses. Written back as
+        ``$this[column]`` (see :func:`~surreal_orm_lite.utils.replace_content`), it passes the check and the ``VALUE``
+        clause recomputes it — an expression reading ``$value`` sees the stored value there. From SurrealDB 3 on (the
+        embedded engine included) and for a model without computed fields: none, no request, the column left out as
+        before. Measured on 2.7.0, 3.3.5 and 4.0.1.
+        """
+        computed = cls.get_computed_fields()
+        if not computed:
+            return ()
+        client = await cls._connection_manager().get_client()
+        if await _time_travel.cached_major(client) >= 3:
+            return ()
+        return tuple(cls._columns_for(dict.fromkeys(computed)))
 
     @classmethod
     def _is_write_protected(cls, name: str) -> bool:
@@ -4046,7 +4068,7 @@ class BaseSurrealModel(BaseModel):
         # RETURN $before, $after reports both states of the row in a single statement, so
         # `created` is the truth rather than an assumption (issue #156). Verified on
         # SurrealDB 2.6.x and 3.x alike.
-        content, bound = replace_content(data)
+        content, bound = replace_content(data, stored=await self._replace_stored_columns())
         statement = f"UPSERT $rid CONTENT {content} RETURN $before AS before, $after AS after;"
         variables = {"rid": record_id, **bound}
 
@@ -4084,9 +4106,8 @@ class BaseSurrealModel(BaseModel):
         Runs ``UPSERT $rid CONTENT $data``, the record id bound as a query parameter: this is
         REPLACE semantics, so any field omitted from the model is removed from the stored
         record. For a partial update use ``merge()`` instead. An explicit id is required.
-        A ``datetime`` written back unchanged keeps the stored nanoseconds, as in :meth:`update`;
-        as there, SurrealDB 2.x refuses to replace an existing record when the model leaves out a
-        field with a non-optional ``TYPE`` and a ``VALUE`` clause, a ``Computed`` one (#267).
+        A ``datetime`` written back unchanged keeps the stored nanoseconds, and on SurrealDB 2.x a
+        ``Computed`` column is written back as its stored value, as in :meth:`update` (#267).
 
         When ``tx`` is provided, the ``UPSERT`` is buffered onto the transaction.
 
@@ -4141,10 +4162,12 @@ class BaseSurrealModel(BaseModel):
         :func:`~surreal_orm_lite.utils.replace_content`. Without a datetime to keep, the statement
         is the SDK's ``update()``, as before.
 
-        SurrealDB 2.x still refuses a full replace that leaves out a field declared with a
-        non-optional ``TYPE`` and a ``VALUE`` clause, which the model does not write (a
-        ``Computed`` field, such as a generated ``updated: Computed[datetime]``): there, change
-        such a record with :meth:`merge` (#267). SurrealDB 3.x recomputes the field.
+        A ``Computed`` field is not written from the instance. SurrealDB 2.x checks a column's
+        ``TYPE`` before its ``VALUE`` clause runs, so a computed column with a non-optional ``TYPE``
+        (a generated ``updated: Computed[datetime]``) left out refused the replace: on 2.x it is
+        written back as its stored value (``$this``) and the ``VALUE`` clause recomputes it (#267,
+        the server line read once per client). From SurrealDB 3 on it is left out and recomputed.
+        An expression reading ``$value`` therefore sees the stored value on 2.x, ``NONE`` on 3.x.
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
@@ -4172,7 +4195,7 @@ class BaseSurrealModel(BaseModel):
         data = self._write_payload(replace=True)
         record_id = self._record_id()
         assert record_id is not None  # refused by _update_arguments() (#320)
-        content, bound = replace_content(data)
+        content, bound = replace_content(data, stored=await self._replace_stored_columns())
 
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 

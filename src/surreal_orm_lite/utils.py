@@ -360,7 +360,7 @@ def _keep_plan(value: Any, depth: int, left: int) -> tuple[_KeepPlan | None, int
     return plans, cost
 
 
-def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+def replace_content(data: Mapping[str, Any], stored: Collection[str] = ()) -> tuple[str, dict[str, Any]]:
     """Compile the ``CONTENT`` of a full replace (``UPDATE``/``UPSERT $rid CONTENT …``) of ``data`` (#261).
 
     SurrealDB stores datetimes to the nanosecond, the SDK reads them floored to the microsecond: writing a
@@ -383,13 +383,23 @@ def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     written as sent. Anything past the budget (a long list, a large sub-object, a deeper datetime) is bound whole and
     written as sent, and so is a set, whose items have no position to match a stored value by.
 
+    Each column of ``stored`` that ``data`` does not hold is written as its stored value, ``$this[$cN]`` (``NONE`` when
+    the record has none, or does not exist yet), after the entries of ``data`` (#267). ``update()``/``upsert()`` pass a
+    model's computed columns there on SurrealDB 2.x only: that line checks a column's ``TYPE`` against the value a
+    replace gives it **before** its ``VALUE`` clause runs, so a computed column with a non-optional ``TYPE`` left out
+    (``NONE``) refused the write; written back, it passes the check and the ``VALUE`` clause recomputes it::
+
+        replace_content({"name": "Ada"}, stored=("updated",))
+        # ("object::from_entries([[$c0, $c1], [$c2, $this[$c2]]])", {"c0": "name", "c1": "Ada", "c2": "updated"})
+
     Returns:
         The expression and the variables to bind alongside it: ``(PLAIN_CONTENT, {"data": data})`` when it keeps no
-        stored datetime (``data`` holds none within those bounds, or has a key that is not a ``str``), the statement
-        of before #261.
+        stored value (``data`` holds no datetime within those bounds and ``stored`` adds no column, or ``data`` has a
+        key that is not a ``str``), the statement of before #261.
     """
     if not all(isinstance(key, str) for key in data):
         return PLAIN_CONTENT, {"data": data}
+    stored = [column for column in stored if column not in data]
     left = _KEEP_LIMIT
     plans: dict[str, _KeepPlan] = {}
     for key, value in data.items():
@@ -402,7 +412,7 @@ def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             if plan is not None:
                 plans[key] = plan
                 left -= cost
-    if not plans:
+    if not plans and not stored:
         return PLAIN_CONTENT, {"data": data}
     variables: dict[str, Any] = {}
 
@@ -433,6 +443,9 @@ def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     for key, value in data.items():
         bound = bind(key)
         entries.append(f"[{bound}, {written(value, plans.get(key), f'$this[{bound}]')}]")
+    for column in stored:
+        bound = bind(column)
+        entries.append(f"[{bound}, $this[{bound}]]")
     return f"object::from_entries([{', '.join(entries)}])", variables
 
 

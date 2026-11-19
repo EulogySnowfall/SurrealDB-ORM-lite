@@ -172,6 +172,18 @@ ORM-lite entirely and writes `full_name` directly still gets the expression's re
 No `TYPE` clause is emitted — SurrealDB infers an optional type on both server lines. Behaviour
 is **identical on SurrealDB 2.6.x and 3.x**.
 
+**Full replace (`update()`, `upsert()`) on SurrealDB 2.x.** A database may type a computed
+column with a non-optional `TYPE` (`DEFINE FIELD updated ON person TYPE datetime VALUE
+time::now()`, which `generate_models_from_db()` turns into `updated: Computed[datetime]`).
+SurrealDB 2.x checks that `TYPE` against the value a replace gives the column **before** the
+`VALUE` clause runs, and a column left out is `NONE`. So on 2.x `update()` and `upsert()` write
+each computed column back as its stored value (`$this[column]`, `NONE` for a record the upsert
+creates), and the `VALUE` clause recomputes it (#267). From SurrealDB 3 on, and on the embedded
+engine, the column is left out as before. The ORM reads the server line once per client, only for
+a model with computed fields. One difference remains: an expression that reads `$value` sees the
+stored value on 2.x and `NONE` on 3.x, so `VALUE ($value OR 0) + 1` counts the replaces on 2.x
+only. Keep such an expression for `merge()`, or don't read `$value` in it.
+
 Since v0.34.0, `define_table()` ([section 35](schema.md#35-model-table-ddl-define_table-schema_mode-permissions)) writes a computed field's `TYPE` too
 (`TYPE option<T> VALUE …`), checks its expression, and keeps a field the database defines `COMPUTED` (SurrealDB 3.x)
 `COMPUTED`; `define_computed_fields()` turns such a field into `VALUE`.
