@@ -555,9 +555,9 @@ _SERVER_ROW = [
     "same on both lines: each sub-field under the key `save()` writes, else the first key a read takes, also in "
     "`define_table()`; `merge()` keeps the stored spelling of an object",
     "same on both lines (measured on 3.3.5)",
-    "v0.50.8",
+    "v0.50.10",
 ]
-_HEADER_SENTENCE = "The row added in v0.50.8 was measured on 2.7.0, 3.3.5 and 4.0.1."
+_HEADER_SENTENCE = "The row added in v0.50.10 was measured on 2.7.0, 3.3.5 and 4.0.1."
 
 
 class TestSubModelKeysDocs:

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.10] - 2026-11-19
+
+### Fixed
+
+- A sub-model field (a Pydantic model used as a field's type, also in a `list`, a `dict` or `X | None`) is written
+  under one key on every write and on both server lines: the key `model_dump()` writes when a read takes it, else the
+  first key a read takes. A field read by its alias only, or a `serialization_alias` no validation alias names, was
+  stored where no read found it. `merge()` and `bulk_update()` dicts accept any spelling of a sub-field, and a
+  sub-model instance in a keyword write is written as `save()` writes it.
+- `define_table()` and `table_ddl()` declare each sub-model field under the key the ORM writes, so a `SCHEMAFULL`
+  table takes every sub-model write on 2.x, 3.x and 4.x (3.x/4.x refused them, 2.x dropped them).
+
+### Notes
+
+- Models whose sub-models use no alias send the same payload as before. Rows written by an earlier version under the
+  dumped key keep it until the field is written again; `makemigrations()` proposes the removal of the old definitions.
+  See [the models guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/models.md#sub-model-keys-and-aliases).
+
 ## [0.50.6] - 2026-11-15
 
 ### Changed
