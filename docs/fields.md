@@ -333,6 +333,26 @@ removed. An enum declared `(str, Enum)` or `(int, Enum)` holds the member, as af
 compares equal to its value, but `str()` and f-strings give `Color.RED`, not `red` (a `StrEnum` or
 an `IntEnum` gives the value), so use `.value` to build a key, a URL or a log line from it.
 
+### Untyped fields
+
+A position with no declared type holds what a read gives, the SDK's values: an `Any` field, the
+values of a `dict[str, Any]` or a `list[Any]`, an `Any` field of a sub-model, and under
+`extra="allow"` a column the model does not declare (`model_extra`). There a duration is a
+`surrealdb.Duration`, a range a `surrealdb.Range` and a geometry the SDK's class
+(`surrealdb.data.GeometryPoint`, …), not the ORM's. Every write of the instance sends them back as
+they are: `save()`, `update()`, `upsert()`, `bulk_create()` and an edge's `save()` and `update()`
+keep a loaded row's durations, ranges and geometries, on every line
+([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)). Before, Pydantic's
+`model_dump()` turned these values, which are dataclasses, into dicts of their fields
+(`{"elapsed": 5400000000000}`, `{"begin": …, "end": …}`, `{"longitude": …, "latitude": …}`), and
+the write stored those dicts in their place.
+
+`model_dump()` itself is unchanged: it still gives those dicts. A serializer of your own keeps the
+last word, even one that returns such a dict: a `field_serializer`, an
+`Annotated[Any, PlainSerializer(…)]` or a sub-model's `model_serializer`. Declare the field
+(`Duration`, `Range[T]`, the geometry fields of [section 25](#25-geospatial-fields)) to read the
+ORM's values and serialise them with the ORM's serializers.
+
 ### Values the SDK cannot read
 
 The surrealdb SDK refuses two kinds of values SurrealDB stores and returns: a degenerate geometry
@@ -685,10 +705,10 @@ updating every record migrates a table.
 A field declared `Any` or `dict`, or an undeclared column of an `extra="allow"` model, is not a
 geometry field. A GeoJSON dict written there stays a plain object (see
 [Migrating stored GeoJSON](#migrating-stored-geojson)); an ORM geometry written there is stored
-as a native geometry but reads back as the SDK's class (`surrealdb.data.GeometryPoint`, …), which
-a later write of the instance stores as a plain object
-([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)). Declare geometry fields
-with the annotations above. The results of `raw_query()`, `query()` and `call_function()` are
+as a native geometry and reads back as the SDK's class (`surrealdb.data.GeometryPoint`, …), which
+a later write of the instance stores back as the same native geometry (see
+[Untyped fields](#untyped-fields) in section 24). Declare geometry fields with the annotations above
+to read the ORM's classes. The results of `raw_query()`, `query()` and `call_function()` are
 untyped too: they hold the SDK's classes, which compare equal to the ORM's with the ORM value on
 the left.
 

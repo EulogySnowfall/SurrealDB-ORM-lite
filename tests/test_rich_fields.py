@@ -4034,3 +4034,343 @@ class TestReadmeWording:
 
     def test_behaviour_table_header_names_the_v0_23_0_versions(self) -> None:
         assert_server_header_sentence("rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs")
+
+
+# --- SDK values at untyped positions (#222) -------------------------------------------------------
+
+
+class RfUntypedSub(BaseModel):
+    """A sub-model whose fields are untyped: the read gives the SDK's values there."""
+
+    v: Any = None
+    w: list[Any] = []
+
+
+class RfUntyped(BaseSurrealModel):
+    """Every untyped position: an ``Any`` field, ``dict[str, Any]``, ``list[Any]``, a sub-model's ``Any``, an extra."""
+
+    model_config = SurrealConfigDict(table_name="rf_untyped", extra="allow")
+
+    id: str | None = None
+    a: Any = None
+    d: dict[str, Any] = {}
+    items: list[Any] = []
+    pair: tuple[Any, ...] = ()
+    sub: RfUntypedSub | None = None
+    n: int = 0
+
+
+class RfUntypedLink(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="rf_untyped_link", extra="allow")
+
+    a: Any = None
+    d: dict[str, Any] = {}
+    n: int = 0
+
+
+class RfUntypedSerialized(BaseSurrealModel):
+    """An ``Any`` field whose own serializer turns an SDK duration into another dict: the user's choice is kept."""
+
+    model_config = SurrealConfigDict(table_name="rf_untyped_serialized")
+
+    id: str | None = None
+    a: Any = None
+    b: Any = None
+
+    @field_serializer("a")
+    def _seconds(self, value: Any) -> Any:
+        return {"seconds": value.elapsed // 10**9} if isinstance(value, surrealdb.Duration) else value
+
+    @field_serializer("b")
+    def _flattened(self, value: Any) -> Any:
+        return {"elapsed": value.elapsed} if isinstance(value, surrealdb.Duration) else value
+
+
+@dataclasses.dataclass
+class RfUntypedData:
+    v: Any = None
+
+
+class RfUntypedRenamed(BaseModel):
+    """A sub-model with a ``model_serializer`` of its own: its keys need not name its fields."""
+
+    v: Any = None
+
+    @pydantic.model_serializer(mode="wrap")
+    def _same(self, handler: Any) -> Any:
+        out: Any = handler(self)
+        return out
+
+
+def _flatten_duration(value: Any) -> Any:
+    return {"elapsed": value.elapsed} if isinstance(value, surrealdb.Duration) else value
+
+
+class RfUntypedOwnSerializers(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_untyped_own")
+
+    id: str | None = None
+    a: Annotated[Any, pydantic.PlainSerializer(_flatten_duration)] = None
+    sub: RfUntypedRenamed | None = None
+
+
+def _sdk_ring(*points: tuple[float, float]) -> Any:
+    return _sdk.SdkGeometryLine(*(_sdk.SdkGeometryPoint(lon, lat) for lon, lat in points))
+
+
+#: One SDK value of each kind Pydantic flattens into a dict (each one a dataclass).
+_SDK_UNTYPED: dict[str, Any] = {
+    "duration": surrealdb.Duration(5400 * 10**9 + 1),
+    "range": surrealdb.Range(_sdk.BoundIncluded(1), _sdk.BoundExcluded(5)),
+    "open-range": surrealdb.Range(_sdk.BoundIncluded(1), _sdk.Null),
+    "datetime-range": surrealdb.Range(_sdk.BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC)), None),
+    "point": _sdk.SdkGeometryPoint(1.0, 2.0),
+    "line": _sdk_ring((0.0, 0.0), (1.0, 1.0)),
+    "polygon": _sdk.SdkGeometryPolygon(_sdk_ring((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0))),
+    "multi-point": _sdk.SdkGeometryMultiPoint(_sdk.SdkGeometryPoint(1.0, 2.0), _sdk.SdkGeometryPoint(3.0, 4.0)),
+    "collection": _sdk.SdkGeometryCollection(_sdk.SdkGeometryPoint(5.0, 6.0), _sdk_ring((0.0, 0.0), (1.0, 1.0))),
+}
+
+
+def _pre_222_payload(instance: BaseSurrealModel, replace: bool = False) -> dict[str, Any]:
+    """What ``_write_payload()`` built before #222: the plain ``model_dump()``, re-keyed to columns."""
+    excluded = {"id", *instance.get_computed_fields()}
+    if not replace:
+        excluded |= instance.get_server_fields()
+    return instance._columns_for(instance.model_dump(exclude=excluded))
+
+
+def _wire(payload: Any) -> bytes:
+    """The bytes the SDK sends for *payload*, once through the ORM's encoding boundary."""
+    data: bytes = _sdk.cbor_encode(encoding.encode(payload))
+    return data
+
+
+class TestUntypedSdkValuesPayload:
+    """Unit (#222): the write payload keeps an SDK value at an untyped position, and nothing else changes."""
+
+    @pytest.mark.parametrize("replace", [False, True])
+    @pytest.mark.parametrize("kind", list(_SDK_UNTYPED))
+    def test_kept_at_every_untyped_position(self, kind: str, replace: bool) -> None:
+        value = _SDK_UNTYPED[kind]
+        instance = RfUntyped(
+            id="k",
+            a=value,
+            d={"k": value, "nested": {"deeper": [value]}},
+            items=[value, (1, value)],
+            pair=(value,),
+            sub=RfUntypedSub(v=value, w=[value]),
+            x=value,
+        )
+        payload = instance._write_payload(replace=replace)
+        assert payload["a"] is value, payload["a"]
+        assert payload["d"]["k"] is value and payload["d"]["nested"]["deeper"][0] is value, payload["d"]
+        assert payload["items"][0] is value and payload["items"][1][1] is value, payload["items"]
+        assert type(payload["items"][1]) is tuple and type(payload["pair"]) is tuple and payload["pair"][0] is value
+        assert payload["sub"] == {"v": value, "w": [value]} and payload["sub"]["v"] is value, payload["sub"]
+        assert payload["x"] is value, payload["x"]
+        assert payload["n"] == 0 and "id" not in payload
+
+    @pytest.mark.parametrize("kind", list(_SDK_UNTYPED))
+    def test_kept_on_an_edge(self, kind: str) -> None:
+        value = _SDK_UNTYPED[kind]
+        link = RfUntypedLink(in_=RecordID("rf_untyped", "a"), out=RecordID("rf_untyped", "b"), a=value, d={"k": value}, x=value)
+        payload = link._write_payload()
+        assert payload["a"] is value and payload["d"]["k"] is value and payload["x"] is value, payload
+        assert payload["in"] == RecordID("rf_untyped", "a") and payload["out"] == RecordID("rf_untyped", "b")
+
+    def test_kept_under_an_alias(self) -> None:
+        class RfUntypedAliased(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_untyped_aliased")
+
+            id: str | None = None
+            meta: dict[str, Any] = Field(default={}, alias="m")
+            sub: RfUntypedSub | None = None
+
+        value = _SDK_UNTYPED["duration"]
+        payload = RfUntypedAliased(id="k", m={"ttl": value}, sub=RfUntypedSub(v=value))._write_payload()
+        assert payload["m"]["ttl"] is value and payload["sub"]["v"] is value, payload
+
+    def test_user_serializer_wins(self) -> None:
+        """A serializer's own dict is the user's choice, the flattened form included: never replaced."""
+        value = surrealdb.Duration(90 * 10**9)
+        payload = RfUntypedSerialized(id="k", a=value, b=value)._write_payload()
+        assert payload == {"a": {"seconds": 90}, "b": {"elapsed": 90 * 10**9}}, payload
+        assert payload == _pre_222_payload(RfUntypedSerialized(id="k", a=value, b=value))
+
+    def test_kept_in_a_dataclass_and_a_typed_dict(self) -> None:
+        value = _SDK_UNTYPED["polygon"]
+        payload = RfUntyped(id="k", a=RfUntypedData(v=value), d={"t": {"v": value}})._write_payload()
+        assert payload["a"] == {"v": value} and payload["a"]["v"] is value, payload["a"]
+        assert payload["d"]["t"]["v"] is value, payload["d"]
+
+    def test_other_serializers_win(self) -> None:
+        """An ``Annotated`` serializer and a sub-model's ``model_serializer`` are the user's choice too."""
+        value = surrealdb.Duration(90 * 10**9)
+        instance = RfUntypedOwnSerializers(id="k", a=value, sub=RfUntypedRenamed(v=value))
+        payload = instance._write_payload()
+        assert payload == {"a": {"elapsed": 90 * 10**9}, "sub": {"v": {"elapsed": 90 * 10**9}}}, payload
+        assert payload == _pre_222_payload(instance)
+
+    def test_declared_fields_unchanged(self) -> None:
+        """A declared rich field holding a raw SDK value keeps the ORM's own serializer (v0.23.0, v0.24.0)."""
+        instance = RfEvent.model_construct(
+            id="k", grace=surrealdb.Duration(7), hours=surrealdb.Range(_sdk.BoundIncluded(1), _sdk.BoundExcluded(2))
+        )
+        assert _wire(instance._write_payload()) == _wire(_pre_222_payload(instance))
+
+    @pytest.mark.parametrize("replace", [False, True])
+    def test_models_without_sdk_values_send_the_same_bytes(self, replace: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC: a model without SDK values sends byte for byte the payload it sent before #222, built from the very
+        objects ``model_dump()`` returned (nothing rebuilt)."""
+        orm_values: dict[str, Any] = {
+            "duration": Duration.parse("1h"),
+            "range": Range(BoundIncluded(1), None),
+            "point": GeometryPoint(1.0, 2.0),
+            "record": RecordID("rf_untyped", "z"),
+            "when": datetime(2026, 1, 2, tzinfo=UTC),
+        }
+        instances: list[BaseSurrealModel] = [
+            RfEvent(id="k", **FULL),
+            RfHolder(id="k", **HOLDER),
+            RfUntyped(
+                id="k",
+                a={"plain": [1, "two", 3.0, None, {"x": (1, 2)}], **orm_values},
+                d={"k": [orm_values["duration"], orm_values["point"]], "nested": {"deep": {"deeper": [1, 2]}}},
+                items=[1, "a", orm_values["range"], {"elapsed": 5}],
+                pair=(orm_values["record"], {"begin": {"value": 1}}),
+                sub=RfUntypedSub(v={"longitude": 1.0, "latitude": 2.0}, w=[orm_values["when"]]),
+                x={"elapsed": 5},
+                y=[orm_values["point"]],
+            ),
+            RfUntypedLink(in_=RecordID("rf_untyped", "a"), out=RecordID("rf_untyped", "b"), a=[1, 2], d={"k": "v"}),
+        ]
+        for instance in instances:
+            expected = _pre_222_payload(instance, replace=replace)
+            dumped: list[dict[str, Any]] = []
+            real = type(instance).model_dump
+
+            def spy(
+                self: BaseModel, *args: Any, _real: Any = real, _sink: list[dict[str, Any]] = dumped, **kwargs: Any
+            ) -> dict[str, Any]:
+                out: dict[str, Any] = _real(self, *args, **kwargs)
+                _sink.append(out)
+                return out
+
+            with monkeypatch.context() as patched:
+                patched.setattr(type(instance), "model_dump", spy)
+                payload = instance._write_payload(replace=replace)
+            assert payload == expected, type(instance).__name__
+            assert _wire(payload) == _wire(expected), type(instance).__name__
+            [dump] = dumped
+            for name, value in dump.items():
+                assert payload[instance.to_db_field(name)] is value, (type(instance).__name__, name)
+
+
+#: A row of every untyped position, written by the server from SurrealQL literals.
+_UNTYPED_SET = (
+    "a = 1h30m1ns, "
+    "d = {ttl: 1h30m, r: 1..5, ex: 1>..=5, open: 1.., p: (1.0, 2.0), "
+    "poly: {type: 'Polygon', coordinates: [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]}, "
+    "multi: {type: 'MultiPoint', coordinates: [[1.0, 2.0], [3.0, 4.0]]}, "
+    "coll: {type: 'GeometryCollection', geometries: [{type: 'Point', coordinates: [5.0, 6.0]}, "
+    "{type: 'LineString', coordinates: [[0.0, 0.0], [1.0, 1.0]]}]}}, "
+    "x = (3.0, 4.0), y = 5m, z = [2h, 3..4, (7.0, 8.0)], n = 1"
+)
+_UNTYPED_SEED = (
+    f"CREATE rf_untyped:k SET {_UNTYPED_SET}, items = [2h, 3..4, (7.0, 8.0)], pair = [5m, (1.0, 1.0)], "
+    "sub = {v: 4h, w: [1..2, (9.0, 9.5)]};"
+)
+_UNTYPED_EDGE_SEED = (
+    f"CREATE rf_untyped:a; CREATE rf_untyped:b; RELATE rf_untyped:a->rf_untyped_link:k->rf_untyped:b SET {_UNTYPED_SET};"
+)
+
+_K = RecordID("rf_untyped", "k")
+_C = RecordID("rf_untyped", "c")
+_EDGE_K = RecordID("rf_untyped_link", "k")
+_EDGE_C = RecordID("rf_untyped_link", "c")
+
+
+def _stored_values(row: dict[str, Any]) -> dict[str, Any]:
+    """A raw row without what each write case sets itself."""
+    return {key: value for key, value in row.items() if key not in {"id", "n"}}
+
+
+def _copy_of(loaded: RfUntyped) -> RfUntyped:
+    """A new instance (id ``c``) holding the loaded instance's values as they are: no ``model_dump()`` in between."""
+    return RfUntyped(
+        id="c", a=loaded.a, d=loaded.d, items=loaded.items, pair=loaded.pair, sub=loaded.sub, n=2, **(loaded.model_extra or {})
+    )
+
+
+async def _untyped_save() -> RecordID:
+    await _copy_of(await RfUntyped.objects().get("k")).save()
+    return _C
+
+
+async def _untyped_update() -> RecordID:
+    loaded = await RfUntyped.objects().get("k")
+    loaded.n = 2
+    await loaded.update()
+    return _K
+
+
+async def _untyped_upsert() -> RecordID:
+    loaded = await RfUntyped.objects().get("k")
+    loaded.n = 2
+    await loaded.upsert()
+    return _K
+
+
+async def _untyped_bulk_create() -> RecordID:
+    [created] = await RfUntyped.objects().bulk_create([_copy_of(await RfUntyped.objects().get("k"))])
+    assert isinstance(created, RfUntyped) and type(created.a) is surrealdb.Duration, created
+    return _C
+
+
+async def _untyped_edge_update() -> RecordID:
+    loaded = await RfUntypedLink.objects().get("k")
+    loaded.n = 2
+    await loaded.update()
+    return _EDGE_K
+
+
+async def _untyped_edge_save() -> RecordID:
+    loaded = await RfUntypedLink.objects().get("k")
+    extra = loaded.model_extra or {}
+    await RfUntypedLink(id="c", in_=loaded.in_, out=loaded.out, a=loaded.a, d=loaded.d, n=2, **extra).save()
+    return _EDGE_C
+
+
+_UNTYPED_WRITES: dict[str, tuple[Callable[[], Awaitable[RecordID]], RecordID]] = {
+    "save": (_untyped_save, _K),
+    "update": (_untyped_update, _K),
+    "upsert": (_untyped_upsert, _K),
+    "bulk_create": (_untyped_bulk_create, _K),
+    "edge-update": (_untyped_edge_update, _EDGE_K),
+    "edge-save": (_untyped_edge_save, _EDGE_K),
+}
+
+
+class TestUntypedSdkValuesE2E:
+    """#222: a row whose untyped positions hold durations, ranges and geometries is unchanged by a write of the
+    loaded instance, on both lines."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", list(_UNTYPED_WRITES))
+    async def test_loaded_row_written_back_unchanged(self, case: str) -> None:
+        write, seeded = _UNTYPED_WRITES[case]
+        async with orm_client("rf_untyped", "rf_untyped_link") as client:
+            await _client.query(client, _UNTYPED_SEED + _UNTYPED_EDGE_SEED, {})
+            before = _stored_values(await _raw(seeded))
+            assert type(before["a"]) is surrealdb.Duration and type(before["d"]["poly"]) is _sdk.SdkGeometryPolygon, before
+            target = await write()
+            after = await _raw(target)
+            assert after["n"] == 2, after
+            assert _stored_values(after) == before
+            # The read paths are unchanged: the written row loads and refreshes with the SDK's values.
+            model = RfUntypedLink if target.table_name == "rf_untyped_link" else RfUntyped
+            loaded = await model.objects().get(target.id)
+            await loaded.refresh()
+            assert type(loaded.a) is surrealdb.Duration and loaded.d == before["d"], loaded
+            assert loaded.model_extra == {key: before[key] for key in ("x", "y", "z")}, loaded.model_extra

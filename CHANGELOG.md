@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.9] - 2026-11-19
+
+### Fixed
+
+- A write of a model instance no longer replaces the SDK's values at untyped positions with dicts of their fields
+  ([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)). A loaded row's durations, ranges and
+  geometries held in an `Any` field, in a `dict[str, Any]` or `list[Any]`, in a sub-model's `Any` field or in an
+  `extra="allow"` column used to be turned into plain objects by Pydantic's `model_dump()` on `save()`, `update()`,
+  `upsert()`, `bulk_create()` and an edge's `save()` and `update()`; they are now sent back as the same native values
+  on every SurrealDB line. `model_dump()` itself is unchanged, and a serializer of your own still has the last word.
+
+### Notes
+
+- Declare the field (`Duration`, `Range[T]`, the geometry fields) to read the ORM's classes instead of the SDK's; see
+  "Untyped fields" in the [fields guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/fields.md).
+
 ## [0.50.8] - 2026-11-18
 
 ### Fixed
