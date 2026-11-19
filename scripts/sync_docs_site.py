@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the docs.page site's ``.mdx`` pages from the Markdown guides under ``docs/``.
+r"""Generate the docs.page site's ``.mdx`` pages from the Markdown guides under ``docs/``.
 
 The guides ``docs/**/*.md`` are the single source of the documentation: GitHub renders them, the README and
 ``llms.txt`` link to them, and the tests read them. The docs.page site (configured by ``docs.json`` at the repository
@@ -8,16 +8,17 @@ root) renders only ``docs/**/*.mdx``, so this script writes one ``.mdx`` mirror 
 
 A mirror is the guide's text with:
 
-- a YAML front matter: ``title`` from the first ``#`` heading, ``description`` from the first paragraph;
-- an MDX comment naming its source, so nobody edits the mirror;
+- a YAML front matter: ``title`` from the first ``#`` heading, ``description`` from the first paragraph, and a YAML
+  comment naming the guide to edit (docs.page shows an MDX comment as text, but never the front matter);
 - its relative links rewritten for the site (outside code spans and fenced blocks only): ``models.md#custom-primary-key``
   becomes ``/models#custom-primary-key``, ``README.md`` becomes ``/``, ``ai/CLAUDE.md`` becomes ``/ai/CLAUDE``, and a
   link that leaves ``docs/`` (``../CHANGELOG.md``, ``../examples/``) becomes an absolute GitHub URL of ``main``;
 - the heading a link names after ``#`` given docs.page's anchor in place of GitHub's
   (``writing.md#14-optimistic-concurrency-retry_on_conflict`` becomes
   ``/writing#14-optimistic-concurrency-retryonconflict``);
-- the characters MDX reads as JSX or expressions (``<``, ``{``, ``}``) escaped outside code, and an HTML comment turned
-  into an MDX comment.
+- the characters MDX reads as JSX or expressions escaped outside code: ``<`` as ``&lt;`` (docs.page turns a ``<`` that
+  starts no tag into ``&lt;`` before parsing, so ``\<`` would show its backslash), ``{`` and ``}`` as ``\{`` and ``\}``;
+  an HTML comment, which MDX refuses and GitHub does not show, is dropped.
 
 Usage:
     python scripts/sync_docs_site.py          # Check only (exit 1 if a mirror is missing, stale or orphaned)
@@ -52,7 +53,9 @@ _FENCE = re.compile(r"^ {0,3}(?:> ?)*\s*(`{3,}|~{3,})")
 _HEADING = re.compile(r"^#{1,6} ")
 #: Outside code: an HTML comment, a link target (``](target)``, with an optional title), or a character MDX would read
 #: as JSX or an expression (unless already escaped).
-_TOKEN = re.compile(r"<!--(?P<comment>[\s\S]*?)-->|\]\((?P<target>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\)|(?<!\\)(?P<char>[<{}])")
+_TOKEN = re.compile(
+    r"<!--(?P<comment>[\s\S]*?)-->|\]\((?P<target>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\)|(?P<char>\\?<|(?<!\\)[{}])"
+)
 _SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 
@@ -116,8 +119,13 @@ def _outside_code(text: str, change: Callable[[str], str]) -> str:
 
 
 def _escape(text: str) -> str:
-    """*text* with every ``<``, ``{`` and ``}`` outside code escaped (unless already escaped)."""
-    return _outside_code(text, lambda part: re.sub(r"(?<!\\)([<{}])", r"\\\1", part))
+    """*text* with every ``<``, ``{`` and ``}`` outside code escaped as a page writes them (:func:`_escaped`)."""
+    return _outside_code(text, lambda part: re.sub(r"\\?<|(?<!\\)[{}]", _escaped, part))
+
+
+def _escaped(match: re.Match[str]) -> str:
+    """How a page writes a ``<`` (escaped or not), ``{`` or ``}`` of prose: ``&lt;``, ``\\{``, ``\\}``."""
+    return "&lt;" if match.group(0).endswith("<") else "\\" + match.group(0)
 
 
 # --- Heading anchors -------------------------------------------------------------------------------------------------
@@ -237,10 +245,10 @@ class _Site:
 
         def token(match: re.Match[str]) -> str:
             if match.group("comment") is not None:
-                return "{/*" + match.group("comment").replace("*/", "* /") + "*/}"
+                return ""
             if match.group("target") is not None:
                 return f"]({self.target(match.group('target'), here)}{match.group('title') or ''})"
-            return "\\" + match.group("char")
+            return _escaped(match)
 
         return _outside_code(text, lambda part: _TOKEN.sub(token, part))
 
@@ -328,9 +336,8 @@ def render(source: Path, root: Path = ROOT) -> str:
         "---",
         f"title: {json.dumps(title(text), ensure_ascii=False)}",
         f"description: {json.dumps(description(text), ensure_ascii=False)}",
+        f"# Generated from {relative} by scripts/sync_docs_site.py. Edit the .md source.",
         "---",
-        "",
-        f"{{/* Generated from {relative} by scripts/sync_docs_site.py. Edit the .md source. */}}",
         "",
     ]
     return "\n".join(head) + "\n" + convert(text, source, root)

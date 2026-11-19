@@ -91,11 +91,12 @@ class TestPages:
         assert sorted(site.mirror(source) for source in sources) == _pages()
 
     def test_front_matter_and_source_note(self) -> None:
-        """A page opens with its title and description, then names the guide to edit."""
+        """A page opens with its front matter: its title, its description and a YAML comment naming the guide to edit
+        (docs.page would show an MDX comment as text)."""
         for source in site.sources():
             text = site.mirror(source).read_text(encoding="utf-8")
             relative = source.relative_to(ROOT).as_posix()
-            match = re.match(r'---\ntitle: (".*")\ndescription: (".*")\n---\n\n\{/\* (.*) \*/\}\n\n# ', text)
+            match = re.match(r'---\ntitle: (".*")\ndescription: (".*")\n# (.*)\n---\n\n# ', text)
             assert match is not None, relative
             title, description, note = json.loads(match.group(1)), json.loads(match.group(2)), match.group(3)
             assert title == site.title(source.read_text(encoding="utf-8")), relative
@@ -138,12 +139,11 @@ class TestPages:
 
     @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
     def test_no_mdx_hazard(self, page: Path) -> None:
-        """Outside code, every ``<``, ``{`` and ``}`` is escaped, but for the page's one comment, ``{/* … */}``."""
+        """Outside code, no ``<`` (written ``&lt;``) and no unescaped ``{`` or ``}``: nothing MDX would read as JSX, an
+        expression or an HTML comment."""
         text = page.read_text(encoding="utf-8")
         body = _prose(text.split("\n---\n", 1)[1])
-        assert body.count("{/*") == 1
-        body = re.sub(r"\{/\*.*?\*/\}", "", body, count=1)
-        hazards = [line for line in body.split("\n") if re.search(r"(?<!\\)[<{}]", line)]
+        hazards = [line for line in body.split("\n") if re.search(r"<|(?<!\\)[{}]", line)]
         assert hazards == []
 
 
@@ -204,7 +204,7 @@ class TestConversion:
             ]
         )
         assert site.convert(text, DOCS / "querying.md").split("\n") == [
-            "Use `a < b` and ``x `{y}` z`` but not a \\< b or \\{c\\}: [m](/models).",
+            "Use `a < b` and ``x `{y}` z`` but not a &lt; b or \\{c\\}: [m](/models).",
             "```python",
             "x = {'a': 1} if a < b else fns[0](models.md)",
             "```",
@@ -219,13 +219,15 @@ class TestConversion:
 
     def test_a_code_span_never_crosses_a_blank_line(self) -> None:
         """A lone backtick does not open a span that would hide the next paragraph's hazards."""
-        assert site.convert("a ` b\n\nc <d", DOCS / "models.md") == "a ` b\n\nc \\<d"
+        assert site.convert("a ` b\n\nc <d", DOCS / "models.md") == "a ` b\n\nc &lt;d"
 
-    def test_escaped_characters_stay_escaped(self) -> None:
-        assert site.convert("\\{a\\} \\< b", DOCS / "models.md") == "\\{a\\} \\< b"
+    def test_escaped_characters(self) -> None:
+        """An escaped brace stays escaped; an escaped ``<`` becomes ``&lt;``, as docs.page would show ``\\&lt;``."""
+        assert site.convert("\\{a\\} \\< b <c", DOCS / "models.md") == "\\{a\\} &lt; b &lt;c"
 
-    def test_html_comment_becomes_an_mdx_comment(self) -> None:
-        assert site.convert("a <!-- note */ here --> b", DOCS / "models.md") == "a {/* note * / here */} b"
+    def test_html_comment_is_dropped(self) -> None:
+        """MDX refuses an HTML comment and GitHub does not show it: the page leaves it out."""
+        assert site.convert("a <!-- note\nhere --> b `<!-- kept -->`", DOCS / "models.md") == "a  b `<!-- kept -->`"
 
     def test_title_and_description(self) -> None:
         text = "# The `Q` guide\n\n> **Short** [summary](models.md) of `Q`.\n> Second line.\n\n## Part\n"
