@@ -71,6 +71,11 @@ class AliasOnly(BaseModel):
     first_name: str = Field(default="", alias="firstName")
 
 
+def _only(first_name: str) -> AliasOnly:
+    """An ``AliasOnly`` built by its alias, the only key its validation takes."""
+    return AliasOnly.model_validate({"firstName": first_name})
+
+
 class Choices(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     nick: str = Field(default="", validation_alias=AliasChoices("nickName", "handle"))
@@ -133,7 +138,18 @@ class StrictHolder(BaseSurrealModel):
     by_name: ProfName | None = None
 
 
-TABLES = ("sub_keys_holder", "sub_keys_path", "sub_keys_plain", "sub_keys_strict")
+class StrictAliases(BaseSurrealModel):
+    """A ``SCHEMAFULL`` table whose sub-models are written under aliases: ``define_table()`` declares those keys."""
+
+    model_config = SurrealConfigDict(table_name="sub_keys_strict_alias", schema_mode=SchemaMode.SCHEMAFULL)
+    id: str | None = None
+    alias_only: AliasOnly | None = None
+    by_alias: ProfAlias | None = None
+    unreadable: Unreadable | None = None
+    many: list[AliasOnly] = []
+
+
+TABLES = ("sub_keys_holder", "sub_keys_path", "sub_keys_plain", "sub_keys_strict", "sub_keys_strict_alias")
 
 
 async def _row(client: Any, table: str, key: str) -> dict[str, Any]:
@@ -159,6 +175,28 @@ class TestSubModelKeys:
         choices = _sub_keys.keys_of(Choices).fields["nick"]
         assert (choices.reads, choices.key) == (("nickName", "handle", "nick"), "nick")
         assert _sub_keys.keys_of(PathOnly).fields["x"].key is None
+
+    def test_ddl_declares_the_keys_the_orm_writes(self) -> None:
+        """``define_table()`` declares each sub-model field under the key a write sends: an alias read alone, a
+        ``serialize_by_alias`` dump, the read key of an unread ``serialization_alias``; plain sub-models by name."""
+        paths = {column.path for column in StrictAliases._table_columns()}
+        for path in (
+            ("alias_only", "firstName"),
+            ("by_alias", "firstName"),
+            ("by_alias", "homeAddr"),
+            ("by_alias", "homeAddr", "zip_code"),
+            ("by_alias", "metaData"),
+            ("unreadable", "fn"),
+            ("many", "*", "firstName"),
+        ):
+            assert path in paths, path
+        assert not {("alias_only", "first_name"), ("by_alias", "first_name"), ("unreadable", "first_name")} & paths
+        by_name = {column.path for column in StrictHolder._table_columns()}
+        assert {("by_name", "first_name"), ("by_name", "home_addr", "city_name")} <= by_name
+        assert {column.path for column in PlainHolder._table_columns()} >= {
+            ("profile", "first_name"),
+            ("items", "*", "home", "city"),
+        }
 
     def test_plain_sub_models_have_no_shape(self) -> None:
         assert _sub_keys.keys_of(Plain).plain
@@ -438,6 +476,31 @@ class TestSubModelKeysE2E:
             assert got.by_name == ProfName(first_name="Bob", home_addr=Addr(zip_code="2", city_name="Paris"))
 
     @pytest.mark.asyncio
+    async def test_a_schemafull_table_takes_the_keys_the_orm_writes(self) -> None:
+        """A sub-model read by alias only, or dumped by alias, on a ``SCHEMAFULL`` table the ORM defined: every write
+        lands in a declared column and reads back, on both lines (3.x refused it, 2.x dropped it without the DDL)."""
+        async with orm_client(*TABLES) as client:
+            await StrictAliases.define_table()
+            holder = await StrictAliases(
+                id="s",
+                alias_only=_only("Ann"),
+                by_alias=ProfAlias(first_name="Bo", home_addr=Addr(zip_code="1"), meta_data={"k": 1}),
+                unreadable=Unreadable(first_name="Cy"),
+                many=[_only("Di")],
+            ).save()
+            got = await StrictAliases.objects().get("s")
+            assert got.alias_only == _only("Ann") and got.many == [_only("Di")]
+            assert got.by_alias == ProfAlias(first_name="Bo", home_addr=Addr(zip_code="1"), meta_data={"k": 1})
+            assert got.unreadable == Unreadable(first_name="Cy")
+            row = await _row(client, "sub_keys_strict_alias", "s")
+            assert row["alias_only"] == {"firstName": "Ann"} and row["unreadable"] == {"fn": "Cy"}
+            await holder.merge(alias_only={"first_name": "Eve"}, by_alias={"homeAddr": {"cityName": "Lyon"}})
+            await StrictAliases.objects().filter(id="s").bulk_update(many=[{"firstName": "Fay"}])
+            got = await StrictAliases.objects().get("s")
+            assert got.alias_only == _only("Eve") and got.many == [_only("Fay")]
+            assert got.by_alias is not None and got.by_alias.home_addr == Addr(zip_code="1", city_name="Lyon")
+
+    @pytest.mark.asyncio
     async def test_plain_models_send_v0_22_2_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No alias on the sub-models: every write sends, encoded, the bytes v0.22.2 sent."""
         sent: dict[str, list[Any]] = {"create": [], "update": [], "merge": [], "query": []}
@@ -472,8 +535,8 @@ class TestSubModelKeysE2E:
 
 _SERVER_ROW = [
     "Sub-model keys in writes (aliases, `merge()`/`bulk_update()` dicts and instances)",
-    "same on both lines: each sub-field under the key `save()` writes, or else the first key a read takes; `merge()` "
-    "merges an object into the spelling stored",
+    "same on both lines: each sub-field under the key `save()` writes, else the first key a read takes, also in "
+    "`define_table()`; `merge()` keeps the stored spelling of an object",
     "same on both lines (measured on 3.3.5)",
     "v0.50.8",
 ]
@@ -493,5 +556,7 @@ class TestSubModelKeysDocs:
             "written as `save()`",
             "assign the field whole (`SET`)",
             "up to three such objects nested",
+            "`define_table()` (and `table_ddl()`) declares each sub-model field under that same key",
+            'A field read by its alias only (`Field(alias="firstName")`',
         ):
             assert text in part, text

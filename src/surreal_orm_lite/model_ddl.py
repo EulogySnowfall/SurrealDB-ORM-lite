@@ -49,6 +49,7 @@ from pydantic import BaseModel
 from pydantic.fields import ComputedFieldInfo, FieldInfo
 from pydantic_core import PydanticUndefined
 
+from . import _sub_keys
 from ._sdk import RecordID, SdkDuration, SdkRange
 from .define_parser import DefineParseError, Kind, KLiteral, KName, KObject, KTuple, KUnion, render_kind, scan_fragment
 from .geo import _ALL_KINDS, _geo_kinds, _GeoMarker, _ordered
@@ -93,8 +94,8 @@ class Column:
     """One column a model's table DDL defines (v0.34.0).
 
     ``path``: the unescaped segments, ``"*"`` for an array's items (``("address", "city")``, ``("subs", "*", "city")``,
-    ``("bag", "*")``); the first is the column of a top-level field (its alias when it has one), the others the field
-    names of a sub-model. ``field``: the Python name of the top-level field the column belongs to, for messages.
+    ``("bag", "*")``); the first is the column of a top-level field (its alias when it has one), the others the keys
+    the ORM writes a sub-model's fields under (their names, unless an alias decides, #218). ``field``: the Python name of the top-level field the column belongs to, for messages.
     ``kind``: the kind ``TYPE`` writes. ``free_object``: the kind holds a free-form object — a ``dict``, a record model,
     a sub-model where its fields are not defined — or is a sub-model with ``extra="allow"``, so a ``SCHEMAFULL`` table
     writes it ``FLEXIBLE``. ``flexible_requested``: the field is in ``flexible_fields`` or has
@@ -555,9 +556,15 @@ def _from_computed_info(
 
 
 def _sub_fields(model: str, field: str, base: tuple[str, ...], sub: type[BaseModel]) -> list[_Field]:
-    """A sub-model's fields (but ``Field(exclude=True)``), then its Pydantic computed fields, under *base*."""
+    """A sub-model's fields (but ``Field(exclude=True)``), then its Pydantic computed fields, under *base*.
+
+    Each field under the key the ORM writes it under (``_sub_keys.keys_of()``, #218): its name for a sub-model read
+    and written by name, else its alias (read alone, or dumped with ``serialize_by_alias``), or the first key a read
+    takes. A field no plain key reads (an ``AliasPath`` of several steps), which a write refuses, keeps its name.
+    """
+    keys = _sub_keys.keys_of(sub).fields
     fields = [
-        _from_field_info(model, field, (*base, name), info)
+        _from_field_info(model, field, (*base, keys[name].key or name), info)
         for name, info in sub.model_fields.items()
         if info.exclude is not True
     ]
@@ -638,7 +645,7 @@ def model_columns(
     field's name. Each column is followed by the item definition of each untyped array position (``bag.*``,
     ``lol.*.*``: kind ``any``, ``item=True``) and, for a sub-model ``M`` annotated ``M``, ``M | None``, ``list[M]`` or
     ``list[M] | None``, by the columns of its fields and computed fields (``address.city``, ``subs.*.city``) by the
-    same rules, depth first. ``M`` anywhere else, a record model and a sub-model already on the path are free-form
+    same rules, depth first, each field under the key the ORM writes it under (its name unless an alias decides, #218). ``M`` anywhere else, a record model and a sub-model already on the path are free-form
     objects without nested columns. A ``list[M]`` column is ``flexible_items`` when a column under it is written
     ``FLEXIBLE`` before SurrealDB 3.x (a free-form object, a ``FLEXIBLE`` request, a kind holding ``any``).
 
