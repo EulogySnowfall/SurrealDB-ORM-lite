@@ -4,14 +4,21 @@ write exclusion, and the write guards."""
 import contextlib
 import os
 import warnings
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Annotated, Any, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel as PydanticBaseModel
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, _client
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import Computed, SurrealFunc, _ComputedDefault, _ComputedMarker, computed
+from surreal_orm_lite.testing import embedded_database
+from surreal_orm_lite.time_travel import cached_major
+from surreal_orm_lite.utils import PLAIN_CONTENT, replace_content
+from tests._readme_tables import assert_server_header_sentence, assert_server_rows, guide
+from tests.conftest import orm_client
 
 
 class TestComputedType:
@@ -669,3 +676,184 @@ class TestComputedForwardReference:
     def test_subscript_accepts_a_forward_reference(self) -> None:
         """Computed["Foo"] must not raise — "Foo" | None would be a TypeError."""
         assert get_origin(Computed["SomeLaterType"]) is Annotated
+
+
+# --- a full replace of a typed VALUE field (#267) -------------------------------------------------
+
+
+class CfStamped(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cf_stamped")
+
+    id: str
+    name: str = ""
+    born: datetime | None = None
+    updated: Computed[datetime] = computed("time::now()")
+
+
+class CfCounter(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cf_counter")
+
+    id: str
+    name: str = ""
+    hits: Computed[int] = computed("($value OR 0) + 1")
+
+
+#: The definition of the issue (a ``generate_models_from_db()`` model's ``updated: Computed[datetime]``): a non-optional
+#: ``TYPE`` with a ``VALUE`` clause. ``born`` is a ``READONLY`` datetime, so a replace also keeps a stored datetime (#261).
+_CF_STAMPED_DDL = (
+    "DEFINE TABLE cf_stamped SCHEMAFULL;"
+    "DEFINE FIELD name ON cf_stamped TYPE string;"
+    "DEFINE FIELD born ON cf_stamped TYPE option<datetime> READONLY;"
+    "DEFINE FIELD updated ON cf_stamped TYPE datetime VALUE time::now();"
+)
+#: A ``VALUE`` that reads ``$value``: what the replace writes for the computed column is what it reads.
+_CF_COUNTER_DDL = (
+    "DEFINE TABLE cf_counter SCHEMAFULL;"
+    "DEFINE FIELD name ON cf_counter TYPE string;"
+    "DEFINE FIELD hits ON cf_counter TYPE option<int> VALUE ($value OR 0) + 1;"
+)
+
+
+@contextlib.asynccontextmanager
+async def _cf_engine(kind: str, ddl: str, table: str) -> AsyncIterator[Any]:
+    """*ddl* applied on the line under test (``ws``, *table* dropped before and after) or on a fresh ``mem://``."""
+    if kind == "mem":
+        async with embedded_database() as client:
+            await _client.query(client, ddl, {})
+            yield client
+        return
+    async with orm_client(table) as client:
+        await _client.query(client, ddl, {})
+        yield client
+
+
+async def _cf_replace(instance: BaseSurrealModel, write: str, tx: bool) -> None:
+    """``instance.update()`` or ``.upsert()``, directly or in a transaction (interactive on 3.x, buffered on 2.x)."""
+    if not tx:
+        await getattr(instance, write)()
+        return
+    async with SurrealDBConnectionManager.transaction() as transaction:
+        await getattr(instance, write)(tx=transaction)
+
+
+class TestReplaceTypedComputedFieldE2E:
+    """#267: ``update()``/``upsert()`` of a record whose ``Computed`` column has a non-optional ``TYPE`` and a ``VALUE``.
+
+    SurrealDB 2.x checked the column's ``TYPE`` against the ``NONE`` a replace that leaves it out gives, before its
+    ``VALUE`` ran, and refused the write. The ORM writes the stored value back there (``$this``), and the ``VALUE``
+    recomputes it; on 3.x, 4.x and ``mem://`` the column is left out, as before."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["update", "upsert"])
+    @pytest.mark.parametrize("tx", [False, True], ids=["direct", "tx"])
+    async def test_replace_recomputes_the_typed_value(self, kind: str, write: str, tx: bool) -> None:
+        async with _cf_engine(kind, _CF_STAMPED_DDL, "cf_stamped") as client:
+            born = datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
+            stamped = await CfStamped(id="ada", name="Ada", born=born).save()
+            first = stamped.updated
+            assert isinstance(first, datetime)
+            stamped.name = "Ada King"
+            await _cf_replace(stamped, write, tx)
+            row = (await _client.query(client, "SELECT * FROM ONLY cf_stamped:ada;", {})) or {}
+            assert row["name"] == "Ada King"
+            assert row["born"] == born
+            assert row["updated"] >= first
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_upsert_of_a_new_record_computes_the_value(self, kind: str) -> None:
+        async with _cf_engine(kind, _CF_STAMPED_DDL, "cf_stamped"):
+            stamped = await CfStamped(id="new", name="New").upsert()
+            assert isinstance(stamped.updated, datetime)
+
+    @pytest.mark.asyncio
+    async def test_merge_is_unaffected(self) -> None:
+        async with _cf_engine("ws", _CF_STAMPED_DDL, "cf_stamped"):
+            stamped = await CfStamped(id="ada", name="Ada").save()
+            first = stamped.updated
+            await stamped.merge(name="Ada Byron")
+            assert stamped.name == "Ada Byron"
+            assert stamped.updated is not None and first is not None and stamped.updated >= first
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("write", ["update", "upsert"])
+    async def test_a_value_reading_its_input_sees_the_stored_value_on_2x_only(self, write: str) -> None:
+        """What the line under test gives ``$value`` on a replace: the stored value on 2.x, ``NONE`` from 3.x on."""
+        async with _cf_engine("ws", _CF_COUNTER_DDL, "cf_counter") as client:
+            counter = await CfCounter(id="c", name="c").save()
+            assert counter.hits == 1
+            counter.name = "d"
+            await getattr(counter, write)()
+            await counter.refresh()
+            assert counter.hits == (2 if await cached_major(client) < 3 else 1)
+
+
+class TestReplaceStoredColumns:
+    """#267 (unit): the computed columns a replace writes back, and how :func:`replace_content` writes them."""
+
+    def test_a_stored_column_reads_this(self) -> None:
+        assert replace_content({"name": "Ada"}, stored=("updated",)) == (
+            "object::from_entries([[$c0, $c1], [$c2, $this[$c2]]])",
+            {"c0": "name", "c1": "Ada", "c2": "updated"},
+        )
+
+    def test_a_column_the_data_holds_is_written_as_sent(self) -> None:
+        assert replace_content({"name": "Ada"}, stored=("name",)) == (PLAIN_CONTENT, {"data": {"name": "Ada"}})
+
+    def test_no_stored_column_keeps_the_plain_content(self) -> None:
+        assert replace_content({"name": "Ada"}) == (PLAIN_CONTENT, {"data": {"name": "Ada"}})
+
+    def test_stored_columns_follow_the_kept_datetimes(self) -> None:
+        born = datetime(2026, 1, 2, tzinfo=UTC)
+        content, bound = replace_content({"born": born}, stored=("updated",))
+        assert content.endswith(", [$c2, $this[$c2]]])")
+        assert bound == {"c0": "born", "c1": born, "c2": "updated"}
+
+    @pytest.mark.asyncio
+    async def test_a_model_without_computed_fields_asks_no_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def refuse(*_: Any, **__: Any) -> Any:
+            raise AssertionError("no client")
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", refuse)
+        assert await Plain._replace_stored_columns() == ()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("version", "expected"), [("surrealdb-2.7.0", ("updated",)), ("surrealdb-3.3.5", ())])
+    async def test_computed_columns_on_2x_only(
+        self, monkeypatch: pytest.MonkeyPatch, version: str, expected: tuple[str, ...]
+    ) -> None:
+        class Client:
+            async def version(self) -> str:
+                return version
+
+        client = Client()
+
+        async def get_client(*_: Any, **__: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        assert await CfStamped._replace_stored_columns() == expected
+
+
+#: The 2.x/3.x row of #267 (its 4.x cell: "as 3.x").
+_REPLACE_ROW = [
+    "`update()`/`upsert()` of a `Computed` field with a non-optional `TYPE` and a `VALUE` (`TYPE datetime VALUE time::now()`)",
+    "the stored value is written back (`$this`), then recomputed; a `VALUE` reading `$value` sees it (#267)",
+    "left out, recomputed; a `VALUE` reading `$value` sees `NONE`",
+    "v0.50.8",
+]
+#: The sentence #267 adds to the 2.x/3.x table's intro paragraph.
+_HEADER_SENTENCE_267 = "The row added in v0.50.8 was measured on 2.7.0, 3.3.5, 4.0.1 and the embedded engine."
+
+
+class TestReplaceTypedComputedFieldDocs:
+    """Unit: the 2.x/3.x row and sentence of #267, and the guides no longer calling the replace refused on 2.x."""
+
+    def test_the_server_row_and_sentence(self) -> None:
+        assert_server_rows([_REPLACE_ROW])
+        assert_server_header_sentence(_HEADER_SENTENCE_267)
+
+    def test_the_guides_describe_the_write_back(self) -> None:
+        assert "SurrealDB 2.x also refuses, for now" not in guide("fields.md")
+        assert "**Full replace (`update()`, `upsert()`) on SurrealDB 2.x.**" in guide("models.md")
