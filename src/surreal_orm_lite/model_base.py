@@ -19,7 +19,7 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, PrivateAttr, TypeAdapter, model_validator
 from pydantic_core import PydanticUndefined, ValidationError
 
-from . import _client
+from . import _client, _sdk_values
 from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
@@ -3402,11 +3402,18 @@ class BaseSurrealModel(BaseModel):
                 Only ``*_or_create`` passes it: there the name came from the lookup or from
                 ``defaults``, and omitting it would create a row the same lookup cannot find.
                 A computed field listed here is still excluded.
+
+        **SDK values at untyped positions are kept** (#222). ``model_dump()`` turns the SDK's
+        ``Duration``, ``Range`` and geometries (dataclasses) into dicts of their fields wherever no
+        type is declared: an ``Any`` field, ``dict[str, Any]``, ``list[Any]``, an extra. A row loaded
+        with such values and written back would store those dicts instead.
+        :func:`~surreal_orm_lite._sdk_values.kept` puts each one back, walking the values, never the
+        annotations; a model without SDK values gets the dump itself, so its payload is unchanged.
         """
         excluded = {"id", *self.get_computed_fields()}
         if not replace:
             excluded |= self.get_server_fields() - set(keep)
-        return self._columns_for(self.model_dump(exclude=excluded))
+        return self._columns_for(_sdk_values.kept(self, self.model_dump(exclude=excluded)))
 
     @classmethod
     async def _replace_stored_columns(cls) -> tuple[str, ...]:
