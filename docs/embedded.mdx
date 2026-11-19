@@ -45,10 +45,10 @@ which one is configured.
 | Embedded URL                    | surreal-orm-lite (official SDK 3.0, `[embedded]`)                                        | Full SurrealDB-ORM       |
 | ------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------ |
 | `mem://`, `memory://`, `memory` | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
-| `surrealkv://<path>`            | ✅ on disk (SurrealKV)                                                                   | ❌                       |
-| `surrealkv+versioned://<path>`  | ✅ on disk, keeps history: time travel with `as_of()` (section 27)                       | ❌                       |
-| `file://<path>`                 | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
-| `rocksdb://<path>`              | ❌ not yet supported by the official SDK (#233): the ORM raises the SDK's refusal        | ❌                       |
+| <code>surrealkv://&lt;path&gt;</code>            | ✅ on disk (SurrealKV)                                                                   | ❌                       |
+| <code>surrealkv+versioned://&lt;path&gt;</code>  | ✅ on disk, keeps history: time travel with `as_of()` (section 27)                       | ❌                       |
+| <code>file://&lt;path&gt;</code>                 | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
+| <code>rocksdb://&lt;path&gt;</code>              | ❌ not yet supported by the official SDK (#233): the ORM raises the SDK's refusal        | ❌                       |
 
 A bare `memory` (no `://`) is accepted too (SDK 2.0.0 refused it). The engine is SurrealDB core
 **4.0.0**, bundled with SDK 3.0.0 (it was 2.3.10 with SDK 2.0.0): the ORM reads it as a 4.x server
@@ -207,11 +207,15 @@ assert await SurrealDBConnectionManager.info() is None  # anonymous: the in-proc
 
 ### Test fixtures
 
-`embedded_database()` runs a block against an isolated in-memory database (`mem://` by default,
-namespace and database `test`), then puts the previous connection back: its settings, stored
+<div>
+
+<code>embedded\_database()</code> runs a block against an isolated in-memory database (<code>mem://</code> by default,
+namespace and database <code>test</code>), then puts the previous connection back: its settings, stored
 session and engine. Blocks nest. It yields the block's SDK client for raw SurrealQL and DDL,
-valid **inside the block only**. Pass `surrealkv://<path>` for an on-disk database (with pytest,
-under `tmp_path`).
+valid **inside the block only**. Pass <code>surrealkv://&lt;path&gt;</code> for an on-disk database (with pytest,
+under <code>tmp\_path</code>).
+
+</div>
 
 `SurrealFixture` and `@fixture` declare model instances as test data: `load()` saves a fresh
 copy of each, in declaration order, yields them, and deletes them on exit. They work on any

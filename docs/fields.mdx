@@ -10,11 +10,15 @@ Rich field types (datetimes, durations, decimals, sets, ranges…) and geospatia
 
 ## 24. Rich field types
 
-Since v0.23.0 a model can declare `timedelta`, `date` and `set[X]`/`frozenset[X]` fields, and the
-ORM's own `Duration` and `Range[T]`: every write stores them as SurrealDB's native values and every
+<div>
+
+Since v0.23.0 a model can declare <code>timedelta</code>, <code>date</code> and <code>set\[X\]</code>/<code>frozenset\[X\]</code> fields, and the
+ORM's own <code>Duration</code> and <code>Range\[T\]</code>: every write stores them as SurrealDB's native values and every
 read returns the declared type, with the same behaviour on SurrealDB 2.x and 3.x (one exception:
-`TYPE set<…>` columns, see [Sets](#sets)). `datetime`, `Decimal`, `UUID` and `bytes` fields keep
+<code>TYPE set&lt;…&gt;</code> columns, see [Sets](#sets)). <code>datetime</code>, <code>Decimal</code>, <code>UUID</code> and <code>bytes</code> fields keep
 working as before.
+
+</div>
 
 ```python
 from datetime import UTC, date, datetime, timedelta
@@ -249,21 +253,29 @@ both lines.
 
 ### Sets
 
-`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.3 and 4.x a `TYPE set<…>`
+<div>
+
+<code>set\[X\]</code>/<code>frozenset\[X\]</code> fields are stored as arrays. On SurrealDB 3.3 and 4.x a <code>TYPE set&lt;…&gt;</code>
 column stores the array as a native set, which the field reads back as the declared set; a raw
-result (`raw_query()`, `QuerySet.query()`, a live or change-feed event's `raw`) holds it as a
-Python `set` (a `list` when an item is unhashable, or when two items are equal in Python, such as
-`1` and `True`). SurrealDB 2.x has no native set: the column is an array there, read as a `list`.
-SurrealDB 3.1 refuses an array in a `set<…>` column; to support 3.1, declare such columns
-`array<…>`, optionally with `VALUE $value.distinct()`:
+result (<code>raw\_query()</code>, <code>QuerySet.query()</code>, a live or change-feed event's <code>raw</code>) holds it as a
+Python <code>set</code> (a <code>list</code> when an item is unhashable, or when two items are equal in Python, such as
+<code>1</code> and <code>True</code>). SurrealDB 2.x has no native set: the column is an array there, read as a <code>list</code>.
+SurrealDB 3.1 refuses an array in a <code>set&lt;…&gt;</code> column; to support 3.1, declare such columns
+<code>array&lt;…&gt;</code>, optionally with <code>VALUE $value.distinct()</code>:
+
+</div>
 
 ```sql
 DEFINE FIELD tags ON subscription TYPE array<string> VALUE $value.distinct();
 ```
 
-On a schemaless or `array<…>` column the field reads back as the declared `set` or `frozenset`, on
+<div>
+
+On a schemaless or <code>array&lt;…&gt;</code> column the field reads back as the declared <code>set</code> or <code>frozenset</code>, on
 both lines. The array is sorted when its items can be ordered, so a set is written the same way
 every time.
+
+</div>
 
 ### `NULL` and open range sides
 
@@ -287,7 +299,7 @@ is sent, with a plain `ValueError` that says why, never re-wrapped in a `Surreal
 | An `int` outside the signed 64-bit range                                                  | `ValueError` (use `Decimal`) |
 | A `Range` side that is neither `BoundIncluded`/`BoundExcluded` nor an open side           | `ValueError`                 |
 | `id__in=Range(…)`, `id__not_in=Range(…)`, or the same on an edge's `in`/`out`             | `ValueError`                 |
-| `atomic_increment(field, <a duration>)`                                                   | `TypeError` (use `merge()`)  |
+| <code>atomic\_increment(field, &lt;a duration&gt;)</code>                                                   | `TypeError` (use `merge()`)  |
 | In a live filter, a negative or oversized duration, or a range bound with no literal form | `TypeError` from `live()`    |
 | A `Duration` or `Range` field given a value it does not accept                            | Pydantic's `ValidationError` |
 
@@ -370,7 +382,7 @@ and a native set included (see [Sets](#sets)):
 
 - a degenerate geometry reads as its GeoJSON `dict`;
 - a datetime before `0001-01-01T00:00:00Z` or after `9999-12-31T23:59:59.999999999Z` reads as its
-  RFC 3339 text, the one SurrealDB gives it (`<string>`): `"0000-06-01T00:00:00Z"`,
+  RFC 3339 text, the one SurrealDB gives it (<code>&lt;string&gt;</code>): `"0000-06-01T00:00:00Z"`,
   `"-0001-01-01T00:00:00Z"`, `"+10000-01-01T00:00:00.500Z"` (a sign and at least four digits outside
   years 0000-9999, every nanosecond kept). An untyped field, `raw_query()` and live notifications
   give that string; a `datetime` field refuses it with a `ValidationError` naming the field: `get()`
@@ -583,12 +595,16 @@ farthest_first[0].name                             # 'Paris Bistro'
 farthest_first[-1].name, farthest_first[-1].dist  # ('Food Truck', None): no location, last
 ```
 
-`annotate(<alias>=GeoDistance(field, point))` gives each instance the distance as an attribute
-named after the alias (`r.dist`): metres as a `float`, or `None` when the record's field is not a
-point. `order_by("dist")` sorts the nearest first, after the records without a point;
-`order_by("-dist")` sorts the farthest first and the records without a point last. The attribute is
-never written back: `model_dump()`, `update()` and `upsert()` ignore it. Rows that do not validate
-(a `select()` that omits a required field) come back as dicts carrying the alias.
+<div>
+
+<code>annotate(&lt;alias&gt;=GeoDistance(field, point))</code> gives each instance the distance as an attribute
+named after the alias (<code>r.dist</code>): metres as a <code>float</code>, or <code>None</code> when the record's field is not a
+point. <code>order\_by("dist")</code> sorts the nearest first, after the records without a point;
+<code>order\_by("-dist")</code> sorts the farthest first and the records without a point last. The attribute is
+never written back: <code>model\_dump()</code>, <code>update()</code> and <code>upsert()</code> ignore it. Rows that do not validate
+(a <code>select()</code> that omits a required field) come back as dicts carrying the alias.
+
+</div>
 
 The alias is a projection, not a column: `filter(dist__lt=500)` filters a stored column named
 `dist`, so bound the distance with `nearby()`. Choose an alias no record stores: on an
@@ -699,12 +715,16 @@ for restaurant in await Restaurant.objects().all():
     await restaurant.update()  # a location read from a GeoJSON object is written back as a native point
 ```
 
+<div>
+
 SurrealDB keeps a GeoJSON dict as a plain object, not a geometry: the full SurrealDB-ORM stores its
-geometry fields that way, and so does any client that writes GeoJSON dicts. `nearby()` skips such
-objects, `geo::*` functions and `geometry<…>` columns refuse them, and no SurrealQL cast turns them
+geometry fields that way, and so does any client that writes GeoJSON dicts. <code>nearby()</code> skips such
+objects, <code>geo::\*</code> functions and <code>geometry&lt;…&gt;</code> columns refuse them, and no SurrealQL cast turns them
 into geometries. A geometry field reads them (a GeoJSON object validates, in a read and in the row
-a write returns), and `update()` writes the instance back with a native geometry, so loading and
+a write returns), and <code>update()</code> writes the instance back with a native geometry, so loading and
 updating every record migrates a table.
+
+</div>
 
 ### Untyped fields
 
@@ -753,7 +773,7 @@ rewrites the whole row.
 - **Field values are geometry objects, not GeoJSON dicts.** `location.to_geojson()` gives the
   dict, `model_dump(mode="json")` writes GeoJSON, and a GeoJSON dict (or a `(longitude, latitude)`
   pair for points) is accepted as input, so full-ORM-shaped data keeps loading. SurrealDB keeps a
-  GeoJSON dict as a plain object, which `geo::*` functions and `geometry<…>` columns refuse; lite
+  GeoJSON dict as a plain object, which `geo::*` functions and <code>geometry&lt;…&gt;</code> columns refuse; lite
   stores a native geometry (see [Migrating stored GeoJSON](#migrating-stored-geojson)).
 - **`get_geo_info()` returns SurrealDB's kind names**: `"line"` for `LineStringField` (the full
   ORM: `"linestring"`), `"point|polygon"` for a union; `GeoField["linestring"]` is still accepted.

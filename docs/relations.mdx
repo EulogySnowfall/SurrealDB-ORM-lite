@@ -590,7 +590,7 @@ print(await Follows.define_relation())
   with `define_table()`, not `define_relation()`: `define_relation()` defines no field, so it raises `SurrealDbError`
   before any request, and `define_table()` applies the same relation statement, then the data fields
   ([section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)).
-- SurrealDB rewrites the `in` and `out` field definitions from `IN` and `OUT` (`TYPE record<person>`): an `ASSERT`
+- SurrealDB rewrites the `in` and `out` field definitions from `IN` and `OUT` (<code>TYPE record&lt;person&gt;</code>): an `ASSERT`
   written on them by hand is lost. Declare the tables with `relation_in` and `relation_out` instead.
 - Why not `ALTER TABLE`, which keeps the other clauses too: on SurrealDB 2.x and the embedded engine, a raw
   `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced until a `DEFINE TABLE OVERWRITE` of
@@ -679,7 +679,7 @@ print(edge.in_, edge.out)
 
 - `overwrite=False` removes nothing: `IF NOT EXISTS` leaves a relation table as it is.
 - Turning the table back into `TYPE ANY` is not offered, and it does not lift the constraint: SurrealDB keeps the
-  `in` and `out` field definitions (`TYPE record<person>`) through `ALTER TABLE … TYPE ANY` and
+  `in` and `out` field definitions (<code>TYPE record&lt;person&gt;</code>) through `ALTER TABLE … TYPE ANY` and
   `DEFINE TABLE OVERWRITE … TYPE ANY`, on every line. With raw SurrealQL,
   `REMOVE FIELD in ON likes; REMOVE FIELD out ON likes;` drops them.
 - `REMOVE TABLE likes` removes the table and its edges. `remove_relation()` deletes edges, not the constraint.
@@ -709,7 +709,7 @@ print(edge.in_, edge.out)
 
 - `define_relation()` is the same on every line and on the embedded engine: one `INFO FOR DB`, one
   `DEFINE TABLE OVERWRITE`, enforced at once.
-- The wording of the server's refusals differs: `Found … but expected a record<…>` on 2.x and the embedded engine,
+- The wording of the server's refusals differs: <code>Found … but expected a record&lt;…&gt;</code> on 2.x and the embedded engine,
   `Couldn't coerce value for field …` on 3.x.
 - An endpoint both outside `IN`/`OUT` and missing, on an `ENFORCED` table, raises `SurrealDbNotFoundError` on 2.x and
   the embedded engine (the server reports it missing) and `SurrealDbError` on 3.x. `SurrealDbNotFoundError` is a

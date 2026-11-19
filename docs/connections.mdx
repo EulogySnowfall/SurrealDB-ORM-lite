@@ -251,7 +251,7 @@ What the ORM cannot see, and you keep on one connection yourself:
   `transaction()` is cancelled when its block ends, with nothing committed (`SurrealDbConnectionError`: open it
   again). After `remove_connection()`, a call already under way on the name opens no new client on the old settings:
   one still waiting for the embedded engine while another thread held it raises `ValueError`
-  (`Connection not been set ('<name>').`). A client you obtained yourself with `get_client()` before the change is
+  (<code>Connection not been set ('&lt;name&gt;').</code>). A client you obtained yourself with `get_client()` before the change is
   yours: on WebSocket its socket is closed and its next request fails; an HTTP client keeps the namespace and database
   it was opened on, so call `get_client()` again; an embedded client is the connection's one in-process session: it
   follows a new namespace or database at the ORM's next call, but after a new URL or `remove_connection()` it is the
@@ -292,13 +292,17 @@ when it is awaited, and a context manager (`transaction()`, `ephemeral_client()`
 by `async with` (strictly, when it is called), so both act on the connection of the `using()`
 block they are written in.
 
+<div>
+
 A manager method you replace by hand, in a test for instance, is inherited by every connection, so
 it intercepts the calls of every connection. Save what the class body holds,
-`vars(SurrealDBConnectionManager)[name]`, and put that back: pytest's `monkeypatch.setattr()` and
-`unittest.mock.patch.object()` already do. Saving `SurrealDBConnectionManager.<name>` instead, which
-worked while there was one connection, saves a method bound to `SurrealDBConnectionManager`: put
+<code>vars(SurrealDBConnectionManager)\[name\]</code>, and put that back: pytest's <code>monkeypatch.setattr()</code> and
+<code>unittest.mock.patch.object()</code> already do. Saving <code>SurrealDBConnectionManager.&lt;name&gt;</code> instead, which
+worked while there was one connection, saves a method bound to <code>SurrealDBConnectionManager</code>: put
 back, it is what every connection inherits, and it acts on the current connection, so a model with
-a `connection` key reads and writes the current connection's database, with no error.
+a <code>connection</code> key reads and writes the current connection's database, with no error.
+
+</div>
 
 ```python
 async def offline():

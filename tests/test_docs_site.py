@@ -55,6 +55,16 @@ def _prose(text: str) -> str:
     return re.sub(r"(`+)(?!`).*?(?<!`)\1(?!`)", "", text, flags=re.DOTALL)
 
 
+def _code_spans(text: str) -> list[str]:
+    """The inline code spans of *text*, a page, outside its fenced blocks, one block (between blank lines) at a time."""
+    text = re.sub(r"^ *(`{3,}|~{3,}).*?^ *\1[ \t]*$", "", text, flags=re.MULTILINE | re.DOTALL)
+    return [
+        match.group(0)
+        for block in re.split(r"\n[ \t]*\n", text)
+        for match in re.finditer(r"(`+)(?!`).*?(?<!`)\1(?!`)", block, flags=re.DOTALL)
+    ]
+
+
 def _links(text: str) -> list[str]:
     return re.findall(r"\]\(([^)\s]+)\)", _prose(text))
 
@@ -140,11 +150,31 @@ class TestPages:
     @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
     def test_no_mdx_hazard(self, page: Path) -> None:
         """Outside code, no ``<`` (written ``&lt;``) and no unescaped ``{`` or ``}``: nothing MDX would read as JSX, an
-        expression or an HTML comment."""
+        expression or an HTML comment. The only tags are the generated ``<code>`` elements, whose text is escaped
+        too, and the ``<div>`` lines around a paragraph holding one."""
         text = page.read_text(encoding="utf-8")
         body = _prose(text.split("\n---\n", 1)[1])
-        hazards = [line for line in body.split("\n") if re.search(r"<|(?<!\\)[{}]", line)]
+        elements = re.findall(r"<code>(.*?)</code>", body)
+        assert [element for element in elements if re.search(r"<|(?<!\\)[{}]", element)] == []
+        body = re.sub(r"<code>.*?</code>", "", body)
+        hazards = [line for line in body.split("\n") if line not in ("<div>", "</div>") and re.search(r"<|(?<!\\)[{}]", line)]
         assert hazards == []
+
+    @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
+    def test_no_less_than_in_a_code_span(self, page: Path) -> None:
+        """No code span of a page holds a ``<``: docs.page turns one that starts no tag into ``&lt;`` before parsing,
+        and a code span shows that entity as written (``surrealdb[pydantic]>=3.0.0,&lt;4.0.0``). The guide's span is a
+        ``<code>`` element in the page."""
+        text = page.read_text(encoding="utf-8").split("\n---\n", 1)[1]
+        assert [span for span in _code_spans(text) if "<" in span] == []
+
+    def test_a_less_than_sign_in_code_is_an_element(self) -> None:
+        """The guides' code spans holding a ``<`` reach the pages as ``<code>`` elements showing the same text."""
+        guide = (DOCS / "getting-started.md").read_text(encoding="utf-8")
+        page = (DOCS / "getting-started.mdx").read_text(encoding="utf-8")
+        assert "`surrealdb[pydantic]>=3.0.0,<4.0.0`" in guide
+        assert "<code>surrealdb\\[pydantic\\]&gt;=3.0.0,&lt;4.0.0</code>" in page
+        assert '<code>pip install "surreal-orm-lite&lt;0.50"</code>' in page
 
 
 class TestDocsJson:
@@ -190,7 +220,7 @@ class TestConversion:
         is converted."""
         text = "\n".join(
             [
-                "Use `a < b` and ``x `{y}` z`` but not a < b or {c}: [m](models.md).",
+                "Use `a > b` and ``x `{y}` z`` but not a < b or {c}: [m](models.md).",
                 "```python",
                 "x = {'a': 1} if a < b else fns[0](models.md)",
                 "```",
@@ -204,7 +234,7 @@ class TestConversion:
             ]
         )
         assert site.convert(text, DOCS / "querying.md").split("\n") == [
-            "Use `a < b` and ``x `{y}` z`` but not a &lt; b or \\{c\\}: [m](/models).",
+            "Use `a > b` and ``x `{y}` z`` but not a &lt; b or \\{c\\}: [m](/models).",
             "```python",
             "x = {'a': 1} if a < b else fns[0](models.md)",
             "```",
@@ -217,6 +247,62 @@ class TestConversion:
             "after \\{d\\}",
         ]
 
+    def test_code_with_a_less_than_sign(self) -> None:
+        """A code span holding a ``<`` becomes a ``<code>`` element with its text escaped; a paragraph holding one is
+        wrapped in a ``<div>`` (with all its code spans as elements), a list, a table or a quote is not."""
+        text = "\n".join(
+            [
+                'Pin `pip install "x<0.50"` and `a_b`: [m](models.md).',
+                "",
+                "- Use `a<4` or `b`, and `x <",
+                "  y` across lines",
+                "",
+                "| `<\\|K\\|>` | `c` |",
+                "",
+                "> `{a} & <b>` `` `<t>` ``",
+                "",
+                "```",
+                "a < b",
+                "```",
+                "Run `` DEFINE `<t>` `` now.",
+                "",
+            ]
+        )
+        assert site.convert(text, DOCS / "querying.md").split("\n") == [
+            "<div>",
+            "",
+            'Pin <code>pip install "x&lt;0.50"</code> and <code>a\\_b</code>: [m](/models).',
+            "",
+            "</div>",
+            "",
+            "- Use <code>a&lt;4</code> or `b`, and <code>x &lt; y</code> across lines",
+            "",
+            "| <code>&lt;\\|K\\|&gt;</code> | `c` |",
+            "",
+            "> <code>\\{a\\} &amp; &lt;b&gt;</code> <code>\\`&lt;t&gt;\\`</code>",
+            "",
+            "```",
+            "a < b",
+            "```",
+            "<div>",
+            "",
+            "Run <code>DEFINE \\`&lt;t&gt;\\`</code> now.",
+            "",
+            "</div>",
+            "",
+        ]
+
+    def test_code_element(self) -> None:
+        """Markdown's markup is backslash-escaped (docs.page reads a ``<div>`` as HTML first, which would decode an
+        entity), ``<``, ``>`` and ``&`` are entities, and ``\\|`` is a ``|`` in a table row only."""
+        assert site.code_element("`*a* _b_ [c] ~d~ \\ <e> & {f}`") == (
+            "<code>\\*a\\* \\_b\\_ \\[c\\] \\~d\\~ \\\\ &lt;e&gt; &amp; \\{f\\}</code>"
+        )
+        assert site.code_element("`a\\|b`") == "<code>a\\\\\\|b</code>"
+        assert site.code_element("`a\\|b`", row=True) == "<code>a\\|b</code>"
+        assert site.code_element("``  `x`  ``") == "<code> \\`x\\` </code>"
+        assert site.code_element("`  `") == "<code>  </code>"
+
     def test_a_code_span_never_crosses_a_blank_line(self) -> None:
         """A lone backtick does not open a span that would hide the next paragraph's hazards."""
         assert site.convert("a ` b\n\nc <d", DOCS / "models.md") == "a ` b\n\nc &lt;d"
@@ -227,7 +313,9 @@ class TestConversion:
 
     def test_html_comment_is_dropped(self) -> None:
         """MDX refuses an HTML comment and GitHub does not show it: the page leaves it out."""
-        assert site.convert("a <!-- note\nhere --> b `<!-- kept -->`", DOCS / "models.md") == "a  b `<!-- kept -->`"
+        assert site.convert("a <!-- note\nhere --> b `<!-- kept -->`", DOCS / "models.md") == (
+            "<div>\n\na  b <code>&lt;!-- kept --&gt;</code>\n\n</div>"
+        )
 
     def test_title_and_description(self) -> None:
         text = "# The `Q` guide\n\n> **Short** [summary](models.md) of `Q`.\n> Second line.\n\n## Part\n"

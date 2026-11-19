@@ -150,20 +150,24 @@ trampling each other — the footgun that makes section 18's `signin()` unsuitab
 Pass `bind=True` to _also_ adopt the token process-wide (handy in a script or notebook, wrong in
 a concurrent server).
 
-The model must declare either an `id` field or a `primary_key`, as every ORM model must. Prefer
-`id` here so the server mints the record id during SIGNUP; configure `primary_key` when identity
+<div>
+
+The model must declare either an <code>id</code> field or a <code>primary\_key</code>, as every ORM model must. Prefer
+<code>id</code> here so the server mints the record id during SIGNUP; configure <code>primary\_key</code> when identity
 _is_ a column, and the SIGNUP clause sets the record id from it to match
-(`CREATE User SET id = $email, email = $email, …`): the same statement on SurrealDB 2.x, 3.x and the embedded engine,
-and the record id is the key on all of them. A key that is `None`, or a float that is not an integer in
-[-2\*\*63, 2\*\*63) (`1.5`, NaN, inf, `1e19`: SurrealDB 2.x would truncate `1.5` to `<table>:1` and saturate `1e19` to
-`<table>:9223372036854775807`, 3.x refuses both), makes `signup()` raise `ValueError` before the exchange; an integral
-float within that range, such as `2.0`, creates `<table>:2`.
+(<code>CREATE User SET id = $email, email = $email, …</code>): the same statement on SurrealDB 2.x, 3.x and the embedded engine,
+and the record id is the key on all of them. A key that is <code>None</code>, or a float that is not an integer in
+[-2\*\*63, 2\*\*63) (<code>1.5</code>, NaN, inf, <code>1e19</code>: SurrealDB 2.x would truncate <code>1.5</code> to <code>&lt;table&gt;:1</code> and saturate <code>1e19</code> to
+<code>&lt;table&gt;:9223372036854775807</code>, 3.x refuses both), makes <code>signup()</code> raise <code>ValueError</code> before the exchange; an integral
+float within that range, such as <code>2.0</code>, creates <code>&lt;table&gt;:2</code>.
+
+</div>
 
 ### Configuration
 
 | Key                     | Default          | Purpose                                      |
 | ----------------------- | ---------------- | -------------------------------------------- |
-| `access_name`           | `<table>_access` | Name of the `DEFINE ACCESS` method           |
+| `access_name`           | <code>&lt;table&gt;\_access</code> | Name of the `DEFINE ACCESS` method           |
 | `identifier_field`      | `email`          | Field a user signs in with                   |
 | `password_field`        | `password`       | Field holding the password hash              |
 | `auth_algorithm`        | `argon2`         | `argon2` / `bcrypt` / `pbkdf2` / `scrypt`    |
