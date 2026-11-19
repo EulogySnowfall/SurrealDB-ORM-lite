@@ -138,11 +138,15 @@ player = await Player(id="ada", first_name="Ada", last_name="Lovelace").save()
 player.full_name        # "Ada Lovelace" — computed by the server, not by Python
 ```
 
-`Computed[T]` is the annotation and makes the field `T | None` defaulting to `None`, so an
-instance is constructible before the server has ever computed it; `computed("<expr>")` is the
-default and carries the expression, which may be a plain string or a `SurrealFunc`. The two are
-split — rather than one dual-use name — so that `player.full_name` resolves to `str | None`
-under mypy and pyright, the same shape as SQLAlchemy's `Mapped[T] = mapped_column(...)`.
+<div>
+
+<code>Computed\[T\]</code> is the annotation and makes the field <code>T \| None</code> defaulting to <code>None</code>, so an
+instance is constructible before the server has ever computed it; <code>computed("&lt;expr&gt;")</code> is the
+default and carries the expression, which may be a plain string or a <code>SurrealFunc</code>. The two are
+split — rather than one dual-use name — so that <code>player.full\_name</code> resolves to <code>str \| None</code>
+under mypy and pyright, the same shape as SQLAlchemy's <code>Mapped\[T\] = mapped\_column(...)</code>.
+
+</div>
 
 **Applying the schema.** `define_computed_fields()` is idempotent — call it at start-up:
 
@@ -190,9 +194,13 @@ a model with computed fields. One difference remains: an expression that reads `
 stored value on 2.x and `NONE` on 3.x, so `VALUE ($value OR 0) + 1` counts the replaces on 2.x
 only. Keep such an expression for `merge()`, or don't read `$value` in it.
 
-Since v0.34.0, `define_table()` ([section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)) writes a computed field's `TYPE` too
-(`TYPE option<T> VALUE …`), checks its expression, and keeps a field the database defines `COMPUTED` (SurrealDB 3.x)
-`COMPUTED`; `define_computed_fields()` turns such a field into `VALUE`.
+<div>
+
+Since v0.34.0, <code>define\_table()</code> ([section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)) writes a computed field's <code>TYPE</code> too
+(<code>TYPE option&lt;T&gt; VALUE …</code>), checks its expression, and keeps a field the database defines <code>COMPUTED</code> (SurrealDB 3.x)
+<code>COMPUTED</code>; <code>define\_computed\_fields()</code> turns such a field into <code>VALUE</code>.
+
+</div>
 
 ## 20. Field aliases, `server_fields` and `merge(refresh=False)`
 
@@ -281,17 +289,21 @@ every write and on both server lines:
   `Field(validation_alias="fn", serialization_alias="firstName")` stores `fn`. A field read only through an `AliasPath`
   of several steps has no such key, and writing it raises `ValueError`.
 
-`define_table()` (and `table_ddl()`) declares each sub-model field under that same key, so a `SCHEMAFULL` table the ORM
-defined takes every sub-model write on both lines. A `RootModel` is stored as its root (`RootModel[list[Profile]]` is an
-array of profiles, declared as one), and a sub-model in a fixed tuple of different types (`tuple[Profile, int]`) is a
-free-form object there. Earlier versions stored the two cases of the second rule under the dumped key (`first_name`
-where `firstName` is now stored, `firstName` where `fn` is): rows written then keep that key, which a read skips, until
-the field is written again. A nested path in a query names the stored key (`filter(**{"profile.firstName": …})`), and a
-table defined by an earlier version gets the new sub-field definitions from `define_table()` (the old ones stay until
-you remove them). A generated migration proposes that removal: `makemigrations()` adds the new definitions, names the
-old ones in a warning and writes their `DropField` with `drop_missing=True` (`--drop-missing`). Values under an old key
+<div>
+
+<code>define\_table()</code> (and <code>table\_ddl()</code>) declares each sub-model field under that same key, so a <code>SCHEMAFULL</code> table the ORM
+defined takes every sub-model write on both lines. A <code>RootModel</code> is stored as its root (<code>RootModel\[list\[Profile\]\]</code> is an
+array of profiles, declared as one), and a sub-model in a fixed tuple of different types (<code>tuple\[Profile, int\]</code>) is a
+free-form object there. Earlier versions stored the two cases of the second rule under the dumped key (<code>first\_name</code>
+where <code>firstName</code> is now stored, <code>firstName</code> where <code>fn</code> is): rows written then keep that key, which a read skips, until
+the field is written again. A nested path in a query names the stored key (<code>filter(\*\*\{"profile.firstName": …\})</code>), and a
+table defined by an earlier version gets the new sub-field definitions from <code>define\_table()</code> (the old ones stay until
+you remove them). A generated migration proposes that removal: <code>makemigrations()</code> adds the new definitions, names the
+old ones in a warning and writes their <code>DropField</code> with <code>drop\_missing=True</code> (<code>--drop-missing</code>). Values under an old key
 can be copied first with a raw
-`UPDATE <table> SET p.firstName = p.first_name WHERE p.first_name != NONE AND p.firstName = NONE` before applying it.
+<code>UPDATE &lt;table&gt; SET p.firstName = p.first\_name WHERE p.first\_name != NONE AND p.firstName = NONE</code> before applying it.
+
+</div>
 
 Keyword writes follow the same rule:
 

@@ -245,23 +245,31 @@ server and applies each migration atomically too
 
 #### SurrealDB 4.x: changing a field on a populated table
 
-SurrealDB 4.x creates its databases at compatibility level 4. At that level, on a `SCHEMAFULL` table that holds rows,
+<div>
+
+SurrealDB 4.x creates its databases at compatibility level 4. At that level, on a <code>SCHEMAFULL</code> table that holds rows,
 a field can only be redefined with a type that accepts every value the old type accepted, and a new field must accept
-`NONE`: from `int`, `AlterField` to `"string"` is refused, to `"int | string"` or `"option<int>"` accepted;
-`AddField` of a `"string"` field is refused, of an `"option<string>"` one accepted; `DEFAULT`, `DEFAULT ALWAYS` and
-`VALUE` do not change that. Empty tables, `SCHEMALESS` tables and databases defined `COMPATIBILITY 3` are not subject
+<code>NONE</code>: from <code>int</code>, <code>AlterField</code> to <code>"string"</code> is refused, to <code>"int \| string"</code> or <code>"option&lt;int&gt;"</code> accepted;
+<code>AddField</code> of a <code>"string"</code> field is refused, of an <code>"option&lt;string&gt;"</code> one accepted; <code>DEFAULT</code>, <code>DEFAULT ALWAYS</code> and
+<code>VALUE</code> do not change that. Empty tables, <code>SCHEMALESS</code> tables and databases defined <code>COMPATIBILITY 3</code> are not subject
 to the rule, and SurrealDB 2.x and 3.x apply every such change. The embedded engine follows the rule too.
 
-`migrate()` and `rollback()` raise `FieldChangeRefusedError` for such a change: refused inside the migration's
+</div>
+
+<div>
+
+<code>migrate()</code> and <code>rollback()</code> raise <code>FieldChangeRefusedError</code> for such a change: refused inside the migration's
 transaction, before the field change runs; nothing is applied (the analyzers committed first are restored, as for any
-other refusal). It is a `MigrationStatementError` exported from `surreal_orm_lite.migrations`; its `table` and `field`
-attributes name the field (its dotted path for a nested one), next to `migration`, `operation`, `description` and
-`analyzers_restored`. The check is one `SELECT` of a row of the table, its name bound, inside the migration's
-transaction. A change the ORM cannot judge (`array<int>` to `array<string>`, `record<a>` to `record<b>`, a `number`
-field redefined as `int | float | decimal`) is left to the server, whose refusal raises the same error. A `RawSQL`
-whose own `DEFINE FIELD` the server refuses stays a `MigrationStatementError` carrying the server's reason, and
-`define_table(overwrite=True)` and the other schema-sync paths keep the server's refusal: change such a field with a
+other refusal). It is a <code>MigrationStatementError</code> exported from <code>surreal\_orm\_lite.migrations</code>; its <code>table</code> and <code>field</code>
+attributes name the field (its dotted path for a nested one), next to <code>migration</code>, <code>operation</code>, <code>description</code> and
+<code>analyzers\_restored</code>. The check is one <code>SELECT</code> of a row of the table, its name bound, inside the migration's
+transaction. A change the ORM cannot judge (<code>array&lt;int&gt;</code> to <code>array&lt;string&gt;</code>, <code>record&lt;a&gt;</code> to <code>record&lt;b&gt;</code>, a <code>number</code>
+field redefined as <code>int \| float \| decimal</code>) is left to the server, whose refusal raises the same error. A <code>RawSQL</code>
+whose own <code>DEFINE FIELD</code> the server refuses stays a <code>MigrationStatementError</code> carrying the server's reason, and
+<code>define\_table(overwrite=True)</code> and the other schema-sync paths keep the server's refusal: change such a field with a
 migration.
+
+</div>
 
 Write the change as a `RawSQL` that converts the existing rows, with `state_operations` describing the result. With
 SurrealDB 4.x's own clause (its text is 4.x-only, a parse error on 2.x and 3.x: keep such a migration for 4.x
@@ -359,7 +367,7 @@ A `MigrateRows` operation that writes `MIGRATE EXISTING ROWS` for you is planned
   schema transaction, where the full ORM runs them in position; a data step that reads a field a later operation of the
   same migration removes goes in a migration of its own.
 - **Targets are names**: an unknown `migrate()` or `rollback()` target raises `ValueError`, where the full ORM compares
-  names as strings (`n <= target`, `name > target`).
+  names as strings (<code>n &lt;= target</code>, `name > target`).
 - **`split_destructive()` partitions on removals**: a `RawSQL` without `reverse_sql` or a `RebuildIndex` stays in the
   first list, where the full ORM's partition on `reversible` puts it in the second.
 - **The current state**: `makemigrations()` reads the database and replays the migration files it has not applied on

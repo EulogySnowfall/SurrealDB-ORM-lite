@@ -19,6 +19,10 @@ A mirror is the guide's text with:
 - the characters MDX reads as JSX or expressions escaped outside code: ``<`` as ``&lt;`` (docs.page turns a ``<`` that
   starts no tag into ``&lt;`` before parsing, so ``\<`` would show its backslash), ``{`` and ``}`` as ``\{`` and ``\}``;
   an HTML comment, which MDX refuses and GitHub does not show, is dropped.
+- a code span holding a ``<`` written as a ``<code>`` element whose text is escaped (``&lt;``, ``&#123;``…): docs.page
+  turns that ``<`` into ``&lt;`` before parsing and a code span shows the entity as written, where the element's text
+  decodes it. docs.page cuts a paragraph around such an element into several, so a paragraph holding one (not a list,
+  a table or a quote, which docs.page renders whole) is wrapped in a ``<div>``, which it renders whole.
 
 Usage:
     python scripts/sync_docs_site.py          # Check only (exit 1 if a mirror is missing, stale or orphaned)
@@ -57,6 +61,9 @@ _TOKEN = re.compile(
     r"<!--(?P<comment>[\s\S]*?)-->|\]\((?P<target>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\)|(?P<char>\\?<|(?<!\\)[{}])"
 )
 _SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*:")
+#: A block that starts a paragraph at the margin: not indented (a list item's text), not a list item, a table, a quote,
+#: a heading or a thematic break.
+_PARAGRAPH = re.compile(r"(?![ \t]|(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|[|>#]|(?:[-*_][ \t]*){3,}$)\S")
 
 
 def docs_dir(root: Path = ROOT) -> Path:
@@ -107,19 +114,50 @@ def _code_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _outside_code(text: str, change: Callable[[str], str]) -> str:
-    """*text* with *change* applied to each part outside its code spans."""
+def _outside_code(text: str, change: Callable[[str], str], every: bool = False) -> str:
+    """*text* with *change* applied to each part outside its code spans, and each code span that holds a ``<`` (every
+    code span if *every*) written as a ``<code>`` element (:func:`code_element`)."""
     out = []
     position = 0
     for start, end in _code_spans(text):
-        out += [change(text[position:start]), text[start:end]]
+        span = text[start:end]
+        row = text[text.rfind("\n", 0, start) + 1 :].lstrip().startswith("|")
+        out += [change(text[position:start]), code_element(span, row) if every or "<" in span else span]
         position = end
     out.append(change(text[position:]))
     return "".join(out)
 
 
+#: How a ``<code>`` element's text writes a character MDX or Markdown would read: ``<``, ``>`` and ``&`` as entities,
+#: an expression's braces and Markdown's markup (emphasis, code, links, a table's ``|``, an escape) with a backslash.
+#: docs.page reads a ``<div>``'s text as HTML (which decodes an entity) before it reads it as Markdown, and only the
+#: entities of ``<``, ``>`` and ``&`` come back from that reading.
+_CODE_ESCAPES = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    **{char: "\\" + char for char in "{}*_`[]\\|~"},
+}
+
+
+def code_element(span: str, row: bool = False) -> str:
+    """The code span *span* (its backticks included) as a ``<code>`` element showing the same text on docs.page.
+
+    The span's text is read as GitHub reads it: in a table *row*, ``\\|`` is a ``|``; line endings (and the next
+    line's indentation or quote markers) become one space, and one space is stripped from each end when both ends
+    have one. Every character MDX or Markdown would read is then escaped (:data:`_CODE_ESCAPES`)."""
+    ticks = len(span) - len(span.lstrip("`"))
+    text = re.sub(r"[ \t]*\n[ \t>]*", " ", span[ticks:-ticks])
+    if row:
+        text = text.replace("\\|", "|")
+    if len(text) > 1 and text[0] == text[-1] == " " and text.strip(" "):
+        text = text[1:-1]
+    return "<code>" + "".join(_CODE_ESCAPES.get(char, char) for char in text) + "</code>"
+
+
 def _escape(text: str) -> str:
-    """*text* with every ``<``, ``{`` and ``}`` outside code escaped as a page writes them (:func:`_escaped`)."""
+    """*text* with every ``<``, ``{`` and ``}`` outside code escaped as a page writes them (:func:`_escaped`), and its
+    code spans that hold a ``<`` written as elements."""
     return _outside_code(text, lambda part: re.sub(r"\\?<|(?<!\\)[{}]", _escaped, part))
 
 
@@ -240,8 +278,9 @@ class _Site:
             return GITHUB_TREE + relative + "/" + hash_ + fragment
         return GITHUB_BLOB + relative + hash_ + fragment
 
-    def paragraph(self, text: str, here: Path) -> str:
-        """*text*, one block of prose, with its links rewritten and its MDX hazards escaped outside its code spans."""
+    def paragraph(self, text: str, here: Path, every: bool = False) -> str:
+        """*text*, one block of prose, with its links rewritten and its MDX hazards escaped outside its code spans; a
+        code span holding a ``<`` (every code span if *every*) is written as a ``<code>`` element."""
 
         def token(match: re.Match[str]) -> str:
             if match.group("comment") is not None:
@@ -250,14 +289,27 @@ class _Site:
                 return f"]({self.target(match.group('target'), here)}{match.group('title') or ''})"
             return _escaped(match)
 
-        return _outside_code(text, lambda part: _TOKEN.sub(token, part))
+        return _outside_code(text, lambda part: _TOKEN.sub(token, part), every)
 
     def prose(self, text: str, here: Path) -> str:
         """*text*, a run of lines outside fenced blocks, converted block by block: a code span never crosses a blank
         line."""
         return "".join(
-            piece if index % 2 else self.paragraph(piece, here) for index, piece in enumerate(re.split(r"(\n[ \t]*\n)", text))
+            piece if index % 2 else self.block(piece, here) for index, piece in enumerate(re.split(r"(\n[ \t]*\n)", text))
         )
+
+    def block(self, text: str, here: Path) -> str:
+        """*text*, one block between blank lines, converted; a paragraph holding a ``<code>`` element is wrapped in a
+        ``<div>`` (docs.page would cut the paragraph around the element). docs.page reads a ``<div>`` as HTML before
+        it reads the Markdown inside, which would turn an ``&lt;`` of a code span into ``&#x3C;``: every code span of a
+        wrapped paragraph is an element."""
+        converted = self.paragraph(text, here)
+        if "<code>" not in converted or not _PARAGRAPH.match(text.lstrip("\n")):
+            return converted
+        converted = self.paragraph(text, here, every=True)
+        core = converted.strip("\n")
+        start = converted.index(core)
+        return f"{converted[:start]}<div>\n\n{core}\n\n</div>{converted[start + len(core) :]}"
 
 
 def convert(text: str, here: Path, root: Path = ROOT) -> str:

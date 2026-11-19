@@ -6,11 +6,15 @@ description: "Surreal ORM Lite (pip install surreal-orm-lite, imported as surrea
 
 # Surreal ORM Lite: guide for AI coding assistants
 
-[Surreal ORM Lite](https://github.com/EulogySnowfall/SurrealDB-ORM-lite) (`pip install surreal-orm-lite`, imported as
-`surreal_orm_lite`) is an async, Django-style ORM for SurrealDB with Pydantic models, built on the official SurrealDB
-Python SDK 3.0 (`surrealdb[pydantic]>=3.0.0,<4.0.0`, since v0.50.0; the SDK 2.0 line `0.40.x` is deprecated). This file tells an AI coding assistant how to write code with it. Download it into your project and import
-it from your `CLAUDE.md` with the line `@docs/surreal-orm-lite.md` (Claude Code), or paste it into your assistant's
-instructions. To match the release you installed, replace `main` in the URL with its tag (`v<version>`).
+<div>
+
+[Surreal ORM Lite](https://github.com/EulogySnowfall/SurrealDB-ORM-lite) (<code>pip install surreal-orm-lite</code>, imported as
+<code>surreal\_orm\_lite</code>) is an async, Django-style ORM for SurrealDB with Pydantic models, built on the official SurrealDB
+Python SDK 3.0 (<code>surrealdb\[pydantic\]&gt;=3.0.0,&lt;4.0.0</code>, since v0.50.0; the SDK 2.0 line <code>0.40.x</code> is deprecated). This file tells an AI coding assistant how to write code with it. Download it into your project and import
+it from your <code>CLAUDE.md</code> with the line <code>@docs/surreal-orm-lite.md</code> (Claude Code), or paste it into your assistant's
+instructions. To match the release you installed, replace <code>main</code> in the URL with its tag (<code>v&lt;version&gt;</code>).
+
+</div>
 
 ```bash
 curl -fsSL -o docs/surreal-orm-lite.md https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ai/CLAUDE.md
@@ -39,7 +43,7 @@ SurrealDBConnectionManager.set_connection(
 - `set_connection()` opens nothing: the first database call connects. Call it once, at startup. The
   `surreal-orm-lite` command line reads these same `SURREAL_*` variables.
 - Prefer a WebSocket URL (`ws://…/rpc`): live queries need it, and on SurrealDB 3.x it gives interactive
-  transactions. HTTP works for everything else. `mem://` and `surrealkv://<path>` run the SDK's in-process engine.
+  transactions. HTTP works for everything else. `mem://` and <code>surrealkv://&lt;path&gt;</code> run the SDK's in-process engine.
 - The manager keeps **one client per event loop**, made on first use. Never pass a client to another loop or thread.
 - Close at shutdown: `await SurrealDBConnectionManager.close_connection()` (this loop's client),
   `close_all_connections()` (every client), or `async with SurrealDBConnectionManager():` around the work.

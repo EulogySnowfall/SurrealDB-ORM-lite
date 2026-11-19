@@ -196,7 +196,7 @@ except ServerError as exc:  # the event refused the write: nothing changed
   and on SurrealDB 3.x `$input` holds the fields the write sent. Expressions name **columns**: a field declared with
   `Field(alias=…)` is read by its alias.
 - A guard on `$after` names `$event != 'DELETE'`, as `no_negative_balance` does: after a delete `$after.balance` is
-  `NONE`, and `NONE < 0` is true, so without it the guard would refuse every delete.
+  `NONE`, and <code>NONE &lt; 0</code> is true, so without it the guard would refuse every delete.
 - Event and table names are written quoted, so `update` or `delete` work as event names; a comment is written as an
   escaped string literal.
 - `define_events()` writes `DEFINE EVENT OVERWRITE`: it is idempotent, so run it at start-up or deployment.
@@ -301,10 +301,10 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
   `"fn::greet"` or `"fn::billing::total"`. The body is always written as a block; `RETURN` gives the result.
 - `parameters` maps each parameter name, without the `$`, to its SurrealQL kind, in declaration order, which is the
   order of `call_function()`'s positional `args`. A name SurrealDB defines itself (`auth`, `session`, `this` …) is
-  refused. Kinds are SurrealQL text, written in canonical form: `option<int>` is written `option<int>`, and so is
+  refused. Kinds are SurrealQL text, written in canonical form: <code>option&lt;int&gt;</code> is written <code>option&lt;int&gt;</code>, and so is
   `none | int`. A kind the ORM cannot read raises `ValueError`: it is never rewritten silently. `returns` is the
   result's kind.
-- `permissions` is `"FULL"`, `"NONE"` or `"WHERE <condition>"`, in any case; left out, SurrealDB applies `FULL`.
+- `permissions` is `"FULL"`, `"NONE"` or <code>"WHERE &lt;condition&gt;"</code>, in any case; left out, SurrealDB applies `FULL`.
 - `call_function()` follows a redefinition at once: `define_function()` and `remove_function()` drop the signature
   `params=` had cached, even when only the order of the parameters changed, on every connection of this process to
   the same namespace and database, whatever its URL — the admin connection a `using()` block applies the DDL on and
@@ -351,7 +351,7 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
   record — which fires one `UPDATE` event.
 - Read back (section 31), each line renders the definitions its own way: on 3.x a block is one line and a single
   statement loses its `;`, on 2.x a block of several statements spans several lines; an optional parameter reads
-  `none | int` on 3.x and `option<int>` on 2.x. The [2.x/3.x/4.x table](/compatibility#orm-behaviour-surrealdb-2x-3x-and-4x) lists the
+  `none | int` on 3.x and <code>option&lt;int&gt;</code> on 2.x. The [2.x/3.x/4.x table](/compatibility#orm-behaviour-surrealdb-2x-3x-and-4x) lists the
   differences.
 
 ### Security

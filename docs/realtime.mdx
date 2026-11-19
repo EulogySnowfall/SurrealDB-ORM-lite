@@ -92,12 +92,16 @@ async with Product.objects().live(diff=True) as stream:
             print(event.record_id, "changed", event.changed_fields)  # ["price", "stock"]
 ```
 
-A `CREATE` still carries the whole record, so `event.instance` is complete. An `UPDATE` carries
-only patches: `event.instance` holds just the `id`, `changed_fields` lists what changed, and
-`event.raw` is the patch list. The format is JSON Patch **extended by SurrealDB**: a changed
-string arrives as `{"op": "change", "value": "<diff-match-patch text>"}` rather than a
-`replace`. A `DELETE` gives an instance holding the `id` on 3.x, and its last state on 2.x (see
+<div>
+
+A <code>CREATE</code> still carries the whole record, so <code>event.instance</code> is complete. An <code>UPDATE</code> carries
+only patches: <code>event.instance</code> holds just the <code>id</code>, <code>changed\_fields</code> lists what changed, and
+<code>event.raw</code> is the patch list. The format is JSON Patch **extended by SurrealDB**: a changed
+string arrives as <code>\{"op": "change", "value": "&lt;diff-match-patch text&gt;"\}</code> rather than a
+<code>replace</code>. A <code>DELETE</code> gives an instance holding the <code>id</code> on 3.x, and its last state on 2.x (see
 the behaviour table).
+
+</div>
 
 ### The `post_live_change` signal
 

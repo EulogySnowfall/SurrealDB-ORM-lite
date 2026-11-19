@@ -9,7 +9,7 @@ description: "Feature implementation roadmap inspired by SurrealDB-ORM"
 > Feature implementation roadmap inspired by [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM)
 >
 > **Main constraint**: every feature must be implementable with the official SDK
-> `surrealdb[pydantic]>=3.0.0,<4.0.0` (SurrealDB 2.x, 3.x and 4.x; since v0.50.0) — **no custom SDK**.
+> <code>surrealdb\[pydantic\]&gt;=3.0.0,&lt;4.0.0</code> (SurrealDB 2.x, 3.x and 4.x; since v0.50.0) — **no custom SDK**.
 > Features with no native SDK method are reached through `query()`, which runs any SurrealQL (DDL
 > included). The ORM supports exactly the SurrealDB versions the SDK supports.
 
@@ -96,11 +96,15 @@ A key advantage of ORM-lite: it runs on **three** SurrealDB lines, while the ful
 
 ## 🆕 Everything unlocked by the official SDK 2.0
 
-The migration to `surrealdb[pydantic]>=2.0.0,<3.0.0` exposes connection methods and native
-types unavailable in SDK 1.0.8. Crucially, `query()` runs **any SurrealQL**, including DDL
-(`DEFINE INDEX`, `DEFINE ANALYZER`, `DEFINE EVENT`, `DEFINE TABLE … AS SELECT`, `INFO FOR`).
+<div>
+
+The migration to <code>surrealdb\[pydantic\]&gt;=2.0.0,&lt;3.0.0</code> exposes connection methods and native
+types unavailable in SDK 1.0.8. Crucially, <code>query()</code> runs **any SurrealQL**, including DDL
+(<code>DEFINE INDEX</code>, <code>DEFINE ANALYZER</code>, <code>DEFINE EVENT</code>, <code>DEFINE TABLE … AS SELECT</code>, <code>INFO FOR</code>).
 As a result, **everything below is implementable in lite** — only the founding custom-SDK
 pieces stay out.
+
+</div>
 
 | Feature                                | SDK 2.0 realization                                         | Version        |
 | -------------------------------------- | ----------------------------------------------------------- | -------------- |
@@ -132,7 +136,7 @@ pieces stay out.
 | `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                              | ✅ v0.33.0     |
 | Model table DDL (`define_table()`)     | `DEFINE TABLE` + `DEFINE FIELD` via `query()`               | ✅ v0.34.0     |
 | Full-Text Search (BM25)                | `DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*` | ✅ v0.35.0     |
-| Vector Search (KNN, HNSW)              | `DEFINE INDEX … HNSW` + KNN operator `<\|K,EF\|>`           | ✅ v0.36.0     |
+| Vector Search (KNN, HNSW)              | `DEFINE INDEX … HNSW` + KNN operator <code>&lt;\|K,EF\|&gt;</code>           | ✅ v0.36.0     |
 | Hybrid Search (RRF)                    | `search::rrf()` (3.x) or the same fusion in the ORM (2.x)   | ✅ v0.37.0     |
 | Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`            | ✅ v0.38.0     |
 | CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                                 | ✅ v0.39.0     |
@@ -213,10 +217,10 @@ official SDK's in-process engine from v0.25.0.
 | Embedded URL                   | surreal-orm-lite (official SDK 3.0)                                                      | Full SurrealDB-ORM       |
 | ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
 | `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
-| `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
-| `surrealkv+versioned://<path>` | ✅ on disk, keeps history: time travel with `as_of()` (README section 27)                | ❌                       |
-| `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
-| `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233)                                          | ❌                       |
+| <code>surrealkv://&lt;path&gt;</code>           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
+| <code>surrealkv+versioned://&lt;path&gt;</code> | ✅ on disk, keeps history: time travel with `as_of()` (README section 27)                | ❌                       |
+| <code>file://&lt;path&gt;</code>                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
+| <code>rocksdb://&lt;path&gt;</code>             | ❌ not yet supported by the official SDK (#233)                                          | ❌                       |
 
 Since v0.50.0 the embedded engine is SurrealDB core 4.0.0 with SDK 3.0.0, the `surrealdb[embedded]`
 extra, read as a 4.x server (it was SurrealDB core 2.3.10 with SDK 2.0.0). A bare `memory` (no `://`)
@@ -257,7 +261,7 @@ fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; 
 
 ### Version 0.7.0 — SDK 2.0 / SurrealDB 3.x migration
 
-- Dependency `surrealdb[pydantic]>=2.0.0,<3.0.0`
+- Dependency <code>surrealdb\[pydantic\]&gt;=2.0.0,&lt;3.0.0</code>
 - Native `RecordID`, structured SDK exceptions, signin-before-use ordering
 - CI matrix tested on SurrealDB **v2.7.0 and v3.3.5**
 
@@ -437,7 +441,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - `QuerySet.changes(since=, poll_interval=, batch_size=)` → `ChangeModelStream` (full ORM API)
   with an `int` cursor that resumes exactly on both lines — 2.x's `SINCE` takes
   `versionstamp >> 16`, 3.x's the stamp itself. `since=datetime` is exact on 3.x (converted to
-  `unix_ms << 16`, since the server's own datetime `SINCE` is always empty there) and
+  <code>unix\_ms &lt;&lt; 16</code>, since the server's own datetime `SINCE` is always empty there) and
   at-least-once on 2.x. At-least-once per transaction; works over HTTP; clauses refused; a table
   without `CHANGEFEED` refused
 
@@ -488,9 +492,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Reads: SDK durations become `timedelta` or `Duration` in top-level fields, including on rows
   applied after a write, so an instance written back stores a duration. `atomic_increment()`
   refuses a duration amount (2.x ignores `+=` with a duration)
-- Same on both lines, measured on 2.7.0, 3.1.5 and 3.3.4, with one divergence: a `TYPE set<…>`
+- Same on both lines, measured on 2.7.0, 3.1.5 and 3.3.4, with one divergence: a <code>TYPE set&lt;…&gt;</code>
   column holds a native set on 3.3 that the surrealdb SDK 2.0.0 cannot read (3.1 refuses the
-  array), so such columns are declared `array<…>`. The SDK 2.0.0 limits (zero durations, 3.x
+  array), so such columns are declared <code>array&lt;…&gt;</code>. The SDK 2.0.0 limits (zero durations, 3.x
   native sets) wait for SDK 3.0 (#205), and are read by the ORM's clients since v0.24.3 (#235);
   typed string filters (#220), validated keyword writes (#221) and validating returned rows like
   the full ORM are follow-ups
@@ -530,7 +534,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   reselects on the same engine and ends the stored session; closing discards a `mem://` database
   and keeps a `surrealkv://` one
 - Clear ORM errors before any request for what the engine cannot do (live queries,
-  `changes(since=<datetime>)`, model auth with `bind=False`, `ephemeral_client()`) and for a URL
+  <code>changes(since=&lt;datetime&gt;)</code>, model auth with `bind=False`, `ephemeral_client()`) and for a URL
   the SDK refuses (`rocksdb://`, #233, quoting the SDK)
 - `surreal_orm_lite.testing`: `embedded_database()` (an isolated in-process database per block,
   nestable) and the full ORM's `SurrealFixture` / `@fixture`; `ModelFactory` and `Faker` shipped in
@@ -668,7 +672,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   refusals are classified (`SurrealDbAuthenticationError`, `SurrealDbNotFoundError`,
   `SurrealDbError`). Names are validated and quoted, comments escaped; expressions are trusted
   application code whose structural check catches mistakes and is not an injection defence; kinds
-  are written in canonical form (`option<int>`)
+  are written in canonical form (<code>option&lt;int&gt;</code>)
 - `ASYNC` events (`RETRY`, `MAXDEPTH`) are SurrealDB 3.x only: on 2.x and the embedded engine the
   ORM raises `SurrealDbError` before any DDL. `$input` is 3.x only, and on 3.x an unchanged
   `UPSERT` fires one `UPDATE` event; read back, each line renders definitions its own way.
@@ -683,7 +687,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 - `SurrealConfigDict(view_query="SELECT …")`, the full SurrealDB-ORM's key, declares a read-only
   model over a table SurrealDB computes from that query; `get_view_query()` and `_is_view()`;
-  `Model.view_ddl()` (pure, ``DEFINE TABLE OVERWRITE `<table>` AS (…)``), `Model.define_view()`
+  `Model.view_ddl()` (pure, <code>DEFINE TABLE OVERWRITE \`&lt;table&gt;\` AS (…)</code>), `Model.define_view()`
   (idempotent, `OVERWRITE`; `overwrite=False` for `IF NOT EXISTS`) and `Model.remove_view()`,
   both with `tx=`. The query is checked when the class is defined (one `SELECT`, no `ORDER BY`,
   `LIMIT`, `FETCH` or `SELECT VALUE`); it is trusted application code, and the check catches
@@ -720,7 +724,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   `TypeError`); `get_relation_in()`/`get_relation_out()` return tuples in the shape of
   `TableState`, `is_enforced()` a bool, `get_table_type()` the table's `TableType`
 - On an edge model (`BaseSurrealEdge` only), `Edge.relation_ddl()` renders
-  ``DEFINE TABLE OVERWRITE `<table>` TYPE RELATION IN … OUT …`` (pure);
+  <code>DEFINE TABLE OVERWRITE \`&lt;table&gt;\` TYPE RELATION IN … OUT …</code> (pure);
   `await Edge.define_relation()` applies it (idempotent; `overwrite=False` for `IF NOT EXISTS`;
   `tx=`): one `INFO FOR DB`, then one `DEFINE TABLE OVERWRITE` that keeps the table's schema mode,
   `DROP`, comment, change feed and permissions, and its records, fields, indexes, events, views
@@ -730,10 +734,10 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Enforcement is SurrealDB's: every edge creation path (`relate()` typed or by table name, an
   edge's `save()`, `objects().bulk_create()`) raises `SurrealDbError` for an endpoint outside
   `IN`/`OUT` and `SurrealDbNotFoundError` for a missing endpoint with `ENFORCED`; the string
-  `relate("<edge table>", …)` now translates server errors too. `generate_models_from_db()` writes
+  <code>relate("&lt;edge table&gt;", …)</code> now translates server errors too. `generate_models_from_db()` writes
   `relation_in`/`relation_out`/`enforced` instead of the `# IN … OUT …` comment, so a relation
   table round-trips through introspection
-- Measured differences: the refusal wording (`Found … but expected a record<…>` on 2.x,
+- Measured differences: the refusal wording (<code>Found … but expected a record&lt;…&gt;</code> on 2.x,
   `Couldn't coerce value for field …` on 3.x); an endpoint both outside `IN`/`OUT` and missing on
   an `ENFORCED` table is `SurrealDbNotFoundError` on 2.x and the embedded engine,
   `SurrealDbError` on 3.x; a raw `ALTER TABLE … TYPE RELATION …` of a table already written to is
@@ -758,7 +762,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   them — one `INFO FOR DB`, one `INFO FOR TABLE` for a table that exists, then one statement per
   call (`overwrite=False` for `IF NOT EXISTS`; `tx=`; idempotent) — and returns the statements
   applied joined with `"\n"`, the full ORM's return. Kinds come from the annotations (the rich
-  field types, enums, literals, sub-models with one column per field, `option<…>` for a nullable
+  field types, enums, literals, sub-models with one column per field, <code>option&lt;…&gt;</code> for a nullable
   column); a constant default is `DEFAULT` on a column that is not nullable, a computed field
   `VALUE`, a free-form object column of a `SCHEMAFULL` table `FLEXIBLE`
 - The source rule: what the model declares is written; the table clauses it leaves out (schema
@@ -791,7 +795,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   engine (3.1.5 retro: refuses a Python `set` written to a `set` field and an object item of an
   optional untyped `list`; a keyword field name breaks its table — server defects)
 - Deferred: field clauses declared on the model (`ASSERT`, `READONLY`, field permissions,
-  comment), typed record links (`record<table>`), refusing undeclared field names before a write,
+  comment), typed record links (<code>record&lt;table&gt;</code>), refusing undeclared field names before a write,
   `define_table(tx=…)` seeing a definition queued earlier in the block. For v0.38.0
   (migrations): the removal of fields and clauses a model no longer declares, and
   `CreateTable`/`AlterTable` built on the same table and field statements. **v0.38.0 decides
@@ -855,7 +859,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - A model declares its vector fields with `VectorField[d]` (the full ORM's) or its typed form
   `Annotated[list[float] | None, Vector(d)] = None`, which type checkers accept; both check their
   values on writes and reads (exactly `d` finite numbers) and `define_table()` writes them
-  `option<array<float, d>>`. Vector indexes are `Index(hnsw=True, ...)` with the full ORM's
+  <code>option&lt;array&lt;float, d&gt;&gt;</code>. Vector indexes are `Index(hnsw=True, ...)` with the full ORM's
   `CreateIndex` arguments (`dimension`, `dist`, `vector_type`, `efc`, `m`), in
   `SurrealConfigDict(indexes=[...])`: every HNSW option is written, the same statement on both
   lines, and `define_indexes()` never rebuilds an unchanged vector index
@@ -998,7 +1002,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ### Version 0.50.0 — Official SDK 3.0 and SurrealDB 4.x
 
-- Depends on `surrealdb[pydantic]>=3.0.0,<4.0.0`; SurrealDB 2.x, 3.x and **4.x** supported and
+- Depends on <code>surrealdb\[pydantic\]&gt;=3.0.0,&lt;4.0.0</code>; SurrealDB 2.x, 3.x and **4.x** supported and
   tested (2.7.0, 3.3.5, 4.0.0), a server outside the SDK's range refused at connect time. The
   embedded engine is the optional extra `surreal-orm-lite[embedded]`, a SurrealDB 4.0 core
 - Every SDK call goes through one internal frontier: NULL reads as `None`, native sets as `set`,
@@ -1010,7 +1014,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Migrations raise `FieldChangeRefusedError` for a field change SurrealDB 4.x refuses on a
   populated `SCHEMAFULL` table, with `RawSQL` replacements; `MigrateRows` is v0.56.0 (#427)
 - The SDK 2.0 line `0.40.x` is deprecated (security fixes only):
-  `pip install "surreal-orm-lite<0.50"` stays on it. Migration note: `docs/migrating-to-0.50.md`
+  <code>pip install "surreal-orm-lite&lt;0.50"</code> stays on it. Migration note: `docs/migrating-to-0.50.md`
 
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
@@ -1055,7 +1059,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   model, mirroring v0.14.0's `computed_field_ddl()` / `define_computed_fields()` pair. The
   `DEFINE TABLE … PERMISSIONS FOR select WHERE id = $auth.id` ships with it by default, because
   without it a signin succeeds yet returns no record — v0.16.0's sharpest gotcha
-- A configured `primary_key` makes SIGNUP target `type::thing('<table>', $<pk>)`, so the record
+- A configured `primary_key` makes SIGNUP target <code>type::thing('&lt;table&gt;', $&lt;pk&gt;)</code>, so the record
   stays addressable by the ORM afterwards instead of landing on a random id
 - The hydrated instance's password field holds the **hash**; SurrealDB returns the stored record
 - New `SurrealConfigDict` keys: `access_name`, `identifier_field`, `password_field`,
@@ -1067,7 +1071,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ### Version 0.14.0 — Computed fields
 
-- `Computed[T] = computed("<expr>")` declares a field SurrealDB derives from other fields on
+- <code>Computed\[T\] = computed("&lt;expr&gt;")</code> declares a field SurrealDB derives from other fields on
   **every** write, via `DEFINE FIELD … VALUE`. Where v0.13.0's `SurrealFunc` evaluates an
   expression for one write, `Computed` attaches it to the **schema** — so it applies to writes
   the ORM never sees, making it a server-enforced invariant rather than a convention
@@ -1226,7 +1230,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | Version    | Theme                                               | SDK 2.0 realization                                         |
 | ---------- | --------------------------------------------------- | ----------------------------------------------------------- |
 | ✅ v0.35.0 | Full-Text Search (`search()`, BM25 score/highlight) | `DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*` |
-| ✅ v0.36.0 | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW` + KNN operator `<\|K,EF\|>`           |
+| ✅ v0.36.0 | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW` + KNN operator <code>&lt;\|K,EF\|&gt;</code>           |
 | ✅ v0.37.0 | Hybrid Search (`hybrid_search()`, RRF)              | `search::rrf()` (3.x) + RRF in the ORM (2.x)                |
 
 ### 🛠️ Phase H — Tooling

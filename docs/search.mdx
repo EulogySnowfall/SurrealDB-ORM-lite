@@ -101,17 +101,21 @@ replaces but `define_table(overwrite=False)` leaves as it is.
 
 ### Search, score, highlight
 
-`search(**field_queries)` keeps the records whose fields match: each keyword names a field — a Python field name (an
-aliased field searches its column) or a dotted path (`**{"meta.headline": "rust"}`) — and the text to match, which is
+<div>
+
+<code>search(\*\*field\_queries)</code> keeps the records whose fields match: each keyword names a field — a Python field name (an
+aliased field searches its column) or a dotted path (<code>\*\*\{"meta.headline": "rust"\}</code>) — and the text to match, which is
 bound, never written into the statement, and is data whatever it holds. Each field gets the next match reference, in
-call order and across calls (`search(title="a").search(body="b")`: references 0 and 1), which `SearchScore(ref)`,
-`SearchHighlight(open_tag, close_tag, ref)` and `SearchOffsets(ref)` name in `annotate()`: the BM25 score, a `float`;
-the text with each matched term between the tags, a `str` (a list of strings for an array field); where the terms sit,
-SurrealDB's `{"<item>": [{"s": <start>, "e": <end>}]}`. `exec()`, `first()` and `get()` without an id set each value
-as an attribute named after its alias, never written back (`model_dump()`, `save()` and `update()` leave it out); rows
-that do not validate (a `select()` leaving out a required field) come back as dicts holding the aliases.
-`order_by("-relevance")` sorts on an alias. An alias that would shadow a field, its column or an attribute of the
-model raises `ValueError`, as does a reference no `search()` gave, before any request.
+call order and across calls (<code>search(title="a").search(body="b")</code>: references 0 and 1), which <code>SearchScore(ref)</code>,
+<code>SearchHighlight(open\_tag, close\_tag, ref)</code> and <code>SearchOffsets(ref)</code> name in <code>annotate()</code>: the BM25 score, a <code>float</code>;
+the text with each matched term between the tags, a <code>str</code> (a list of strings for an array field); where the terms sit,
+SurrealDB's <code>\{"&lt;item&gt;": \[\{"s": &lt;start&gt;, "e": &lt;end&gt;\}\]\}</code>. <code>exec()</code>, <code>first()</code> and <code>get()</code> without an id set each value
+as an attribute named after its alias, never written back (<code>model\_dump()</code>, <code>save()</code> and <code>update()</code> leave it out); rows
+that do not validate (a <code>select()</code> leaving out a required field) come back as dicts holding the aliases.
+<code>order\_by("-relevance")</code> sorts on an alias. An alias that would shadow a field, its column or an attribute of the
+model raises <code>ValueError</code>, as does a reference no <code>search()</code> gave, before any request.
+
+</div>
 
 ```python
 corpus = [
@@ -138,10 +142,14 @@ for article in articles:
 # a1 0.952 Quantum <b>physics</b> for beginners {'0': [{'e': 15, 's': 8}]}
 ```
 
-`search()` applies wherever `filter()` does, AND-ed after `filter()`, `Q` and `nearby()`: `count()`, `exists()`, the
-aggregations, `values()` groups, `bulk_update()`, `bulk_delete()`, `patch()`, and a `Subquery` of the queryset
-([section 28](/querying#28-subqueries-subquery)), whose references start again at 0. `get(<id>)` and `all()` ignore it, as they
-ignore `filter()`.
+<div>
+
+<code>search()</code> applies wherever <code>filter()</code> does, AND-ed after <code>filter()</code>, <code>Q</code> and <code>nearby()</code>: <code>count()</code>, <code>exists()</code>, the
+aggregations, <code>values()</code> groups, <code>bulk\_update()</code>, <code>bulk\_delete()</code>, <code>patch()</code>, and a <code>Subquery</code> of the queryset
+([section 28](/querying#28-subqueries-subquery)), whose references start again at 0. <code>get(&lt;id&gt;)</code> and <code>all()</code> ignore it, as they
+ignore <code>filter()</code>.
+
+</div>
 
 ```python
 quantum_qubits = Article.objects().search(title="quantum", body="qubits")
@@ -370,20 +378,24 @@ run as written, in order, on the embedded engine (`mem://`).
 
 ### Declare and apply
 
-`VectorField[d]` is the full ORM's vector field: a list of `d` numbers, optional and `None` by default, which
-`define_table()` writes `option<array<float, d>>`; `VectorField[d, "F64"]` also names its storage type (`F64`, `F32` —
-the default —, `I64`, `I32` or `I16`). An `Index` with `hnsw=True` is a vector index, with `CreateIndex`'s arguments:
-`dimension=` (required: the vectors' length, 1 to 65535), `dist=` (`EUCLIDEAN` by default, `COSINE`, `MANHATTAN`,
-`CHEBYSHEV` or `HAMMING`, in any case), `vector_type=`, `efc=` (the build's candidate list, 150 by default) and `m=`
+<div>
+
+<code>VectorField\[d\]</code> is the full ORM's vector field: a list of <code>d</code> numbers, optional and <code>None</code> by default, which
+<code>define\_table()</code> writes <code>option&lt;array&lt;float, d&gt;&gt;</code>; <code>VectorField\[d, "F64"\]</code> also names its storage type (<code>F64</code>, <code>F32</code> —
+the default —, <code>I64</code>, <code>I32</code> or <code>I16</code>). An <code>Index</code> with <code>hnsw=True</code> is a vector index, with <code>CreateIndex</code>'s arguments:
+<code>dimension=</code> (required: the vectors' length, 1 to 65535), <code>dist=</code> (<code>EUCLIDEAN</code> by default, <code>COSINE</code>, <code>MANHATTAN</code>,
+<code>CHEBYSHEV</code> or <code>HAMMING</code>, in any case), <code>vector\_type=</code>, <code>efc=</code> (the build's candidate list, 150 by default) and <code>m=</code>
 (the links per node, 2 to 127, 12 by default). It covers one field, and the model lists it in
-`SurrealConfigDict(indexes=[...])` next to the full-text indexes of
+<code>SurrealConfigDict(indexes=\[...\])</code> next to the full-text indexes of
 [section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index). Its attributes hold what was
-declared (`None` for an option not given). When the class is defined, two vector indexes on one column are refused,
-and so is a vector index whose dimension or storage type differs from its field's `VectorField`. A field annotated
+declared (<code>None</code> for an option not given). When the class is defined, two vector indexes on one column are refused,
+and so is a vector index whose dimension or storage type differs from its field's <code>VectorField</code>. A field annotated
 with a name defined after the class (a forward reference) is checked once the name resolves, with the same error: at
-`model_rebuild()`, at the model's first instantiation, validation or JSON schema, and before `table_ddl()`,
-`define_table()`, `index_ddl()`, `define_indexes()`, `get_indexes()` or a queryset (`similar_to()` included) reads the
+<code>model\_rebuild()</code>, at the model's first instantiation, validation or JSON schema, and before <code>table\_ddl()</code>,
+<code>define\_table()</code>, <code>index\_ddl()</code>, <code>define\_indexes()</code>, <code>get\_indexes()</code> or a queryset (<code>similar\_to()</code> included) reads the
 model. Once refused, each of these raises it again.
+
+</div>
 
 ```python
 from surreal_orm_lite import (
@@ -558,13 +570,17 @@ print([(document.id, round(document._knn_distance, 4)) for document in exact])  
 
 ### With other conditions
 
-`similar_to()` applies wherever `filter()` does, AND-ed with `filter()`, `Q`, `nearby()`, `search()` and a
-`Subquery` filter: `exec()`, `first()`, `get()` without an id, `count()`, `exists()`, the aggregations, `values()`
-groups, `bulk_update()`, `bulk_delete()`, `patch()`, and a `Subquery` of the queryset
-([section 28](/querying#28-subqueries-subquery)). `get(<id>)` and `all()` ignore it, as they ignore `filter()`. The bulk
-writes act on the `limit` nearest records, whose ids they select first, and return their number; their `limit()`,
-`offset()` and `order_by()` are ignored, as for every bulk write. With `search()`, the records matching the text are
+<div>
+
+<code>similar\_to()</code> applies wherever <code>filter()</code> does, AND-ed with <code>filter()</code>, <code>Q</code>, <code>nearby()</code>, <code>search()</code> and a
+<code>Subquery</code> filter: <code>exec()</code>, <code>first()</code>, <code>get()</code> without an id, <code>count()</code>, <code>exists()</code>, the aggregations, <code>values()</code>
+groups, <code>bulk\_update()</code>, <code>bulk\_delete()</code>, <code>patch()</code>, and a <code>Subquery</code> of the queryset
+([section 28](/querying#28-subqueries-subquery)). <code>get(&lt;id&gt;)</code> and <code>all()</code> ignore it, as they ignore <code>filter()</code>. The bulk
+writes act on the <code>limit</code> nearest records, whose ids they select first, and return their number; their <code>limit()</code>,
+<code>offset()</code> and <code>order\_by()</code> are ignored, as for every bulk write. With <code>search()</code>, the records matching the text are
 ranked by the vector.
+
+</div>
 
 Other conditions select the records first, then `similar_to()` keeps the nearest among them: SurrealDB 3.x applies
 them during the index search. SurrealDB 2.x and the embedded engine answer too few records, or none, next to many
@@ -666,7 +682,7 @@ except ValueError as error:
   `similar_to(field, vector, limit=10, *, ef=None)`, the distance set on each instance as `_knn_distance`, nearest
   first unless `order_by()` is given.
 - **`dist=` is an addition** of this library: an exact, brute-force search that needs no index (SurrealDB's
-  `<|K,DISTANCE|>`).
+  <code>&lt;\|K,DISTANCE\|&gt;</code>).
 - **`similar_to()` applies wherever `filter()` applies**: `count()`, the aggregations, `values()` groups, `exists()`,
   `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery`; the full ORM applies it to `exec()` only. The bulk
   writes act on the ids of the `limit` nearest records, selected first.

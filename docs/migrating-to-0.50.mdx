@@ -6,10 +6,14 @@ description: "Surreal ORM Lite 0.50.0 moves to the official SurrealDB Python SDK
 
 # Migrating to 0.50 (official SDK 3.0, SurrealDB 4.x)
 
-Surreal ORM Lite 0.50.0 moves to the official SurrealDB Python SDK 3.0 (`surrealdb[pydantic]>=3.0.0,<4.0.0`) and
+<div>
+
+Surreal ORM Lite 0.50.0 moves to the official SurrealDB Python SDK 3.0 (<code>surrealdb\[pydantic\]&gt;=3.0.0,&lt;4.0.0</code>) and
 supports the server lines that SDK supports: SurrealDB 2.x, 3.x and 4.x. The ORM's minor series follows the SDK
-major: `0.50.x` is the SDK 3.0 line, `0.40.x` the SDK 2.0 line. The SDK 2.0 line (`0.40.x`) is deprecated and receives
-security fixes only; move to `0.50.x`, or pin `pip install "surreal-orm-lite<0.50"` if you must stay on SDK 2.0.
+major: <code>0.50.x</code> is the SDK 3.0 line, <code>0.40.x</code> the SDK 2.0 line. The SDK 2.0 line (<code>0.40.x</code>) is deprecated and receives
+security fixes only; move to <code>0.50.x</code>, or pin <code>pip install "surreal-orm-lite&lt;0.50"</code> if you must stay on SDK 2.0.
+
+</div>
 
 Most applications upgrade without a code change: models, querysets, transactions, live queries and migrations keep
 their API. This note lists what changes, with the code before and after. The examples run as written on the embedded
@@ -18,7 +22,7 @@ engine (`mem://`), each printed line shown as a `# ` comment under its code; the
 
 ## Installing
 
-- The ORM requires `surrealdb[pydantic]>=3.0.0,<4.0.0` (it was `>=2.0.0,<3.0.0`); Python 3.11 or later, as before.
+- The ORM requires <code>surrealdb\[pydantic\]&gt;=3.0.0,&lt;4.0.0</code> (it was <code>&gt;=2.0.0,&lt;3.0.0</code>); Python 3.11 or later, as before.
   `pip install -U surreal-orm-lite` brings the SDK along.
 - The SDK's in-process engine is now an optional extra: `pip install "surreal-orm-lite[embedded]"`. Without it,
   opening `mem://`, `memory` or `surrealkv://` raises `SurrealDbConnectionError` naming the extra. The testing helpers
@@ -168,5 +172,9 @@ operation is planned for v0.56.0. Outside migrations, `define_table(overwrite=Tr
 
 ## Staying on SDK 2.0
 
-Pin the SDK 2.0 line, which receives security fixes only: `pip install "surreal-orm-lite<0.50"`. Its last release
-is 0.40.x; new features come in `0.50.x` and later.
+<div>
+
+Pin the SDK 2.0 line, which receives security fixes only: <code>pip install "surreal-orm-lite&lt;0.50"</code>. Its last release
+is 0.40.x; new features come in <code>0.50.x</code> and later.
+
+</div>

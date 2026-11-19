@@ -453,11 +453,11 @@ except SurrealDbNotFoundError:
 
 | Where the read runs                                                                               | `as_of()`                                                                                |
 | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Embedded `surrealkv+versioned://<path>`                                                           | ✅ (SDK 2.0.0 ignores `?versioned=true` on `surrealkv://`)                               |
+| Embedded <code>surrealkv+versioned://&lt;path&gt;</code>                                                           | ✅ (SDK 2.0.0 ignores `?versioned=true` on `surrealkv://`)                               |
 | Embedded `mem://`, `memory://`, `surrealkv://`, `file://`                                         | `SurrealDbError` before any request                                                      |
-| SurrealDB 3.x started on `surrealkv://<path>?versioned=true` or `rocksdb://<path>?versioned=true` | ✅                                                                                       |
+| SurrealDB 3.x started on <code>surrealkv://&lt;path&gt;?versioned=true</code> or <code>rocksdb://&lt;path&gt;?versioned=true</code> | ✅                                                                                       |
 | SurrealDB 3.x in memory, or on `surrealkv://` or `rocksdb://` without `versioned=true`            | `SurrealDbError`: the server refuses `VERSION` (the SDK's error is its `__cause__`)      |
-| SurrealDB 2.x started on `surrealkv+versioned://<path>`                                           | ✅                                                                                       |
+| SurrealDB 2.x started on <code>surrealkv+versioned://&lt;path&gt;</code>                                           | ✅                                                                                       |
 | SurrealDB 2.x on RocksDB                                                                          | `SurrealDbError`: the server refuses `VERSION`                                           |
 | SurrealDB 2.x in memory or on plain `surrealkv://`                                                | no error, and the ORM cannot tell (see [below](#surrealdb-2x-without-versioned-storage)) |
 
@@ -776,7 +776,7 @@ A statement with subqueries is one block, whose `LET`s bind each subquery once, 
   per record.
 - **Why `_sqv`**: an ordered subquery selects its column as `_sqv`, with its order fields, and
   reads `._sqv` back: SurrealDB 2.x refuses to order a sub-SELECT of one column by another field.
-- **Reserved names**: `$_sq0`, `$_sq1`, … (`_sq<N>`) are the block's `LET`s and hide a
+- **Reserved names**: `$_sq0`, `$_sq1`, … (<code>\_sq&lt;N&gt;</code>) are the block's `LET`s and hide a
   `variables()` value of the same name; a subquery can order by `_sqv` only when it selects `_sqv`
   itself (`ValueError` otherwise).
 - `limit()` and `offset()` of a subquery take a non-negative integer, as everywhere (`TypeError` or
@@ -908,16 +908,20 @@ fresh = await Product.objects().filter(category="book").order_by("name").cache(t
 
 ### What is cached
 
-Every read of a queryset with `cache()`: `exec()`, `first()`, `get()` by filters or by id
-(`get(<id>)`), `all()`, `count()`, `sum()`, `avg()`, `min()`, `max()`, `exists()`,
-`values(…).annotate(…)` and `annotate(GeoDistance)`. A read is answered from the cache when an
+<div>
+
+Every read of a queryset with <code>cache()</code>: <code>exec()</code>, <code>first()</code>, <code>get()</code> by filters or by id
+(<code>get(&lt;id&gt;)</code>), <code>all()</code>, <code>count()</code>, <code>sum()</code>, <code>avg()</code>, <code>min()</code>, <code>max()</code>, <code>exists()</code>,
+<code>values(…).annotate(…)</code> and <code>annotate(GeoDistance)</code>. A read is answered from the cache when an
 earlier read sent **the same statement with the same variables**, on the same connection and with
 the same identity, within the TTL, and no ORM write that can change its result has completed
 since.
 
+</div>
+
 - **Rows are cached, not instances**: each hit builds new instances from a copy of the cached
   rows, so changing a result never changes the cache.
-- **Empty results are cached too**: `[]`, a count of `0`, a missing record (`get(<id>)` raises
+- **Empty results are cached too**: `[]`, a count of `0`, a missing record (<code>get(&lt;id&gt;)</code> raises
   `SurrealDbNotFoundError` on the hit as on the first read). Errors never are.
 - **Not cached**: reads inside a transaction (`objects(tx=)`, which on SurrealDB 3.x may see its
   uncommitted writes), `refresh()`, `get_related()`, `traverse()`, `raw_query()` and
@@ -990,8 +994,8 @@ table's entries after such a change:
 - writes made by an access method's own `SIGNIN`/`SIGNUP` clauses beyond the record they create;
 - what the server derives on its own: `DEFINE EVENT`, `REFERENCE … ON DELETE` (3.x), views
   (`DEFINE TABLE … AS SELECT`), `PERMISSIONS` that read another table;
-- values computed when the read runs: a `DEFINE PARAM` read with `Var()`, `<future>`/`COMPUTED`
-  fields (over another table, the graph such as `count(<-likes)`, or the time);
+- values computed when the read runs: a `DEFINE PARAM` read with `Var()`, <code>&lt;future&gt;</code>/`COMPUTED`
+  fields (over another table, the graph such as <code>count(&lt;-likes)</code>, or the time);
 - a table of relations read through a model that is not a `BaseSurrealEdge`.
 
 ```python
@@ -1078,7 +1082,7 @@ cached_total = await total_price()  # 96 (the cache answers)
   `make_key()`, `get()`, `set()`, `invalidate()`, `clear()` and `stats()`, imported from
   `surreal_orm_lite`.
 - **Every read is cached**, not only `exec()` (with `first()` and `get()` by filters):
-  `get(<id>)`, `all()`, `count()`, the aggregations, `exists()` and `values()`+`annotate()` too.
+  <code>get(&lt;id&gt;)</code>, `all()`, `count()`, the aggregations, `exists()` and `values()`+`annotate()` too.
 - **Invalidation is built in** and needs no `configure()` call. It covers `bulk_*()`,
   `QuerySet.patch()`, the atomic operations, relations and transactions (at commit), where the
   full ORM listens to `post_save`, `post_update` and `post_delete`. Reads through links
