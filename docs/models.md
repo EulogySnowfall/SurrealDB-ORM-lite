@@ -248,6 +248,69 @@ Result keys stay in your vocabulary too, with one rule for grouped rows: an `ann
 your own word and is never renamed. An alias that spells a grouped field — by name or by column —
 would lose one of the two values in the same row, so it raises `ValueError`.
 
+### Sub-model keys and aliases
+
+A sub-model, a Pydantic `BaseModel` used as a field's type (also in a `list`, a `dict` or `X | None`), is read back
+by Pydantic, which takes each of its fields from the first key it accepts: its validation aliases in order, then its
+name under `populate_by_name`. The ORM writes each sub-field under one key, on every write and on both server lines:
+
+- the key `model_dump()` writes, when a read takes it, so `save()` stores what it always stored: the name, or the
+  alias under `serialize_by_alias=True`;
+- otherwise the first key a read takes. A `serialization_alias` that no validation alias names would land where no read
+  finds it: `Field(validation_alias="fn", serialization_alias="firstName")` stores `fn`. A field read only through an
+  `AliasPath` of several steps has no such key, and writing it raises `ValueError`.
+
+Keyword writes follow the same rule:
+
+```python
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
+
+
+class Address(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    zip_code: str = ""
+    city_name: str = ""
+
+
+class Profile(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    first_name: str = ""
+    home_addr: Address | None = None
+
+
+class Member(BaseSurrealModel):
+    id: str
+    profile: Profile | None = None
+
+
+member = Member(id="ada", profile=Profile(first_name="Ada", home_addr=Address(zip_code="1", city_name="Paris")))
+await member.save()                                                  # first_name, home_addr.zip_code, …
+await member.merge(profile={"firstName": "Ade", "homeAddr": {"zipCode": "2"}})  # city_name kept
+await member.merge(profile=Profile(first_name="Ada"))                # an instance, written as save() writes it
+await Member.objects().filter(id="ada").bulk_update(profile={"firstName": "Ada"})  # the whole profile
+```
+
+- **Spellings.** In a sub-model `dict`, a field may be named by any key a read takes, by its name or by the key
+  `model_dump()` writes. Naming one field twice raises `ValueError`.
+- **Instances.** A sub-model instance in `merge()`, `bulk_update()` or `update_or_create()` is written as `save()`
+  writes it.
+- **`merge()`** merges into the stored object, which the ORM does not see. A value that is not an object goes under the
+  key `save()` writes and removes the keys a read would take first, so the value read is the value merged; `None`
+  removes every key of that field. An object is merged into the spelling the stored object already uses (the server
+  picks the first key present, else the key `save()` writes), so no stored key is lost, also on a row an older version
+  left with both spellings. One `merge()` resolves up to three such objects nested in each other; a deeper one raises
+  `ValueError`: write it with `update()` or `bulk_update()`.
+- **`bulk_update()` and `merge(server_values=…)`** assign the field whole (`SET`), as before: the stored object is
+  replaced, its keys those `save()` writes.
+- A model whose sub-models read and write every field by its name only (no alias, no `populate_by_name`) sends exactly
+  what it sent before.
+
+Two limits remain. A union of several sub-models (`A | B`) given as a `dict` is written as given: only an instance
+tells which model it holds. `define_table()` declares a sub-model's fields by name, so on a `SCHEMAFULL` table a
+sub-model dumped by alias (`serialize_by_alias=True`) is refused by SurrealDB 3.x and 4.x and dropped by 2.x, as
+before.
+
 ### `server_fields`
 
 Mark the columns the **server** owns — filled by a `DEFINE FIELD … DEFAULT`, an event or a

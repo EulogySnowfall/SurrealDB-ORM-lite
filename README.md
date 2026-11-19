@@ -150,7 +150,7 @@ find every guide listed there.
 | Stored `fn::` calls                                                                                                                           | ✅     |
 | JWT / record auth                                                                                                                             | ✅     |
 | Model-level auth mixin                                                                                                                        | ✅     |
-| Field aliases & DX                                                                                                                            | ✅     |
+| Field aliases & DX (sub-model aliases included)                                                                                               | ✅     |
 | Live queries (raw)                                                                                                                            | ✅     |
 | Typed live queries                                                                                                                            | ✅     |
 | Live auto-resubscribe                                                                                                                         | ✅     |
