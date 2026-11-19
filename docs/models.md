@@ -256,9 +256,18 @@ name under `populate_by_name`. The ORM writes each sub-field under one key, on e
 
 - the key `model_dump()` writes, when a read takes it, so `save()` stores what it always stored: the name, or the
   alias under `serialize_by_alias=True`;
-- otherwise the first key a read takes. A `serialization_alias` that no validation alias names would land where no read
-  finds it: `Field(validation_alias="fn", serialization_alias="firstName")` stores `fn`. A field read only through an
-  `AliasPath` of several steps has no such key, and writing it raises `ValueError`.
+- otherwise the first key a read takes. A field read by its alias only (`Field(alias="firstName")`, or an
+  `alias_generator`, without `populate_by_name`) is dumped by name, which no read takes: it stores `firstName`. A
+  `serialization_alias` that no validation alias names would land where no read finds it as well:
+  `Field(validation_alias="fn", serialization_alias="firstName")` stores `fn`. A field read only through an `AliasPath`
+  of several steps has no such key, and writing it raises `ValueError`.
+
+`define_table()` (and `table_ddl()`) declares each sub-model field under that same key, so a `SCHEMAFULL` table the ORM
+defined takes every sub-model write on both lines. Earlier versions stored the two cases of the second rule under the
+dumped key (`first_name` where `firstName` is now stored, `firstName` where `fn` is): rows written then keep that key,
+which a read skips, until the field is written again. A nested path in a query names the stored key
+(`filter(**{"profile.firstName": …})`), and a table defined by an earlier version gets the new sub-field definitions
+from `define_table()` (the old ones stay until you remove them).
 
 Keyword writes follow the same rule:
 
@@ -306,10 +315,8 @@ await Member.objects().filter(id="ada").bulk_update(profile={"firstName": "Ada"}
 - A model whose sub-models read and write every field by its name only (no alias, no `populate_by_name`) sends exactly
   what it sent before.
 
-Two limits remain. A union of several sub-models (`A | B`) given as a `dict` is written as given: only an instance
-tells which model it holds. `define_table()` declares a sub-model's fields by name, so on a `SCHEMAFULL` table a
-sub-model dumped by alias (`serialize_by_alias=True`) is refused by SurrealDB 3.x and 4.x and dropped by 2.x, as
-before.
+One limit remains: a union of several sub-models (`A | B`) given as a `dict` is written as given, since only an
+instance tells which model it holds.
 
 ### `server_fields`
 
