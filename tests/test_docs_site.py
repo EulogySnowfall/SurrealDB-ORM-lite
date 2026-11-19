@@ -65,6 +65,15 @@ def _code_spans(text: str) -> list[str]:
     ]
 
 
+def _fenced_lines(text: str) -> list[str]:
+    """The lines inside the fenced blocks of *text*, a page (the fences themselves left out)."""
+    return [
+        line
+        for match in re.finditer(r"^ *(`{3,}|~{3,}).*?\n(.*?)^ *\1[ \t]*$", text, flags=re.MULTILINE | re.DOTALL)
+        for line in match.group(2).split("\n")
+    ]
+
+
 def _links(text: str) -> list[str]:
     return re.findall(r"\]\(([^)\s]+)\)", _prose(text))
 
@@ -162,11 +171,21 @@ class TestPages:
 
     @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
     def test_no_less_than_in_a_code_span(self, page: Path) -> None:
-        """No code span of a page holds a ``<``: docs.page turns one that starts no tag into ``&lt;`` before parsing,
-        and a code span shows that entity as written (``surrealdb[pydantic]>=3.0.0,&lt;4.0.0``). The guide's span is a
-        ``<code>`` element in the page."""
+        """No inline code span of a page holds a ``<``: docs.page turns one that starts no tag into ``&lt;`` before
+        parsing, and a code span shows that entity as written (``surrealdb[pydantic]>=3.0.0,&lt;4.0.0``). The guide's
+        span is a ``<code>`` element in the page. Inline spans only: fenced blocks are
+        :meth:`test_no_escaped_less_than_in_a_fenced_block`'s."""
         text = page.read_text(encoding="utf-8").split("\n---\n", 1)[1]
         assert [span for span in _code_spans(text) if "<" in span] == []
+
+    @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
+    def test_no_escaped_less_than_in_a_fenced_block(self, page: Path) -> None:
+        """No line of a fenced block of a page holds a ``<`` that starts no tag (not followed by a letter, ``/`` or
+        ``!``): docs.page turns it into ``&lt;`` before parsing, and the block shows that entity as written
+        (``$after.balance &lt; 0``). The guide's line is written without it (``0 > $after.balance``)."""
+        text = page.read_text(encoding="utf-8").split("\n---\n", 1)[1]
+        hazards = [line for line in _fenced_lines(text) if re.search(r"<(?![A-Za-z/!])", line)]
+        assert hazards == []
 
     def test_a_less_than_sign_in_code_is_an_element(self) -> None:
         """The guides' code spans holding a ``<`` reach the pages as ``<code>`` elements showing the same text."""
@@ -222,7 +241,7 @@ class TestConversion:
             [
                 "Use `a > b` and ``x `{y}` z`` but not a < b or {c}: [m](models.md).",
                 "```python",
-                "x = {'a': 1} if a < b else fns[0](models.md)",
+                "x = {'a': 1} if b > a else fns[0](models.md)",
                 "```",
                 "- item",
                 "  ~~~~",
@@ -236,7 +255,7 @@ class TestConversion:
         assert site.convert(text, DOCS / "querying.md").split("\n") == [
             "Use `a > b` and ``x `{y}` z`` but not a &lt; b or \\{c\\}: [m](/models).",
             "```python",
-            "x = {'a': 1} if a < b else fns[0](models.md)",
+            "x = {'a': 1} if b > a else fns[0](models.md)",
             "```",
             "- item",
             "  ~~~~",
@@ -262,7 +281,7 @@ class TestConversion:
                 "> `{a} & <b>` `` `<t>` ``",
                 "",
                 "```",
-                "a < b",
+                "a > b",
                 "```",
                 "Run `` DEFINE `<t>` `` now.",
                 "",
@@ -282,7 +301,7 @@ class TestConversion:
             "> <code>\\{a\\} &amp; &lt;b&gt;</code> <code>\\`&lt;t&gt;\\`</code>",
             "",
             "```",
-            "a < b",
+            "a > b",
             "```",
             "<div>",
             "",
@@ -302,6 +321,32 @@ class TestConversion:
         assert site.code_element("`a\\|b`", row=True) == "<code>a\\|b</code>"
         assert site.code_element("``  `x`  ``") == "<code> \\`x\\` </code>"
         assert site.code_element("`  `") == "<code>  </code>"
+
+    def test_fenced_lines_helper(self) -> None:
+        """The test helper reads the lines inside fenced blocks, fences left out, so the page check above sees them."""
+        assert _fenced_lines("a < b\n```sql\nx < 0\ny\n```\nz\n~~~\n<-w\n~~~\n") == ["x < 0", "y", "", "<-w", ""]
+
+    @pytest.mark.parametrize("line", ["x < 0", "a <= b", "->likes<-person", "<|2|>", "end <", "  <3", "a << b"])
+    def test_a_fenced_less_than_sign_fails(self, line: str) -> None:
+        """A fenced line holding a ``<`` that docs.page would show as ``&lt;`` stops the conversion, naming the guide
+        and the line; the guide is rewritten (``0 > x``) rather than published wrong."""
+        text = f"# T\n\nSome prose.\n\n```python\nok = 1\n{line}\n```\n"
+        with pytest.raises(ValueError, match=r"^docs/models\.md:7: a '<' in a fenced block") as raised:
+            site.convert(text, DOCS / "models.md")
+        assert line.strip() in str(raised.value)
+
+    @pytest.mark.parametrize("line", ['token = SurrealFunc("<string> rand::uuid::v7()")', "</div>", "<!-- c -->", "0 > x"])
+    def test_a_fenced_tag_like_less_than_sign_passes(self, line: str) -> None:
+        """A ``<`` followed by a letter, ``/`` or ``!`` shows as written on docs.page: the line is copied unchanged."""
+        assert site.convert(f"```\n{line}\n```", DOCS / "models.md") == f"```\n{line}\n```"
+
+    def test_only_lines_inside_a_fence_are_checked(self) -> None:
+        """Prose is escaped, not refused; a fence of another marker inside a block is code, and the block goes on to
+        its own closing fence."""
+        text = "a < b\n\n~~~~\n```\nok\n```\n~~~~\nc < d"
+        assert site.convert(text, DOCS / "models.md") == "a &lt; b\n\n~~~~\n```\nok\n```\n~~~~\nc &lt; d"
+        with pytest.raises(ValueError, match=r"^docs/models\.md:5: "):
+            site.convert("~~~~\n```\nok\n```\nx < 1\n~~~~", DOCS / "models.md")
 
     def test_a_code_span_never_crosses_a_blank_line(self) -> None:
         """A lone backtick does not open a span that would hide the next paragraph's hazards."""

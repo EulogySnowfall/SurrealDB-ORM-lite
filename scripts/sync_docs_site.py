@@ -24,6 +24,10 @@ A mirror is the guide's text with:
   decodes it. docs.page cuts a paragraph around such an element into several, so a paragraph holding one (not a list,
   a table or a quote, which docs.page renders whole) is wrapped in a ``<div>``, which it renders whole.
 
+A fenced block is copied as written. docs.page would show a ``<`` of one that starts no tag (``x < 0``, ``<-likes-``) as
+``&lt;``, and an HTML ``<pre>`` would lose its highlighting, so such a line stops the script with an error naming the
+guide and the line: the guide's line is rewritten without it (``0 > x``).
+
 Usage:
     python scripts/sync_docs_site.py          # Check only (exit 1 if a mirror is missing, stale or orphaned)
     python scripts/sync_docs_site.py --fix    # Rewrite every mirror from its guide
@@ -62,6 +66,8 @@ _TOKEN = re.compile(
     r"<!--(?P<comment>-?>|[\s\S]*?--!?>)|\]\((?P<target>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\)|(?P<char>\\?<|(?<!\\)[{}])"
 )
 _SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*:")
+#: In a fenced block: a ``<`` docs.page would show as ``&lt;`` (:func:`fenced_hazard`).
+_FENCED_HAZARD = re.compile(r"<(?![A-Za-z/!])")
 #: A block that starts a paragraph at the margin: not indented (a list item's text), not a list item, a table, a quote,
 #: a heading or a thematic break.
 _PARAGRAPH = re.compile(r"(?![ \t]|(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|[|>#]|(?:[-*_][ \t]*){3,}$)\S")
@@ -313,13 +319,25 @@ class _Site:
         return f"{converted[:start]}<div>\n\n{core}\n\n</div>{converted[start + len(core) :]}"
 
 
+def fenced_hazard(line: str) -> bool:
+    """Whether *line*, a line of a fenced block, holds a ``<`` that docs.page would show as ``&lt;``: one not followed
+    by a letter, ``/`` or ``!`` (``a < 0``, ``a <= b``, ``<-likes-``, ``<|2|>``). docs.page turns a ``<`` that starts no
+    tag into ``&lt;`` before parsing, and a fenced block shows the entity as written. The rule is conservative: a ``<``
+    followed by a letter (``<string>``, ``<future>``) shows as written."""
+    return _FENCED_HAZARD.search(line) is not None
+
+
 def convert(text: str, here: Path, root: Path = ROOT) -> str:
-    """The body of *here*'s mirror: *text* with links and MDX hazards converted outside fenced code blocks."""
+    """The body of *here*'s mirror: *text* with links and MDX hazards converted outside fenced code blocks.
+
+    A fenced block is copied as written, so a line of one that docs.page would show wrongly (:func:`fenced_hazard`)
+    raises :class:`ValueError` naming the guide and the line: rewrite the guide's line without it
+    (``0 > $after.balance`` for ``$after.balance < 0``)."""
     site = _Site(root)
     out: list[str] = []
     prose: list[str] = []
     fence: str | None = None
-    for line in text.split("\n"):
+    for number, line in enumerate(text.split("\n"), start=1):
         match = _FENCE.match(line)
         if fence is None and match is None:
             prose.append(line)
@@ -329,10 +347,20 @@ def convert(text: str, here: Path, root: Path = ROOT) -> str:
                 out.append(site.prose("\n".join(prose), here))
                 prose = []
             fence = match.group(1)
-        elif match is not None and fence is not None:
-            marker = match.group(1)
-            if marker[0] == fence[0] and len(marker) >= len(fence) and not line[match.end() :].strip():
-                fence = None
+        elif (
+            match is not None
+            and fence is not None
+            and match.group(1)[0] == fence[0]
+            and len(match.group(1)) >= len(fence)
+            and not line[match.end() :].strip()
+        ):
+            fence = None
+        elif fenced_hazard(line):
+            name = here.relative_to(root).as_posix() if here.is_relative_to(root) else str(here)
+            raise ValueError(
+                f"{name}:{number}: a '<' in a fenced block that starts no tag, which docs.page shows as '&lt;': "
+                f"rewrite the line without it (e.g. '0 > x' for 'x < 0'): {line.strip()}"
+            )
         out.append(line)
     if prose:
         out.append(site.prose("\n".join(prose), here))
