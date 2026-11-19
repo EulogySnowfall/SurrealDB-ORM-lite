@@ -178,6 +178,56 @@ class StrictShaped(BaseSurrealModel):
     root_one: AliasOnlyRoot | None = None
 
 
+class Contact(BaseModel):
+    """Read by alias only (``firstName``): no ``populate_by_name``."""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+    first_name: str = ""
+
+
+class Account(BaseSurrealModel):
+    """The top-level model dumps by alias: ``model_dump()`` keys its fields by column (``mainContact``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="sub_keys_account", alias_generator=to_camel, populate_by_name=True, serialize_by_alias=True
+    )
+    id: str | None = None
+    main_contact: Contact | None = None
+
+
+class AccountByName(BaseSurrealModel):
+    """The same columns, dumped by name: ``model_dump()`` keys its fields by Python name (``main_contact``)."""
+
+    model_config = SurrealConfigDict(table_name="sub_keys_account", alias_generator=to_camel, populate_by_name=True)
+    id: str | None = None
+    main_contact: Contact | None = None
+
+
+class AccountExplicit(BaseSurrealModel):
+    """An explicit ``Field(alias=…)`` on a top-level model dumped by alias."""
+
+    model_config = SurrealConfigDict(table_name="sub_keys_account", populate_by_name=True, serialize_by_alias=True)
+    id: str | None = None
+    main_contact: Contact | None = Field(default=None, alias="mainContact")
+
+
+class StrictAccount(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="sub_keys_strict_account",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+    )
+    id: str | None = None
+    main_contact: Contact | None = None
+
+
+def _contact(first_name: str) -> Contact:
+    """A ``Contact`` built by its alias, the only key its validation takes."""
+    return Contact.model_validate({"firstName": first_name})
+
+
 TABLES = (
     "sub_keys_holder",
     "sub_keys_path",
@@ -186,6 +236,8 @@ TABLES = (
     "sub_keys_strict_alias",
     "sub_keys_shaped",
     "sub_keys_strict_shaped",
+    "sub_keys_account",
+    "sub_keys_strict_account",
 )
 
 
@@ -280,6 +332,27 @@ class TestSubModelKeys:
         assert render_kind(columns[("roots",)].kind) == "option<array<object>>"
         assert render_kind(columns[("root_one",)].kind) == "option<object>"
         assert not columns[("roots",)].free_object and not columns[("root_one",)].free_object
+
+    @pytest.mark.parametrize("model", [Account, AccountByName, AccountExplicit])
+    def test_top_level_dumped_by_alias_rekeys_its_sub_models(self, model: type[BaseSurrealModel]) -> None:
+        """A top-level model with ``serialize_by_alias=True`` dumps its fields under their columns: the sub-model is
+        still found in that dump and re-keyed (``firstName``, the only key a read takes), as without it."""
+        account = model(id="a", main_contact=_contact("Ann"))
+        payload = account._write_payload()
+        assert payload == {"mainContact": {"firstName": "Ann"}}
+        assert model.model_validate(payload) == account.model_copy(update={"id": None})
+        dumped = model(main_contact=_contact("Bo")).model_dump()[_sub_keys.dump_key(model, "main_contact")]
+        assert model._dumped_keyword("main_contact", _contact("Bo")) == dumped  # what save() dumps, before re-keying
+        assert model._dumped_keyword("mainContact", _contact("Bo")) == dumped
+        assert model._assigned_values({"main_contact": _contact("Cy")}) == {"main_contact": {"firstName": "Cy"}}
+        assert model._merge_content({"mainContact": _contact("Di")})[1]["data"] == {"mainContact": {"firstName": "Di"}}
+        assert model._assigned_values({"main_contact": {"first_name": "Ed"}}) == {"main_contact": {"firstName": "Ed"}}
+
+    def test_dump_key_follows_the_models_serialize_by_alias(self) -> None:
+        assert _sub_keys.dump_key(Account, "main_contact") == "mainContact"
+        assert _sub_keys.dump_key(AccountExplicit, "main_contact") == "mainContact"
+        assert _sub_keys.dump_key(AccountByName, "main_contact") == "main_contact"
+        assert _sub_keys.dump_key(Account, "undeclared") == "undeclared"
 
     def test_plain_sub_models_have_no_shape(self) -> None:
         assert _sub_keys.keys_of(Plain).plain
@@ -605,6 +678,26 @@ class TestSubModelKeysE2E:
                 assert got.roots == AliasOnlyList([_only("Fay"), _only("Gus")]), table
 
     @pytest.mark.asyncio
+    async def test_a_top_level_model_dumped_by_alias(self) -> None:
+        """A top-level model with ``serialize_by_alias=True`` holding a sub-model read by alias only: ``save()``,
+        ``merge()`` and ``bulk_update()`` with an instance store the keys a read takes, on a schemaless table and on a
+        ``SCHEMAFULL`` table the ORM defined (3.x refused ``first_name``, 2.x dropped it), on both lines."""
+        async with orm_client(*TABLES) as client:
+            await StrictAccount.define_table()
+            for model, table in ((Account, "sub_keys_account"), (StrictAccount, "sub_keys_strict_account")):
+                account = await model(id="a", main_contact=_contact("Ann")).save()
+                got = await model.objects().get("a")
+                assert got.main_contact == _contact("Ann"), table
+                saved = (await _row(client, table, "a"))["mainContact"]
+                assert saved == {"firstName": "Ann"}, table
+                await account.merge(main_contact=_contact("Bo"))
+                assert (await _row(client, table, "a"))["mainContact"] == {"firstName": "Bo"}, table
+                assert (await model.objects().get("a")).main_contact == _contact("Bo"), table
+                await model.objects().filter(id="a").bulk_update(main_contact=_contact("Cy"))
+                assert (await _row(client, table, "a"))["mainContact"] == {"firstName": "Cy"}, table
+                assert (await model.objects().get("a")).main_contact == _contact("Cy"), table
+
+    @pytest.mark.asyncio
     async def test_plain_models_send_v0_22_2_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No alias on the sub-models: every write sends, encoded, the bytes v0.22.2 sent."""
         sent: dict[str, list[Any]] = {"create": [], "update": [], "merge": [], "query": []}
@@ -664,6 +757,7 @@ class TestSubModelKeysDocs:
             'A field read by its alias only (`Field(alias="firstName")`',
             "A generated migration proposes that removal",
             "`drop_missing=True` (`--drop-missing`)",
+            "has `serialize_by_alias=True`",
             "UPDATE <table> SET p.firstName = p.first_name WHERE p.first_name != NONE AND p.firstName = NONE",
         ):
             assert text in part, text

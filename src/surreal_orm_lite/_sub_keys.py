@@ -58,6 +58,7 @@ __all__ = [
     "SubKeys",
     "Values",
     "content",
+    "dump_key",
     "field_shape",
     "holds_model",
     "keys_of",
@@ -158,6 +159,7 @@ class Entries:
 
 _MISSING: Final = object()
 _KEYS: dict[type, SubKeys] = {}
+_DUMP_KEYS: dict[type, dict[str, str]] = {}
 _RELEVANT: dict[type, bool] = {}
 _FIELD_SHAPES: dict[type, dict[str, Shape]] = {}
 _MODEL_SHAPES: dict[type, dict[str, Shape]] = {}
@@ -236,6 +238,26 @@ def keys_of(model: type[BaseModel]) -> SubKeys:
     if model.__pydantic_complete__:
         _KEYS[model] = keys
     return keys
+
+
+def dump_key(model: type[BaseModel], name: str) -> str:
+    """The key ``model_dump()`` of *model* writes its field *name* under; *name* itself for an undeclared one.
+
+    Pydantic's rule for the model's own ``serialize_by_alias``: ``serialization_alias``, else ``alias`` (an
+    ``alias_generator`` fills both), else the name; the name when the model dumps by name. Cached once Pydantic has
+    completed the class. Used where a field's value is looked up in a dump of the **top-level** model, whose keys are
+    columns under ``serialize_by_alias=True`` (#218).
+    """
+    keys = _DUMP_KEYS.get(model)
+    if keys is None:
+        by_alias = bool(model.model_config.get("serialize_by_alias"))
+        keys = {
+            field: (info.serialization_alias or info.alias or field) if by_alias else field
+            for field, info in model.model_fields.items()
+        }
+        if model.__pydantic_complete__:
+            _DUMP_KEYS[model] = keys
+    return keys.get(name, name)
 
 
 # --- shapes ----------------------------------------------------------------------------------------------------------

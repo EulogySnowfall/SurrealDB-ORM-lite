@@ -3094,7 +3094,8 @@ class BaseSurrealModel(BaseModel):
         The model's own serializer dumps an instance holding only that field (built without ``__init__``, so no
         validator or ``model_post_init`` runs), exactly as ``model_dump()`` dumps it in ``save()``: field serializers
         and each sub-model's ``serialize_by_alias`` included. An undeclared key goes through ``__pydantic_extra__``
-        under ``extra="allow"``, as ``save()`` writes an extra.
+        under ``extra="allow"``, as ``save()`` writes an extra. The value is taken under the key the dump writes
+        (``_sub_keys.dump_key``): the field's column when the model itself has ``serialize_by_alias=True``.
 
         Raises:
             ValueError: the key is not one ``save()`` writes (undeclared without ``extra="allow"``, or
@@ -3115,12 +3116,12 @@ class BaseSurrealModel(BaseModel):
                 f"{cls.__name__}.{target} holds a model instance that the model's serializer could not dump on its own; "
                 "pass the value as a dict instead."
             ) from error
-        if target not in dumped:
+        if not dumped:  # filtered by ``include``: empty, or the one entry under the key the dump writes
             raise ValueError(
                 f"{cls.__name__}: {key!r} holds a model instance but is not a field save() writes "
                 "(undeclared, or Field(exclude=True)), so the ORM cannot tell its keys; pass the value as a dict instead."
             )
-        return dumped[target]
+        return dumped.get(_sub_keys.dump_key(cls, target), next(iter(dumped.values())))
 
     @classmethod
     def _keyword_parts(cls, data: Mapping[str, Any]) -> list[tuple[str, Any, Any, _sub_keys.Shape]]:
@@ -3469,7 +3470,9 @@ class BaseSurrealModel(BaseModel):
         under the first key a read takes (a ``serialization_alias`` that no validation alias
         names, under ``serialize_by_alias=True``). A sub-model read only through an ``AliasPath``
         of several steps raises ``ValueError``: no key a read takes can hold it. A model whose
-        sub-models read and write their fields by name only sends its dump unchanged.
+        sub-models read and write their fields by name only sends its dump unchanged. A model
+        that itself has ``serialize_by_alias=True`` dumps each field under its column, where its
+        sub-models are found and re-keyed alike (``_sub_keys.dump_key``).
 
         What gets excluded depends on what omitting a field *means* in the statement being
         built, which is not the same for a create and a replace:
@@ -3500,8 +3503,9 @@ class BaseSurrealModel(BaseModel):
             excluded |= self.get_server_fields() - set(keep)
         payload = self.model_dump(exclude=excluded)
         for name, shape in _sub_keys.shapes_of(type(self)).items():
-            if name in payload:
-                payload[name] = _sub_keys.rekeyed(shape, getattr(self, name, None), payload[name], caller=False)
+            key = _sub_keys.dump_key(type(self), name)  # its column under the model's serialize_by_alias=True
+            if key in payload:
+                payload[key] = _sub_keys.rekeyed(shape, getattr(self, name, None), payload[key], caller=False)
         return self._columns_for(payload)
 
     @classmethod
