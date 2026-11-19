@@ -2975,12 +2975,14 @@ class QuerySet:
         """
         if not kwargs:
             return 0
+        # A sub-model dict or instance is assigned whole, its keys those save() writes (#218).
+        values = self.model._assigned_values(kwargs)
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
             where_clause, where_vars = self._write_where(compiler)
             set_parts: list[str] = []
             set_vars: dict[str, Any] = {}
-            for i, (field, value) in enumerate(kwargs.items()):
+            for i, (field, value) in enumerate(values.items()):
                 validate_field_name(field, "bulk_update field")
                 var_name = f"_v{i}"
                 set_parts.append(f"{self._column(field)} = ${var_name}")

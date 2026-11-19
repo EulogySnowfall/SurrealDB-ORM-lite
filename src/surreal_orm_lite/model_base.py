@@ -19,7 +19,7 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, PrivateAttr, TypeAdapter, model_validator
 from pydantic_core import PydanticUndefined, ValidationError
 
-from . import _client
+from . import _client, _sub_keys
 from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
@@ -3077,6 +3077,93 @@ class BaseSurrealModel(BaseModel):
             return {}
         return {cls.to_db_field(key): value for key, value in data.items()}
 
+    # ==================== Sub-model keys in writes (#218) ====================
+
+    @classmethod
+    def _field_named(cls, key: str) -> str | None:
+        """The field a keyword write's *key* names, by its Python name or by its column; ``None`` for none."""
+        if key in cls.model_fields:
+            return key
+        name = cls.to_py_field(key)
+        return name if name in cls.model_fields else None
+
+    @classmethod
+    def _dumped_keyword(cls, key: str, value: Any) -> Any:
+        """*value* as ``save()`` writes the field *key* names: its model instances dumped (#218 (c)).
+
+        The model's own serializer dumps an instance holding only that field (built without ``__init__``, so no
+        validator or ``model_post_init`` runs), exactly as ``model_dump()`` dumps it in ``save()``: field serializers
+        and each sub-model's ``serialize_by_alias`` included. An undeclared key goes through ``__pydantic_extra__``
+        under ``extra="allow"``, as ``save()`` writes an extra.
+
+        Raises:
+            ValueError: the key is not one ``save()`` writes (undeclared without ``extra="allow"``, or
+                ``Field(exclude=True)``), or the serializer fails on an instance holding that field only.
+        """
+        name = cls._field_named(key)
+        target = name if name is not None else key
+        extra = cls.model_config.get("extra") == "allow"
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, "__dict__", {target: value} if name is not None else {})
+        object.__setattr__(instance, "__pydantic_extra__", ({} if name is not None else {key: value}) if extra else None)
+        object.__setattr__(instance, "__pydantic_fields_set__", {target})
+        object.__setattr__(instance, "__pydantic_private__", None)
+        try:
+            dumped = instance.model_dump(include={target}, warnings=False)
+        except Exception as error:
+            raise ValueError(
+                f"{cls.__name__}.{target} holds a model instance that the model's serializer could not dump on its own; "
+                "pass the value as a dict instead."
+            ) from error
+        if target not in dumped:
+            raise ValueError(
+                f"{cls.__name__}: {key!r} holds a model instance but is not a field save() writes "
+                "(undeclared, or Field(exclude=True)), so the ORM cannot tell its keys; pass the value as a dict instead."
+            )
+        return dumped[target]
+
+    @classmethod
+    def _keyword_parts(cls, data: Mapping[str, Any]) -> list[tuple[str, Any, Any, _sub_keys.Shape]]:
+        """``(key, value, what to send, shape)`` for each item of a keyword write's *data* (#218).
+
+        What to send is *value* itself unless it holds a model instance, then :meth:`_dumped_keyword`. The shape is
+        that of the field the key names (``_sub_keys.field_shape``): ``None`` for a field whose sub-models are all
+        read and written under their names, which keeps v0.22.2's payload.
+        """
+        parts: list[tuple[str, Any, Any, _sub_keys.Shape]] = []
+        for key, value in data.items():
+            name = cls._field_named(key)
+            sent = cls._dumped_keyword(key, value) if _sub_keys.holds_model(value) else value
+            shape = None if name is None else _sub_keys.field_shape(cls, name)
+            parts.append((key, value, sent, shape))
+        return parts
+
+    @classmethod
+    def _assigned_values(cls, data: Mapping[str, Any]) -> dict[str, Any]:
+        """Keyword values a ``SET`` assigns whole (``bulk_update()``, ``merge(server_values=…)``), keys as given (#218).
+
+        A model instance is sent as ``save()`` writes it, and every sub-field goes under the key ``save()`` writes it
+        under (``_sub_keys.rekeyed``): it replaces the stored object, so no other spelling survives to hide it.
+        """
+        return {key: _sub_keys.rekeyed(shape, value, sent) for key, value, sent, shape in cls._keyword_parts(data)}
+
+    @classmethod
+    def _merge_content(cls, data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        """The ``MERGE`` content of ``merge(**data)`` and its variables, column-keyed (#218).
+
+        ``(PLAIN_CONTENT, {"data": <payload>})`` unless a sub-model object must go under the spelling the stored
+        object uses (``_sub_keys.merged``), then an ``object::from_entries()`` expression reading ``$this``
+        (``_sub_keys.content``). A model whose sub-models are all read and written under their names sends v0.22.2's
+        payload, the very values given.
+        """
+        wire: dict[str, Any] = {}
+        for key, value, sent, shape in cls._keyword_parts(data):
+            column = cls.to_db_field(key)
+            wire[column] = _sub_keys.merged(shape, value, sent, (column,))
+        if any(isinstance(item, _sub_keys.Entries) for item in wire.values()):
+            return _sub_keys.content(wire)
+        return PLAIN_CONTENT, {"data": wire}
+
     @classmethod
     def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:
         """Name a column-keyed payload's fields the way a signal handler expects them.
@@ -3377,6 +3464,13 @@ class BaseSurrealModel(BaseModel):
         under a name that ``filter()``, ``select()`` and ``_apply_record()`` never look for —
         the value would land in the database and become unreachable through the ORM.
 
+        The same holds below the top level (#218): a sub-model's field is written under the key
+        ``model_dump()`` writes when a read takes it, which is what v0.22.2 stored, and otherwise
+        under the first key a read takes (a ``serialization_alias`` that no validation alias
+        names, under ``serialize_by_alias=True``). A sub-model read only through an ``AliasPath``
+        of several steps raises ``ValueError``: no key a read takes can hold it. A model whose
+        sub-models read and write their fields by name only sends its dump unchanged.
+
         What gets excluded depends on what omitting a field *means* in the statement being
         built, which is not the same for a create and a replace:
 
@@ -3404,7 +3498,11 @@ class BaseSurrealModel(BaseModel):
         excluded = {"id", *self.get_computed_fields()}
         if not replace:
             excluded |= self.get_server_fields() - set(keep)
-        return self._columns_for(self.model_dump(exclude=excluded))
+        payload = self.model_dump(exclude=excluded)
+        for name, shape in _sub_keys.shapes_of(type(self)).items():
+            if name in payload:
+                payload[name] = _sub_keys.rekeyed(shape, getattr(self, name, None), payload[name], caller=False)
+        return self._columns_for(payload)
 
     @classmethod
     def _is_write_protected(cls, name: str) -> bool:
@@ -3967,18 +4065,23 @@ class BaseSurrealModel(BaseModel):
             raise SurrealDbError("Can't merge data, no record found.") from e
         self._sync_after_merge(rows, refresh, data, server_values)
 
-    async def _merge_native(self, record_id: Any, wire_data: dict[str, Any], data: Mapping[str, Any], refresh: bool) -> None:
+    async def _merge_native(
+        self, record_id: Any, merge_content: str, bound: dict[str, Any], data: Mapping[str, Any], refresh: bool
+    ) -> None:
         """Run a non-transactional ``merge()`` without ``server_values``.
 
         The SDK's ``merge()`` already answers with the merged row, which is everything a
         re-read would return — so the instance is synced from it in one round-trip, and its
         emptiness still reports a record that does not exist. ``refresh=False`` needs
-        ``RETURN NONE``, which the SDK method cannot express, so that case is compiled.
+        ``RETURN NONE``, which the SDK method cannot express, so that case is compiled, and so is
+        a content that picks the stored spelling of a sub-model (#218, :meth:`_merge_content`):
+        the ``UPDATE`` returns the merged row too.
         """
-        if not refresh:
-            statement = "UPDATE $rid MERGE $data RETURN NONE;"
-            await self._run_update(statement, {"rid": record_id, "data": wire_data}, False, data, {})
+        if not refresh or merge_content != PLAIN_CONTENT:
+            statement = f"UPDATE $rid MERGE {merge_content}{'' if refresh else ' RETURN NONE'};"
+            await self._run_update(statement, {"rid": record_id, **bound}, refresh, data, {})
             return
+        wire_data = bound["data"]
         encoded = _encoding.encode(wire_data)  # issue #325: refused before any client is asked for
         client = await type(self)._connection_manager().get_client()
         try:
@@ -4244,7 +4347,8 @@ class BaseSurrealModel(BaseModel):
         assert record_id is not None  # refused by merge()'s _merge_arguments() (#320)
 
         # Columns on the wire, Python names in the signal payload and the local apply below.
-        merged: dict[str, Any] = {**self._columns_for(data), **self._columns_for(server_values)}
+        # A sub-model dict or instance is assigned whole, its keys those save() writes (#218).
+        merged: dict[str, Any] = {**self._columns_for(self._assigned_values(data)), **self._columns_for(server_values)}
         clause, variables = build_set_clause(merged)
         variables["rid"] = record_id
         variables = merge_extra_vars(variables, extra_vars)
@@ -4328,6 +4432,16 @@ class BaseSurrealModel(BaseModel):
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
             >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
 
+        **Sub-models** (#218). A sub-model instance is written as ``save()`` writes it. In a
+        sub-model ``dict``, each field may be named by any key a read takes, by its name or by
+        the key ``model_dump()`` writes, and goes under the key ``save()`` writes. A value that
+        is not an object also removes the keys a read would take before it, so the value read is
+        the value merged; ``None`` removes every key of that field. An object is merged into the
+        spelling the stored object already uses, chosen by the server, so no stored key is lost.
+        A field named twice raises ``ValueError``. With ``server_values`` the field is assigned
+        whole (``SET``), as before, with the keys ``save()`` writes. A model whose sub-models
+        read and write their fields by name only sends ``data`` as given.
+
         A computed field or an edge endpoint in ``data`` (``ValueError``), an invalid
         ``server_values``/``extra_vars`` pair (``ValueError``/``TypeError``), a computed field or an
         endpoint in ``server_values`` (``ValueError``) and a missing id (``SurrealDbError``) are
@@ -4341,7 +4455,8 @@ class BaseSurrealModel(BaseModel):
         data_set = dict(data.items())
         # Keyword arguments name Python fields; the MERGE payload names columns. Everything
         # that stays on this side of the wire — signals, the local apply — keeps `data_set`.
-        wire_data = self._columns_for(data_set)
+        # Sub-model keys follow save() and the stored spelling (#218), before any signal.
+        merge_content, bound = self._merge_content(data_set)
         record_id = self._record_id()
         assert record_id is not None  # refused by _merge_arguments() (#320)
 
@@ -4351,22 +4466,22 @@ class BaseSurrealModel(BaseModel):
             update_fields = list(data_set.keys())
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
-            statement = "UPDATE $rid MERGE $data;" if refresh else "UPDATE $rid MERGE $data RETURN NONE;"
-            rows = await tx.add(statement, {"rid": record_id, "data": wire_data})
+            statement = f"UPDATE $rid MERGE {merge_content};" if refresh else f"UPDATE $rid MERGE {merge_content} RETURN NONE;"
+            rows = await tx.add(statement, {"rid": record_id, **bound})
             self._sync_after_merge(rows, tx.is_interactive and refresh, data_set, {})
             if has_signals:
                 tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
         if not has_signals:
-            await self._merge_native(record_id, wire_data, data_set, refresh)
+            await self._merge_native(record_id, merge_content, bound, data_set, refresh)
             return
 
         update_fields = list(data_set.keys())
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            await self._merge_native(record_id, wire_data, data_set, refresh)
+            await self._merge_native(record_id, merge_content, bound, data_set, refresh)
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
 
