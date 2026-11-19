@@ -233,7 +233,7 @@ class AuthorFactory(ModelFactory[Author]):
 
 
 draft = AuthorFactory.build()  # no database
-assert draft.get_id() is None and 18 <= draft.age <= 80
+assert draft.get_id() is None and 80 >= draft.age >= 18
 
 async with embedded_database():  # a fresh, empty in-memory database
     await AuthorFactory.create_batch(3)

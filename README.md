@@ -103,7 +103,8 @@ lists every QuerySet method and filter lookup.
 | [Testing](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/testing.md)                                  | `ModelFactory`, `Faker` and the pytest plugin                                                              |
 | [Compatibility](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/compatibility.md)                      | Tested versions and every behaviour that differs between SurrealDB 2.x, 3.x, 4.x and the embedded engine   |
 
-The [documentation index](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/README.md) lists every section of the guides.
+The [documentation index](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/README.md) lists every section of the guides. The
+guides are also published as a [documentation site](https://docs.page/EulogySnowfall/SurrealDB-ORM-lite).
 
 ## Using with AI assistants
 
