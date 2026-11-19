@@ -1,0 +1,53 @@
+{
+  "$schema": "https://docs.page/schema.json",
+  "name": "Surreal ORM Lite",
+  "description": "A Django-style async ORM for SurrealDB with Pydantic models, built on the official SurrealDB Python SDK.",
+  "social": {
+    "github": "EulogySnowfall/SurrealDB-ORM-lite"
+  },
+  "content": {
+    "showPageTitle": false
+  },
+  "sidebar": [
+    {
+      "group": "Start here",
+      "pages": [
+        { "title": "Overview", "href": "/" },
+        { "title": "Getting started", "href": "/getting-started" },
+        { "title": "Migrating to 0.50", "href": "/migrating-to-0.50" }
+      ]
+    },
+    {
+      "group": "Guides",
+      "pages": [
+        { "title": "Models", "href": "/models" },
+        { "title": "Field types", "href": "/fields" },
+        { "title": "Querying", "href": "/querying" },
+        { "title": "Writing data", "href": "/writing" },
+        { "title": "Relations and graph", "href": "/relations" },
+        {
+          "title": "Stored functions and events",
+          "href": "/functions-and-events"
+        },
+        { "title": "Authentication", "href": "/authentication" },
+        { "title": "Live queries and change feeds", "href": "/realtime" },
+        { "title": "Connections", "href": "/connections" },
+        { "title": "Embedded engine", "href": "/embedded" },
+        { "title": "Schema and DDL", "href": "/schema" },
+        { "title": "Search", "href": "/search" },
+        { "title": "Migrations", "href": "/migrations" },
+        { "title": "Command line", "href": "/cli" },
+        { "title": "Testing", "href": "/testing" }
+      ]
+    },
+    {
+      "group": "Reference",
+      "pages": [
+        { "title": "Compatibility", "href": "/compatibility" },
+        { "title": "Roadmap", "href": "/ROADMAP" },
+        { "title": "Guide for AI assistants", "href": "/ai/CLAUDE" },
+        { "title": "Contributing", "href": "/contributing" }
+      ]
+    }
+  ]
+}
