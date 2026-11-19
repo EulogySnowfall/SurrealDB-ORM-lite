@@ -318,6 +318,8 @@ await Member.objects().filter(id="ada").bulk_update(profile={"firstName": "Ada"}
   `ValueError`: write it with `update()` or `bulk_update()`.
 - **`bulk_update()` and `merge(server_values=…)`** assign the field whole (`SET`), as before: the stored object is
   replaced, its keys those `save()` writes.
+- **A model dumped by alias.** The rule is the same when the `BaseSurrealModel` itself has `serialize_by_alias=True`
+  (its fields are then dumped under their columns): its sub-models are written under the same keys as without it.
 - A model whose sub-models read and write every field by its name only (no alias, no `populate_by_name`) sends exactly
   what it sent before.
 

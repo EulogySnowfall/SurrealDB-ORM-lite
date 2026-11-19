@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under a `RootModel`) is written under one key on every write and on both server lines: the key `model_dump()` writes
   when a read takes it, else the first key a read takes. A field read by its alias only, or a `serialization_alias` no validation alias names, was
   stored where no read found it. `merge()` and `bulk_update()` dicts accept any spelling of a sub-field, and a
-  sub-model instance in a keyword write is written as `save()` writes it.
+  sub-model instance in a keyword write is written as `save()` writes it, also on a model that itself has
+  `serialize_by_alias=True`.
 - `define_table()` and `table_ddl()` declare each sub-model field under the key the ORM writes, so a `SCHEMAFULL`
   table takes every sub-model write on 2.x, 3.x and 4.x (3.x/4.x refused them, 2.x dropped them). A `RootModel`
   field is declared as its root (an array for `RootModel[list[M]]`), no longer as an `object` with a `root` field.
