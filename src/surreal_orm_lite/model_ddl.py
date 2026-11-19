@@ -37,6 +37,7 @@ returned, not an injection defence.
 
 from collections.abc import Collection, Iterable, Mapping, MutableSequence, MutableSet, Sequence
 from collections.abc import Set as AbstractSet
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -45,10 +46,11 @@ from types import NoneType, UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
 from pydantic.fields import ComputedFieldInfo, FieldInfo
 from pydantic_core import PydanticUndefined
 
+from . import _sub_keys
 from ._sdk import RecordID, SdkDuration, SdkRange
 from .define_parser import DefineParseError, Kind, KLiteral, KName, KObject, KTuple, KUnion, render_kind, scan_fragment
 from .geo import _ALL_KINDS, _geo_kinds, _GeoMarker, _ordered
@@ -84,6 +86,8 @@ _ARRAY_ORIGINS: tuple[Any, ...] = (list, Sequence, MutableSequence)
 _SET_ORIGINS: tuple[Any, ...] = (set, frozenset, AbstractSet, MutableSet)
 #: The default values written as a ``DEFAULT`` literal (a ``str`` or ``int`` enum member is written as its value).
 _DEFAULT_TYPES = (bool, int, float, Decimal, str, datetime, date, timedelta, Duration, SdkDuration, UUID)
+#: The root models whose kind :func:`_map` is mapping: one met again below itself (its root holds it) is ``any`` there.
+_ROOTS: ContextVar[frozenset[type]] = ContextVar("_ROOTS", default=frozenset())
 # ``Annotated`` subscripted with values built at run time (mypy takes it for a type expression).
 _ANNOTATED: Any = Annotated
 
@@ -93,8 +97,8 @@ class Column:
     """One column a model's table DDL defines (v0.34.0).
 
     ``path``: the unescaped segments, ``"*"`` for an array's items (``("address", "city")``, ``("subs", "*", "city")``,
-    ``("bag", "*")``); the first is the column of a top-level field (its alias when it has one), the others the field
-    names of a sub-model. ``field``: the Python name of the top-level field the column belongs to, for messages.
+    ``("bag", "*")``); the first is the column of a top-level field (its alias when it has one), the others the keys
+    the ORM writes a sub-model's fields under (their names, unless an alias decides, #218). ``field``: the Python name of the top-level field the column belongs to, for messages.
     ``kind``: the kind ``TYPE`` writes. ``free_object``: the kind holds a free-form object — a ``dict``, a record model,
     a sub-model where its fields are not defined — or is a sub-model with ``extra="allow"``, so a ``SCHEMAFULL`` table
     writes it ``FLEXIBLE``. ``flexible_requested``: the field is in ``flexible_fields`` or has
@@ -141,9 +145,28 @@ def _is_record_model(annotation: Any) -> bool:
     return isinstance(annotation, type) and isinstance(getattr(annotation, "__surreal_edge__", None), bool)
 
 
+def _is_root_model(annotation: Any) -> bool:
+    """A Pydantic ``RootModel``: ``model_dump()`` writes its root, and a read validates its root (#218)."""
+    return isinstance(annotation, type) and issubclass(annotation, RootModel)
+
+
 def _is_sub_model(annotation: Any) -> bool:
-    """A Pydantic model that is not a record model: its fields are written inside the record."""
-    return isinstance(annotation, type) and issubclass(annotation, BaseModel) and not _is_record_model(annotation)
+    """A Pydantic model that is not a record model nor a ``RootModel``: its fields are written inside the record."""
+    return (
+        isinstance(annotation, type)
+        and issubclass(annotation, BaseModel)
+        and not _is_record_model(annotation)
+        and not _is_root_model(annotation)
+    )
+
+
+def _rooted(annotation: Any) -> Any:
+    """*annotation*, a ``RootModel`` replaced by its root's annotation (at any depth, each root model once)."""
+    seen: set[type] = set()
+    while _is_root_model(annotation) and annotation not in seen and "root" in annotation.model_fields:
+        seen.add(annotation)
+        annotation, _ = _unwrap(annotation.model_fields["root"].annotation, ())
+    return annotation
 
 
 def _admits_none(annotation: Any) -> bool:
@@ -271,8 +294,23 @@ def _flag(cls: type[Flag]) -> Kind:
     return KName("int")
 
 
+def _root_kind(cls: type[BaseModel]) -> tuple[Kind, bool]:
+    """A ``RootModel``: the kind of its root, which is what is stored; ``any`` below itself (a root holding it)."""
+    info = cls.model_fields.get("root")
+    trail = _ROOTS.get()
+    if info is None or cls in trail:
+        return _ANY, False
+    token = _ROOTS.set(trail | {cls})
+    try:
+        return _map(info.annotation, tuple(info.metadata))
+    finally:
+        _ROOTS.reset(token)
+
+
 def _class(cls: type) -> tuple[Kind, bool]:
     """A class used as a whole annotation (``list``, ``dict`` and ``set`` bare)."""
+    if _is_root_model(cls):
+        return _root_kind(cls)
     if _is_record_model(cls) or issubclass(cls, BaseModel) or issubclass(cls, Mapping):
         return _OBJECT, True
     if issubclass(cls, Flag):  # before ``Enum``, of which a flag is one (and ``IntFlag`` an ``int`` too)
@@ -456,19 +494,21 @@ def _sub_model_shape(
     annotation: Any, metadata: tuple[Any, ...], trail: tuple[type, ...]
 ) -> tuple[type[BaseModel], bool] | None:
     """``(M, star)`` when the annotation is ``M``, ``M | None``, ``list[M]`` or ``list[M] | None`` for a sub-model ``M``
-    that is not already on the *trail* (``star``: its fields are under ``*``); ``None`` otherwise."""
+    that is not already on the *trail* (``star``: its fields are under ``*``); ``None`` otherwise. A ``RootModel``
+    at any of those places stands for its root (``RootModel[list[M]]`` is ``list[M]``)."""
     annotation, _ = _unwrap(annotation, metadata)
+    annotation = _rooted(annotation)
     if _is_union(annotation):
         args = get_args(annotation)
         rest = [member for member in args if member is not NoneType]
         if len(rest) != 1 or len(rest) == len(args):
             return None
-        annotation, _ = _unwrap(rest[0], ())
+        annotation = _rooted(_unwrap(rest[0], ())[0])
     star = False
     origin = get_origin(annotation)
     args = get_args(annotation)
     if (origin is tuple and len(args) == 2 and args[1] is Ellipsis) or (origin in _ARRAY_ORIGINS and len(args) == 1):
-        annotation, _ = _unwrap(args[0], ())
+        annotation = _rooted(_unwrap(args[0], ())[0])
         star = True
     if _is_sub_model(annotation) and annotation not in trail:
         return annotation, star
@@ -555,9 +595,15 @@ def _from_computed_info(
 
 
 def _sub_fields(model: str, field: str, base: tuple[str, ...], sub: type[BaseModel]) -> list[_Field]:
-    """A sub-model's fields (but ``Field(exclude=True)``), then its Pydantic computed fields, under *base*."""
+    """A sub-model's fields (but ``Field(exclude=True)``), then its Pydantic computed fields, under *base*.
+
+    Each field under the key the ORM writes it under (``_sub_keys.keys_of()``, #218): its name for a sub-model read
+    and written by name, else its alias (read alone, or dumped with ``serialize_by_alias``), or the first key a read
+    takes. A field no plain key reads (an ``AliasPath`` of several steps), which a write refuses, keeps its name.
+    """
+    keys = _sub_keys.keys_of(sub).fields
     fields = [
-        _from_field_info(model, field, (*base, name), info)
+        _from_field_info(model, field, (*base, keys[name].key or name), info)
         for name, info in sub.model_fields.items()
         if info.exclude is not True
     ]
@@ -638,7 +684,7 @@ def model_columns(
     field's name. Each column is followed by the item definition of each untyped array position (``bag.*``,
     ``lol.*.*``: kind ``any``, ``item=True``) and, for a sub-model ``M`` annotated ``M``, ``M | None``, ``list[M]`` or
     ``list[M] | None``, by the columns of its fields and computed fields (``address.city``, ``subs.*.city``) by the
-    same rules, depth first. ``M`` anywhere else, a record model and a sub-model already on the path are free-form
+    same rules, depth first, each field under the key the ORM writes it under (its name unless an alias decides, #218). ``M`` anywhere else, a record model and a sub-model already on the path are free-form
     objects without nested columns. A ``list[M]`` column is ``flexible_items`` when a column under it is written
     ``FLEXIBLE`` before SurrealDB 3.x (a free-form object, a ``FLEXIBLE`` request, a kind holding ``any``).
 

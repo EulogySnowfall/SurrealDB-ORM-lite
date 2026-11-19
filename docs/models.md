@@ -260,6 +260,84 @@ Result keys stay in your vocabulary too, with one rule for grouped rows: an `ann
 your own word and is never renamed. An alias that spells a grouped field — by name or by column —
 would lose one of the two values in the same row, so it raises `ValueError`.
 
+### Sub-model keys and aliases
+
+A sub-model, a Pydantic `BaseModel` used as a field's type (also in a `list`, a `tuple`, a `dict`, `X | None` or the
+root of a `RootModel`), is read back by Pydantic, which takes each of its fields from the first key it accepts: its
+validation aliases in order, then its name under `populate_by_name`. The ORM writes each sub-field under one key, on
+every write and on both server lines:
+
+- the key `model_dump()` writes, when a read takes it, so `save()` stores what it always stored: the name, or the
+  alias under `serialize_by_alias=True`;
+- otherwise the first key a read takes. A field read by its alias only (`Field(alias="firstName")`, or an
+  `alias_generator`, without `populate_by_name`) is dumped by name, which no read takes: it stores `firstName`. A
+  `serialization_alias` that no validation alias names would land where no read finds it as well:
+  `Field(validation_alias="fn", serialization_alias="firstName")` stores `fn`. A field read only through an `AliasPath`
+  of several steps has no such key, and writing it raises `ValueError`.
+
+`define_table()` (and `table_ddl()`) declares each sub-model field under that same key, so a `SCHEMAFULL` table the ORM
+defined takes every sub-model write on both lines. A `RootModel` is stored as its root (`RootModel[list[Profile]]` is an
+array of profiles, declared as one), and a sub-model in a fixed tuple of different types (`tuple[Profile, int]`) is a
+free-form object there. Earlier versions stored the two cases of the second rule under the dumped key (`first_name`
+where `firstName` is now stored, `firstName` where `fn` is): rows written then keep that key, which a read skips, until
+the field is written again. A nested path in a query names the stored key (`filter(**{"profile.firstName": …})`), and a
+table defined by an earlier version gets the new sub-field definitions from `define_table()` (the old ones stay until
+you remove them). A generated migration proposes that removal: `makemigrations()` adds the new definitions, names the
+old ones in a warning and writes their `DropField` with `drop_missing=True` (`--drop-missing`). Values under an old key
+can be copied first with a raw
+`UPDATE <table> SET p.firstName = p.first_name WHERE p.first_name != NONE AND p.firstName = NONE` before applying it.
+
+Keyword writes follow the same rule:
+
+```python
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
+
+
+class Address(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    zip_code: str = ""
+    city_name: str = ""
+
+
+class Profile(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    first_name: str = ""
+    home_addr: Address | None = None
+
+
+class Member(BaseSurrealModel):
+    id: str
+    profile: Profile | None = None
+
+
+member = Member(id="ada", profile=Profile(first_name="Ada", home_addr=Address(zip_code="1", city_name="Paris")))
+await member.save()                                                  # first_name, home_addr.zip_code, …
+await member.merge(profile={"firstName": "Ade", "homeAddr": {"zipCode": "2"}})  # city_name kept
+await member.merge(profile=Profile(first_name="Ada"))                # an instance, written as save() writes it
+await Member.objects().filter(id="ada").bulk_update(profile={"firstName": "Ada"})  # the whole profile
+```
+
+- **Spellings.** In a sub-model `dict`, a field may be named by any key a read takes, by its name or by the key
+  `model_dump()` writes. Naming one field twice raises `ValueError`.
+- **Instances.** A sub-model instance in `merge()`, `bulk_update()` or `update_or_create()` is written as `save()`
+  writes it.
+- **`merge()`** merges into the stored object, which the ORM does not see. A value that is not an object goes under the
+  key `save()` writes and removes the keys a read would take first, so the value read is the value merged; `None`
+  removes every key of that field. An object is merged into the spelling the stored object already uses (the server
+  picks the first key present, else the key `save()` writes), so no stored key is lost, also on a row an older version
+  left with both spellings. One `merge()` resolves up to three such objects nested in each other; a deeper one raises
+  `ValueError`: write it with `update()` or `bulk_update()`.
+- **`bulk_update()` and `merge(server_values=…)`** assign the field whole (`SET`), as before: the stored object is
+  replaced, its keys those `save()` writes.
+- **A model dumped by alias.** The rule is the same when the `BaseSurrealModel` itself has `serialize_by_alias=True`
+  (its fields are then dumped under their columns): its sub-models are written under the same keys as without it.
+- A model whose sub-models read and write every field by its name only (no alias, no `populate_by_name`) sends exactly
+  what it sent before.
+
+One limit remains: a union of several sub-models (`A | B`) given as a `dict` is written as given, since only an
+instance tells which model it holds.
+
 ### `server_fields`
 
 Mark the columns the **server** owns — filled by a `DEFINE FIELD … DEFAULT`, an event or a
