@@ -1576,11 +1576,14 @@ class TestNoSerializationWarningGuard:
             RfGuarded.model_construct(x="a").model_dump()
 
     def test_a_resource_warning_is_not_an_error(self) -> None:
+        probe = "#239 guard probe: unclosed transport"
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            with _no_serialization_warning():
-                warnings.warn("unclosed transport", ResourceWarning, stacklevel=1)
-        assert [type(w.message) for w in caught] == [ResourceWarning]
+            with _no_serialization_warning():  # a raised ResourceWarning would fail the test here
+                warnings.warn(probe, ResourceWarning, stacklevel=1)
+        # The guard's gc.collect() may record warnings for garbage other tests left: check only the probe.
+        probes = [w for w in caught if str(w.message) == probe]
+        assert [type(w.message) for w in probes] == [ResourceWarning]
 
     def test_pending_garbage_is_collected_before_the_block(self) -> None:
         enabled = gc.isenabled()
