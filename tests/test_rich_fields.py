@@ -11,11 +11,13 @@ import contextlib
 import copy
 import dataclasses
 import enum
+import gc
 import inspect
 import re
 import threading
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal, Optional, Self
@@ -1083,8 +1085,7 @@ class TestApplyRecordE2E:
             assert type(event.hours) is Range and event.hours == FULL["hours"]
             assert type(event.period) is Range and event.period == FULL["period"]
 
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", UserWarning)  # no PydanticSerializationUnexpectedValue any more
+            with _no_serialization_warning():  # no PydanticSerializationUnexpectedValue any more
                 await event.update()  # the §3.7 regression: durations written back as {elapsed: …}
             rid = event._record_id()
             assert rid is not None
@@ -1425,8 +1426,7 @@ class TestSubModelSyncRule:
             assert type(got.by_key["a"]) is timedelta and got.by_key == {"a": timedelta(seconds=90)}
             assert type(got.either) is timedelta and got.either == timedelta(seconds=90)
             assert type(got.window) is Range and got.window == Range(BoundIncluded(timedelta(seconds=90)), None)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")  # the full write serialises timedeltas, not the SDK's dataclass
+        with _no_serialization_warning():  # the full write serialises timedeltas, not the SDK's dataclass
             dumped = kinds.model_dump(include={"many", "by_key", "either"})
         assert dumped == {"many": read.many, "by_key": read.by_key, "either": read.either}
 
@@ -1544,6 +1544,59 @@ class TestSubModelSyncRule:
         assert RfIncomplete not in model_base._SYNC_FIELDS and RfIncomplete not in model_base._SYNC_ADAPTERS
 
 
+@contextlib.contextmanager
+def _no_serialization_warning() -> Iterator[None]:
+    """Turn Pydantic's serializer warnings (a ``UserWarning``) into errors, and only those (#239).
+
+    A socket an earlier test left open can be finalised by the garbage collector inside the block: its
+    ``ResourceWarning`` is not this test's, and under a blanket ``"error"`` filter pytest reports it as a
+    ``PytestUnraisableExceptionWarning`` here. Pending garbage is collected first, and the filter is narrowed.
+    """
+    gc.collect()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        yield
+
+
+class _Cycle:
+    """An object in a reference cycle: only the cyclic garbage collector frees it."""
+
+    def __init__(self) -> None:
+        self.me = self
+
+
+class TestNoSerializationWarningGuard:
+    """#239: the guard of the write-sync tests fails on Pydantic's warning, and on nothing another test left behind."""
+
+    def test_a_serialization_warning_still_fails(self) -> None:
+        class RfGuarded(BaseModel):
+            x: int
+
+        with pytest.raises(UserWarning, match="PydanticSerializationUnexpectedValue"), _no_serialization_warning():
+            RfGuarded.model_construct(x="a").model_dump()
+
+    def test_a_resource_warning_is_not_an_error(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with _no_serialization_warning():
+                warnings.warn("unclosed transport", ResourceWarning, stacklevel=1)
+        assert [type(w.message) for w in caught] == [ResourceWarning]
+
+    def test_pending_garbage_is_collected_before_the_block(self) -> None:
+        enabled = gc.isenabled()
+        gc.disable()  # no automatic collection between the ``del`` and the block
+        try:
+            cycle = _Cycle()
+            ref = weakref.ref(cycle)
+            del cycle
+            assert ref() is not None, "a cycle waits for the collector"
+            with _no_serialization_warning():
+                assert ref() is None
+        finally:
+            if enabled:
+                gc.enable()
+
+
 class TestSubModelWriteSyncE2E:
     """#228: after a write that syncs the instance, sub-models hold their declared types and a full write keeps them native."""
 
@@ -1554,8 +1607,7 @@ class TestSubModelWriteSyncE2E:
         async with orm_client("rf_holder"):
             holder = await _SYNC_CASES[case]()
             _assert_sub_models(holder)
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue on the full write
+            with _no_serialization_warning():  # no PydanticSerializationUnexpectedValue on the full write
                 await getattr(holder, write)()
             rid = holder._record_id()
             assert rid is not None
@@ -1570,8 +1622,7 @@ class TestSubModelWriteSyncE2E:
             holder = RfIssueHolder(id="h", sub=sub, many=[Duration.parse("2m")])
             await holder.upsert()
             assert type(holder.sub) is RfIssueSub and holder.sub == sub, holder.sub
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue
+            with _no_serialization_warning():  # no PydanticSerializationUnexpectedValue
                 await holder.update()
             row = await _raw(RecordID("rf_issue_holder", "h"))
             assert type(row["sub"]["ttl"]) is surrealdb.Duration and type(row["sub"]["td"]) is surrealdb.Duration, row
@@ -1856,8 +1907,7 @@ class TestNestedTimedeltaReadE2E:
                 _assert_td_positions(holder)
             await got.merge(n=1)  # a write sync: every position keeps what a read gives
             _assert_td_positions(got)
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")
+            with _no_serialization_warning():
                 await got.update()
             stored = await _raw(rid)
             assert type(stored["sub"]["td"]) is surrealdb.Duration and type(stored["tds"][0]) is surrealdb.Duration
@@ -2958,8 +3008,7 @@ class TestWriteSyncGivesTheReadTypesE2E:
                 assert type(getattr(got, name)) is type(value) and getattr(got, name) == value, name
                 assert type(getattr(shapes, name)) is type(value) and getattr(shapes, name) == value, name
             assert type(shapes.nested[0]) is tuple
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue on the full write
+            with _no_serialization_warning():  # no PydanticSerializationUnexpectedValue on the full write
                 await shapes.update()
 
 
@@ -3089,8 +3138,7 @@ class TestWriteSyncGivesTheReadScalarsE2E:
                 assert typed.model_dump(exclude={"id"}) == got.model_dump(exclude={"id"})
                 names = ("status", "level", "amount")
                 assert [type(getattr(typed, name)) for name in names] == [type(getattr(got, name)) for name in names]
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue ("Expected `enum`")
+            with _no_serialization_warning():  # no PydanticSerializationUnexpectedValue ("Expected `enum`")
                 typed.model_dump(exclude={"id"})  # a returned id stays the native RecordID (README, record IDs)
                 await typed.update()
 
