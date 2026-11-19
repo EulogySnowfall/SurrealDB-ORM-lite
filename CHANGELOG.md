@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Declare the field (`Duration`, `Range[T]`, the geometry fields) to read the ORM's classes instead of the SDK's; see
   "Untyped fields" in the [fields guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/fields.md).
 
+## [0.50.8] - 2026-11-18
+
+### Fixed
+
+- `update()` and `upsert()` of a model with a `Computed` field whose column has a non-optional `TYPE` and a `VALUE`
+  clause (`TYPE datetime VALUE time::now()`, as `generate_models_from_db()` produces) no longer fail on SurrealDB 2.x
+  with `Found NONE for field ...` ([#267](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/267)). 2.x checks
+  the `TYPE` before the `VALUE` clause runs, so on 2.x the replace now writes each computed column back as its stored
+  value and the `VALUE` clause recomputes it. SurrealDB 3.x, 4.x and the embedded engine are unchanged.
+
+### Notes
+
+- On 2.x a `VALUE` expression that reads `$value` sees the stored value during a replace, and `NONE` on 3.x; see the
+  [models guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/models.md) and the 2.x vs 3.x
+  table in the compatibility guide.
+
 ## [0.50.6] - 2026-11-15
 
 ### Changed

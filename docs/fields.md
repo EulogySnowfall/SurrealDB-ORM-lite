@@ -224,10 +224,12 @@ both lines.
   still refuses it. Before v0.50.0 the SDK floored datetimes to the microsecond, so a `READONLY`
   datetime below the top level (in a sub-model, a `list`, a `tuple` or a set) could make
   `update()` fail; a value read from the server is now written back as it was read.
-  SurrealDB 2.x also refuses, for now, `update()` and `upsert()` of an existing record that has
-  a field with a non-optional `TYPE` and a `VALUE` clause the model does not write (a `Computed`
-  field, such as a generated `updated: Computed[datetime]`): change it with `merge()` there
-  ([#267](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/267)).
+  A `Computed` field with a non-optional `TYPE` and a `VALUE` clause (such as a generated
+  `updated: Computed[datetime]` over `TYPE datetime VALUE time::now()`) no longer makes
+  `update()` and `upsert()` fail on SurrealDB 2.x
+  ([#267](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/267)): 2.x checks the
+  `TYPE` before the `VALUE` runs, so there the replace writes the stored value back and the
+  `VALUE` clause recomputes it. See [Models](models.md#16-computed-fields-computed--define-field--value).
 - `timedelta`: floored to the microsecond on read (`1h30m1ns` reads `timedelta(seconds=5400)`).
 - `Duration`: exact, to the nanosecond.
 - `Decimal`: a value whose `str()` writes no exponent is sent as before. A value written with an

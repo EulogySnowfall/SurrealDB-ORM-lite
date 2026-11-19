@@ -2263,11 +2263,24 @@ class TestArgumentRefusalLeavesTheTransaction:
         assert tx._records_written() == frozenset()
         assert tx._cache_written() == frozenset()
 
-    async def test_the_transaction_still_takes_a_write(self, no_client: list[str]) -> None:
-        """The refusal does not spoil the transaction: the next write joins it and notes its table."""
+    async def test_the_transaction_still_takes_a_write(self, no_client: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+        """The refusal does not spoil the transaction: the next write joins it and notes its table. That write, of a
+        model with a computed field, reads the server line once per client (#267): a stub client answers it."""
         tx = BufferedTransaction(client=None)
         with pytest.raises(SurrealDbError):
             await TxArgs(n=1).update(tx=tx)
+        assert no_client == []
+
+        class Line:
+            async def version(self) -> str:
+                return "surrealdb-3.3.5"
+
+        line = Line()
+
+        async def get_client(*args: Any, **kwargs: Any) -> Any:
+            return line
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
         await TxArgs(id="a", n=1).update(tx=tx)
         assert len(tx.statements) == 1
         assert tx._records_written() == frozenset({"tx_args"})
