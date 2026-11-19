@@ -56,9 +56,10 @@ DESCRIPTION_MAX = 200
 _FENCE = re.compile(r"^ {0,3}(?:> ?)*\s*(`{3,}|~{3,})")
 _HEADING = re.compile(r"^#{1,6} ")
 #: Outside code: an HTML comment, a link target (``](target)``, with an optional title), or a character MDX would read
-#: as JSX or an expression (unless already escaped).
+#: as JSX or an expression (unless already escaped). A comment ends as HTML parses it: at the first ``-->`` or
+#: ``--!>``, and ``<!-->`` and ``<!--->`` are empty comments.
 _TOKEN = re.compile(
-    r"<!--(?P<comment>[\s\S]*?)-->|\]\((?P<target>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\)|(?P<char>\\?<|(?<!\\)[{}])"
+    r"<!--(?P<comment>-?>|[\s\S]*?--!?>)|\]\((?P<target>[^)\s]+)(?P<title>\s+\"[^\"]*\")?\)|(?P<char>\\?<|(?<!\\)[{}])"
 )
 _SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*:")
 #: A block that starts a paragraph at the margin: not indented (a list item's text), not a list item, a table, a quote,

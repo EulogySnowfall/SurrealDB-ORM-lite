@@ -317,6 +317,20 @@ class TestConversion:
             "<div>\n\na  b <code>&lt;!-- kept --&gt;</code>\n\n</div>"
         )
 
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("a <!-- note --!> b", "a  b"),
+            ("a <!-- x --!>-->", "a -->"),
+            ("a <!--> b", "a  b"),
+            ("a <!---> b", "a  b"),
+        ],
+    )
+    def test_html_comment_endings(self, text: str, expected: str) -> None:
+        """An HTML comment ends at ``-->`` or ``--!>``, the first one wins, and ``<!-->`` and ``<!--->`` are empty
+        comments (the HTML parsing rules): none of them reaches the page as text."""
+        assert site.convert(text, DOCS / "models.md") == expected
+
     def test_title_and_description(self) -> None:
         text = "# The `Q` guide\n\n> **Short** [summary](models.md) of `Q`.\n> Second line.\n\n## Part\n"
         assert site.title(text) == "The Q guide"
