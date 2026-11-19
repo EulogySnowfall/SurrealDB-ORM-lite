@@ -224,10 +224,12 @@ both lines.
   still refuses it. Before v0.50.0 the SDK floored datetimes to the microsecond, so a `READONLY`
   datetime below the top level (in a sub-model, a `list`, a `tuple` or a set) could make
   `update()` fail; a value read from the server is now written back as it was read.
-  SurrealDB 2.x also refuses, for now, `update()` and `upsert()` of an existing record that has
-  a field with a non-optional `TYPE` and a `VALUE` clause the model does not write (a `Computed`
-  field, such as a generated `updated: Computed[datetime]`): change it with `merge()` there
-  ([#267](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/267)).
+  A `Computed` field with a non-optional `TYPE` and a `VALUE` clause (such as a generated
+  `updated: Computed[datetime]` over `TYPE datetime VALUE time::now()`) no longer makes
+  `update()` and `upsert()` fail on SurrealDB 2.x
+  ([#267](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/267)): 2.x checks the
+  `TYPE` before the `VALUE` runs, so there the replace writes the stored value back and the
+  `VALUE` clause recomputes it. See [Models](models.md#16-computed-fields-computed--define-field--value).
 - `timedelta`: floored to the microsecond on read (`1h30m1ns` reads `timedelta(seconds=5400)`).
 - `Duration`: exact, to the nanosecond.
 - `Decimal`: a value whose `str()` writes no exponent is sent as before. A value written with an
@@ -330,6 +332,26 @@ keep every digit), and under `extra="allow"` the columns in `model_extra` are wr
 removed. An enum declared `(str, Enum)` or `(int, Enum)` holds the member, as after `get()`: it
 compares equal to its value, but `str()` and f-strings give `Color.RED`, not `red` (a `StrEnum` or
 an `IntEnum` gives the value), so use `.value` to build a key, a URL or a log line from it.
+
+### Untyped fields
+
+A position with no declared type holds what a read gives, the SDK's values: an `Any` field, the
+values of a `dict[str, Any]` or a `list[Any]`, an `Any` field of a sub-model, and under
+`extra="allow"` a column the model does not declare (`model_extra`). There a duration is a
+`surrealdb.Duration`, a range a `surrealdb.Range` and a geometry the SDK's class
+(`surrealdb.data.GeometryPoint`, …), not the ORM's. Every write of the instance sends them back as
+they are: `save()`, `update()`, `upsert()`, `bulk_create()` and an edge's `save()` and `update()`
+keep a loaded row's durations, ranges and geometries, on every line
+([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)). Before, Pydantic's
+`model_dump()` turned these values, which are dataclasses, into dicts of their fields
+(`{"elapsed": 5400000000000}`, `{"begin": …, "end": …}`, `{"longitude": …, "latitude": …}`), and
+the write stored those dicts in their place.
+
+`model_dump()` itself is unchanged: it still gives those dicts. A serializer of your own keeps the
+last word, even one that returns such a dict: a `field_serializer`, an
+`Annotated[Any, PlainSerializer(…)]` or a sub-model's `model_serializer`. Declare the field
+(`Duration`, `Range[T]`, the geometry fields of [section 25](#25-geospatial-fields)) to read the
+ORM's values and serialise them with the ORM's serializers.
 
 ### Values the SDK cannot read
 
@@ -683,10 +705,10 @@ updating every record migrates a table.
 A field declared `Any` or `dict`, or an undeclared column of an `extra="allow"` model, is not a
 geometry field. A GeoJSON dict written there stays a plain object (see
 [Migrating stored GeoJSON](#migrating-stored-geojson)); an ORM geometry written there is stored
-as a native geometry but reads back as the SDK's class (`surrealdb.data.GeometryPoint`, …), which
-a later write of the instance stores as a plain object
-([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)). Declare geometry fields
-with the annotations above. The results of `raw_query()`, `query()` and `call_function()` are
+as a native geometry and reads back as the SDK's class (`surrealdb.data.GeometryPoint`, …), which
+a later write of the instance stores back as the same native geometry (see
+[Untyped fields](#untyped-fields) in section 24). Declare geometry fields with the annotations above
+to read the ORM's classes. The results of `raw_query()`, `query()` and `call_function()` are
 untyped too: they hold the SDK's classes, which compare equal to the ORM's with the ORM value on
 the left.
 

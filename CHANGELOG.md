@@ -25,6 +25,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dumped key keep it until the field is written again; `makemigrations()` proposes the removal of the old definitions.
   See [the models guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/models.md#sub-model-keys-and-aliases).
 
+## [0.50.9] - 2026-11-19
+
+### Fixed
+
+- A write of a model instance no longer replaces the SDK's values at untyped positions with dicts of their fields
+  ([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)). A loaded row's durations, ranges and
+  geometries held in an `Any` field, in a `dict[str, Any]` or `list[Any]`, in a sub-model's `Any` field or in an
+  `extra="allow"` column used to be turned into plain objects by Pydantic's `model_dump()` on `save()`, `update()`,
+  `upsert()`, `bulk_create()` and an edge's `save()` and `update()`; they are now sent back as the same native values
+  on every SurrealDB line. `model_dump()` itself is unchanged, and a serializer of your own still has the last word.
+
+### Notes
+
+- Declare the field (`Duration`, `Range[T]`, the geometry fields) to read the ORM's classes instead of the SDK's; see
+  "Untyped fields" in the [fields guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/fields.md).
+
+## [0.50.8] - 2026-11-18
+
+### Fixed
+
+- `update()` and `upsert()` of a model with a `Computed` field whose column has a non-optional `TYPE` and a `VALUE`
+  clause (`TYPE datetime VALUE time::now()`, as `generate_models_from_db()` produces) no longer fail on SurrealDB 2.x
+  with `Found NONE for field ...` ([#267](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/267)). 2.x checks
+  the `TYPE` before the `VALUE` clause runs, so on 2.x the replace now writes each computed column back as its stored
+  value and the `VALUE` clause recomputes it. SurrealDB 3.x, 4.x and the embedded engine are unchanged.
+
+### Notes
+
+- On 2.x a `VALUE` expression that reads `$value` sees the stored value during a replace, and `NONE` on 3.x; see the
+  [models guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/models.md) and the 2.x vs 3.x
+  table in the compatibility guide.
+
 ## [0.50.6] - 2026-11-15
 
 ### Changed
