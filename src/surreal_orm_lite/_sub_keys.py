@@ -3,7 +3,7 @@
 Not part of the public API — nothing here is exported by ``surreal_orm_lite``.
 
 A sub-model (a Pydantic ``BaseModel`` used as the type of a field, at any depth, also inside a
-``list``, a ``dict`` or ``X | None``) is read back by Pydantic's validation, which takes each
+``list``, a ``tuple``, a ``dict``, ``X | None`` or a ``RootModel``) is read back by Pydantic's validation, which takes each
 sub-field from the first of its **read keys** present in the stored object: its validation
 aliases in order (an ``AliasChoices`` gives several), then its name under ``validate_by_name``
 (``populate_by_name``). ``model_dump()`` writes it under its **dumped key**: the name, or its
@@ -44,7 +44,7 @@ import typing
 from collections.abc import Mapping
 from typing import Any, Final, TypeAlias, Union, get_args, get_origin
 
-from pydantic import AliasChoices, AliasPath, BaseModel
+from pydantic import AliasChoices, AliasPath, BaseModel, RootModel
 
 __all__ = [
     "MAX_PICKS",
@@ -53,6 +53,7 @@ __all__ = [
     "Items",
     "Model",
     "Pick",
+    "Positions",
     "SubField",
     "SubKeys",
     "Values",
@@ -101,7 +102,9 @@ class SubKeys:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Model:
-    """A sub-model class whose keys, or those of a sub-model below it, the ORM rewrites."""
+    """A sub-model class whose keys, or those of a sub-model below it, the ORM rewrites.
+
+    A ``RootModel`` is dumped as its root: the walkers take the shape of its ``root`` field (:func:`_root`)."""
 
     model: type[BaseModel]
 
@@ -111,6 +114,13 @@ class Items:
     """A ``list``, ``tuple`` or set whose items have a shape."""
 
     item: Shape
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Positions:
+    """A fixed ``tuple`` of different types (``tuple[A, int]``): one shape per position."""
+
+    items: tuple[Shape, ...]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -127,7 +137,7 @@ class Choice:
     members: tuple[Shape, ...]
 
 
-Shape: TypeAlias = Model | Items | Values | Choice | None
+Shape: TypeAlias = Model | Items | Positions | Values | Choice | None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -268,7 +278,8 @@ def _shape(annotation: Any, active: frozenset[type]) -> Shape:
     args = get_args(annotation)
     if origin in _SEQUENCES and args:
         if origin is tuple and not (len(args) == 2 and args[1] is Ellipsis) and len(set(map(id, args))) != 1:
-            return None  # a fixed tuple of different types: no item shape
+            positions = tuple(_shape(arg, active) for arg in args)
+            return None if all(position is None for position in positions) else Positions(positions)
         item = _shape(args[0], active)
         return None if item is None else Items(item)
     if origin in _MAPPINGS and len(args) == 2:
@@ -331,15 +342,26 @@ def holds_model(value: Any) -> bool:
 # --- walkers ---------------------------------------------------------------------------------------------------------
 
 
+def _root(shape: Shape, original: Any) -> tuple[Shape, Any]:
+    """*shape* and *original*, a ``RootModel`` replaced by its root (any depth): the shape of its ``root`` field and,
+    for an instance, its ``root`` value — what ``model_dump()`` writes for it, and what a read validates."""
+    while isinstance(shape, Model) and issubclass(shape.model, RootModel):
+        if isinstance(original, shape.model):
+            original = original.root
+        shape = field_shape(shape.model, "root")
+    return shape, original
+
+
 def _chosen(choice: Choice, original: Any) -> Shape:
     """The member of *choice* that *original* takes: the first model class it is an instance of, a list for a list…;
-    for a ``dict`` the caller wrote, the only member that takes a ``dict``, else ``None`` (left as given)."""
+    for a ``dict`` the caller wrote, the only member that takes a ``dict``, else ``None`` (left as given). A
+    ``RootModel`` member takes what its root takes."""
     if isinstance(original, BaseModel):
         return next((m for m in choice.members if isinstance(m, Model) and isinstance(original, m.model)), None)
     if isinstance(original, (list, tuple, set, frozenset)):
-        return next((m for m in choice.members if isinstance(m, Items)), None)
+        return next((m for m in choice.members if isinstance(_root(m, None)[0], (Items, Positions))), None)
     if isinstance(original, Mapping):
-        takers = [m for m in choice.members if isinstance(m, (Model, Values))]
+        takers = [m for m in choice.members if isinstance(_root(m, None)[0], (Model, Values))]
         return takers[0] if len(takers) == 1 else None
     return None
 
@@ -394,16 +416,20 @@ def rekeyed(shape: Shape, original: Any, value: Any, caller: bool = True) -> Any
     a sub-model is declared (a row applied as received after a write, see ``_apply_record()``) is written as it is,
     as before #218.
     """
+    shape, original = _root(shape, original)
     if shape is None:
         return value
     if isinstance(shape, Choice):
         chosen = _chosen(shape, original)
         return value if chosen is None else rekeyed(chosen, original, value, caller)
-    if isinstance(shape, Items):
+    if isinstance(shape, (Items, Positions)):
         if not isinstance(value, (list, tuple)):
             return value
+        shapes = (shape.item,) * len(value) if isinstance(shape, Items) else shape.items
+        if len(shapes) != len(value):
+            return value  # not the tuple the annotation declares: a read refuses it whatever its keys
         originals = original if isinstance(original, (list, tuple)) and len(original) == len(value) else value
-        items = [rekeyed(shape.item, sub, item, caller) for sub, item in zip(originals, value, strict=True)]
+        items = [rekeyed(*parts, caller) for parts in zip(shapes, originals, value, strict=True)]
         if all(new is old for new, old in zip(items, value, strict=True)):
             return value
         return tuple(items) if isinstance(value, tuple) else items
@@ -438,17 +464,18 @@ def merged(shape: Shape, original: Any, value: Any, path: tuple[str | Pick, ...]
     """*value* as ``MERGE`` must send it into the object stored at *path* (from ``$this``) — plain, or an
     :class:`Entries` holding a :class:`Pick`.
 
-    The rules are in the module docstring. A list or a set replaces what is stored (``MERGE`` replaces an array):
+    The rules are in the module docstring. A list, a tuple or a set replaces what is stored (``MERGE`` replaces an array):
     :func:`rekeyed`. A ``dict`` whose values are sub-models has each entry merged into the stored entry of that key.
     ``ValueError`` as :func:`rekeyed`, for a read key two fields claim (removing it could remove another field's
     value), and for an object more than :data:`MAX_PICKS` picked keys deep.
     """
+    shape, original = _root(shape, original)
     if shape is None:
         return value
     if isinstance(shape, Choice):
         chosen = _chosen(shape, original)
         return value if chosen is None else merged(chosen, original, value, path, picks)
-    if isinstance(shape, Items) or not isinstance(value, dict):
+    if isinstance(shape, (Items, Positions)) or not isinstance(value, dict):
         return rekeyed(shape, original, value)
     items: list[tuple[str | Pick, Any]] = []
     if isinstance(shape, Values):

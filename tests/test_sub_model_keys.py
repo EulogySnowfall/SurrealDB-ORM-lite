@@ -15,7 +15,7 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
-from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, RootModel
 from pydantic.alias_generators import to_camel
 
 from surreal_orm_lite import (
@@ -28,6 +28,7 @@ from surreal_orm_lite import (
     _sdk,
     _sub_keys,
 )
+from surreal_orm_lite.define_parser import render_kind
 from surreal_orm_lite.migrations import ModelIntrospector, split_destructive
 from surreal_orm_lite.utils import PLAIN_CONTENT
 from tests._readme_tables import assert_server_header_sentence, assert_server_rows, doc_part
@@ -151,7 +152,41 @@ class StrictAliases(BaseSurrealModel):
     many: list[AliasOnly] = []
 
 
-TABLES = ("sub_keys_holder", "sub_keys_path", "sub_keys_plain", "sub_keys_strict", "sub_keys_strict_alias")
+class AliasOnlyList(RootModel[list[AliasOnly]]):
+    """A root model: dumped as its root, a list of sub-models read by alias only."""
+
+
+class AliasOnlyRoot(RootModel[AliasOnly]):
+    """A root model over one sub-model read by alias only."""
+
+
+class Shaped(BaseSurrealModel):
+    """Sub-models in a fixed tuple of different types and under root models."""
+
+    model_config = SurrealConfigDict(table_name="sub_keys_shaped")
+    id: str | None = None
+    pair: tuple[AliasOnly, int] | None = None
+    roots: AliasOnlyList | None = None
+    root_one: AliasOnlyRoot | None = None
+
+
+class StrictShaped(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="sub_keys_strict_shaped", schema_mode=SchemaMode.SCHEMAFULL)
+    id: str | None = None
+    pair: tuple[AliasOnly, int] | None = None
+    roots: AliasOnlyList | None = None
+    root_one: AliasOnlyRoot | None = None
+
+
+TABLES = (
+    "sub_keys_holder",
+    "sub_keys_path",
+    "sub_keys_plain",
+    "sub_keys_strict",
+    "sub_keys_strict_alias",
+    "sub_keys_shaped",
+    "sub_keys_strict_shaped",
+)
 
 
 async def _row(client: Any, table: str, key: str) -> dict[str, Any]:
@@ -214,6 +249,37 @@ class TestSubModelKeys:
         assert [operation.describe() for operation in removals] == [
             "Drop field alias_only.first_name from sub_keys_strict_alias"
         ]
+
+    def test_a_save_rekeys_a_fixed_tuple_and_root_models(self) -> None:
+        """(a) a sub-model in a fixed tuple of different types or under a ``RootModel`` is stored under the key a read
+        takes (``firstName``), not under its name, which no read takes."""
+        holder = Shaped(id="r", pair=(_only("Ann"), 1), roots=AliasOnlyList([_only("Bo")]), root_one=AliasOnlyRoot(_only("Cy")))
+        payload = holder._write_payload()
+        assert payload == {"pair": ({"firstName": "Ann"}, 1), "roots": [{"firstName": "Bo"}], "root_one": {"firstName": "Cy"}}
+        assert Shaped.model_validate(payload) == holder.model_copy(update={"id": None})
+
+    def test_keyword_writes_rekey_a_fixed_tuple_and_root_models(self) -> None:
+        """(b)/(c) ``bulk_update()``, ``merge()`` and an instance in a keyword write: the keys ``save()`` writes."""
+        given = {"pair": [{"first_name": "B"}, 2], "roots": [{"first_name": "C"}], "root_one": {"first_name": "D"}}
+        expected = {"pair": [{"firstName": "B"}, 2], "roots": [{"firstName": "C"}], "root_one": {"firstName": "D"}}
+        assert Shaped._assigned_values(given) == expected
+        merge_content, bound = Shaped._merge_content(given)
+        assert merge_content == PLAIN_CONTENT and bound["data"] == expected
+        instances = {"pair": (_only("E"), 3), "roots": AliasOnlyList([_only("F")]), "root_one": AliasOnlyRoot(_only("G"))}
+        saved = Shaped(id="i", **instances)._write_payload()
+        assert Shaped._assigned_values(instances) == saved
+        assert Shaped._merge_content(instances)[1]["data"] == saved
+        assert Shaped._assigned_values({"pair": [{"first_name": "x"}]}) == {"pair": [{"first_name": "x"}]}  # not a pair
+
+    def test_ddl_of_a_fixed_tuple_and_root_models(self) -> None:
+        """``define_table()`` follows: a root model stands for its root (an array, not an ``object`` with a ``root``
+        field), its sub-model's fields under the keys written; an object in a fixed tuple is free-form."""
+        columns = {column.path: column for column in StrictShaped._table_columns()}
+        assert set(columns) == {("pair",), ("roots",), ("roots", "*", "firstName"), ("root_one",), ("root_one", "firstName")}
+        assert render_kind(columns[("pair",)].kind) == "option<[object, int]>" and columns[("pair",)].free_object
+        assert render_kind(columns[("roots",)].kind) == "option<array<object>>"
+        assert render_kind(columns[("root_one",)].kind) == "option<object>"
+        assert not columns[("roots",)].free_object and not columns[("root_one",)].free_object
 
     def test_plain_sub_models_have_no_shape(self) -> None:
         assert _sub_keys.keys_of(Plain).plain
@@ -516,6 +582,27 @@ class TestSubModelKeysE2E:
             got = await StrictAliases.objects().get("s")
             assert got.alias_only == _only("Eve") and got.many == [_only("Fay")]
             assert got.by_alias is not None and got.by_alias.home_addr == Addr(zip_code="1", city_name="Lyon")
+
+    @pytest.mark.asyncio
+    async def test_a_fixed_tuple_and_root_models_round_trip(self) -> None:
+        """A sub-model read by alias only, in a fixed tuple of different types or under a root model: every write
+        reads back, on a schemaless table and on a ``SCHEMAFULL`` table the ORM defined, on both lines."""
+        async with orm_client(*TABLES) as client:
+            await StrictShaped.define_table()
+            for model, table in ((Shaped, "sub_keys_shaped"), (StrictShaped, "sub_keys_strict_shaped")):
+                holder = await model(
+                    id="r", pair=(_only("Ann"), 1), roots=AliasOnlyList([_only("Bo")]), root_one=AliasOnlyRoot(_only("Cy"))
+                ).save()
+                got = await model.objects().get("r")
+                assert got.pair == (_only("Ann"), 1), table
+                assert got.roots == AliasOnlyList([_only("Bo")]) and got.root_one == AliasOnlyRoot(_only("Cy")), table
+                row = await _row(client, table, "r")
+                assert row["pair"] == [{"firstName": "Ann"}, 1] and row["roots"] == [{"firstName": "Bo"}], table
+                await holder.merge(pair=[{"first_name": "Dee"}, 2], root_one={"first_name": "Eve"})
+                await model.objects().filter(id="r").bulk_update(roots=[{"first_name": "Fay"}, {"firstName": "Gus"}])
+                got = await model.objects().get("r")
+                assert got.pair == (_only("Dee"), 2) and got.root_one == AliasOnlyRoot(_only("Eve")), table
+                assert got.roots == AliasOnlyList([_only("Fay"), _only("Gus")]), table
 
     @pytest.mark.asyncio
     async def test_plain_models_send_v0_22_2_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
