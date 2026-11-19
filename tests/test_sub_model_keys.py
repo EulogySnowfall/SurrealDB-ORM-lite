@@ -11,6 +11,7 @@ Every E2E test runs on both SurrealDB lines: nothing here depends on the server 
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -27,6 +28,7 @@ from surreal_orm_lite import (
     _sdk,
     _sub_keys,
 )
+from surreal_orm_lite.migrations import ModelIntrospector, split_destructive
 from surreal_orm_lite.utils import PLAIN_CONTENT
 from tests._readme_tables import assert_server_header_sentence, assert_server_rows, doc_part
 from tests.conftest import orm_client
@@ -197,6 +199,21 @@ class TestSubModelKeys:
             ("profile", "first_name"),
             ("items", "*", "home", "city"),
         }
+
+    def test_migration_from_an_earlier_ddl_adds_the_new_key_and_proposes_the_old_ones_removal(self) -> None:
+        """A table an earlier version defined declares ``alias_only.first_name``: the diff adds ``alias_only.firstName``
+        and its ``DropField`` of the old key is the removal ``makemigrations()`` writes only with ``drop_missing``."""
+        target = ModelIntrospector([StrictAliases]).introspect()
+        table = target.tables["sub_keys_strict_alias"]
+        new = table.fields["alias_only.firstName"]
+        fields = {name: field for name, field in table.fields.items() if name != "alias_only.firstName"}
+        fields["alias_only.first_name"] = replace(new, name="alias_only.first_name", path=["alias_only", "first_name"])
+        current = replace(target, tables={**target.tables, "sub_keys_strict_alias": replace(table, fields=fields)})
+        keep, removals = split_destructive(current.diff(target))
+        assert [operation.describe() for operation in keep] == ["Add field alias_only.firstName to sub_keys_strict_alias"]
+        assert [operation.describe() for operation in removals] == [
+            "Drop field alias_only.first_name from sub_keys_strict_alias"
+        ]
 
     def test_plain_sub_models_have_no_shape(self) -> None:
         assert _sub_keys.keys_of(Plain).plain
@@ -558,5 +575,8 @@ class TestSubModelKeysDocs:
             "up to three such objects nested",
             "`define_table()` (and `table_ddl()`) declares each sub-model field under that same key",
             'A field read by its alias only (`Field(alias="firstName")`',
+            "A generated migration proposes that removal",
+            "`drop_missing=True` (`--drop-missing`)",
+            "UPDATE <table> SET p.firstName = p.first_name WHERE p.first_name != NONE AND p.firstName = NONE",
         ):
             assert text in part, text

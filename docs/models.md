@@ -267,7 +267,10 @@ defined takes every sub-model write on both lines. Earlier versions stored the t
 dumped key (`first_name` where `firstName` is now stored, `firstName` where `fn` is): rows written then keep that key,
 which a read skips, until the field is written again. A nested path in a query names the stored key
 (`filter(**{"profile.firstName": …})`), and a table defined by an earlier version gets the new sub-field definitions
-from `define_table()` (the old ones stay until you remove them).
+from `define_table()` (the old ones stay until you remove them). A generated migration proposes that removal:
+`makemigrations()` adds the new definitions, names the old ones in a warning and writes their `DropField` with
+`drop_missing=True` (`--drop-missing`). Values under an old key can be copied first with a raw
+`UPDATE <table> SET p.firstName = p.first_name WHERE p.first_name != NONE AND p.firstName = NONE` before applying it.
 
 Keyword writes follow the same rule:
 
