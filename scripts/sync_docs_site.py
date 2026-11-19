@@ -13,6 +13,9 @@ A mirror is the guide's text with:
 - its relative links rewritten for the site (outside code spans and fenced blocks only): ``models.md#custom-primary-key``
   becomes ``/models#custom-primary-key``, ``README.md`` becomes ``/``, ``ai/CLAUDE.md`` becomes ``/ai/CLAUDE``, and a
   link that leaves ``docs/`` (``../CHANGELOG.md``, ``../examples/``) becomes an absolute GitHub URL of ``main``;
+- the heading a link names after ``#`` given docs.page's anchor in place of GitHub's
+  (``writing.md#14-optimistic-concurrency-retry_on_conflict`` becomes
+  ``/writing#14-optimistic-concurrency-retryonconflict``);
 - the characters MDX reads as JSX or expressions (``<``, ``{``, ``}``) escaped outside code, and an HTML comment turned
   into an MDX comment.
 
@@ -26,9 +29,11 @@ an unattended pin bump carries the mirrors along.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,25 +88,6 @@ def route(source: Path, root: Path = ROOT) -> str:
     return "/" + source.relative_to(docs).with_suffix("").as_posix()
 
 
-def _rewrite_target(target: str, here: Path, root: Path, pages: set[Path]) -> str:
-    """The site's form of the link *target* written in the guide *here*; *pages* are the guides with a mirror."""
-    if _SCHEME.match(target) or target.startswith(("#", "/")):
-        return target
-    path, hash_, fragment = target.partition("#")
-    resolved = (here.parent / path).resolve()
-    docs = docs_dir(root).resolve()
-    if not resolved.is_relative_to(root.resolve()):
-        raise ValueError(f"{here}: the link {target!r} leaves the repository")
-    if resolved.suffix == ".md" and resolved.is_relative_to(docs):
-        page = docs_dir(root) / resolved.relative_to(docs)
-        if page in pages:
-            return route(page, root) + hash_ + fragment
-    relative = resolved.relative_to(root.resolve()).as_posix()
-    if path.endswith("/"):  # a folder (``../examples/``): written with its slash, so the output reads no disk state
-        return GITHUB_TREE + relative + "/" + hash_ + fragment
-    return GITHUB_BLOB + relative + hash_ + fragment
-
-
 def _code_spans(text: str) -> list[tuple[int, int]]:
     """The ``(start, end)`` offsets of the inline code spans of *text* (a run of n backticks up to the next run of
     exactly n)."""
@@ -118,38 +104,157 @@ def _code_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _convert_paragraph(text: str, here: Path, root: Path, pages: set[Path]) -> str:
-    """*text*, one block of prose, with its links rewritten and its MDX hazards escaped outside its code spans."""
-
-    def token(match: re.Match[str]) -> str:
-        if match.group("comment") is not None:
-            return "{/*" + match.group("comment").replace("*/", "* /") + "*/}"
-        if match.group("target") is not None:
-            return f"]({_rewrite_target(match.group('target'), here, root, pages)}{match.group('title') or ''})"
-        return "\\" + match.group("char")
-
+def _outside_code(text: str, change: Callable[[str], str]) -> str:
+    """*text* with *change* applied to each part outside its code spans."""
     out = []
     position = 0
     for start, end in _code_spans(text):
-        out.append(_TOKEN.sub(token, text[position:start]))
-        out.append(text[start:end])
+        out += [change(text[position:start]), text[start:end]]
         position = end
-    out.append(_TOKEN.sub(token, text[position:]))
+    out.append(change(text[position:]))
     return "".join(out)
 
 
-def _convert_prose(text: str, here: Path, root: Path, pages: set[Path]) -> str:
-    """*text*, a run of lines outside fenced blocks, converted block by block: a code span never crosses a blank
-    line."""
-    return "".join(
-        piece if index % 2 else _convert_paragraph(piece, here, root, pages)
-        for index, piece in enumerate(re.split(r"(\n[ \t]*\n)", text))
-    )
+def _escape(text: str) -> str:
+    """*text* with every ``<``, ``{`` and ``}`` outside code escaped (unless already escaped)."""
+    return _outside_code(text, lambda part: re.sub(r"(?<!\\)([<{}])", r"\\\1", part))
+
+
+# --- Heading anchors -------------------------------------------------------------------------------------------------
+#
+# The guides link to a heading by GitHub's anchor; docs.page gives the same heading its own: it drops what is not
+# ``[a-z0-9]``, a space or ``-`` (so ``server_values`` becomes ``servervalues``) and turns each run of spaces into one
+# ``-`` (so ``Relations & Graph`` becomes ``relations-graph``). A link of a page carries docs.page's anchor of the
+# heading the guide's link names.
+
+
+def heading_titles(text: str) -> list[str]:
+    """The title of every heading of *text*, fenced blocks skipped, as docs.page reads them (``extractHeadingNodes``
+    in its ``packages/mdx-bundler/src/markdown/headings.ts``)."""
+    titles = []
+    fence: tuple[str, int] | None = None
+    for line in text.split("\n"):
+        run = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if run:
+            marker = (run.group(1)[0], len(run.group(1)))
+            if fence is None:
+                fence = marker
+            elif marker[0] == fence[0] and marker[1] >= fence[1]:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if match:
+            titles.append(re.sub(r"\s+#+\s*$", "", match.group(1)).strip())
+    return titles
+
+
+def github_anchor(title: str) -> str:
+    """GitHub's anchor of a heading's title (without its ``#`` and its ``-1`` suffix)."""
+    return re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+
+
+def site_anchor(title: str) -> str:
+    """docs.page's anchor of a heading's title (without its ``#`` and its ``-1`` suffix): ``cleanHeadingTitle`` then
+    ``slugifyHeading`` of ``headings.ts``."""
+    title = re.sub(r"!\[([^]]*)\]\([^)]*\)", r"\1", title.strip())
+    title = re.sub(r"\[([^]]+)\]\([^)]*\)", r"\1", title)
+    title = re.sub(r"`([^`]+)`", r"\1", title)
+    title = re.sub(r"<[^>]+>", "", title)
+    title = html.unescape(title)
+    title = re.sub(r"(\*\*|__)(.+?)\1", r"\2", title)
+    title = re.sub(r"(\*|_)(.+?)\1", r"\2", title)
+    title = re.sub(r"~~(.+?)~~", r"\1", title)
+    slug = re.sub(r"\s+", "-", re.sub(r"[^a-z0-9\s-]", "", " ".join(title.split()).lower()).strip())
+    return slug or "section"
+
+
+def _numbered(slugs: list[str]) -> list[str]:
+    """*slugs* with a repeated one numbered from its second: ``-1``, ``-2``."""
+    seen: dict[str, int] = {}
+    out = []
+    for slug in slugs:
+        count = seen.get(slug, 0)
+        seen[slug] = count + 1
+        out.append(slug if count == 0 else f"{slug}-{count}")
+    return out
+
+
+def site_anchors(text: str) -> list[str]:
+    """docs.page's anchor of every heading of *text*, a page's body, in order."""
+    return _numbered([site_anchor(title) for title in heading_titles(text)])
+
+
+def anchor_map(text: str) -> dict[str, str]:
+    """GitHub's anchor of each heading of *text*, a guide, to docs.page's anchor of the same heading in its page."""
+    titles = heading_titles(text)
+    github = _numbered([github_anchor(title) for title in titles])
+    site = _numbered([site_anchor(_escape(title)) for title in titles])
+    return dict(zip(github, site, strict=True))
+
+
+# --- Conversion -------------------------------------------------------------------------------------------------------
+
+
+class _Site:
+    """The guides of *root* that get a page, and their anchors (read once)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.docs = docs_dir(root)
+        self.pages = set(sources(root))
+        self._anchors: dict[Path, dict[str, str]] = {}
+
+    def anchor(self, page: Path, fragment: str) -> str:
+        """docs.page's anchor, in *page*'s page, of the heading GitHub calls *fragment* (unchanged if none is)."""
+        if page not in self._anchors:
+            self._anchors[page] = anchor_map(page.read_text(encoding="utf-8")) if page.is_file() else {}
+        return self._anchors[page].get(fragment, fragment)
+
+    def target(self, target: str, here: Path) -> str:
+        """The site's form of the link *target* written in the guide *here*."""
+        if _SCHEME.match(target) or target.startswith("/"):
+            return target
+        if target.startswith("#"):
+            return "#" + self.anchor(here, target[1:])
+        path, hash_, fragment = target.partition("#")
+        resolved = (here.parent / path).resolve()
+        docs = self.docs.resolve()
+        if not resolved.is_relative_to(self.root.resolve()):
+            raise ValueError(f"{here}: the link {target!r} leaves the repository")
+        if resolved.suffix == ".md" and resolved.is_relative_to(docs):
+            page = self.docs / resolved.relative_to(docs)
+            if page in self.pages:
+                return route(page, self.root) + (hash_ + self.anchor(page, fragment) if hash_ else "")
+        relative = resolved.relative_to(self.root.resolve()).as_posix()
+        if path.endswith("/"):  # a folder (``../examples/``): written with its slash, so the output reads no disk state
+            return GITHUB_TREE + relative + "/" + hash_ + fragment
+        return GITHUB_BLOB + relative + hash_ + fragment
+
+    def paragraph(self, text: str, here: Path) -> str:
+        """*text*, one block of prose, with its links rewritten and its MDX hazards escaped outside its code spans."""
+
+        def token(match: re.Match[str]) -> str:
+            if match.group("comment") is not None:
+                return "{/*" + match.group("comment").replace("*/", "* /") + "*/}"
+            if match.group("target") is not None:
+                return f"]({self.target(match.group('target'), here)}{match.group('title') or ''})"
+            return "\\" + match.group("char")
+
+        return _outside_code(text, lambda part: _TOKEN.sub(token, part))
+
+    def prose(self, text: str, here: Path) -> str:
+        """*text*, a run of lines outside fenced blocks, converted block by block: a code span never crosses a blank
+        line."""
+        return "".join(
+            piece if index % 2 else self.paragraph(piece, here) for index, piece in enumerate(re.split(r"(\n[ \t]*\n)", text))
+        )
 
 
 def convert(text: str, here: Path, root: Path = ROOT) -> str:
     """The body of *here*'s mirror: *text* with links and MDX hazards converted outside fenced code blocks."""
-    pages = set(sources(root))
+    site = _Site(root)
     out: list[str] = []
     prose: list[str] = []
     fence: str | None = None
@@ -160,7 +265,7 @@ def convert(text: str, here: Path, root: Path = ROOT) -> str:
             continue
         if fence is None and match is not None:
             if prose:
-                out.append(_convert_prose("\n".join(prose), here, root, pages))
+                out.append(site.prose("\n".join(prose), here))
                 prose = []
             fence = match.group(1)
         elif match is not None and fence is not None:
@@ -169,7 +274,7 @@ def convert(text: str, here: Path, root: Path = ROOT) -> str:
                 fence = None
         out.append(line)
     if prose:
-        out.append(_convert_prose("\n".join(prose), here, root, pages))
+        out.append(site.prose("\n".join(prose), here))
     return "\n".join(out)
 
 

@@ -236,7 +236,7 @@ both lines.
   `update()` and `upsert()` fail on SurrealDB 2.x
   ([#267](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/267)): 2.x checks the
   `TYPE` before the `VALUE` runs, so there the replace writes the stored value back and the
-  `VALUE` clause recomputes it. See [Models](/models#16-computed-fields-computed--define-field--value).
+  `VALUE` clause recomputes it. See [Models](/models#16-computed-fields-computed-define-field-value).
 - `timedelta`: floored to the microsecond on read (`1h30m1ns` reads `timedelta(seconds=5400)`).
 - `Duration`: exact, to the nanosecond.
 - `Decimal`: a value whose `str()` writes no exponent is sent as before. A value written with an
@@ -687,7 +687,7 @@ await Zone(id="unmapped", name="Unmapped").save()
 (await Zone.objects().get("unmapped")).centroid  # None: the guard skips a zone without an area
 ```
 
-`Zone.centroid` is a computed field ([section 16](/models#16-computed-fields-computed--define-field--value))
+`Zone.centroid` is a computed field ([section 16](/models#16-computed-fields-computed-define-field-value))
 read back as an ORM `GeometryPoint`. Guard geometry functions with a type check: `geo::centroid()`
 raises on a record without a polygon, so `computed("geo::centroid(area)")` would make every write
 of a zone without an area fail, while `IF area.is_polygon() THEN … END` leaves its centroid

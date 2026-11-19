@@ -182,7 +182,7 @@ SurrealDB core 2.3.10, a 2.x line.
 
 - The **anonymous session is the in-process owner**: full access (DDL, writes), and
   `info()` returns `None`.
-- `signin()` / `signup()` / `authenticate()` ([section 18](/authentication#18-authentication-signin--signup--info--invalidate))
+- `signin()` / `signup()` / `authenticate()` ([section 18](/authentication#18-authentication-signin-signup-info-invalidate))
   work with the engine's record access methods and `DEFINE USER`s, and record users and table
   `PERMISSIONS` apply as on a server. A sign-in changes the session of the **whole process**:
   every event loop and thread shares the engine's single session.
@@ -265,7 +265,7 @@ pytest-asyncio gives the fixture and the test: there is one engine per process. 
 A fresh engine raises a retryable write conflict when several writes run concurrently on a table
 that does not exist yet: define the tables your test writes to concurrently first
 (`DEFINE TABLE`), or run those writes in a function decorated with `@retry_on_conflict()`
-([section 14](/writing#14-optimistic-concurrency-retry_on_conflict)).
+([section 14](/writing#14-optimistic-concurrency-retryonconflict)).
 
 ```python
 import asyncio

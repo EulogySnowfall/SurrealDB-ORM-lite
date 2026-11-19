@@ -150,7 +150,7 @@ queries on it. A bare `memory` URL is accepted.
   before the first sign-in and removed right after the return. `__surreal_orm_lite_owner` is reserved on in-memory
   embedded engines only: if your application defines a root user of that name there, the next sign-in raises
   `SurrealDbConnectionError` before anything is exchanged, and your user is left as it is. Servers and file-backed
-  engines never get that user ([authentication guide](/authentication#18-authentication-signin--signup--info--invalidate)).
+  engines never get that user ([authentication guide](/authentication#18-authentication-signin-signup-info-invalidate)).
 - `close()` now stops the engine: a client kept after `close_connection()` no longer runs.
 
 ## Migrations on SurrealDB 4.x

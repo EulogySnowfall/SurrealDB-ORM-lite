@@ -155,7 +155,7 @@ class Follows(BaseSurrealEdge):
   (`joe@x.com`) or an integer id, pass the instance or a `RecordID`. Anything else, an unsaved
   instance or `"nocolon"`, is a `ValidationError`.
 - `table_name` maps the model to its edge table, here the lower-case `purchased` and `follows`
-  that `relate("purchased", …)` writes (see [Custom table name](/models#custom-table-name-table_name)).
+  that `relate("purchased", …)` writes (see [Custom table name](/models#custom-table-name-tablename)).
   Without it the table is the class name.
 - A subclass may not redeclare `in_` or `out` (`TypeError` at the `class` statement).
 
@@ -408,7 +408,7 @@ ORM errors on both lines: an endpoint from the wrong table raises `SurrealDbErro
 `ENFORCED`, an endpoint record that does not exist raises `SurrealDbNotFoundError`; a
 `TYPE NORMAL` table raises `SurrealDbError`. Since v0.33.0 the model declares it (`relation_in`,
 `relation_out`, `enforced`) and `define_relation()` applies it: see
-[section 34](#34-relation-constraints-relation_in-define_relation).
+[section 34](#34-relation-constraints-relationin-definerelation).
 
 ### Migrating from SurrealDB-ORM (graph API)
 
@@ -533,7 +533,7 @@ except SurrealDbNotFoundError as exc:
 - `table_type=TableType.RELATION` is optional: an edge model's table is always `TYPE RELATION`, and an edge model
   with another `TableType` raises `TypeError`. `TableType` is the full ORM's enum (`NORMAL`, `USER`, `STREAM`, `HASH`,
   `RELATION`, `ANY`); its other members take effect in `define_table()`
-  ([section 35](/schema#35-model-table-ddl-define_table-schema_mode-permissions)).
+  ([section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)).
 - The keys are checked when the class is defined: a `table_type` that is not a `TableType` (a plain `"relation"`
   string included), an `enforced` that is not a bool, or a value that is not a string, a list or a tuple raises
   `TypeError`; a name that is not an identifier, or a string of spaces only, raises `ValueError`. On a node model
@@ -542,7 +542,7 @@ except SurrealDbNotFoundError as exc:
   keys; setting one to `None` resets it.
 - The getters read the declaration back: `get_relation_in()` and `get_relation_out()` return tuples (`()` for any
   table), the shape of introspection's `TableState.relation_in` and `relation_out`
-  ([section 31](/schema#31-schema-introspection-databaseintrospector-generate_models_from_db)), so a model compares with the
+  ([section 31](/schema#31-schema-introspection-databaseintrospector-generatemodelsfromdb)), so a model compares with the
   database; `is_enforced()` returns a bool; `get_table_type()`, on every model as in the full ORM, returns
   `TableType.RELATION` for an edge model, else the configured `table_type`, else `TableType.NORMAL`.
 
@@ -575,7 +575,7 @@ print(await Follows.define_relation())
   connection. Applied by hand, that bare `OVERWRITE` would reset the other clauses to SurrealDB's defaults —
   `SCHEMALESS`, no change feed, `PERMISSIONS NONE`, which hides every edge from record users.
 - The table's records, fields, indexes and events, the views that read it
-  ([section 33](/schema#33-materialized-views-view_query-define_view)), its live queries and its change feed's history are
+  ([section 33](/schema#33-materialized-views-viewquery-defineview)), its live queries and its change feed's history are
   kept; the views keep counting the edges written afterwards. Each `define_relation()` on a table with a change feed
   adds a `define_table` entry to it; `changes()` skips it, a raw `SHOW CHANGES` shows it.
 - The constraint is enforced at once, on every connection. A missing table is defined as a relation table. The call
@@ -590,7 +590,7 @@ print(await Follows.define_relation())
   `generate_models_from_db()` writes for a `SCHEMAFULL` relation table with data fields, since v0.34.0 — is applied
   with `define_table()`, not `define_relation()`: `define_relation()` defines no field, so it raises `SurrealDbError`
   before any request, and `define_table()` applies the same relation statement, then the data fields
-  ([section 35](/schema#35-model-table-ddl-define_table-schema_mode-permissions)).
+  ([section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)).
 - SurrealDB rewrites the `in` and `out` field definitions from `IN` and `OUT` (`TYPE record<person>`): an `ASSERT`
   written on them by hand is lost. Declare the tables with `relation_in` and `relation_out` instead.
 - Why not `ALTER TABLE`, which keeps the other clauses too: on SurrealDB 2.x and the embedded engine, a raw
@@ -610,8 +610,8 @@ print(await Follows.define_relation())
 - **Updating** an edge the constraint refuses (one stored before it, next subsection) raises the SDK's
   `InternalError` too.
 - Both are `surrealdb.ServerError`s, as every update the server refuses in the lite (an event's `THROW`,
-  [section 32](/functions-and-events#32-server-side-events-and-stored-functions-event-define_events-define_function); a failed `patch()`
-  test, [section 13](/writing#13-patch--atomic-fieldarray-operations)).
+  [section 32](/functions-and-events#32-server-side-events-and-stored-functions-event-defineevents-definefunction); a failed `patch()`
+  test, [section 13](/writing#13-patch-atomic-fieldarray-operations)).
 
 `SurrealDbNotFoundError` is a `SurrealDbError`, so `except SurrealDbError` handles every refused edge creation the
 same way on both lines.
@@ -757,10 +757,10 @@ session.
 - **A refused edge creation raises the ORM's `SurrealDbError` or `SurrealDbNotFoundError`, a refused update the
   official SDK's `InternalError`** (full ORM: its SDK's `QueryError` for both).
 - **Generated edge models carry the keys but no `table_type=`**
-  ([section 31](/schema#31-schema-introspection-databaseintrospector-generate_models_from_db)): their base class,
+  ([section 31](/schema#31-schema-introspection-databaseintrospector-generatemodelsfromdb)): their base class,
   `BaseSurrealEdge`, says it.
 - **`TableType`'s other members take effect in `define_table()`**
-  ([section 35](/schema#35-model-table-ddl-define_table-schema_mode-permissions)).
+  ([section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)).
 - **`remove_relation()` deletes edges, not a constraint**: the name is the graph API's (section 7); a keyless
   `define_relation()` removes the constraint.
 - **Upgrading from 0.32 or earlier**: these keys were accepted and ignored before 0.33.0. They are now checked at the

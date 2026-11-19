@@ -5,6 +5,10 @@ the index ``docs/README.md`` links to, and ``docs/index.mdx`` from the index; th
 source. These tests check that every page is in step with its guide, that ``docs.json``'s sidebar lists exactly the
 generated pages, that every link of a page opens a page of the site (and its heading, after ``#``) or a file of the
 repository, and that no page holds what MDX would read as JSX or an expression. No server, no network, no node.
+
+docs.page anchors a heading its own way, not GitHub's (``server_values`` gives ``servervalues``, ``Relations & Graph``
+gives ``relations-graph``): the pages' links carry docs.page's anchors, checked with the script's port of its slugger,
+which :class:`TestAnchors` pins to the ids the live site gave.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from tests._readme_tables import DOCS, GITHUB_BLOB, GITHUB_TREE, ROOT, anchors, guide_order
+from tests._readme_tables import DOCS, GITHUB_BLOB, GITHUB_TREE, ROOT, guide_order
 
 SCRIPT = ROOT / "scripts" / "sync_docs_site.py"
 PINS_SCRIPT = ROOT / "scripts" / "sync_surrealdb_pins.py"
@@ -108,8 +112,8 @@ class TestPages:
 
     @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
     def test_links_resolve(self, page: Path) -> None:
-        """A site link names a page and, after ``#``, one of its headings (GitHub's slugs); a repository link names a
-        file or folder of the checkout."""
+        """A site link names a page and, after ``#``, one of its headings (docs.page's anchors); a repository link
+        names a file or folder of the checkout."""
         routes = _routes()
         text = page.read_text(encoding="utf-8")
         broken = []
@@ -117,7 +121,7 @@ class TestPages:
             if link.startswith(("/", "#")):
                 path, _, fragment = link.partition("#")
                 target = routes.get(path) if path else page
-                if target is None or fragment and fragment not in anchors(target.read_text(encoding="utf-8")):
+                if target is None or fragment and fragment not in site.site_anchors(target.read_text(encoding="utf-8")):
                     broken.append(link)
             elif link.startswith((GITHUB_BLOB, GITHUB_TREE)):
                 path = link.removeprefix(GITHUB_BLOB).removeprefix(GITHUB_TREE).partition("#")[0]
@@ -129,6 +133,7 @@ class TestPages:
         """The index links to the guides' headings: the check above has links with a fragment to resolve."""
         links = _links((DOCS / "index.mdx").read_text(encoding="utf-8"))
         assert "/models#custom-primary-key" in links and "/getting-started#1-configure-the-connection" in links
+        assert "/writing#14-optimistic-concurrency-retryonconflict" in links, "a GitHub anchor left in a page"
         assert f"{GITHUB_BLOB}CHANGELOG.md" in links and f"{GITHUB_TREE}examples/" in links
 
     @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
@@ -236,6 +241,53 @@ class TestConversion:
 
     def test_a_table_or_heading_is_not_the_description(self) -> None:
         assert site.description("# T\n\n## Part\n\n| a | b |\n\nThe text.\n") == "The text."
+
+
+class TestAnchors:
+    """The port of docs.page's heading anchors, pinned to the ids its site gave these headings (fetched on 2026-11-19),
+    and the translation of a guide's GitHub anchors."""
+
+    @pytest.mark.parametrize(
+        ("title", "anchor"),
+        [
+            ("Custom Primary Key", "custom-primary-key"),
+            ("Custom table name (`table_name`)", "custom-table-name-tablename"),
+            ("15. Server-side values: `SurrealFunc` + `server_values=`", "15-server-side-values-surrealfunc-servervalues"),
+            ("16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`", "16-computed-fields-computed-define-field-value"),
+            (
+                "20. Field aliases, `server_fields` and `merge(refresh=False)`",
+                "20-field-aliases-serverfields-and-mergerefreshfalse",
+            ),
+            ("7. Relations & Graph", "7-relations-graph"),
+            ("12. Upsert & get_or_create / update_or_create", "12-upsert-getorcreate-updateorcreate"),
+            ("13. Patch & atomic field/array operations", "13-patch-atomic-fieldarray-operations"),
+            ("_underscore_ emphasis", "underscore-emphasis"),
+            ("!!!", "section"),
+        ],
+    )
+    def test_site_anchor(self, title: str, anchor: str) -> None:
+        assert site.site_anchor(title) == anchor
+
+    def test_repeated_and_fenced_headings(self) -> None:
+        text = "# A\n\n## Part\n\n```\n## code\n```\n\n~~~~\n```\n## still code\n~~~~\n\n## Part\n"
+        assert site.site_anchors(text) == ["a", "part", "part-1"]
+
+    def test_anchor_map(self) -> None:
+        text = "# Guide\n\n## 1. `snake_case` & more\n\n## Part\n\n## Part\n"
+        assert site.anchor_map(text) == {
+            "guide": "guide",
+            "1-snake_case--more": "1-snakecase-more",
+            "part": "part",
+            "part-1": "part-1",
+        }
+
+    def test_links_carry_the_site_anchor(self) -> None:
+        """A link to a heading of another guide or of the same one carries docs.page's anchor; an unknown fragment is
+        left as written (the page test then reports it)."""
+        text = "[a](writing.md#14-optimistic-concurrency-retry_on_conflict) [b](#custom-table-name-table_name) [c](models.md#nowhere)"
+        assert site.convert(text, DOCS / "models.md") == (
+            "[a](/writing#14-optimistic-concurrency-retryonconflict) [b](#custom-table-name-tablename) [c](/models#nowhere)"
+        )
 
 
 class TestCheckAndFix:

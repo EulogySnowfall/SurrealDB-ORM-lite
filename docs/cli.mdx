@@ -21,7 +21,7 @@ with no extra to install: it is the full SurrealDB-ORM's command line — its ni
 `SURREAL_*` environment variables, defaults and output texts — built on the standard library's `argparse`. Each
 command is a thin front end over the migrations of [section 39](/migrations#39-migrations-makemigrations-migrationexecutor-operations)
 and the `generate_models_from_db()` of
-[section 31](/schema#31-schema-introspection-databaseintrospector-generate_models_from_db): the command line decides nothing
+[section 31](/schema#31-schema-introspection-databaseintrospector-generatemodelsfromdb): the command line decides nothing
 about the schema.
 
 ### Install and run
@@ -140,7 +140,7 @@ Each input line is one request: a transaction must fit on one line (`BEGIN; …;
 
 `--connection NAME` registers the settings under that connection name, and every command uses it: `makemigrations`
 writes the models declared with `connection="NAME"`, and `inspectdb` writes `connection="NAME"` in the models it
-generates ([section 30](/connections#30-multiple-databases-add_connection-using)). Without it the connection is `default`.
+generates ([section 30](/connections#30-multiple-databases-addconnection-using)). Without it the connection is `default`.
 
 ### Exit codes
 

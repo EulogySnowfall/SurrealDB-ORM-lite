@@ -152,18 +152,18 @@ class Person(BaseSurrealModel):
   existing path with `FileExistsError` before reading anything, and creates the file exclusively.
 - One class per table: a `BaseSurrealModel`, or a `BaseSurrealEdge` for a `TYPE RELATION` table (which declares no
   `id`, `in_` or `out`: the base class provides them). Its `model_config` holds the `table_name`, `view_query` for a
-  view table (since v0.32.0: a materialized view model, [section 33](#33-materialized-views-view_query-define_view)),
+  view table (since v0.32.0: a materialized view model, [section 33](#33-materialized-views-viewquery-defineview)),
   `relation_in`/`relation_out`/`enforced` for a relation table (since v0.33.0,
-  [section 34](/relations#34-relation-constraints-relation_in-define_relation)), the table's clauses —
+  [section 34](/relations#34-relation-constraints-relationin-definerelation)), the table's clauses —
   `table_type=TableType.ANY` for a `TYPE ANY` node table, `schema_mode=SchemaMode.SCHEMAFULL`, `changefeed=`,
-  `permissions={…}` and `comment=` (since v0.34.0, [section 35](#35-model-table-ddl-define_table-schema_mode-permissions)) —, `connection=`
+  `permissions={…}` and `comment=` (since v0.34.0, [section 35](#35-model-table-ddl-definetable-schemamode-permissions)) —, `connection=`
   when the schema was read from another connection than `"default"`, then `server_fields` and `extra="allow"`
   (below). A model declares
   `id: str | None = None` first (`id: RecordID | None = None` for a view: a grouped view's ids are arrays), then one
   line per field, in codepoint order of the columns. A `SCHEMAFULL` relation table with data fields gives an edge model
   with `schema_mode=SchemaMode.SCHEMAFULL` (since v0.34.0): apply it with `define_table()`, which defines those fields,
   not `define_relation()`, which raises `SurrealDbError` before any request
-  ([section 34](/relations#34-relation-constraints-relation_in-define_relation)).
+  ([section 34](/relations#34-relation-constraints-relationin-definerelation)).
 - A class is named after its table in PascalCase, without singularisation (`game_tables` → `GameTables`); a name
   that is taken — a Python keyword, a name the module imports, another table's class — gets `Model` appended (`range`
   → `RangeModel`). The table's indexes and events are comments of its class, and so are its comment, change feed
@@ -223,11 +223,11 @@ class Person(BaseSurrealModel):
   required, because SurrealDB refuses a create that leaves it to that default. Any other default — an expression such
   as `time::now()`, a record id, `math::INF`, a non-empty object, a datetime with nanoseconds, a literal of another
   type — makes the field `T | None = None` and lists its attribute in `server_fields`
-  ([section 20](/models#20-field-aliases-server_fields-and-mergerefreshfalse)): omitted on create, so that the server's
+  ([section 20](/models#20-field-aliases-serverfields-and-mergerefreshfalse)): omitted on create, so that the server's
   default applies, and read back after `save()`. A value you set on such a field before `save()` is not written: set
   it with `merge()` once the record exists.
 - **`VALUE` and `COMPUTED`**: `COMPUTED e` (SurrealDB 3.x), and a `VALUE e` that reads neither `$value` nor
-  `$input`, become `Computed[T] = computed("e")` ([section 16](/models#16-computed-fields-computed--define-field--value)):
+  `$input`, become `Computed[T] = computed("e")` ([section 16](/models#16-computed-fields-computed-define-field-value)):
   never written, read back after `save()`. When `computed()` refuses the expression (a `;`, even inside a string, or
   a block `{ … }`) or the column needs an alias, the field takes the server form instead: `T | None = None`, listed in
   `server_fields`. A `VALUE` that reads `$value` (`string::lowercase($value)`) is an ordinary field: you write the
@@ -235,7 +235,7 @@ class Person(BaseSurrealModel):
 - **`SCHEMALESS` tables** get `extra="allow"`: the fields the table does not declare are read into `model_extra` and
   written back.
 - **Aliases**: a column that cannot be an attribute name as it is gets one, with `Field(alias=<column>)`
-  ([section 20](/models#20-field-aliases-server_fields-and-mergerefreshfalse)): `first-name` → `first_name`, `class` →
+  ([section 20](/models#20-field-aliases-serverfields-and-mergerefreshfalse)): `first-name` → `first_name`, `class` →
   `class_`, `_private` → `private`, `9lives` → `f_9lives`. So does a column named like a type or a name the module
   uses (`datetime`, `computed`, `list`, `str`, `Field`, `Any`), like a model attribute (`save`, `objects`, `json`), like
   a class of the module, or `l`, `O` or `I` (ambiguous names for linters): it gets a `_` suffix (`datetime_`, with
@@ -603,12 +603,12 @@ record user's session.
   (full ORM: `save()`, `update()`, `merge()`, `delete()` only).
 - **`define_view()`/`remove_view()`/`view_ddl()`** apply, remove and render the view, where the full ORM applies one
   through migrations (`CreateTable`/`AlterTable`) or `define_table()`. `define_table()` (since v0.34.0,
-  [section 35](#35-model-table-ddl-define_table-schema_mode-permissions)) accepts a view model and applies it through `define_view()`, so
+  [section 35](#35-model-table-ddl-definetable-schemamode-permissions)) accepts a view model and applies it through `define_view()`, so
   full-ORM code calling `define_table()` on a view works. Migrations (`CreateTable`/`AlterTable` with `view_query`)
   are in [section 39](/migrations#39-migrations-makemigrations-migrationexecutor-operations).
 - **`AS (…)` as in the full ORM, the table name quoted** (``DEFINE TABLE OVERWRITE `order_stats` AS (…)``).
 - **Generated models write `view_query=`**, as the full ORM's do
-  ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)).
+  ([section 31](#31-schema-introspection-databaseintrospector-generatemodelsfromdb)).
 - **The documented `MaterializedView` base class with `source_query` is not shipped by the full ORM either**: declare
   `view_query` on a `BaseSurrealModel`.
 
@@ -761,7 +761,7 @@ incomplete, completes or sees a name its own annotations mention change — a li
 imported only under `TYPE_CHECKING` costs one `model_rebuild()`, not one per call, even from a loop.
 
 - **Columns**: every field but `id` (and an edge's `in_` and `out`), under its column — its alias, if any
-  ([section 20](/models#20-field-aliases-server_fields-and-mergerefreshfalse)) —, then the Pydantic `@computed_field`s; a
+  ([section 20](/models#20-field-aliases-serverfields-and-mergerefreshfalse)) —, then the Pydantic `@computed_field`s; a
   `Field(exclude=True)` field is left out. A sub-model's fields follow its column (`address.city`, `subs.*.city`), its
   `@computed_field`s included; a sub-model with `extra="allow"` keeps its columns and is free-form too.
 - **Optional**: a column is `option<…>` when its annotation admits `None` or its default is `None` (`x: int = None`),
@@ -771,7 +771,7 @@ imported only under `TYPE_CHECKING` costs one `model_rebuild()`, not one per cal
   `DEFAULT 'free'`, `DEFAULT 1.50dec`). An optional column gets none: SurrealDB applies `DEFAULT` to a `NONE` on every
   create, so a `None` the ORM writes would become the default. A container, a record, a geometry, a range and a
   `default_factory` get none either: the ORM always sends them.
-- **`server_fields`** ([section 20](/models#20-field-aliases-server_fields-and-mergerefreshfalse)): the database's `DEFAULT`,
+- **`server_fields`** ([section 20](/models#20-field-aliases-serverfields-and-mergerefreshfalse)): the database's `DEFAULT`,
   `VALUE` or `COMPUTED` on the column is kept, and the model's constant default is written `DEFAULT` only where the
   database has none, since a `save()` leaves a server field out. A `server_fields` column that is not nullable and has
   no constant default (a `default_factory`, or a required field) is written `TYPE <kind>` with no `DEFAULT`: every
@@ -779,7 +779,7 @@ imported only under `TYPE_CHECKING` costs one `model_rebuild()`, not one per cal
   refuses it until the database gives the column a `DEFAULT` or `VALUE`
   (`DEFINE FIELD OVERWRITE created ON note TYPE datetime DEFAULT time::now()`), which `define_table()` then keeps; or
   annotate it `T | None`.
-- **Computed fields** ([section 16](/models#16-computed-fields-computed--define-field--value)): `Computed[T]` is
+- **Computed fields** ([section 16](/models#16-computed-fields-computed-define-field-value)): `Computed[T]` is
   `TYPE option<T>`. A computed field is written `VALUE`; over a field the database defines `COMPUTED` (SurrealDB 3.x),
   `define_table()` writes `COMPUTED`: replacing it by `VALUE` would leave the stored records without the field until
   their next write. The expression is checked before any request: a SurrealQL comment marker (`--`, `#`, `//`,
@@ -866,7 +866,7 @@ What the model declares wins; the rest is kept from the database:
 | `REFERENCE`, `READONLY`, `ASSERT`, `PERMISSIONS`, `COMMENT` | —                                                                                                                                               | always                                                                |
 
 - Nothing is removed: the table keeps its records, the fields, clauses, indexes and events the model does not declare,
-  the views that read it ([section 33](#33-materialized-views-view_query-define_view)), its live queries and its
+  the views that read it ([section 33](#33-materialized-views-viewquery-defineview)), its live queries and its
   change feed's history. A key left out never removes a stored clause, and the migrations' diff leaves it too
   ([section 39](/migrations#39-migrations-makemigrations-migrationexecutor-operations)): to remove a clause the model no longer declares, write an `AlterTable` or
   `AlterField` migration by hand; a field the model no longer declares is removed by the `DropField` that
@@ -1054,7 +1054,7 @@ print(*table, sep="\n")
   connection raises `SurrealDbError` before any request.
 - The query cache ([section 29](/querying#29-query-cache-cache-querycache)): `define_table()` drops the model's cached reads,
   as every write does.
-- The table's events ([section 32](/functions-and-events#32-server-side-events-and-stored-functions-event-define_events-define_function))
+- The table's events ([section 32](/functions-and-events#32-server-side-events-and-stored-functions-event-defineevents-definefunction))
   are kept: `define_events()` runs before or after. `define_computed_fields()` still writes `VALUE` alone and resets
   the field's other clauses: prefer `define_table()`.
 - Defining needs a system user allowed to define: root, or a namespace or database `OWNER` or `EDITOR`. A session that
@@ -1120,4 +1120,4 @@ Applying needs a privileged session: run `define_table()` at start-up or deploym
   `define_view()` keeps a view's clauses set by hand; `access_ddl()`/`define_access()` of a `TableType.USER` model
   define a `SCHEMAFULL` table with its fields (and raise `TypeError` with `extra="allow"`), and write `TYPE NORMAL`
   (or `TYPE ANY`) for any model with `table_type`; generated models carry the keys
-  ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)).
+  ([section 31](#31-schema-introspection-databaseintrospector-generatemodelsfromdb)).

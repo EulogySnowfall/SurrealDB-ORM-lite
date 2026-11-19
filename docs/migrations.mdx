@@ -122,7 +122,7 @@ A second `makemigrations()`, run before `migrate()`, writes nothing: the pending
 so a new migration never repeats a pending one. The diff compares tables (schema mode, type, change feed, permissions,
 comment, view query, relation ends), fields, indexes, events, analyzers and the access of a user model; functions are
 not compared. It carries what a model leaves to the database: a clause the model does not declare stays as the
-database has it, as with `define_table()` — [section 35](/schema#35-model-table-ddl-define_table-schema_mode-permissions)
+database has it, as with `define_table()` — [section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)
 says how to remove one. Without `drop_missing=True`, removals (`DropTable`, `DropField`, `DropIndex`, `RemoveEvent`,
 `RemoveAnalyzer`, `RemoveAccess`), reversible or not, are left out and named in a warning: an event added by hand,
 which no model declares, is never removed by default. With `from_db=False` a removal is relative to the files: a model

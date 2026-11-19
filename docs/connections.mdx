@@ -48,7 +48,7 @@ socket is released when the loop is finalised.
   loop still holds a client.
 
 Each named connection keeps its own per-loop clients in the same way
-([section 30](#30-multiple-databases-add_connection-using)).
+([section 30](#30-multiple-databases-addconnection-using)).
 
 Long-lived single-loop applications are unaffected: one loop, one connection, as before.
 
@@ -68,7 +68,7 @@ pings); an HTTP request keeps a 30-second deadline. The SDK's version check stay
 
 `get_client()` returns that SDK 3.0 client, for what the ORM does not cover. Its methods are the SDK's: `query()`
 returns one result per statement, `update(record).merge(…)` replaces `merge()`, and a plain `str` target is a table
-name ([migration note](/migrating-to-0.50#the-client-of-get_client)). A client the ORM gave up refuses every request
+name ([migration note](/migrating-to-0.50#the-client-of-getclient)). A client the ORM gave up refuses every request
 instead of reconnecting anonymously: after its WebSocket connection dropped, a kept client — an
 `InteractiveTransaction` begun before, a `LiveStream` — raises a retryable `SurrealDbConnectionError` (retry the call;
 the ORM opens a new client); after `close_connection()`, a new registration or `remove_connection()` it raises a

@@ -124,7 +124,7 @@ never shared between two instances.
 
 ### Server-generated values (`SurrealFunc`)
 
-A `SurrealFunc` attribute ([section 15](/models#15-server-side-values-surrealfunc--server_values)) is SurrealQL the server
+A `SurrealFunc` attribute ([section 15](/models#15-server-side-values-surrealfunc-servervalues)) is SurrealQL the server
 evaluates: `create()` passes it to `save(server_values=…)`, so SurrealDB computes the value — `rand::uuid::v7()`,
 `rand::int(18, 80)`, `time::now()` — and each record of a batch gets its own. `build()` leaves the field out, so the
 model's default applies: the field must have one (`token: str | None = None`). A `SurrealFunc` passed to `build()`
@@ -138,7 +138,7 @@ field a server value with `DEFINE FIELD … DEFAULT` on the edge table, or decla
 ### Names and checks
 
 A declaration or an override names a field by its Python name or by its column — an alias
-([section 20](/models#20-field-aliases-server_fields-and-mergerefreshfalse)), an edge's `in`: `password = …` and
+([section 20](/models#20-field-aliases-serverfields-and-mergerefreshfalse)), an edge's `in`: `password = …` and
 `password_hash = …` both set `password`, and a subclass's declaration replaces its parent's under either name. Use one
 form per field: both in one class body, or in one call, raise `TypeError`.
 
@@ -195,7 +195,7 @@ async with embedded_database():
 An edge factory takes its endpoints at the call, as `in_` (or `in`) and `out`: a saved instance or a `RecordID`.
 `build()` gives a `SurrealFixture` its templates, each loaded as a fresh copy
 ([section 26](/embedded#26-embedded-engine-and-test-fixtures)). In a transaction, build and save with `tx=`: `create()` takes no
-`tx=`. On a named connection ([section 30](/connections#30-multiple-databases-add_connection-using)), `create()` inside
+`tx=`. On a named connection ([section 30](/connections#30-multiple-databases-addconnection-using)), `create()` inside
 `SurrealDBConnectionManager.using("archive")` writes to that database, as `save()` does.
 
 ### The pytest plugin

@@ -319,12 +319,12 @@ print(await NoteV2.objects().search(text="physics").count())
 
 ### Not supported
 
-- `as_of()` ([section 27](/querying#27-time-travel-as_of)): `search()` with `as_of()` raises `SurrealDbError` before any
+- `as_of()` ([section 27](/querying#27-time-travel-asof)): `search()` with `as_of()` raises `SurrealDbError` before any
   request, in either order and in a subquery under it. The index holds the records' current text, so a time-travel
   read would select records by their text now.
 - `changes()` ([section 22](/realtime#22-change-feeds-changes)): a change feed refuses `search()` and the search annotations
   (`SurrealDbError`), and a `Subquery` refuses the search annotations.
-- Indexes on materialized views ([section 33](/schema#33-materialized-views-view_query-define_view)), refused with
+- Indexes on materialized views ([section 33](/schema#33-materialized-views-viewquery-defineview)), refused with
   `ValueError` when the class is defined. A materialized view model cannot declare `indexes=`: SurrealDB 3.x does not
   index the records a view gains after the index is defined, and `define_view()` drops the indexes of the view's table.
 - `@AND@`/`@OR@`: SurrealDB 3.x's boolean match operators are not exposed. The terms of one text, and the fields of
@@ -651,7 +651,7 @@ except ValueError as error:
   (`exec()`, `first()`, `get()` without an id): `SurrealDbError` before the statement is sent. `search()` as a
   condition stays available there, and `count()`, `exists()` and the aggregations answer. `hybrid_search()` gives each
   record found by both searches its BM25 score and its distance, on every line.
-- `as_of()` ([section 27](/querying#27-time-travel-as_of)): `similar_to()` with `as_of()` raises `SurrealDbError` before any
+- `as_of()` ([section 27](/querying#27-time-travel-asof)): `similar_to()` with `as_of()` raises `SurrealDbError` before any
   request, in either order and in a subquery under it. The index holds the records' current vectors, so a time-travel
   read would pick its neighbours by their vectors now.
 - `live()`/`watch()` ([section 21](/realtime#21-live-queries-real-time-notifications)) refuse `similar_to()`, and a `Subquery`
@@ -697,7 +697,7 @@ except ValueError as error:
 
 Since v0.37.0 a queryset fuses two rankings of its records with the full SurrealDB-ORM's `hybrid_search()`: the
 records nearest to a query vector, as `similar_to()` finds them
-([section 37](#37-vector-search-similar_to-vectorfield-indexhnswtrue)), and the best matches of a text, as `search()`
+([section 37](#37-vector-search-similarto-vectorfield-indexhnswtrue)), and the best matches of a text, as `search()`
 ranks them by BM25 score ([section 36](#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)), are
 fused into one ranking by Reciprocal Rank Fusion. SurrealDB 3.x fuses the two lists with its `search::rrf()`;
 SurrealDB 2.x and the embedded engine have no such function, so the ORM fuses them with the same formula: the same

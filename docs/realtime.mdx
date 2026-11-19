@@ -383,7 +383,7 @@ async for event in stream:
   collection (`--changefeed-gc-interval`, 10 s by default), and not on every cycle. The same
   8-writer load refused nothing on a table without a change feed, nor on 3.3.4 (`save()`,
   `merge()` and `delete()`). The ORM does not retry these writes for you: apply
-  `retry_on_conflict` yourself (see [section 14](/writing#14-optimistic-concurrency-retry_on_conflict)).
+  `retry_on_conflict` yourself (see [section 14](/writing#14-optimistic-concurrency-retryonconflict)).
   A refused write stores nothing, so replaying it is safe for the data; the `pre_save` and
   `around_save` handlers run again on each attempt. Outside a transaction the error is the SDK's
   own `InternalError` ("… This transaction can be retried"), which `is_conflict_error()`

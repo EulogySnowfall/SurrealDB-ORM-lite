@@ -818,7 +818,7 @@ post, created = await Post.objects().get_or_create(author__in=active, title="one
   accept a live query whose subquery table does not exist and never notify, so the ORM raises
   `SurrealDbNotFoundError` there; 2.x reads that table as empty.
 - **Time travel**: under `as_of()` every subquery reads at the same moment (the ORM gives it the
-  moment's `VERSION` and the per-record check of [section 27](#27-time-travel-as_of)). Without
+  moment's `VERSION` and the per-record check of [section 27](#27-time-travel-asof)). Without
   versioned storage the read raises section 27's `SurrealDbError`; SurrealDB 3.1.5 raises its own
   `ThrownError` ("Failed to scan record") instead.
 - **`changes()`** refuses `filter()`, so subqueries too.

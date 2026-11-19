@@ -191,7 +191,7 @@ a model with computed fields. One difference remains: an expression that reads `
 stored value on 2.x and `NONE` on 3.x, so `VALUE ($value OR 0) + 1` counts the replaces on 2.x
 only. Keep such an expression for `merge()`, or don't read `$value` in it.
 
-Since v0.34.0, `define_table()` ([section 35](/schema#35-model-table-ddl-define_table-schema_mode-permissions)) writes a computed field's `TYPE` too
+Since v0.34.0, `define_table()` ([section 35](/schema#35-model-table-ddl-definetable-schemamode-permissions)) writes a computed field's `TYPE` too
 (`TYPE option<T> VALUE …`), checks its expression, and keeps a field the database defines `COMPUTED` (SurrealDB 3.x)
 `COMPUTED`; `define_computed_fields()` turns such a field into `VALUE`.
 

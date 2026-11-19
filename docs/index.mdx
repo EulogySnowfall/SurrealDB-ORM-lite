@@ -25,10 +25,10 @@ guide says so and [Compatibility](/compatibility) lists every difference. Coming
     - [3. CRUD Operations](/getting-started#3-crud-operations)
 - **[Models](/models)**
   - [Custom Primary Key](/models#custom-primary-key)
-  - [Custom table name (`table_name`)](/models#custom-table-name-table_name)
-  - [15. Server-side values: `SurrealFunc` + `server_values=`](/models#15-server-side-values-surrealfunc--server_values)
-  - [16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`](/models#16-computed-fields-computed--define-field--value)
-  - [20. Field aliases, `server_fields` and `merge(refresh=False)`](/models#20-field-aliases-server_fields-and-mergerefreshfalse)
+  - [Custom table name (`table_name`)](/models#custom-table-name-tablename)
+  - [15. Server-side values: `SurrealFunc` + `server_values=`](/models#15-server-side-values-surrealfunc-servervalues)
+  - [16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`](/models#16-computed-fields-computed-define-field-value)
+  - [20. Field aliases, `server_fields` and `merge(refresh=False)`](/models#20-field-aliases-serverfields-and-mergerefreshfalse)
 - **[Field types](/fields)**
   - [24. Rich field types](/fields#24-rich-field-types)
   - [25. Geospatial fields](/fields#25-geospatial-fields)
@@ -38,25 +38,25 @@ guide says so and [Compatibility](/compatibility) lists every difference. Coming
   - [5. Q Objects (Complex Queries)](/querying#5-q-objects-complex-queries)
   - [8. FETCH Clause](/querying#8-fetch-clause)
   - [9. Aggregations](/querying#9-aggregations)
-  - [27. Time travel (`as_of()`)](/querying#27-time-travel-as_of)
+  - [27. Time travel (`as_of()`)](/querying#27-time-travel-asof)
   - [28. Subqueries (`Subquery`)](/querying#28-subqueries-subquery)
   - [29. Query cache (`cache()`, `QueryCache`)](/querying#29-query-cache-cache-querycache)
 - **[Writing data](/writing)**
   - [6. Bulk Operations](/writing#6-bulk-operations)
   - [10. Model Signals](/writing#10-model-signals)
   - [11. Transactions (atomic, all-or-nothing)](/writing#11-transactions-atomic-all-or-nothing)
-  - [12. Upsert & get_or_create / update_or_create](/writing#12-upsert--get_or_create--update_or_create)
-  - [13. Patch & atomic field/array operations](/writing#13-patch--atomic-fieldarray-operations)
-  - [14. Optimistic concurrency: `retry_on_conflict`](/writing#14-optimistic-concurrency-retry_on_conflict)
+  - [12. Upsert & get_or_create / update_or_create](/writing#12-upsert-getorcreate-updateorcreate)
+  - [13. Patch & atomic field/array operations](/writing#13-patch-atomic-fieldarray-operations)
+  - [14. Optimistic concurrency: `retry_on_conflict`](/writing#14-optimistic-concurrency-retryonconflict)
 - **[Relations and graph](/relations)**
-  - [7. Relations & Graph](/relations#7-relations--graph)
+  - [7. Relations & Graph](/relations#7-relations-graph)
   - [23. Typed edges (`BaseSurrealEdge`)](/relations#23-typed-edges-basesurrealedge)
-  - [34. Relation constraints (`relation_in`, `define_relation()`)](/relations#34-relation-constraints-relation_in-define_relation)
+  - [34. Relation constraints (`relation_in`, `define_relation()`)](/relations#34-relation-constraints-relationin-definerelation)
 - **[Stored functions and events](/functions-and-events)**
-  - [17. Stored functions: `call_function()`](/functions-and-events#17-stored-functions-call_function)
-  - [32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)](/functions-and-events#32-server-side-events-and-stored-functions-event-define_events-define_function)
+  - [17. Stored functions: `call_function()`](/functions-and-events#17-stored-functions-callfunction)
+  - [32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)](/functions-and-events#32-server-side-events-and-stored-functions-event-defineevents-definefunction)
 - **[Authentication](/authentication)**
-  - [18. Authentication (`signin` / `signup` / `info` / `invalidate`)](/authentication#18-authentication-signin--signup--info--invalidate)
+  - [18. Authentication (`signin` / `signup` / `info` / `invalidate`)](/authentication#18-authentication-signin-signup-info-invalidate)
   - [19. Model-level authentication (`AuthenticatedUserMixin`)](/authentication#19-model-level-authentication-authenticatedusermixin)
 - **[Live queries and change feeds](/realtime)**
   - [21. Live queries (real-time notifications)](/realtime#21-live-queries-real-time-notifications)
@@ -64,17 +64,17 @@ guide says so and [Compatibility](/compatibility) lists every difference. Coming
 - **[Connections](/connections)**
   - [Context Manager](/connections#context-manager)
   - [Connections and event loops](/connections#connections-and-event-loops)
-  - [30. Multiple databases (`add_connection()`, `using()`)](/connections#30-multiple-databases-add_connection-using)
+  - [30. Multiple databases (`add_connection()`, `using()`)](/connections#30-multiple-databases-addconnection-using)
 - **[Embedded engine](/embedded)**
   - [26. Embedded engine and test fixtures](/embedded#26-embedded-engine-and-test-fixtures)
 - **[Schema and DDL](/schema)**
-  - [31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)](/schema#31-schema-introspection-databaseintrospector-generate_models_from_db)
-  - [33. Materialized views (`view_query`, `define_view()`)](/schema#33-materialized-views-view_query-define_view)
-  - [35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)](/schema#35-model-table-ddl-define_table-schema_mode-permissions)
+  - [31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)](/schema#31-schema-introspection-databaseintrospector-generatemodelsfromdb)
+  - [33. Materialized views (`view_query`, `define_view()`)](/schema#33-materialized-views-viewquery-defineview)
+  - [35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)](/schema#35-model-table-ddl-definetable-schemamode-permissions)
 - **[Search](/search)**
   - [36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)](/search#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)
-  - [37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)](/search#37-vector-search-similar_to-vectorfield-indexhnswtrue)
-  - [38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)](/search#38-hybrid-search-hybrid_search-reciprocal-rank-fusion)
+  - [37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)](/search#37-vector-search-similarto-vectorfield-indexhnswtrue)
+  - [38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)](/search#38-hybrid-search-hybridsearch-reciprocal-rank-fusion)
 - **[Migrations](/migrations)**
   - [39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)](/migrations#39-migrations-makemigrations-migrationexecutor-operations)
 - **[Command line](/cli)**
@@ -86,7 +86,7 @@ guide says so and [Compatibility](/compatibility) lists every difference. Coming
   - [ORM behaviour: the embedded engine](/compatibility#orm-behaviour-the-embedded-engine)
 - **[Migrating to 0.50](/migrating-to-0.50)**
   - [Installing](/migrating-to-0.50#installing)
-  - [The client of `get_client()`](/migrating-to-0.50#the-client-of-get_client)
+  - [The client of `get_client()`](/migrating-to-0.50#the-client-of-getclient)
   - [Order of `first()` and of pages](/migrating-to-0.50#order-of-first-and-of-pages)
   - [The embedded engine is SurrealDB 4.0](/migrating-to-0.50#the-embedded-engine-is-surrealdb-40)
   - [Migrations on SurrealDB 4.x](/migrating-to-0.50#migrations-on-surrealdb-4x)
@@ -104,38 +104,38 @@ The guides keep the section numbers of the manual, so a reference such as "secti
 | [4. QuerySet Methods](/querying#4-queryset-methods)                                                                                                                                                   | Querying                      |
 | [5. Q Objects (Complex Queries)](/querying#5-q-objects-complex-queries)                                                                                                                               | Querying                      |
 | [6. Bulk Operations](/writing#6-bulk-operations)                                                                                                                                                      | Writing data                  |
-| [7. Relations & Graph](/relations#7-relations--graph)                                                                                                                                                 | Relations and graph           |
+| [7. Relations & Graph](/relations#7-relations-graph)                                                                                                                                                 | Relations and graph           |
 | [8. FETCH Clause](/querying#8-fetch-clause)                                                                                                                                                           | Querying                      |
 | [9. Aggregations](/querying#9-aggregations)                                                                                                                                                           | Querying                      |
 | [10. Model Signals](/writing#10-model-signals)                                                                                                                                                        | Writing data                  |
 | [11. Transactions (atomic, all-or-nothing)](/writing#11-transactions-atomic-all-or-nothing)                                                                                                           | Writing data                  |
-| [12. Upsert & get_or_create / update_or_create](/writing#12-upsert--get_or_create--update_or_create)                                                                                                  | Writing data                  |
-| [13. Patch & atomic field/array operations](/writing#13-patch--atomic-fieldarray-operations)                                                                                                          | Writing data                  |
-| [14. Optimistic concurrency: `retry_on_conflict`](/writing#14-optimistic-concurrency-retry_on_conflict)                                                                                               | Writing data                  |
-| [15. Server-side values: `SurrealFunc` + `server_values=`](/models#15-server-side-values-surrealfunc--server_values)                                                                                  | Models                        |
-| [16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`](/models#16-computed-fields-computed--define-field--value)                                                                             | Models                        |
-| [17. Stored functions: `call_function()`](/functions-and-events#17-stored-functions-call_function)                                                                                                    | Stored functions and events   |
-| [18. Authentication (`signin` / `signup` / `info` / `invalidate`)](/authentication#18-authentication-signin--signup--info--invalidate)                                                                | Authentication                |
+| [12. Upsert & get_or_create / update_or_create](/writing#12-upsert-getorcreate-updateorcreate)                                                                                                  | Writing data                  |
+| [13. Patch & atomic field/array operations](/writing#13-patch-atomic-fieldarray-operations)                                                                                                          | Writing data                  |
+| [14. Optimistic concurrency: `retry_on_conflict`](/writing#14-optimistic-concurrency-retryonconflict)                                                                                               | Writing data                  |
+| [15. Server-side values: `SurrealFunc` + `server_values=`](/models#15-server-side-values-surrealfunc-servervalues)                                                                                  | Models                        |
+| [16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`](/models#16-computed-fields-computed-define-field-value)                                                                             | Models                        |
+| [17. Stored functions: `call_function()`](/functions-and-events#17-stored-functions-callfunction)                                                                                                    | Stored functions and events   |
+| [18. Authentication (`signin` / `signup` / `info` / `invalidate`)](/authentication#18-authentication-signin-signup-info-invalidate)                                                                | Authentication                |
 | [19. Model-level authentication (`AuthenticatedUserMixin`)](/authentication#19-model-level-authentication-authenticatedusermixin)                                                                     | Authentication                |
-| [20. Field aliases, `server_fields` and `merge(refresh=False)`](/models#20-field-aliases-server_fields-and-mergerefreshfalse)                                                                         | Models                        |
+| [20. Field aliases, `server_fields` and `merge(refresh=False)`](/models#20-field-aliases-serverfields-and-mergerefreshfalse)                                                                         | Models                        |
 | [21. Live queries (real-time notifications)](/realtime#21-live-queries-real-time-notifications)                                                                                                       | Live queries and change feeds |
 | [22. Change feeds (`changes()`)](/realtime#22-change-feeds-changes)                                                                                                                                   | Live queries and change feeds |
 | [23. Typed edges (`BaseSurrealEdge`)](/relations#23-typed-edges-basesurrealedge)                                                                                                                      | Relations and graph           |
 | [24. Rich field types](/fields#24-rich-field-types)                                                                                                                                                   | Field types                   |
 | [25. Geospatial fields](/fields#25-geospatial-fields)                                                                                                                                                 | Field types                   |
 | [26. Embedded engine and test fixtures](/embedded#26-embedded-engine-and-test-fixtures)                                                                                                               | Embedded engine               |
-| [27. Time travel (`as_of()`)](/querying#27-time-travel-as_of)                                                                                                                                         | Querying                      |
+| [27. Time travel (`as_of()`)](/querying#27-time-travel-asof)                                                                                                                                         | Querying                      |
 | [28. Subqueries (`Subquery`)](/querying#28-subqueries-subquery)                                                                                                                                       | Querying                      |
 | [29. Query cache (`cache()`, `QueryCache`)](/querying#29-query-cache-cache-querycache)                                                                                                                | Querying                      |
-| [30. Multiple databases (`add_connection()`, `using()`)](/connections#30-multiple-databases-add_connection-using)                                                                                     | Connections                   |
-| [31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)](/schema#31-schema-introspection-databaseintrospector-generate_models_from_db)                                        | Schema and DDL                |
-| [32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)](/functions-and-events#32-server-side-events-and-stored-functions-event-define_events-define_function) | Stored functions and events   |
-| [33. Materialized views (`view_query`, `define_view()`)](/schema#33-materialized-views-view_query-define_view)                                                                                        | Schema and DDL                |
-| [34. Relation constraints (`relation_in`, `define_relation()`)](/relations#34-relation-constraints-relation_in-define_relation)                                                                       | Relations and graph           |
-| [35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)](/schema#35-model-table-ddl-define_table-schema_mode-permissions)                                                               | Schema and DDL                |
+| [30. Multiple databases (`add_connection()`, `using()`)](/connections#30-multiple-databases-addconnection-using)                                                                                     | Connections                   |
+| [31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)](/schema#31-schema-introspection-databaseintrospector-generatemodelsfromdb)                                        | Schema and DDL                |
+| [32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)](/functions-and-events#32-server-side-events-and-stored-functions-event-defineevents-definefunction) | Stored functions and events   |
+| [33. Materialized views (`view_query`, `define_view()`)](/schema#33-materialized-views-viewquery-defineview)                                                                                        | Schema and DDL                |
+| [34. Relation constraints (`relation_in`, `define_relation()`)](/relations#34-relation-constraints-relationin-definerelation)                                                                       | Relations and graph           |
+| [35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)](/schema#35-model-table-ddl-definetable-schemamode-permissions)                                                               | Schema and DDL                |
 | [36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)](/search#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)                             | Search                        |
-| [37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)](/search#37-vector-search-similar_to-vectorfield-indexhnswtrue)                                                                | Search                        |
-| [38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)](/search#38-hybrid-search-hybrid_search-reciprocal-rank-fusion)                                                                        | Search                        |
+| [37. Vector search (`similar_to()`, `VectorField`, `Index(hnsw=True)`)](/search#37-vector-search-similarto-vectorfield-indexhnswtrue)                                                                | Search                        |
+| [38. Hybrid search (`hybrid_search()`, Reciprocal Rank Fusion)](/search#38-hybrid-search-hybridsearch-reciprocal-rank-fusion)                                                                        | Search                        |
 | [39. Migrations (`makemigrations()`, `MigrationExecutor`, operations)](/migrations#39-migrations-makemigrations-migrationexecutor-operations)                                                         | Migrations                    |
 | [40. Command line (`surreal-orm-lite`)](/cli#40-command-line-surreal-orm-lite)                                                                                                                        | Command line                  |
 | [41. Test data factories (`ModelFactory`, `Faker`) and the pytest plugin](/testing#41-test-data-factories-modelfactory-faker-and-the-pytest-plugin)                                                   | Testing                       |
