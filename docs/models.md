@@ -250,9 +250,10 @@ would lose one of the two values in the same row, so it raises `ValueError`.
 
 ### Sub-model keys and aliases
 
-A sub-model, a Pydantic `BaseModel` used as a field's type (also in a `list`, a `dict` or `X | None`), is read back
-by Pydantic, which takes each of its fields from the first key it accepts: its validation aliases in order, then its
-name under `populate_by_name`. The ORM writes each sub-field under one key, on every write and on both server lines:
+A sub-model, a Pydantic `BaseModel` used as a field's type (also in a `list`, a `tuple`, a `dict`, `X | None` or the
+root of a `RootModel`), is read back by Pydantic, which takes each of its fields from the first key it accepts: its
+validation aliases in order, then its name under `populate_by_name`. The ORM writes each sub-field under one key, on
+every write and on both server lines:
 
 - the key `model_dump()` writes, when a read takes it, so `save()` stores what it always stored: the name, or the
   alias under `serialize_by_alias=True`;
@@ -263,13 +264,15 @@ name under `populate_by_name`. The ORM writes each sub-field under one key, on e
   of several steps has no such key, and writing it raises `ValueError`.
 
 `define_table()` (and `table_ddl()`) declares each sub-model field under that same key, so a `SCHEMAFULL` table the ORM
-defined takes every sub-model write on both lines. Earlier versions stored the two cases of the second rule under the
-dumped key (`first_name` where `firstName` is now stored, `firstName` where `fn` is): rows written then keep that key,
-which a read skips, until the field is written again. A nested path in a query names the stored key
-(`filter(**{"profile.firstName": …})`), and a table defined by an earlier version gets the new sub-field definitions
-from `define_table()` (the old ones stay until you remove them). A generated migration proposes that removal:
-`makemigrations()` adds the new definitions, names the old ones in a warning and writes their `DropField` with
-`drop_missing=True` (`--drop-missing`). Values under an old key can be copied first with a raw
+defined takes every sub-model write on both lines. A `RootModel` is stored as its root (`RootModel[list[Profile]]` is an
+array of profiles, declared as one), and a sub-model in a fixed tuple of different types (`tuple[Profile, int]`) is a
+free-form object there. Earlier versions stored the two cases of the second rule under the dumped key (`first_name`
+where `firstName` is now stored, `firstName` where `fn` is): rows written then keep that key, which a read skips, until
+the field is written again. A nested path in a query names the stored key (`filter(**{"profile.firstName": …})`), and a
+table defined by an earlier version gets the new sub-field definitions from `define_table()` (the old ones stay until
+you remove them). A generated migration proposes that removal: `makemigrations()` adds the new definitions, names the
+old ones in a warning and writes their `DropField` with `drop_missing=True` (`--drop-missing`). Values under an old key
+can be copied first with a raw
 `UPDATE <table> SET p.firstName = p.first_name WHERE p.first_name != NONE AND p.firstName = NONE` before applying it.
 
 Keyword writes follow the same rule:
