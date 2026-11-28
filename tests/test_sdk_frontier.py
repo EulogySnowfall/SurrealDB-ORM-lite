@@ -539,6 +539,67 @@ def test_the_orm_calls_the_sdk_only_through_the_frontier() -> None:
     assert violations == [], "\n".join(violations)
 
 
+def _unwrapped_sdk_calls(source: str, filename: str) -> list[str]:
+    """The SDK data calls of the frontier module *source* not made inside an operation given to ``_sdk_call()``.
+
+    An SDK call is a call of a data method (``DATA_METHODS``, or ``NEVER``'s ``refresh``) on a parameter of the function
+    or lambda that makes it; it is wrapped when that scope is the lambda passed as ``_sdk_call``'s second argument.
+    """
+    tree = ast.parse(source, filename)
+    operations = {
+        id(node.args[1])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _callee_name(node.func) == "_sdk_call"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Lambda)
+    }
+    unwrapped: list[str] = []
+    for scope in ast.walk(tree):
+        if not isinstance(scope, _SCOPES):
+            continue
+        parameters = set(_parameters(scope))
+        for node in _own_nodes(scope):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in DATA_METHODS | {"refresh"}
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in parameters
+                and id(scope) not in operations
+            ):
+                unwrapped.append(f"{filename}:{node.lineno}: {node.func.value.id}.{node.func.attr}()")
+    return unwrapped
+
+
+class TestFrontierCallsGoThroughSdkCall:
+    """``_client.in_flight()`` and the mapping of the SDK's errors hold for every SDK call the frontier makes only
+    when each one is an operation given to ``_sdk_call()``."""
+
+    def test_the_frontier_module(self) -> None:
+        path = SRC / "_client.py"
+        assert _unwrapped_sdk_calls(path.read_text(encoding="utf-8"), "_client.py") == []
+
+    def test_detection(self) -> None:
+        source = textwrap.dedent(
+            """
+            async def wrapped(client):
+                return await _sdk_call(client, lambda c: c.select(t))
+
+            async def bare(client):
+                return await client.query(sql)
+
+            async def elsewhere(client):
+                op = lambda c: c.create(t, d)
+                return await _sdk_call(client, op)
+
+            async def not_a_parameter(client):
+                return await shared.query(sql)
+            """
+        )
+        assert _unwrapped_sdk_calls(source, "m.py") == ["m.py:6: client.query()", "m.py:9: c.create()"]
+
+
 # --- the runtime check (tests/_frontier_spy.py) -----------------------------------------------------
 
 

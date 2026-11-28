@@ -134,7 +134,7 @@ def require_supported_url(url: str | None) -> None:
         SdkUrl(url)
     except Exception as exc:
         error = SurrealDbConnectionError(unsupported_url_message(url, exc))
-        error.retryable = False  # type: ignore[attr-defined]
+        error.retryable = False
         raise error from exc
 
 

@@ -56,6 +56,8 @@ from surreal_orm_lite import (
     SearchScore,
     Subquery,
     SurrealConfigDict,
+    SurrealDbAuthenticationError,
+    SurrealDbConnectionError,
     SurrealDBConnectionManager,
     SurrealFunc,
     TableState,
@@ -871,3 +873,19 @@ async def factory_create_forms() -> None:
     assert_type(await FactoryUserFactory.create(), FactoryUser)
     assert_type(await FactoryUserFactory.create_batch(2), list[FactoryUser])
     assert_type(await PlainFactory.create(), BaseSurrealModel)
+
+
+def connection_error_flags(error: SurrealDbConnectionError) -> tuple[bool, bool, AuthTokens | None]:
+    """v0.51.0: ``retryable``, ``may_have_run`` and ``tokens`` are declared on ``SurrealDbConnectionError``."""
+    assert_type(error.retryable, bool)
+    assert_type(error.may_have_run, bool)
+    assert_type(error.tokens, AuthTokens | None)
+    tokens: AuthTokens | None = error.tokens
+    return error.retryable, error.may_have_run, tokens
+
+
+def authentication_error_tokens(error: SurrealDbAuthenticationError) -> AuthTokens | None:
+    """v0.51.0: ``tokens`` is declared on ``SurrealDbAuthenticationError``."""
+    assert_type(error.tokens, AuthTokens | None)
+    tokens: AuthTokens | None = error.tokens
+    return tokens

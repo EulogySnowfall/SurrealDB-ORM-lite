@@ -205,7 +205,9 @@ class TestSdkErrorsUnit:
 
         assert caught.value.__cause__ is error
         assert str(caught.value) == str(error)
-        assert caught.value.retryable is retryable  # type: ignore[attr-defined]
+        assert caught.value.retryable is retryable
+        # Nothing let this request through to a transport.
+        assert caught.value.may_have_run is False
 
     @pytest.mark.asyncio
     async def test_a_server_error_passes_through_unchanged(self) -> None:

@@ -20,7 +20,7 @@ import pytest
 
 from surreal_orm_lite import _client, _sdk
 from surreal_orm_lite._sdk import BoundIncluded, Null, PreciseDatetime, RecordID, SdkRange, SurrealSet, Table
-from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.exceptions import SurrealDbConnectionError, SurrealDbError
 from tests.conftest import orm_client
 
 
@@ -341,6 +341,92 @@ class TestRetire:
 
         await _client.retire(_Broken(), "closed")
         await _client.retire(_Hanging(), "closed")
+
+
+# --- _sdk_call(): the operation, the in-flight count ----------------------------------------------
+
+
+class _HoldingClient:
+    """A client whose ``query_raw`` waits for ``release`` (or raises ``error``)."""
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.release = asyncio.Event()
+        self.error = error
+
+    async def query_raw(self, sql: str, variables: Any = None) -> Any:
+        await self.release.wait()
+        if self.error is not None:
+            raise self.error
+        return {"result": []}
+
+
+class TestSdkCall:
+    """Every frontier call runs through ``_sdk_call(client, op)``, which counts it on its client while it runs."""
+
+    async def test_the_operation_is_given_the_client(self) -> None:
+        client = _FakeClient()
+        seen: list[Any] = []
+
+        async def operation(given: Any) -> int:
+            seen.append(given)
+            return 7
+
+        assert await _client._sdk_call(client, operation) == 7
+        assert seen == [client]
+
+    def test_a_client_never_called_has_nothing_in_flight(self) -> None:
+        assert _client.in_flight(_FakeClient()) == 0
+
+    async def test_concurrent_calls_are_counted_per_client_until_they_return(self) -> None:
+        client, other = _HoldingClient(), _HoldingClient()
+        calls = [asyncio.ensure_future(_client.query_raw(client, "RETURN 1")) for _ in range(3)]
+        side = asyncio.ensure_future(_client.query_raw(other, "RETURN 1"))
+        await asyncio.sleep(0)
+        assert _client.in_flight(client) == 3
+        assert _client.in_flight(other) == 1
+        client.release.set()
+        await asyncio.gather(*calls)
+        assert _client.in_flight(client) == 0
+        assert _client.in_flight(other) == 1
+        other.release.set()
+        await side
+        assert _client.in_flight(other) == 0
+
+    @pytest.mark.parametrize(
+        "error",
+        [_sdk.ConnectionUnavailableError("the connection is gone"), _sdk.NotFoundError("NotFound", "no table")],
+        ids=["transport", "server"],
+    )
+    async def test_a_failed_call_is_no_longer_counted(self, error: BaseException) -> None:
+        client = _HoldingClient(error)
+        call = asyncio.ensure_future(_client.query_raw(client, "RETURN 1"))
+        await asyncio.sleep(0)
+        assert _client.in_flight(client) == 1
+        client.release.set()
+        with pytest.raises((SurrealDbConnectionError, _sdk.NotFoundError)):
+            await call
+        assert _client.in_flight(client) == 0
+
+    async def test_a_cancelled_call_is_no_longer_counted(self) -> None:
+        client = _HoldingClient()
+        call = asyncio.ensure_future(_client.query_raw(client, "RETURN 1"))
+        await asyncio.sleep(0)
+        assert _client.in_flight(client) == 1
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert _client.in_flight(client) == 0
+
+    async def test_a_client_that_cannot_be_counted_still_runs(self) -> None:
+        class _Slotted:
+            __slots__ = ()
+
+        async def operation(_given: Any) -> str:
+            return "ran"
+
+        client = _Slotted()
+        assert await _client._sdk_call(client, operation) == "ran"
+        assert _client.in_flight(client) == 0
 
 
 # --- normalize() ----------------------------------------------------------------------------------

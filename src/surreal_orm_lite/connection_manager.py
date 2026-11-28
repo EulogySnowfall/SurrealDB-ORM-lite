@@ -1023,10 +1023,10 @@ class SurrealDBConnectionManager:
                 if isinstance(e, UnsupportedEngineError | ImportError):
                     # SDK 3.0: the engine is the optional extra; its parser still routes the URL without it.
                     missing = SurrealDbConnectionError(ENGINE_MISSING)
-                    missing.retryable = False  # type: ignore[attr-defined]
+                    missing.retryable = False
                     raise missing from e
                 error = SurrealDbConnectionError(f"Can't open the embedded database {url!r}: {e}")
-                error.retryable = False  # type: ignore[attr-defined]
+                error.retryable = False
                 raise error from e
             logger.warning(f"Can't get connection: {e}")
             # Before the close: a closed client reads as dead (its reader is gone), whatever failed.
@@ -1039,13 +1039,13 @@ class SurrealDBConnectionManager:
                 unsupported = SurrealDbConnectionError(
                     f"SurrealDB {e.version} is not supported by surrealdb SDK 3.x ({e.minimum} to {e.maximum} excluded)."
                 )
-                unsupported.retryable = False  # type: ignore[attr-defined]
+                unsupported.retryable = False
                 raise unsupported from e
             error = SurrealDbConnectionError("Can't connect to the database.")
             # Kept as SurrealDbConnectionError for every caller, but a server that *answered*
             # — the configured credentials rejected, the namespace refused — will answer the same
             # on the next attempt, so the reconnect loops (v0.21.0) must not retry it.
-            error.retryable = retryable  # type: ignore[attr-defined]
+            error.retryable = retryable
             raise error from None
         except BaseException:
             # A cancellation (a stream stopped mid-reconnect) must not leave a socket behind.
@@ -1336,7 +1336,7 @@ class SurrealDBConnectionManager:
             _BACKGROUND.add(closing)
             closing.add_done_callback(_BACKGROUND.discard)
             error = SurrealDbConnectionError("The reconnect was abandoned: its stream was torn down.")
-            error.retryable = False  # type: ignore[attr-defined]
+            error.retryable = False
             raise error
         if generation is not None and generation != cls.__generation:
             # Built on settings the connection no longer serves: never cached, closed in the background, quietly
@@ -1345,7 +1345,7 @@ class SurrealDBConnectionManager:
             _BACKGROUND.add(closing)
             closing.add_done_callback(_BACKGROUND.discard)
             error = SurrealDbConnectionError(_opening_retired_text(cls._connection_name))
-            error.retryable = True  # type: ignore[attr-defined]
+            error.retryable = True
             raise error
         cls._stamp_identity(client, fingerprint=fingerprint, replayable=True, kind=kind)
         cls.__clients[loop] = client
@@ -1378,7 +1378,7 @@ class SurrealDBConnectionManager:
                 # The network failed, not the token: keep the session for the next attempt. A
                 # brief outage during a reconnect must not log the application out for good.
                 error = SurrealDbConnectionError("The connection dropped while restoring the session.")
-                error.retryable = True  # type: ignore[attr-defined]
+                error.retryable = True
                 raise error from exc
             # Forgotten only if it still is the session this replay sent: one stored meanwhile is not the refused one.
             cls._set_stored(None, expected=replayed)
@@ -1481,7 +1481,7 @@ class SurrealDBConnectionManager:
                 "embedded session was being selected on the old ones; the engine was kept, and the call did not run. "
                 "Retry the call."
             )
-        error.retryable = True  # type: ignore[attr-defined]
+        error.retryable = True
         if cause is None:
             raise error
         raise error from cause
@@ -1574,7 +1574,7 @@ class SurrealDBConnectionManager:
             error = SurrealDbConnectionError(
                 f"Can't select namespace {namespace!r} and database {database!r} on the embedded database {url!r}: {exc}"
             )
-            error.retryable = False  # type: ignore[attr-defined]
+            error.retryable = False
             raise error from exc
         try:
             await cls._replay_embedded_session(client)
@@ -1717,7 +1717,7 @@ class SurrealDBConnectionManager:
                 error = SurrealDbConnectionError(
                     f"Can't reopen the embedded database {cls._embedded_slot_url()!r} to return to its owner session: {exc}"
                 )
-                error.retryable = False  # type: ignore[attr-defined]
+                error.retryable = False
                 raise error from exc
             cls.__embedded_owner = True
             return
@@ -1728,7 +1728,7 @@ class SurrealDBConnectionManager:
                 f"Can't end the session of the embedded database {cls._embedded_slot_url()!r} to return to its owner "
                 f"session: {exc}"
             )
-            error.retryable = False  # type: ignore[attr-defined]
+            error.retryable = False
             raise error from exc
         if ended is not None:
             ended()
@@ -2133,7 +2133,7 @@ class SurrealDBConnectionManager:
                 # commit into the old database. No deferred post_* signal, no cache invalidation (cancel() forgets).
                 await tx.cancel()
                 error = SurrealDbConnectionError(_transaction_retired_text(cls._connection_name))
-                error.retryable = False  # type: ignore[attr-defined]
+                error.retryable = False
                 raise error
             # A commit failure (e.g. a server-side conflict surfacing at COMMIT) must also
             # cancel: on the interactive strategy the txn rides the shared connection, so we
@@ -2709,7 +2709,7 @@ class SurrealDBConnectionManager:
             else:
                 # Cancelled (or interrupted): the token may or may not be spent; the session is kept.
                 interrupted = SurrealDbConnectionError(_RENEWAL_INTERRUPTED)
-                interrupted.retryable = True  # type: ignore[attr-defined]
+                interrupted.retryable = True
                 renewal.set_exception(interrupted)
             raise
 
@@ -3851,7 +3851,7 @@ def _owner_error(text: str) -> SurrealDbConnectionError:
     """A not-retryable ``SurrealDbConnectionError`` with one of the owner user's fixed texts (spec §5.7, C6). The caller
     raises it ``from None`` outside any ``except`` block, so it has neither ``__cause__`` nor ``__context__``."""
     error = SurrealDbConnectionError(text)
-    error.retryable = False  # type: ignore[attr-defined]
+    error.retryable = False
     return error
 
 
@@ -3946,7 +3946,7 @@ def _claim_store(url: str | None, connection: type[SurrealDBConnectionManager]) 
         f"process, and two in-process engines on one store miss each other's writes. Use one connection for the "
         f"store, or close {holding!r} first."
     )
-    error.retryable = False  # type: ignore[attr-defined]
+    error.retryable = False
     raise error
 
 

@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING
 
 from ._sdk import SdkInvalidDurationError, SdkInvalidGeometryError
 
+if TYPE_CHECKING:
+    # auth.py imports this module: the annotation only.
+    from .auth import AuthTokens
+
 
 class SurrealORMError(Exception):
     """Base exception for all SurrealDB ORM errors."""
@@ -38,9 +42,22 @@ class SurrealDbConnectionError(SurrealORMError):
 
     Raised when the connection to SurrealDB cannot be established
     or when an existing connection is lost.
+
+    Attributes (v0.51.0, declared on the class; an instance sets its own value):
+
+    - ``retryable`` — whether the same call may succeed if made again (``True`` by default): a lost or unreachable
+      connection is, a deadline that passed, a refusal by the server or a deliberately closed client is not.
+    - ``may_have_run`` — ``True`` only when the request was handed to the transport and its answer never came: the
+      server may have run it. ``False`` everywhere else (the request was refused before it was sent, the connection
+      could not be opened, an HTTP 401). A retry loop reads it before running a write again: an error can be
+      ``retryable`` **and** ``may_have_run``.
+    - ``tokens`` — ``None``, except on the error of a ``signin()``/``signup()`` that obtained tokens but could not put
+      them on the shared connection.
     """
 
-    pass
+    retryable: bool = True
+    may_have_run: bool = False
+    tokens: "AuthTokens | None" = None
 
 
 class SurrealDbValidationError(SurrealORMError):
@@ -97,9 +114,12 @@ class SurrealDbAuthenticationError(SurrealDbError):
 
     Inherits from SurrealDbError, so existing ``except SurrealDbError`` handlers
     continue to catch it.
+
+    ``tokens`` (v0.51.0, declared on the class) is ``None``, except on the error of a ``signin()``/``signup()`` that
+    obtained tokens but could not put them on the shared connection.
     """
 
-    pass
+    tokens: "AuthTokens | None" = None
 
 
 # The SDK's class comes first: a 2.x SDK release may declare its own class a ``ValueError`` too, and

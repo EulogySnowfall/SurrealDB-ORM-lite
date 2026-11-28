@@ -28,7 +28,10 @@ chained to the SDK's error (``__cause__``). ``ConnectionUnavailableError`` (the 
 reached) and any other ``TransportError`` are retryable, but for an ``HttpStatusError`` other than 408, 429, 502, 503 or
 504 (the server's own refusal); ``TransportTimeoutError`` (a deadline set with
 ``get_client().timeout(…)``) and ``UnexpectedResponseError`` (a response the SDK cannot read) are not. Server errors
-(``ServerError`` and its subclasses) pass through unchanged.
+(``ServerError`` and its subclasses) pass through unchanged. Every SDK call is made by ``_sdk_call(client, op)``
+(v0.51.0), which maps these errors, sets ``may_have_run`` (the request was handed to the transport and its answer
+never came: a lost connection or a deadline after the request was let through, or over HTTP after the client
+connected) and counts the call on its client while it runs (``in_flight()``).
 
 Retired clients (v0.50.0): SDK 3.0's WebSocket client opens a new socket on any request made once its socket is gone,
 and that socket is anonymous (the ORM signs in itself, it never hands the SDK credentials). ``retire()`` makes a client
@@ -47,16 +50,19 @@ client; code that calls it directly gets the SDK's own semantics.
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import weakref
-from collections.abc import Callable, Iterator
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 from uuid import UUID
 
 from ._sdk import (
+    ConnectionUnavailableError,
     HttpStatusError,
     Null,
     RecordID,
+    SdkAsyncHttpConnection,
     SdkAsyncWsConnection,
     SdkRange,
     ServerError,
@@ -75,6 +81,7 @@ __all__ = [
     "connection_error",
     "create",
     "delete",
+    "in_flight",
     "insert",
     "insert_relation",
     "merge",
@@ -109,13 +116,78 @@ def _txn(txn_id: UUID | None) -> dict[str, Any]:
     return {} if txn_id is None else {"txn_id": txn_id}
 
 
-@contextlib.contextmanager
-def _sdk_errors() -> Iterator[None]:
-    """Re-raise the SDK's transport and response errors as ``SurrealDbConnectionError`` (see the module docstring)."""
+_T = TypeVar("_T")
+
+#: Whether the request of the frontier call running in this context was let through to the transport: set ``False``
+#: by :func:`_sdk_call` before its SDK call, read by that same call when the SDK raises (``may_have_run``).
+# TODO(Task 8): nothing sets it to True on a WebSocket client yet, so a WebSocket request caught by a drop still
+# reports may_have_run=False.
+_reached_transport: contextvars.ContextVar[bool] = contextvars.ContextVar("_reached_transport", default=False)
+
+#: The frontier calls in progress on each client (:func:`in_flight`); a client with none has no entry.
+_IN_FLIGHT: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+
+
+def in_flight(client: Any) -> int:
+    """How many frontier calls are in progress on *client*.
+
+    Counts the calls made through this module only, never the SDK calls an application makes itself on a client it
+    got from ``get_client()``. ``0`` for a client that cannot be weakly referenced (never counted).
+    """
     try:
-        yield
+        return _IN_FLIGHT.get(client, 0)
+    except TypeError:
+        return 0
+
+
+def _count(client: Any, delta: int) -> None:
+    """Add *delta* to *client*'s in-flight count (a client that cannot be weakly referenced is not counted)."""
+    try:
+        count = _IN_FLIGHT.get(client, 0) + delta
+        if count > 0:
+            _IN_FLIGHT[client] = count
+        else:
+            _IN_FLIGHT.pop(client, None)
+    except TypeError:
+        return
+
+
+async def _sdk_call(client: Any, op: Callable[[Any], Awaitable[_T]]) -> _T:
+    """Run the SDK call ``op(client)``: counted in :func:`in_flight` while it runs, its transport and response errors
+    re-raised as ``SurrealDbConnectionError`` (see the module docstring), ``may_have_run`` set.
+
+    *op* takes the client, so that the same call can be made on another one.
+    """
+    reached = _reached_transport.set(False)
+    _count(client, 1)
+    try:
+        return await op(client)
     except (TransportError, UnexpectedResponseError) as exc:
-        raise connection_error(exc) from exc
+        raise connection_error(exc, may_have_run=_may_have_run(client, exc)) from exc
+    finally:
+        _count(client, -1)
+        _reached_transport.reset(reached)
+
+
+#: aiohttp's errors for a request that never reached the server (no connection was made), matched by name in the MRO
+#: of the SDK error's cause: the ORM does not import aiohttp.
+_NEVER_CONNECTED = frozenset({"ClientConnectorError", "ConnectionTimeoutError"})
+
+
+def _may_have_run(client: Any, exc: BaseException) -> bool:
+    """Whether the request whose SDK call raised *exc* may have run on the server.
+
+    Only a lost connection (``ConnectionUnavailableError``) or a deadline that passed (``TransportTimeoutError``) can
+    leave a request without its answer. Over HTTP, the request was sent unless the client never connected (the SDK
+    error's cause is one of :data:`_NEVER_CONNECTED`); otherwise, it was sent when the call let it through to the
+    transport (:data:`_reached_transport`). An HTTP status (a 401 included) is the answer to the request.
+    """
+    if not isinstance(exc, ConnectionUnavailableError | TransportTimeoutError):
+        return False
+    if SdkAsyncHttpConnection is not None and isinstance(client, SdkAsyncHttpConnection):
+        cause = exc.__cause__
+        return cause is None or not any(klass.__name__ in _NEVER_CONNECTED for klass in type(cause).__mro__)
+    return _reached_transport.get()
 
 
 #: The HTTP statuses that say the request may succeed if sent again: a timeout, a rate limit, a gateway or a server
@@ -123,8 +195,9 @@ def _sdk_errors() -> Iterator[None]:
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 502, 503, 504})
 
 
-def connection_error(exc: BaseException) -> SurrealDbConnectionError:
-    """The ``SurrealDbConnectionError`` an SDK transport or response error becomes, ``retryable`` set.
+def connection_error(exc: BaseException, *, may_have_run: bool = False) -> SurrealDbConnectionError:
+    """The ``SurrealDbConnectionError`` an SDK transport or response error becomes, ``retryable`` and *may_have_run*
+    set.
 
     Retryable: a connection that is gone or could not be reached (``ConnectionUnavailableError`` and the other
     ``TransportError``s), and an HTTP answer of a gateway or a busy server (``HttpStatusError`` 408, 429, 502, 503,
@@ -136,7 +209,8 @@ def connection_error(exc: BaseException) -> SurrealDbConnectionError:
     retryable = isinstance(exc, TransportError) and not isinstance(exc, TransportTimeoutError)
     if isinstance(exc, HttpStatusError):
         retryable = exc.status in _RETRYABLE_HTTP_STATUSES
-    error.retryable = retryable  # type: ignore[attr-defined]
+    error.retryable = retryable
+    error.may_have_run = may_have_run
     return error
 
 
@@ -149,8 +223,7 @@ async def refresh(client: Any, access: str, refresh_token: str) -> Any:
     Only the connection manager's renewal of the stored session calls it, on a short-lived anonymous client, so no
     shared client ever holds a refresh token. The refresh token is spent once the server answers.
     """
-    with _sdk_errors():
-        return await client.refresh(Tokens(access=access, refresh=refresh_token))
+    return await _sdk_call(client, lambda c: c.refresh(Tokens(access=access, refresh=refresh_token)))
 
 
 # --- queries --------------------------------------------------------------------------------------
@@ -161,15 +234,13 @@ async def query(client: Any, sql: str, variables: dict[str, Any] | None = None, 
 
     A failing statement raises, even when it is not the first (SDK 3.0).
     """
-    with _sdk_errors():
-        results = await client.query(sql, variables, **_txn(txn_id))
+    results = await _sdk_call(client, lambda c: c.query(sql, variables, **_txn(txn_id)))
     return normalize(results[0]) if results else None
 
 
 async def query_all(client: Any, sql: str, variables: dict[str, Any] | None = None, *, txn_id: UUID | None = None) -> list[Any]:
     """One normalised result per statement."""
-    with _sdk_errors():
-        results = await client.query(sql, variables, **_txn(txn_id))
+    results = await _sdk_call(client, lambda c: c.query(sql, variables, **_txn(txn_id)))
     return [normalize(result) for result in results]
 
 
@@ -266,8 +337,7 @@ async def query_raw(
     client: Any, sql: str, variables: dict[str, Any] | None = None, *, txn_id: UUID | None = None
 ) -> dict[str, Any]:
     """The server's response envelope (``{"result": [{"status", "result", "time", …}]}`` or ``{"error": …}``), normalised."""
-    with _sdk_errors():
-        response = await client.query_raw(sql, variables, **_txn(txn_id))
+    response = await _sdk_call(client, lambda c: c.query_raw(sql, variables, **_txn(txn_id)))
     raw: dict[str, Any] = normalize(response)
     return raw
 
@@ -277,15 +347,13 @@ async def query_raw(
 
 async def select(client: Any, target: Target, *, txn_id: UUID | None = None) -> Any:
     """A record (``dict``, or ``None`` when it does not exist) or a table's records (``list``)."""
-    with _sdk_errors():
-        result = await client.select(_target(target), **_txn(txn_id))
+    result = await _sdk_call(client, lambda c: c.select(_target(target), **_txn(txn_id)))
     return normalize(result)
 
 
 async def create(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
     """``CREATE``: the new record, or a list of records for a table target."""
-    with _sdk_errors():
-        result = await client.create(_target(target), data, **_txn(txn_id))
+    result = await _sdk_call(client, lambda c: c.create(_target(target), data, **_txn(txn_id)))
     return normalize(result)
 
 
@@ -294,52 +362,45 @@ async def update(client: Any, target: Target, data: Any, *, txn_id: UUID | None 
 
     A field missing from *data* is removed, as with SDK 2.0's ``update()`` (measured on SurrealDB 2.x, 3.x and 4.x).
     """
-    with _sdk_errors():
-        result = await client.update(_target(target), data, **_txn(txn_id))
+    result = await _sdk_call(client, lambda c: c.update(_target(target), data, **_txn(txn_id)))
     return normalize(result)
 
 
 async def upsert(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
     """``UPSERT … CONTENT``: creates or replaces the record(s)."""
-    with _sdk_errors():
-        result = await client.upsert(_target(target), data, **_txn(txn_id))
+    result = await _sdk_call(client, lambda c: c.upsert(_target(target), data, **_txn(txn_id)))
     return normalize(result)
 
 
 async def merge(client: Any, target: Target, data: Any, *, txn_id: UUID | None = None) -> Any:
     """``UPDATE … MERGE``: SDK 3.0's ``update(target).merge(data)``; ``None`` for a missing record."""
-    with _sdk_errors():
-        result = await client.update(_target(target), **_txn(txn_id)).merge(data)
+    result = await _sdk_call(client, lambda c: c.update(_target(target), **_txn(txn_id)).merge(data))
     return normalize(result)
 
 
 async def patch(client: Any, target: Target, ops: list[Any], *, txn_id: UUID | None = None) -> Any:
     """``UPDATE … PATCH`` (JSON Patch *ops*): SDK 3.0's ``update(target).patch(ops)``; ``None`` for a missing record."""
-    with _sdk_errors():
-        result = await client.update(_target(target), **_txn(txn_id)).patch(ops)
+    result = await _sdk_call(client, lambda c: c.update(_target(target), **_txn(txn_id)).patch(ops))
     return normalize(result)
 
 
 async def insert(client: Any, table: str | Table, data: Any, *, txn_id: UUID | None = None) -> list[Any]:
     """``INSERT INTO``: the inserted records, always a list."""
-    with _sdk_errors():
-        result = await client.insert(_target(table), data, **_txn(txn_id))
+    result = await _sdk_call(client, lambda c: c.insert(_target(table), data, **_txn(txn_id)))
     rows: list[Any] = normalize(result)
     return rows
 
 
 async def insert_relation(client: Any, table: str | Table, data: Any, *, txn_id: UUID | None = None) -> list[Any]:
     """``INSERT RELATION INTO``: SDK 3.0's ``insert(table, data, relation=True)``; the edges, always a list."""
-    with _sdk_errors():
-        result = await client.insert(_target(table), data, relation=True, **_txn(txn_id))
+    result = await _sdk_call(client, lambda c: c.insert(_target(table), data, relation=True, **_txn(txn_id)))
     rows: list[Any] = normalize(result)
     return rows
 
 
 async def delete(client: Any, target: Target, *, txn_id: UUID | None = None) -> Any:
     """``DELETE``: the deleted record(s)."""
-    with _sdk_errors():
-        result = await client.delete(_target(target), **_txn(txn_id))
+    result = await _sdk_call(client, lambda c: c.delete(_target(target), **_txn(txn_id)))
     return normalize(result)
 
 
@@ -381,7 +442,7 @@ def refuse(client: Any, reason: str, *, retryable: bool = False) -> None:
 
     async def _refuse(*args: Any, **kwargs: Any) -> None:
         error = SurrealDbConnectionError(reason)
-        error.retryable = retryable  # type: ignore[attr-defined]
+        error.retryable = retryable
         raise error
 
     # The closure holds the reason, never the client: no reference cycle.

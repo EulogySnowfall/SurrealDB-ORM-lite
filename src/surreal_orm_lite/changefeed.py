@@ -390,7 +390,7 @@ class ChangeModelStream(Generic[T]):
                 "this change feed was being read; its position belongs to the previous database, so the stream "
                 "ended. Start a new one."
             )
-            error.retryable = False  # type: ignore[attr-defined]
+            error.retryable = False
             raise error
 
     async def _poll(self) -> bool:

@@ -4,7 +4,9 @@ Unit tests (no server): :class:`~surreal_orm_lite.ReconnectPolicy` and its conve
 ``ReconnectOptions``, the ``reconnect=``/``renew_access=`` settings of ``set_connection()`` and ``add_connection()``,
 :class:`~surreal_orm_lite.ConnectionConfig`'s new fields and the settings epoch every setter bumps; the identity key
 of a token (its claims, so a renewal is not an identity change), the identity stamp, the compare-and-set of the stored
-session with its ``"auth"`` event, and the single renewal of the stored refresh token across event loops.
+session with its ``"auth"`` event, and the single renewal of the stored refresh token across event loops; the
+attributes a connection error declares (``retryable``, ``may_have_run``, ``tokens``) and how the frontier sets
+``may_have_run`` from what it knows of the request.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from surreal_orm_lite import (
     ConnectionConfig,
     ReconnectPolicy,
     SurrealDBConnectionManager,
+    _client,
     _sdk,
     connection_manager,
     resilience,
@@ -834,3 +837,144 @@ class TestRenewStored:
         refresher.release.set()
         assert await owner == _NEW
         assert _stored() == _NEW
+
+
+# ==================== Connection errors: retryable, may_have_run, tokens ====================
+
+
+class TestErrorAttributes:
+    """The flags a caller reads on a connection or authentication error are declared on the classes, with defaults."""
+
+    def test_a_connection_error_is_retryable_did_not_run_and_carries_no_tokens(self) -> None:
+        error = SurrealDbConnectionError("the connection is gone")
+        assert error.retryable is True
+        assert error.may_have_run is False
+        assert error.tokens is None
+
+    @pytest.mark.parametrize("name", ["retryable", "may_have_run", "tokens"])
+    def test_the_connection_error_class_declares_it(self, name: str) -> None:
+        assert name in vars(SurrealDbConnectionError)
+
+    def test_an_authentication_error_carries_no_tokens(self) -> None:
+        assert SurrealDbAuthenticationError("refused").tokens is None
+        assert "tokens" in vars(SurrealDbAuthenticationError)
+
+    def test_an_instance_value_leaves_the_class_default(self) -> None:
+        error = SurrealDbConnectionError("in flight")
+        error.may_have_run = True
+        error.retryable = False
+        assert SurrealDbConnectionError("other").may_have_run is False
+        assert SurrealDbConnectionError("other").retryable is True
+
+
+class _WsClient:
+    """A client the frontier does not know as HTTP: whether a request ran is what the call itself recorded."""
+
+
+# Local classes named as aiohttp's "never connected" errors: the frontier matches them by name, in the cause's MRO.
+class ClientConnectorError(OSError):
+    pass
+
+
+class ConnectionTimeoutError(TimeoutError):
+    pass
+
+
+class _RefusedConnection(ClientConnectorError):
+    pass
+
+
+class ServerDisconnectedError(OSError):
+    pass
+
+
+def _http_client() -> Any:
+    """A real SDK HTTP client, never used to send anything."""
+    return _sdk.SdkAsyncHttpConnection("http://127.0.0.1:9")
+
+
+def _with_cause(error: BaseException, cause: BaseException | None) -> BaseException:
+    error.__cause__ = cause
+    return error
+
+
+async def _failed(client: Any, error: BaseException, *, reached: bool = False) -> SurrealDbConnectionError:
+    """The error a frontier call on *client* raises when the SDK raises *error*; *reached*: the request had been let
+    through to the transport."""
+
+    async def operation(_c: Any) -> None:
+        if reached:
+            _client._reached_transport.set(True)
+        raise error
+
+    with pytest.raises(SurrealDbConnectionError) as caught:
+        await _client._sdk_call(client, operation)
+    assert caught.value.__cause__ is error
+    return caught.value
+
+
+class TestMayHaveRun:
+    """``may_have_run`` is ``True`` only for a request handed to the transport whose answer never came."""
+
+    @pytest.mark.parametrize("reached", [True, False])
+    async def test_an_unavailable_connection_follows_whether_the_request_reached_the_transport(self, reached: bool) -> None:
+        error = await _failed(_WsClient(), _sdk.ConnectionUnavailableError("the connection is gone"), reached=reached)
+        assert error.may_have_run is reached
+        assert error.retryable is True
+
+    @pytest.mark.parametrize("reached", [True, False])
+    async def test_a_timeout_follows_whether_the_request_reached_the_transport(self, reached: bool) -> None:
+        error = await _failed(_WsClient(), _sdk.TransportTimeoutError("timed out while querying"), reached=reached)
+        assert error.may_have_run is reached
+        assert error.retryable is False
+
+    async def test_a_previous_call_that_reached_the_transport_does_not_count(self) -> None:
+        _client._reached_transport.set(True)
+        error = await _failed(_WsClient(), _sdk.ConnectionUnavailableError("the connection is gone"))
+        assert error.may_have_run is False
+
+    @pytest.mark.parametrize("http", [True, False], ids=["http", "ws"])
+    async def test_an_http_401_did_not_run(self, http: bool) -> None:
+        client = _http_client() if http else _WsClient()
+        refused = _sdk.HttpStatusError(401, "The access method 'a' does not exist", "http://db/rpc")
+        error = await _failed(client, refused, reached=True)
+        assert error.may_have_run is False
+        assert error.retryable is False
+
+    async def test_an_unreadable_response_did_not_run(self) -> None:
+        error = await _failed(_WsClient(), _sdk.UnexpectedResponseError("unreadable"), reached=True)
+        assert error.may_have_run is False
+
+    @pytest.mark.parametrize(
+        "error_class", [_sdk.ConnectionUnavailableError, _sdk.TransportTimeoutError], ids=["unavailable", "timeout"]
+    )
+    @pytest.mark.parametrize(
+        ("cause", "may_have_run"),
+        [
+            (ClientConnectorError("connect call failed"), False),
+            (ConnectionTimeoutError("connection timeout"), False),
+            (_RefusedConnection("refused"), False),
+            (ServerDisconnectedError("server disconnected"), True),
+            (TimeoutError("no answer"), True),
+            (None, True),
+        ],
+        ids=["connector", "connect-timeout", "connector-subclass", "disconnected", "read-timeout", "no-cause"],
+    )
+    async def test_over_http_a_request_ran_unless_the_client_never_connected(
+        self, error_class: type[BaseException], cause: BaseException | None, may_have_run: bool
+    ) -> None:
+        sdk_error = _with_cause(error_class("could not reach http://db/rpc"), cause)
+        error = await _failed(_http_client(), sdk_error)
+        assert error.may_have_run is may_have_run
+        assert error.retryable is (error_class is _sdk.ConnectionUnavailableError)
+
+    async def test_over_http_the_context_is_not_read(self) -> None:
+        cause = ClientConnectorError("connect call failed")
+        sdk_error = _with_cause(_sdk.ConnectionUnavailableError("could not reach http://db/rpc"), cause)
+        error = await _failed(_http_client(), sdk_error, reached=True)
+        assert error.may_have_run is False
+
+    def test_connection_error_alone_says_nothing_ran(self) -> None:
+        error = _client.connection_error(_sdk.ConnectionUnavailableError("the connection is gone"))
+        assert error.may_have_run is False
+        assert error.retryable is True
