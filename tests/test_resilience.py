@@ -2,15 +2,22 @@
 
 Unit tests (no server): :class:`~surreal_orm_lite.ReconnectPolicy` and its conversion to the SDK's
 ``ReconnectOptions``, the ``reconnect=``/``renew_access=`` settings of ``set_connection()`` and ``add_connection()``,
-:class:`~surreal_orm_lite.ConnectionConfig`'s new fields and the settings epoch every setter bumps.
+:class:`~surreal_orm_lite.ConnectionConfig`'s new fields and the settings epoch every setter bumps; the identity key
+of a token (its claims, so a renewal is not an identity change), the identity stamp, the compare-and-set of the stored
+session with its ``"auth"`` event, and the single renewal of the stored refresh token across event loops.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import base64
+import contextlib
 import dataclasses
+import json
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,7 +31,10 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     _sdk,
     connection_manager,
+    resilience,
 )
+from surreal_orm_lite.auth import AuthTokens
+from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
 from surreal_orm_lite.testing import embedded_database
 from tests.conftest import default_connection_class
 from tests.test_embedded import _embedded_engine_available
@@ -405,3 +415,422 @@ class TestResilienceState:
         for key in ("listeners", "listener_lock", "session_lock"):
             assert vars(a)[_P + key] is not vars(default)[_P + key], key
             assert vars(a)[_P + key] is not vars(SurrealDBConnectionManager)[_P + key], key
+
+
+# ==================== Identity key, stamp, stored session, renewal (Task 2) ====================
+
+
+def _jwt(**claims: Any) -> str:
+    """An unsigned JWT-shaped token carrying *claims*: the identity key reads claims without verifying anything."""
+
+    def part(value: dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    return f"{part({'alg': 'HS512', 'typ': 'JWT'})}.{part(claims)}.c2lnbmF0dXJl"
+
+
+#: The claims SurrealDB puts in a record user's token (measured): the identity, then the token's own.
+_RECORD = {"NS": "ns", "DB": "db", "AC": "account", "ID": "user:alice", "iss": "SurrealDB"}
+
+
+def _record_token(**changes: Any) -> str:
+    claims = {**_RECORD, "exp": 2000, "iat": 1000, "nbf": 1000, "jti": "first"}
+    claims.update(changes)
+    return _jwt(**claims)
+
+
+class _Stampable:
+    """An object the manager can stamp (weakly referenced) and nothing talks to."""
+
+
+class TestIdentityKey:
+    """A token's identity is its claims without the ones that change at every issue (``exp``, ``iat``, ``nbf``,
+    ``jti``): a renewed token of the same user keys the same, another user, access method, namespace or database
+    does not."""
+
+    def test_a_renewed_token_keys_the_same(self) -> None:
+        first = _record_token()
+        renewed = _record_token(exp=9000, iat=8000, nbf=8000, jti="second")
+        assert first != renewed
+        assert resilience.identity_key(first) == resilience.identity_key(renewed) == _RECORD
+        assert resilience.key_hash(resilience.identity_key(first)) == resilience.key_hash(resilience.identity_key(renewed))
+
+    @pytest.mark.parametrize("claim", ["ID", "AC", "NS", "DB"])
+    def test_another_identity_keys_differently(self, claim: str) -> None:
+        other = _record_token(**{claim: "other"})
+        assert resilience.identity_key(other) != resilience.identity_key(_record_token())
+        assert resilience.key_hash(resilience.identity_key(other)) != resilience.key_hash(
+            resilience.identity_key(_record_token())
+        )
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "not-a-token",
+            "a.b",
+            "a.!!!.c",
+            f"x.{base64.urlsafe_b64encode(b'[1, 2]').decode()}.y",
+            f"x.{base64.urlsafe_b64encode(b'not json').decode()}.y",
+            f"x.{base64.urlsafe_b64encode(bytes([0xFF, 0xFE])).decode()}.y",
+        ],
+    )
+    def test_an_unreadable_token_keys_as_itself(self, token: str) -> None:
+        assert resilience.identity_key(token) == token
+
+    def test_the_hash_tells_a_token_from_claims_that_spell_it(self) -> None:
+        assert resilience.key_hash("x") != resilience.key_hash({"x": None})
+        # Canonical: the order the claims came in does not matter.
+        assert resilience.key_hash({"a": 1, "b": 2}) == resilience.key_hash({"b": 2, "a": 1})
+
+    def test_the_fingerprint_keeps_across_a_renewal(self) -> None:
+        fingerprint = SurrealDBConnectionManager._fingerprint
+        settings = ("ws://db/rpc", "ns", "db", "root")
+        first = fingerprint(*settings, _record_token())
+        assert first == fingerprint(*settings, _record_token(exp=9000, iat=8000, nbf=8000, jti="second"))
+        assert first != fingerprint(*settings, _record_token(ID="user:bob"))
+        assert first != fingerprint(*settings, None)
+        assert first != fingerprint("ws://other/rpc", "ns", "db", "root", _record_token())
+
+
+@pytest.fixture
+def no_session() -> Iterator[None]:
+    """The default connection's stored session and ``"auth"`` listeners empty for the test, and again after it."""
+    default = default_connection_class()
+    listeners: dict[str, list[Any]] = vars(default)[_P + "listeners"]
+    saved = dict(listeners)
+    listeners.clear()
+    SurrealDBConnectionManager.clear_session()
+    yield
+    SurrealDBConnectionManager.clear_session()
+    listeners.clear()
+    listeners.update(saved)
+    setattr(default, _P + "renewing", None)
+
+
+def _auth_events() -> list[Any]:
+    """Register a listener for the default connection's ``"auth"`` event; the list it appends the tokens to."""
+    seen: list[Any] = []
+    vars(default_connection_class())[_P + "listeners"].setdefault("auth", []).append(seen.append)
+    return seen
+
+
+def _stored() -> AuthTokens | None:
+    access = SurrealDBConnectionManager.get_session_token()
+    return None if access is None else AuthTokens(access, SurrealDBConnectionManager.get_refresh_token())
+
+
+@pytest.mark.usefixtures("no_session")
+class TestIdentityStamp:
+    """What the manager records when it sets a client's identity: who, whether a reconnect restores it, what it put
+    on the client, and a serial that is new at every stamp."""
+
+    def test_it_still_indexes_as_fingerprint_then_replayable(self) -> None:
+        client = _Stampable()
+        SurrealDBConnectionManager._stamp_identity(client, replayable=False, fingerprint="fp")
+        stamp = SurrealDBConnectionManager._identity_of(client)
+        assert isinstance(stamp, resilience.IdentityStamp)
+        assert (stamp[0], stamp[1]) == ("fp", False)
+        assert (stamp.fingerprint, stamp.replayable, stamp.kind) == ("fp", False, "unstored")
+
+    def test_every_stamp_has_a_new_serial(self) -> None:
+        client = _Stampable()
+        SurrealDBConnectionManager._stamp_identity(client, replayable=True, fingerprint="fp")
+        first = SurrealDBConnectionManager._identity_of(client)
+        SurrealDBConnectionManager._stamp_identity(client, replayable=True, fingerprint="fp")
+        second = SurrealDBConnectionManager._identity_of(client)
+        assert first is not None and second is not None
+        assert first.serial != second.serial
+        assert first != second
+        assert first.same_identity(second)
+
+    def test_the_kind_is_what_the_manager_put_on_the_client(self) -> None:
+        client = _Stampable()
+        SurrealDBConnectionManager._stamp_identity(client, replayable=True)
+        assert getattr(SurrealDBConnectionManager._identity_of(client), "kind", None) == "configured"
+        SurrealDBConnectionManager._set_stored(AuthTokens(_record_token()))
+        SurrealDBConnectionManager._stamp_identity(client, replayable=True)
+        assert getattr(SurrealDBConnectionManager._identity_of(client), "kind", None) == "stored"
+        SurrealDBConnectionManager._stamp_identity(client, replayable=False)
+        assert getattr(SurrealDBConnectionManager._identity_of(client), "kind", None) == "unstored"
+        SurrealDBConnectionManager._stamp_identity(client, replayable=True, fingerprint="fp", kind="configured")
+        assert getattr(SurrealDBConnectionManager._identity_of(client), "kind", None) == "configured"
+
+    def test_same_identity_reads_the_fingerprint_and_replayable_only(self) -> None:
+        stamp = resilience.IdentityStamp.new("fp", True, "stored")
+        assert stamp.same_identity(resilience.IdentityStamp.new("fp", True, "configured"))
+        assert not stamp.same_identity(resilience.IdentityStamp.new("other", True, "stored"))
+        assert not stamp.same_identity(resilience.IdentityStamp.new("fp", False, "stored"))
+        assert not stamp.same_identity(None)
+
+
+@pytest.mark.usefixtures("no_session")
+class TestStoredSession:
+    """Every write of the stored session goes through ``_set_stored``: compare-and-set, one ``"auth"`` event per
+    change and none when nothing changed."""
+
+    def test_an_unconditional_set_stores_and_announces(self) -> None:
+        events = _auth_events()
+        pair = AuthTokens("access", "refresh")
+        assert SurrealDBConnectionManager._set_stored(pair) is True
+        assert _stored() == pair
+        assert events == [pair]
+        assert SurrealDBConnectionManager._set_stored(pair) is True
+        assert events == [pair]  # nothing changed: nothing announced
+
+    def test_a_compare_and_set_replaces_only_the_expected_pair(self) -> None:
+        events = _auth_events()
+        first, second, third = AuthTokens("a1", "r1"), AuthTokens("a2", "r2"), AuthTokens("a3", "r3")
+        assert SurrealDBConnectionManager._set_stored(first, expected=None) is True
+        assert SurrealDBConnectionManager._set_stored(third, expected=second) is False
+        assert _stored() == first
+        assert SurrealDBConnectionManager._set_stored(second, expected=first) is True
+        assert _stored() == second
+        assert events == [first, second]
+
+    def test_forgetting_announces_none_once(self) -> None:
+        events = _auth_events()
+        SurrealDBConnectionManager._set_stored(AuthTokens("a", "r"))
+        SurrealDBConnectionManager.clear_session()
+        SurrealDBConnectionManager.clear_session()
+        assert _stored() is None
+        assert events == [AuthTokens("a", "r"), None]
+
+    def test_only_set_stored_writes_the_two_fields(self) -> None:
+        source = Path(connection_manager.__file__).read_text(encoding="utf-8")
+        writers = set()
+        for function in ast.walk(ast.parse(source)):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None)]
+                if not isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                    continue
+                for target in targets:
+                    for leaf in ast.walk(target) if target is not None else ():
+                        if isinstance(leaf, ast.Attribute) and leaf.attr in {"__session_token", "__refresh_token"}:
+                            writers.add(function.name)
+        assert writers == {"_set_stored"}
+
+    async def test_a_listener_that_raises_is_logged_and_the_others_still_run(self, caplog: pytest.LogCaptureFixture) -> None:
+        listeners = vars(default_connection_class())[_P + "listeners"].setdefault("auth", [])
+
+        def broken(tokens: Any) -> None:
+            raise RuntimeError("listener bug")
+
+        listeners.append(broken)
+        events = _auth_events()
+        with caplog.at_level("ERROR", logger="surreal_orm_lite.connection_manager"):
+            SurrealDBConnectionManager._set_stored(AuthTokens("a"))
+        assert events == [AuthTokens("a")]
+        assert "listener bug" in caplog.text
+
+    async def test_a_coroutine_listener_runs_as_a_task_of_the_loop(self) -> None:
+        seen: list[Any] = []
+        done = asyncio.Event()
+
+        async def listener(tokens: Any) -> None:
+            seen.append(tokens)
+            done.set()
+
+        vars(default_connection_class())[_P + "listeners"].setdefault("auth", []).append(listener)
+        SurrealDBConnectionManager._set_stored(AuthTokens("a"))
+        assert seen == []  # scheduled, not awaited by the writer
+        async with asyncio.timeout(2):
+            await done.wait()
+        assert seen == [AuthTokens("a")]
+
+    def test_a_coroutine_listener_without_a_loop_is_dropped_quietly(self, caplog: pytest.LogCaptureFixture) -> None:
+        async def listener(tokens: Any) -> None:
+            raise AssertionError("never run")
+
+        vars(default_connection_class())[_P + "listeners"].setdefault("auth", []).append(listener)
+        with caplog.at_level("WARNING", logger="surreal_orm_lite.connection_manager"):
+            SurrealDBConnectionManager._set_stored(AuthTokens("a"))
+        assert "no running event loop" in caplog.text
+
+
+class _FakeRefresher:
+    """The short-lived client ``_renew_stored`` exchanges the refresh token on: counts the exchanges, waits for
+    ``release`` when asked to, then answers ``answer`` (a pair) or raises it (an exception)."""
+
+    def __init__(self, answer: Any, *, hold: bool = False, before_answer: Any = None) -> None:
+        self.answer = answer
+        self.calls: list[Any] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+        if not hold:
+            self.release.set()
+        self.before_answer = before_answer
+        self.lock = threading.Lock()
+
+    async def refresh(self, tokens: Any) -> Any:
+        with self.lock:
+            self.calls.append(tokens)
+        self.started.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.005)
+        if self.before_answer is not None:
+            self.before_answer()
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+@pytest.fixture
+def fake_refresher(monkeypatch: pytest.MonkeyPatch, no_session: None) -> Any:
+    """Install a :class:`_FakeRefresher` as the default connection's short-lived client; returns a setter."""
+    default = default_connection_class()
+
+    def install(refresher: _FakeRefresher, *, opening: BaseException | None = None) -> _FakeRefresher:
+        @contextlib.asynccontextmanager
+        async def ephemeral(cls: Any) -> AsyncIterator[Any]:
+            if opening is not None:
+                raise opening
+            yield refresher
+
+        monkeypatch.setattr(default, "ephemeral_client", classmethod(ephemeral))
+        return refresher
+
+    return install
+
+
+_SPENT = AuthTokens("spent-access", "spent-refresh")
+_NEW = AuthTokens("new-access", "new-refresh")
+
+
+def _renewing() -> Any:
+    return vars(default_connection_class())[_P + "renewing"]
+
+
+class TestRenewStored:
+    """The stored refresh token has one owner: ``_renew_stored`` spends it once per connection, whatever the number
+    of callers and event loops, and stores the outcome with a compare-and-set."""
+
+    async def test_concurrent_callers_on_two_loops_share_one_exchange(self, fake_refresher: Any) -> None:
+        refresher = fake_refresher(_FakeRefresher(_sdk.Tokens(_NEW.access, _NEW.refresh), hold=True))
+        events = _auth_events()
+        SurrealDBConnectionManager._set_stored(_SPENT)
+        first = asyncio.ensure_future(SurrealDBConnectionManager._renew_stored(_SPENT))
+        await asyncio.to_thread(refresher.started.wait, 5)
+        second = asyncio.ensure_future(SurrealDBConnectionManager._renew_stored(_SPENT))
+        other_loop: list[Any] = []
+
+        def on_another_loop() -> None:
+            try:
+                other_loop.append(asyncio.run(SurrealDBConnectionManager._renew_stored(_SPENT)))
+            except BaseException as exc:  # reported by the assertion below
+                other_loop.append(exc)
+
+        thread = threading.Thread(target=on_another_loop)
+        thread.start()
+        pending = _renewing()
+        assert pending is not None
+        async with asyncio.timeout(5):
+            # Both waiters (this loop's second call, the other loop's call) wait on the renewal in progress.
+            while len(getattr(pending, "_done_callbacks", ())) < 2:
+                await asyncio.sleep(0.005)
+        refresher.release.set()
+        results = [await first, await second]
+        await asyncio.to_thread(thread.join, 5)
+
+        assert results + other_loop == [_NEW, _NEW, _NEW]
+        assert len(refresher.calls) == 1
+        assert (refresher.calls[0].access, refresher.calls[0].refresh) == (_SPENT.access, _SPENT.refresh)
+        assert _stored() == _NEW
+        assert events == [_SPENT, _NEW]
+        assert _renewing() is None
+
+    async def test_a_pair_already_renewed_is_returned_without_an_exchange(self, fake_refresher: Any) -> None:
+        refresher = fake_refresher(_FakeRefresher(AssertionError("no exchange")))
+        SurrealDBConnectionManager._set_stored(_NEW)
+        assert await SurrealDBConnectionManager._renew_stored(_SPENT) == _NEW
+        assert refresher.calls == []
+
+    @pytest.mark.parametrize("stored", [None, AuthTokens("spent-access")])
+    async def test_a_forgotten_pair_raises_without_an_exchange(self, fake_refresher: Any, stored: Any) -> None:
+        refresher = fake_refresher(_FakeRefresher(AssertionError("no exchange")))
+        SurrealDBConnectionManager._set_stored(stored)
+        with pytest.raises(SurrealDbAuthenticationError):
+            await SurrealDBConnectionManager._renew_stored(_SPENT)
+        assert refresher.calls == []
+        assert _stored() == stored
+
+    async def test_a_refusal_forgets_the_refresh_token(self, fake_refresher: Any) -> None:
+        refused = _sdk.ServerError("NotAllowed", "There was a problem with authentication")
+        fake_refresher(_FakeRefresher(refused))
+        SurrealDBConnectionManager._set_stored(_SPENT)
+        events = _auth_events()
+        with pytest.raises(SurrealDbAuthenticationError) as caught:
+            await SurrealDBConnectionManager._renew_stored(_SPENT)
+        assert caught.value.__cause__ is refused
+        assert _stored() == AuthTokens(_SPENT.access, None)
+        assert events == [AuthTokens(_SPENT.access, None)]
+        assert _renewing() is None
+
+    async def test_a_refusal_after_another_rotation_keeps_the_rotated_pair(self, fake_refresher: Any) -> None:
+        rotated = AuthTokens("rotated-access", "rotated-refresh")
+        fake_refresher(
+            _FakeRefresher(
+                _sdk.ServerError("NotAllowed", "There was a problem with authentication"),
+                before_answer=lambda: SurrealDBConnectionManager._set_stored(rotated),
+            )
+        )
+        SurrealDBConnectionManager._set_stored(_SPENT)
+        with pytest.raises(SurrealDbAuthenticationError):
+            await SurrealDBConnectionManager._renew_stored(_SPENT)
+        assert _stored() == rotated
+        assert _renewing() is None
+
+    @pytest.mark.parametrize("failure", ["exchange", "opening"])
+    async def test_a_connection_failure_keeps_the_pair(self, fake_refresher: Any, failure: str) -> None:
+        if failure == "exchange":
+            fake_refresher(_FakeRefresher(_sdk.ConnectionUnavailableError("the connection is gone")))
+        else:
+            opening = SurrealDbConnectionError("Can't connect to the database.")
+            fake_refresher(_FakeRefresher(AssertionError("no exchange")), opening=opening)
+        SurrealDBConnectionManager._set_stored(_SPENT)
+        events = _auth_events()
+        with pytest.raises(SurrealDbConnectionError):
+            await SurrealDBConnectionManager._renew_stored(_SPENT)
+        assert _stored() == _SPENT
+        assert events == []
+        assert _renewing() is None
+
+    async def test_a_server_without_refresh_tokens_raises_an_authentication_error(self, fake_refresher: Any) -> None:
+        unavailable = _sdk.UnavailableFeatureError("refresh-tokens", "2.7.0", "3.0.0")
+        fake_refresher(_FakeRefresher(unavailable))
+        SurrealDBConnectionManager._set_stored(_SPENT)
+        with pytest.raises(SurrealDbAuthenticationError) as caught:
+            await SurrealDBConnectionManager._renew_stored(_SPENT)
+        assert caught.value.__cause__ is unavailable
+        assert _stored() == _SPENT
+        assert _renewing() is None
+
+    async def test_a_cancelled_owner_releases_the_waiters_and_keeps_the_pair(self, fake_refresher: Any) -> None:
+        refresher = fake_refresher(_FakeRefresher(_sdk.Tokens(_NEW.access, _NEW.refresh), hold=True))
+        SurrealDBConnectionManager._set_stored(_SPENT)
+        owner = asyncio.ensure_future(SurrealDBConnectionManager._renew_stored(_SPENT))
+        await asyncio.to_thread(refresher.started.wait, 5)
+        waiter = asyncio.ensure_future(SurrealDBConnectionManager._renew_stored(_SPENT))
+        await asyncio.sleep(0.05)
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        with pytest.raises(SurrealDbConnectionError):
+            await waiter
+        assert _stored() == _SPENT
+        assert _renewing() is None
+
+    async def test_a_cancelled_waiter_does_not_cancel_the_renewal(self, fake_refresher: Any) -> None:
+        refresher = fake_refresher(_FakeRefresher(_sdk.Tokens(_NEW.access, _NEW.refresh), hold=True))
+        SurrealDBConnectionManager._set_stored(_SPENT)
+        owner = asyncio.ensure_future(SurrealDBConnectionManager._renew_stored(_SPENT))
+        await asyncio.to_thread(refresher.started.wait, 5)
+        waiter = asyncio.ensure_future(SurrealDBConnectionManager._renew_stored(_SPENT))
+        await asyncio.sleep(0.05)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        refresher.release.set()
+        assert await owner == _NEW
+        assert _stored() == _NEW

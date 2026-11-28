@@ -74,6 +74,7 @@ from .utils import user_stacklevel
 if TYPE_CHECKING:
     from .connection_manager import SurrealDBConnectionManager
     from .model_base import BaseSurrealModel
+    from .resilience import IdentityStamp
 
 __all__ = ["LiveIterator", "LiveModelStream", "LiveStream", "ModelChangeEvent", "ReconnectCallback"]
 
@@ -696,7 +697,7 @@ class LiveStream:
         self._resubscribing: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         # The identity stamp of the client the live query was opened on (see _check_identity).
-        self._identity: tuple[str, bool] | None = None
+        self._identity: IdentityStamp | None = None
 
     @property
     def table(self) -> str:
@@ -904,10 +905,12 @@ class LiveStream:
 
         The connection manager stamps each client with ``(fingerprint, replayable)`` whenever it
         sets the client's identity, the fingerprint covering what a connection is built from (url,
-        namespace, database, user, stored token). So: the client the stream started on must have
-        been replayable, its fingerprint must still be the replay identity, and the new *client*
-        must carry that same stamp. Settings changed and then restored count as no change. All of
-        it is read on *manager*, the stream's connection (v0.29.0): its settings and session.
+        namespace, database, user, and the stored token's identity: its claims, so a renewed token
+        or the same user signing in again is no change, v0.51.0). So: the client the stream started
+        on must have been replayable, its fingerprint must still be the replay identity, and the new
+        *client* must carry that same identity (``IdentityStamp.same_identity``). Settings changed
+        and then restored count as no change. All of it is read on *manager*, the stream's
+        connection (v0.29.0): its settings and session.
 
         :raises SurrealDbAuthenticationError: the stream started under an identity a reconnect
             cannot restore (``store=False``), or that identity is no longer the one a reconnect
@@ -923,7 +926,7 @@ class LiveStream:
                 "different permissions."
             )
         moved = started[0] != manager._replay_identity()
-        if moved or (client is not None and manager._identity_of(client) != started):
+        if moved or (client is not None and not started.same_identity(manager._identity_of(client))):
             raise SurrealDbAuthenticationError(
                 f"The identity a new connection comes back as changed since the live query on "
                 f"{self._table!r} was opened (signin, signup, authenticate, invalidate, "

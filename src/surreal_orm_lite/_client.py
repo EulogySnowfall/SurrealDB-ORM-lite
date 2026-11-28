@@ -62,6 +62,7 @@ from ._sdk import (
     ServerError,
     SurrealSet,
     Table,
+    Tokens,
     TransportError,
     TransportTimeoutError,
     UnexpectedResponseError,
@@ -84,6 +85,7 @@ __all__ = [
     "query_all_tolerant",
     "query_at",
     "query_raw",
+    "refresh",
     "is_retired",
     "refuse",
     "refuse_on_drop",
@@ -136,6 +138,19 @@ def connection_error(exc: BaseException) -> SurrealDbConnectionError:
         retryable = exc.status in _RETRYABLE_HTTP_STATUSES
     error.retryable = retryable  # type: ignore[attr-defined]
     return error
+
+
+# --- sessions -------------------------------------------------------------------------------------
+
+
+async def refresh(client: Any, access: str, refresh_token: str) -> Any:
+    """Exchange the pair (*access*, *refresh_token*) for a new one on *client*: the SDK's ``Tokens``.
+
+    Only the connection manager's renewal of the stored session calls it, on a short-lived anonymous client, so no
+    shared client ever holds a refresh token. The refresh token is spent once the server answers.
+    """
+    with _sdk_errors():
+        return await client.refresh(Tokens(access=access, refresh=refresh_token))
 
 
 # --- queries --------------------------------------------------------------------------------------

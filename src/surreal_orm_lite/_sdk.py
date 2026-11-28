@@ -45,7 +45,8 @@ them, and the hook is then not installed. The embedded engine is an optional ext
 ``SdkAsyncEmbeddedConnection`` is ``None`` without it, and importing the ORM never needs it.
 
 v0.51.0 adds ``ReconnectOptions`` (a top-level export of SDK 3.0): the reconnect options of a WebSocket client, which
-``resilience.ReconnectPolicy`` builds.
+``resilience.ReconnectPolicy`` builds; ``Tokens``, the access/refresh pair the ORM's renewal of the stored session
+exchanges; and ``UnavailableFeatureError``, what the SDK raises before sending a call the server's version lacks.
 """
 
 import importlib
@@ -69,8 +70,10 @@ from surrealdb import (  # noqa: F401
     SurrealSet,
     Table,
     ThrownError,
+    Tokens,
     TransportError,
     TransportTimeoutError,
+    UnavailableFeatureError,
     UnexpectedResponseError,
     UnsupportedEngineError,
     UnsupportedFeatureError,
@@ -202,6 +205,8 @@ __all__ = [
     "UnsupportedEngineError",
     # Connection resilience (v0.51.0): the WebSocket client's reconnect options (``resilience.ReconnectPolicy``)
     "ReconnectOptions",
+    "Tokens",
+    "UnavailableFeatureError",
     "SdkDecoder",
     "SDK_TAG_READERS",
     "TAG_GEOMETRY_POINT",

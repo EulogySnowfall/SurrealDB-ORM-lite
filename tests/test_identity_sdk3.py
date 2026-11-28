@@ -37,6 +37,7 @@ from surreal_orm_lite.live import is_connection_failure, is_dead
 from tests._proxy import CuttableProxy, _RequestLog
 from tests.test_auth import AUTH_TABLE, PASSWORD, REFRESH_ACCESS, _unique_email, auth_client
 from tests.test_reconnect import (
+    OWNED_ACCESS,
     TABLE,
     Reconnected,
     _direct_lives,
@@ -387,6 +388,25 @@ class TestResubscriptionIdentityE2E:
                 assert len(_identity_before_data(connection)) == sum(
                     method in {"signin", "authenticate"} for method in connection.methods()
                 ), connection.requests
+
+    @pytest.mark.asyncio
+    async def test_a_stored_record_identity_signed_in_again_keeps_its_stream(self) -> None:
+        """The same user signing in again gets a new token, not a new identity: the stream resubscribes after a
+        drop."""
+        async with proxied() as proxy, record_user(store=True) as user_id, Reconnected.objects().watch() as stream:
+            client = await SurrealDBConnectionManager.get_client()
+            email = await _client.query(client, "RETURN $auth.email;", {})
+            before = SurrealDBConnectionManager.get_session_token()
+            await SurrealDBConnectionManager.signin(access=OWNED_ACCESS, variables={"email": email})
+            assert SurrealDBConnectionManager.get_session_token() != before
+            old = stream.live_id
+            proxy.cut()
+            await _resubscribed(stream, old)
+            await _direct_query(f"CREATE {TABLE}:again SET owner = <record> '{user_id}';")
+            envelope = await _next_within(stream)
+
+            assert isinstance(envelope, dict)
+            assert str(envelope["record"].id) == "again"
 
     @pytest.mark.asyncio
     async def test_an_unstored_record_identity_opens_no_connection_and_leaves_no_live_query(self) -> None:

@@ -1,6 +1,8 @@
 import asyncio
+import concurrent.futures
 import contextlib
 import dataclasses
+import enum
 import functools
 import hashlib
 import inspect
@@ -25,6 +27,7 @@ from ._sdk import (
     AsyncSurreal,
     Features,
     NotFoundError,
+    ServerError,
     UnsupportedEngineError,
     UnsupportedFeatureError,
     UnsupportedVersionError,
@@ -61,7 +64,7 @@ from .live import (
     release_subscribers,
     require_websocket,
 )
-from .resilience import ReconnectPolicy
+from .resilience import IdentityStamp, ReconnectPolicy, StampKind, call_listeners, identity_key, key_hash
 from .routing import check_call_transaction, check_name
 from .schema import (
     Event,
@@ -123,6 +126,19 @@ def _bump_signature_epoch() -> None:
     """Record that cached stored-function signatures were dropped: a read in flight is no longer stored."""
     global _signature_epoch
     _signature_epoch += 1
+
+
+class _Any(enum.Enum):
+    """The type of :data:`_ANY`."""
+
+    ANY = enum.auto()
+
+
+#: ``_set_stored(…, expected=_ANY)``: replace the stored session whatever it is.
+_ANY: Final = _Any.ANY
+
+#: The text of the error waiters of a renewal of the stored session get when the renewal was interrupted.
+_RENEWAL_INTERRUPTED = "The renewal of the stored session was interrupted; the stored session is kept."
 
 
 async def _read_function_signature(client: Any, function: str) -> tuple[str, ...]:
@@ -371,14 +387,17 @@ class SurrealDBConnectionManager:
     # * Each client carries a stamp ``(fingerprint, replayable)``, set whenever the manager sets
     #   its identity: opened (and replayed), signed in, authenticated, invalidated.
     #   ``replayable`` is False after ``store=False``: the client runs as someone a reconnect
-    #   will not restore.
+    #   will not restore. Since v0.51.0 the stamp is an ``IdentityStamp``, which also records
+    #   what the manager put on the client (``kind``) and a serial new at every stamp; the
+    #   fingerprint hashes the stored token's identity key (its claims, not the token), so a
+    #   renewed token of the same user is the same identity.
     #
     # A live stream resubscribes only if its client's stamp was replayable and still matches the
     # replay identity. And when a client whose stamp is *not* replayable dies, its loop enters a
     # "lost identity" state in which get_client() raises until the application re-establishes an
     # identity — rather than silently answering as the configured (root) user. Per client and per
     # loop rather than global: clients are per event loop (issue #163).
-    __client_identities: "weakref.WeakKeyDictionary[Any, tuple[str, bool]]" = weakref.WeakKeyDictionary()
+    __client_identities: "weakref.WeakKeyDictionary[Any, IdentityStamp]" = weakref.WeakKeyDictionary()
     __lost_identity: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
 
     # The SDK's in-process engine (v0.25.0): ONE client for the whole process, in this slot beside
@@ -1190,8 +1209,13 @@ class SurrealDBConnectionManager:
     @staticmethod
     def _fingerprint(url: str | None, namespace: str | None, database: str | None, user: str | None, token: str | None) -> str:
         """The identity a connection built from these settings comes back as — hashed, so no
-        credential is kept twice."""
-        material = "\x00".join(value or "" for value in (url, namespace, database, user, token))
+        credential is kept twice.
+
+        The stored *token* counts by its identity key (v0.51.0, :func:`~.resilience.identity_key`): a renewed token of
+        the same user, access method, namespace and database is the same identity.
+        """
+        identity = None if not token else key_hash(identity_key(token))
+        material = "\x00".join(value or "" for value in (url, namespace, database, user, identity))
         return hashlib.sha256(material.encode()).hexdigest()
 
     @classmethod
@@ -1237,7 +1261,7 @@ class SurrealDBConnectionManager:
             opened,
             replayed=replayed,
             configured=configured,
-            publish=lambda client, fingerprint: cls._publish(loop, client, fingerprint, still_wanted, generation),
+            publish=lambda client, fingerprint, kind: cls._publish(loop, client, fingerprint, kind, still_wanted, generation),
         )
 
     @classmethod
@@ -1248,7 +1272,7 @@ class SurrealDBConnectionManager:
         *,
         replayed: str,
         configured: str,
-        publish: Callable[[Any, str], None],
+        publish: Callable[[Any, str, StampKind], None],
         replay: Callable[[Any], Awaitable[None]] | None = None,
     ) -> Any:
         """Replay the stored session on a freshly opened *client*, then publish it with the stamp of
@@ -1256,7 +1280,8 @@ class SurrealDBConnectionManager:
 
         :param replayed: the fingerprint of the configured identity *with* the stored token.
         :param configured: the same without it — what the client is when the token is refused.
-        :param publish: stamps and caches the client under the given fingerprint.
+        :param publish: stamps and caches the client under the given fingerprint and stamp kind (``"stored"`` when
+            the stored session was replayed, else ``"configured"``).
         :param replay: how the stored session is replayed, :meth:`_replay_session` by default (the embedded slot
             tracks its owner session around it).
         """
@@ -1279,7 +1304,7 @@ class SurrealDBConnectionManager:
             raise
         except Exception:
             # Refused: the token was forgotten and the client stayed at the configured identity.
-            publish(client, configured)
+            publish(client, configured, "configured")
             raise
         except BaseException:
             # Cancelled mid-replay: nobody knows which identity the client ended up with, so it is
@@ -1287,7 +1312,8 @@ class SurrealDBConnectionManager:
             with contextlib.suppress(Exception):
                 await client.close()
             raise
-        publish(client, replayed)
+        # A stored token makes the two fingerprints differ: the client now carries the stored session.
+        publish(client, replayed, "configured" if replayed == configured else "stored")
         return client
 
     @classmethod
@@ -1297,6 +1323,7 @@ class SurrealDBConnectionManager:
         loop: asyncio.AbstractEventLoop,
         client: Any,
         fingerprint: str,
+        kind: StampKind,
         still_wanted: Callable[[], bool] | None,
         generation: int | None = None,
     ) -> None:
@@ -1320,7 +1347,7 @@ class SurrealDBConnectionManager:
             error = SurrealDbConnectionError(_opening_retired_text(cls._connection_name))
             error.retryable = True  # type: ignore[attr-defined]
             raise error
-        cls._stamp_identity(client, fingerprint=fingerprint, replayable=True)
+        cls._stamp_identity(client, fingerprint=fingerprint, replayable=True, kind=kind)
         cls.__clients[loop] = client
 
     @classmethod
@@ -1338,6 +1365,7 @@ class SurrealDBConnectionManager:
         token = cls.__session_token
         if token is None:
             return
+        replayed = AuthTokens(token, cls.__refresh_token)
         # See authenticate(): on HTTP the SDK stamps the token before sending, so a rejected
         # one must be rolled back or the freshly built client is born poisoned.
         previous = getattr(client, "token", None)
@@ -1352,8 +1380,8 @@ class SurrealDBConnectionManager:
                 error = SurrealDbConnectionError("The connection dropped while restoring the session.")
                 error.retryable = True  # type: ignore[attr-defined]
                 raise error from exc
-            cls.__session_token = None
-            cls.__refresh_token = None
+            # Forgotten only if it still is the session this replay sent: one stored meanwhile is not the refused one.
+            cls._set_stored(None, expected=replayed)
             raise wrap_auth_error(exc, "restoring the session on a new connection") from exc
 
     # ------------------------------------------------------------------
@@ -1499,8 +1527,8 @@ class SurrealDBConnectionManager:
             configured = cls._fingerprint(url, namespace, database, cls.__user, None)
             client = await cls._open_client(signin_as_configured=False)
 
-            def publish(opened: Any, fingerprint: str) -> None:
-                cls._stamp_identity(opened, fingerprint=fingerprint, replayable=True)
+            def publish(opened: Any, fingerprint: str, kind: StampKind) -> None:
+                cls._stamp_identity(opened, fingerprint=fingerprint, replayable=True, kind=kind)
                 cls.__embedded_url = url
                 cls.__embedded_selection = (namespace, database)
                 cls.__embedded_client = opened  # last: see the fast path of _acquire_embedded_client()
@@ -1554,10 +1582,11 @@ class SurrealDBConnectionManager:
             raise  # the selection stays stale
         except Exception:
             # Refused: the token is forgotten and the session is the owner on the selection — as at open.
-            cls._stamp_identity(client, fingerprint=configured, replayable=True)
+            cls._stamp_identity(client, fingerprint=configured, replayable=True, kind="configured")
             cls.__embedded_selection = (namespace, database)
             raise
-        cls._stamp_identity(client, fingerprint=replayed, replayable=True)
+        kind: StampKind = "configured" if replayed == configured else "stored"
+        cls._stamp_identity(client, fingerprint=replayed, replayable=True, kind=kind)
         cls.__embedded_selection = (namespace, database)
 
     @classmethod
@@ -1852,8 +1881,8 @@ class SurrealDBConnectionManager:
             cls.__reconnect = state.reconnect
             cls.__renew_access = state.renew_access
             cls._bump_settings_epoch()
-            cls.__session_token = state.session_token
-            cls.__refresh_token = state.refresh_token
+            restored = None if state.session_token is None else AuthTokens(state.session_token, state.refresh_token)
+            cls._set_stored(restored)
             cls.__lost_identity.clear()
             for loop in state.lost_identity:
                 if not loop.is_closed():
@@ -2304,24 +2333,30 @@ class SurrealDBConnectionManager:
 
         adopted = AuthTokens(access=access, refresh=getattr(tokens, "refresh", None))
         if store:
-            cls.__session_token = adopted.access
-            cls.__refresh_token = adopted.refresh
-        cls._stamp_identity(client, replayable=store)
+            cls._set_stored(adopted)
+        cls._stamp_identity(client, replayable=store, kind="stored" if store else "unstored")
         if not embedded:
             cls._identity_restored()
         return adopted
 
     @classmethod
     @_routed("current")
-    def _stamp_identity(cls, client: Any, *, replayable: bool, fingerprint: str | None = None) -> None:
+    def _stamp_identity(
+        cls, client: Any, *, replayable: bool, fingerprint: str | None = None, kind: StampKind | None = None
+    ) -> None:
         """Record that the manager just set *client*'s identity, and whether a reconnect restores it,
         and mint the client's query-cache scope: a new one at every stamp, so cached results never
         cross identities; the scope is retired when the manager drops the client.
 
         *fingerprint* is what the client was built from when that was read before an await; by
-        default, the current replay identity.
+        default, the current replay identity. *kind* is what the manager put on the client
+        (:data:`~.resilience.StampKind`); by default ``"unstored"`` when not *replayable*, else
+        ``"stored"`` when a session is stored and ``"configured"`` when none is. The stamp is an
+        :class:`~.resilience.IdentityStamp` with a new serial.
         """
-        stamp = (cls._replay_identity() if fingerprint is None else fingerprint, replayable)
+        if kind is None:
+            kind = "unstored" if not replayable else "configured" if cls.__session_token is None else "stored"
+        stamp = IdentityStamp.new(cls._replay_identity() if fingerprint is None else fingerprint, replayable, kind)
         with contextlib.suppress(TypeError):  # an object that cannot be weakly referenced
             cls.__client_identities[client] = stamp
         _cache.bind_scope(client)
@@ -2336,7 +2371,7 @@ class SurrealDBConnectionManager:
 
     @classmethod
     @_routed("current")
-    def _identity_of(cls, client: Any) -> tuple[str, bool] | None:
+    def _identity_of(cls, client: Any) -> IdentityStamp | None:
         """*client*'s identity stamp, or ``None`` for a client the manager did not identify."""
         try:
             return cls.__client_identities.get(client)
@@ -2388,12 +2423,11 @@ class SurrealDBConnectionManager:
             await (cls._embedded_exchange(client, exchange) if embedded else exchange())
 
             if store:
-                cls.__session_token = token
                 # A JWT handed in from outside brings no refresh token with it, so the previous
                 # session's one is dropped rather than left paired with an identity it cannot
                 # renew. A caller that *does* hold the matching pair passes refresh=.
-                cls.__refresh_token = refresh
-            cls._stamp_identity(client, replayable=store)
+                cls._set_stored(AuthTokens(token, refresh))
+            cls._stamp_identity(client, replayable=store, kind="stored" if store else "unstored")
             if not embedded:
                 cls._identity_restored()
 
@@ -2453,7 +2487,7 @@ class SurrealDBConnectionManager:
             if cls.__namespace is not None and cls.__database is not None:
                 await client.use(cls.__namespace, cls.__database)
             # Back at the configured identity — exactly what a reconnect restores.
-            cls._stamp_identity(client, replayable=True)
+            cls._stamp_identity(client, replayable=True, kind="configured")
             cls._identity_restored()
         except Exception as exc:
             # The session is anonymous at this point — exactly the state this method exists to
@@ -2495,7 +2529,7 @@ class SurrealDBConnectionManager:
             cls.__embedded_selection = (namespace, database)
         # Back at the configured identity — exactly what a reopen restores. A server loop's
         # lost-identity state is left as it is: the engine's owner says nothing about it.
-        cls._stamp_identity(client, replayable=True)
+        cls._stamp_identity(client, replayable=True, kind="configured")
 
     @classmethod
     @_routed("current")
@@ -2510,8 +2544,7 @@ class SurrealDBConnectionManager:
         The **current** connection keeps whatever identity it already has; only the replay is
         forgotten. Call :meth:`invalidate` when you mean to log out for real.
         """
-        cls.__session_token = None
-        cls.__refresh_token = None
+        cls._set_stored(None)
 
     @classmethod
     @_routed("current")
@@ -2549,6 +2582,136 @@ class SurrealDBConnectionManager:
         :return: The stored refresh token, or None if there is none.
         """
         return cls.__refresh_token
+
+    # ------------------------------------------------------------------
+    # The stored session: one writer, one renewal (v0.51.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @_routed("current")
+    def _stored(cls) -> AuthTokens | None:
+        """The stored session as a pair, or ``None`` when none is stored."""
+        access = cls.__session_token
+        return None if access is None else AuthTokens(access, cls.__refresh_token)
+
+    @classmethod
+    @_routed("current")
+    def _set_stored(
+        cls,
+        new: AuthTokens | None,
+        *,
+        expected: AuthTokens | None | _Any = _ANY,
+        ending: "concurrent.futures.Future[AuthTokens] | None" = None,
+    ) -> bool:
+        """Store *new* as the session (``None`` forgets it), but only while the stored pair still is *expected*.
+
+        The only writer of the stored session: a compare-and-set under the connection's session lock, so a renewal
+        or a refusal that lands late never replaces a session stored meanwhile (:data:`_ANY`, the default, replaces
+        unconditionally). When the pair changed, the ``"auth"`` event is announced with *new*, after the lock is
+        released; nothing is announced when nothing changed.
+
+        :param ending: the renewal in progress (:meth:`_renew_stored`) this write concludes: it stops being the
+            renewal in progress in the same locked step, so no caller sees the new pair next to the old renewal.
+        :return: whether the stored pair was *expected*, so that the stored session is *new* now.
+        """
+        with cls.__session_lock:
+            current = cls._stored()
+            matched = expected is _ANY or current == expected
+            changed = matched and current != new
+            if changed:
+                cls.__session_token = None if new is None else new.access
+                cls.__refresh_token = None if new is None else new.refresh
+            if ending is not None and cls.__renewing is ending:
+                cls.__renewing = None
+        if changed:
+            cls._emit_auth(new)
+        return matched
+
+    @classmethod
+    @_routed("current")
+    def _emit_auth(cls, tokens: AuthTokens | None) -> None:
+        """Announce a change of the stored session to the connection's ``"auth"`` listeners."""
+        with cls.__listener_lock:
+            callbacks = list(cls.__listeners.get("auth", ()))
+        call_listeners(callbacks, (tokens,), logger)
+
+    @classmethod
+    @_routed("current")
+    async def _renew_stored(cls, spent: AuthTokens) -> AuthTokens:
+        """Renew the stored session with its refresh token: the one place the ORM spends it.
+
+        Single-flight per connection, across event loops and threads: while a renewal runs, every other caller waits
+        for its outcome instead of spending the token again. When the stored pair is no longer *spent* (renewed
+        meanwhile), it is returned without any exchange. The exchange runs on a short-lived anonymous client, so no
+        shared client ever holds the new refresh token; its outcome is stored with a compare-and-set on *spent*.
+
+        :param spent: the stored pair to renew.
+        :return: the stored pair after the renewal.
+        :raises SurrealDbAuthenticationError: no refresh token is stored (or the session was forgotten); the server
+            refused the token (the refresh token is then forgotten, unless the stored session changed meanwhile); the
+            server cannot renew a session (SurrealDB 2.x: the SDK's error is the ``__cause__``; the session is kept).
+        :raises SurrealDbConnectionError: the exchange could not reach the server or lost its answer; the session is
+            kept (the server may or may not have spent the token: the next use finds out).
+        """
+        with cls.__session_lock:
+            stored = cls._stored()
+            if stored != spent:
+                if stored is None or stored.refresh is None:
+                    raise SurrealDbAuthenticationError("No refresh token is stored to renew the session with.")
+                return stored
+            if spent.refresh is None:
+                raise SurrealDbAuthenticationError("No refresh token is stored to renew the session with.")
+            pending: concurrent.futures.Future[AuthTokens] | None = cls.__renewing
+            if pending is None:
+                renewal: concurrent.futures.Future[AuthTokens] = concurrent.futures.Future()
+                # Running from the start: a waiter that is cancelled never cancels the renewal itself.
+                renewal.set_running_or_notify_cancel()
+                cls.__renewing = renewal
+        if pending is not None:
+            return await asyncio.wrap_future(pending)
+        return await cls._own_renewal(spent, spent.refresh, renewal)
+
+    @classmethod
+    @_routed("current")
+    async def _own_renewal(
+        cls, spent: AuthTokens, refresh: str, renewal: "concurrent.futures.Future[AuthTokens]"
+    ) -> AuthTokens:
+        """The renewal :meth:`_renew_stored` owns: exchange, store, then hand the outcome to the waiters."""
+        try:
+            try:
+                async with cls.ephemeral_client() as client:
+                    answer = await _client.refresh(client, spent.access, refresh)
+            except SurrealDbConnectionError:
+                raise
+            except UnsupportedFeatureError as exc:
+                raise SurrealDbAuthenticationError(
+                    f"The server cannot renew the stored session (refresh tokens need SurrealDB 3.x): {exc}"
+                ) from exc
+            except ServerError as exc:
+                # Refused: the refresh token is forgotten, unless the stored session changed meanwhile.
+                cls._set_stored(AuthTokens(spent.access, None), expected=spent, ending=renewal)
+                raise wrap_auth_error(exc, "the renewal of the stored session") from exc
+            except Exception as exc:
+                raise wrap_auth_error(exc, "the renewal of the stored session") from exc
+            access = getattr(answer, "access", None)
+            if not access:
+                raise SurrealDbAuthenticationError("The server returned no access token for the renewal.")
+            renewed = AuthTokens(access, getattr(answer, "refresh", None))
+            cls._set_stored(renewed, expected=spent, ending=renewal)
+            renewal.set_result(renewed)
+            return renewed
+        except BaseException as exc:
+            with cls.__session_lock:
+                if cls.__renewing is renewal:
+                    cls.__renewing = None
+            if isinstance(exc, Exception):
+                renewal.set_exception(exc)
+            else:
+                # Cancelled (or interrupted): the token may or may not be spent; the session is kept.
+                interrupted = SurrealDbConnectionError(_RENEWAL_INTERRUPTED)
+                interrupted.retryable = True  # type: ignore[attr-defined]
+                renewal.set_exception(interrupted)
+            raise
 
     @classmethod
     @_routed("current")
