@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
+from surreal_orm_lite import BaseSurrealModel, ReconnectPolicy, SurrealDBConnectionManager, _client
 from surreal_orm_lite.exceptions import SurrealDbConnectionError
 from surreal_orm_lite.live import is_dead, recv_task_of
 from tests._proxy import CuttableProxy
@@ -42,15 +42,29 @@ def _direct_url() -> str:
 
 
 @contextlib.asynccontextmanager
-async def proxied(*tables: str) -> AsyncIterator[CuttableProxy]:
+async def proxied(
+    *tables: str, reconnect: bool | ReconnectPolicy = False, renew_access: bool = False
+) -> AsyncIterator[CuttableProxy]:
     """An ORM connection routed through a cuttable proxy, with ``tables`` defined and dropped.
+
+    *reconnect* and *renew_access* are the connection's resilience settings (v0.51.0). They default to ``False``: the
+    tests of this file pin the v0.50.x drop path (the ORM replaces a dropped client on the next call) and the absence
+    of renewal; a test of the v0.51.0 defaults passes them explicitly.
 
     Cleanup goes through a *direct* connection, so it works whatever state the test left the
     proxy in (cut, refusing, or closed).
     """
     tables = tables or (TABLE,)
     async with CuttableProxy() as proxy:
-        SurrealDBConnectionManager.set_connection(url=proxy.url(), user="root", password="root", namespace="ns", database="db")
+        SurrealDBConnectionManager.set_connection(
+            url=proxy.url(),
+            user="root",
+            password="root",
+            namespace="ns",
+            database="db",
+            reconnect=reconnect,
+            renew_access=renew_access,
+        )
         client = await SurrealDBConnectionManager.get_client()
         for table in tables:
             await client.query(f"REMOVE TABLE IF EXISTS {table}; DEFINE TABLE {table} SCHEMALESS;", {})
@@ -559,7 +573,13 @@ class TestResubscribeFailuresUnit:
         from surreal_orm_lite.live import LiveStream
 
         SurrealDBConnectionManager.set_connection(
-            url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
+            url="ws://unused.invalid/rpc",
+            user="root",
+            password="root",
+            namespace="ns",
+            database="db",
+            reconnect=False,
+            renew_access=False,
         )
 
         async def _get_client(cls: Any) -> Any:
@@ -793,7 +813,13 @@ class TestResubscribeIdentityUnit:
         await SurrealDBConnectionManager.set_user("someone-else")
         await SurrealDBConnectionManager.set_user("root")
         SurrealDBConnectionManager.set_connection(
-            url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
+            url="ws://unused.invalid/rpc",
+            user="root",
+            password="root",
+            namespace="ns",
+            database="db",
+            reconnect=False,
+            renew_access=False,
         )
         first.drop()
 
@@ -1026,7 +1052,13 @@ class TestReviewIdentityE2E:
 
         async with proxied() as proxy, Reconnected.objects().watch() as stream:
             SurrealDBConnectionManager.set_connection(
-                url=proxy.url(), user="root", password="root", namespace="ns", database="elsewhere"
+                url=proxy.url(),
+                user="root",
+                password="root",
+                namespace="ns",
+                database="elsewhere",
+                reconnect=False,
+                renew_access=False,
             )
             proxy.cut()
             with pytest.raises(SurrealDbAuthenticationError):
@@ -1060,7 +1092,13 @@ class TestOpenClientFailuresE2E:
         async with CuttableProxy() as proxy:
             proxy.refuse()
             SurrealDBConnectionManager.set_connection(
-                url=proxy.url(), user="root", password="root", namespace="ns", database="db"
+                url=proxy.url(),
+                user="root",
+                password="root",
+                namespace="ns",
+                database="db",
+                reconnect=False,
+                renew_access=False,
             )
             with pytest.raises(SurrealDbConnectionError) as excinfo:
                 await SurrealDBConnectionManager.get_client()

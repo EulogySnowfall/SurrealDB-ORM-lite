@@ -988,7 +988,13 @@ class TestKillOnADroppedConnectionUnit:
     @staticmethod
     def _serve(monkeypatch: pytest.MonkeyPatch, client: Any) -> None:
         SurrealDBConnectionManager.set_connection(
-            url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
+            url="ws://unused.invalid/rpc",
+            user="root",
+            password="root",
+            namespace="ns",
+            database="db",
+            reconnect=False,
+            renew_access=False,
         )
         monkeypatch.setattr(SurrealDBConnectionManager, "_cached_client", classmethod(lambda cls: client))
 

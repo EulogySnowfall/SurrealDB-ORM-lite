@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, _client
+from surreal_orm_lite import BaseSurrealModel, ReconnectPolicy, SurrealDBConnectionManager, _client
 from surreal_orm_lite.changefeed import ChangeModelStream, feed_events, next_cursor, since_sql
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbError
@@ -51,10 +51,27 @@ def _url(scheme: str = "ws") -> str:
 
 
 @contextlib.asynccontextmanager
-async def feed_client(definition: str = "CHANGEFEED 1h", *, scheme: str = "ws", url: str | None = None) -> AsyncIterator[Any]:
-    """Connected client with ``Fed`` recreated as ``DEFINE TABLE Fed SCHEMALESS <definition>``."""
+async def feed_client(
+    definition: str = "CHANGEFEED 1h",
+    *,
+    scheme: str = "ws",
+    url: str | None = None,
+    reconnect: bool | ReconnectPolicy = True,
+    renew_access: bool = True,
+) -> AsyncIterator[Any]:
+    """Connected client with ``Fed`` recreated as ``DEFINE TABLE Fed SCHEMALESS <definition>``.
+
+    *reconnect* and *renew_access* are the connection's resilience settings (v0.51.0); the drop tests pass ``False``
+    to pin the v0.50.x path (the ORM replaces a dropped client on the next call).
+    """
     SurrealDBConnectionManager.set_connection(
-        url=url or _url(scheme), user="root", password="root", namespace="ns", database="db"
+        url=url or _url(scheme),
+        user="root",
+        password="root",
+        namespace="ns",
+        database="db",
+        reconnect=reconnect,
+        renew_access=renew_access,
     )
     client = await SurrealDBConnectionManager.get_client()
     await client.query(f"REMOVE TABLE IF EXISTS {TABLE};", {})
@@ -419,7 +436,7 @@ class TestChangesReconnectE2E:
     async def test_a_drop_while_polling_loses_nothing_and_duplicates_nothing(self) -> None:
         from tests._proxy import CuttableProxy
 
-        async with CuttableProxy() as proxy, feed_client(url=proxy.url()):
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url(), reconnect=False, renew_access=False):
             stream = _fast(await Fed.objects().changes(poll_interval=0.05).start())
             await _write(lambda: Fed(id="d0").save())
             await _write(lambda: Fed(id="d1").save())
@@ -444,7 +461,7 @@ class TestChangesReconnectE2E:
         from surreal_orm_lite.exceptions import SurrealDbConnectionError
         from tests._proxy import CuttableProxy
 
-        async with CuttableProxy() as proxy, feed_client(url=proxy.url()):
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url(), reconnect=False, renew_access=False):
             stream = _fast(await Fed.objects().changes(poll_interval=0.05).start())
             stream.reconnect_max_attempts = 2
             proxy.refuse()
@@ -509,7 +526,7 @@ class TestReviewChangeFeedE2E:
         """Finding #10: stop() used to wait out the backoff, up to 30 s."""
         from tests._proxy import CuttableProxy
 
-        async with CuttableProxy() as proxy, feed_client(url=proxy.url()):
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url(), reconnect=False, renew_access=False):
             stream = await Fed.objects().changes(poll_interval=0.05).start()
             stream.reconnect_delay = 10.0
             proxy.refuse()
@@ -527,7 +544,7 @@ class TestReviewChangeFeedE2E:
         """Finding #6b: aiohttp's ServerDisconnectedError is not an OSError, yet a lost connection."""
         from tests._proxy import CuttableProxy
 
-        async with CuttableProxy() as proxy, feed_client(url=proxy.url("http")):
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url("http"), reconnect=False, renew_access=False):
             stream = _fast(await Fed.objects().changes(poll_interval=0.05).start())
             await _direct_write(f"CREATE {TABLE}:h0;")
             first = await _take(stream, 1)
@@ -547,7 +564,7 @@ class TestReviewStoppedStartE2E:
         permitted" — start() then carried on querying after stop()."""
         from tests._proxy import CuttableProxy
 
-        async with CuttableProxy() as proxy, feed_client(url=proxy.url()):
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url(), reconnect=False, renew_access=False):
             client = await SurrealDBConnectionManager.get_client()
             stream = Fed.objects().changes(poll_interval=0.05)
             stream.reconnect_delay = 10.0

@@ -243,8 +243,10 @@ def _url(scheme: str = "ws") -> str:
     return f"ws://{host}:{port}/rpc" if scheme == "ws" else f"http://{host}:{port}"
 
 
-def _connect(scheme: str = "ws") -> None:
-    SurrealDBConnectionManager.set_connection(url=_url(scheme), user="root", password="root", namespace="ns", database="db")
+def _connect(scheme: str = "ws", *, renew_access: bool = True) -> None:
+    SurrealDBConnectionManager.set_connection(
+        url=_url(scheme), user="root", password="root", namespace="ns", database="db", renew_access=renew_access
+    )
 
 
 def _unique_email() -> str:
@@ -275,8 +277,11 @@ DEFINE ACCESS OVERWRITE {AUTH_ACCESS} ON DATABASE TYPE RECORD
 
 
 @contextlib.asynccontextmanager
-async def auth_client(*, permissions: str = SELF_READABLE, scheme: str = "ws") -> AsyncIterator[Any]:
+async def auth_client(*, permissions: str = SELF_READABLE, scheme: str = "ws", renew_access: bool = True) -> AsyncIterator[Any]:
     """Connected ORM client with a record-access method defined, removed again afterwards.
+
+    *renew_access* is the connection's renewal setting (v0.51.0); a test that pins the v0.50.x behaviour passes
+    ``False``.
 
     An async context manager rather than a pytest fixture: the SDK's WebSocket client is bound
     to the event loop that created it, and fixtures run in the module-scoped loop while tests
@@ -286,7 +291,7 @@ async def auth_client(*, permissions: str = SELF_READABLE, scheme: str = "ws") -
     session authenticated as a record user (or anonymous), and neither can drop a table. It
     then calls ``unset_connection()`` so no session token survives into the next test.
     """
-    _connect(scheme)
+    _connect(scheme, renew_access=renew_access)
     client = await SurrealDBConnectionManager.get_client()
     await client.query(f"DEFINE TABLE OVERWRITE {AUTH_TABLE} SCHEMALESS PERMISSIONS {permissions};", {})
     await client.query(DEFINE_ACCESS, {})

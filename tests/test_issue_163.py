@@ -47,7 +47,9 @@ def _run(coro) -> object:  # type: ignore[no-untyped-def]
 
 
 def _connect(url: str) -> None:
-    SurrealDBConnectionManager.set_connection(url, "root", "root", "ns", "db")
+    """The v0.50.x settings (no SDK reconnect, no renewal): these tests pin how a client left on a closed loop is
+    replaced."""
+    SurrealDBConnectionManager.set_connection(url, "root", "root", "ns", "db", reconnect=False, renew_access=False)
 
 
 def _cache() -> dict:

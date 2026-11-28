@@ -84,6 +84,7 @@ def _spy_constructor(monkeypatch: pytest.MonkeyPatch, client: _OpenedClient | No
     return calls
 
 
+#: The exact v0.50.0 constructor options of a server client, kept with ``reconnect=False, renew_access=False``.
 _SERVER_OPTIONS = {"reconnect": False, "streaming": False, "renew_access": False}
 
 
@@ -94,7 +95,9 @@ class TestClientOptionsUnit:
         self, monkeypatch: pytest.MonkeyPatch, url: str
     ) -> None:
         calls = _spy_constructor(monkeypatch)
-        SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database="db")
+        SurrealDBConnectionManager.set_connection(
+            url=url, user="root", password="root", namespace="ns", database="db", reconnect=False, renew_access=False
+        )
 
         await SurrealDBConnectionManager._open_client(signin_as_configured=True)
 
@@ -108,7 +111,9 @@ class TestClientOptionsUnit:
         """M32, measured with SDK 2.0.0 on 2.7.0 and 3.3.5: ``SLEEP 35s`` over HTTP raised ``TimeoutError`` after 30 s
         (its HTTP client sends every request with ``aiohttp.ClientTimeout(total=30)``). The ORM keeps that deadline."""
         calls = _spy_constructor(monkeypatch)
-        SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database="db")
+        SurrealDBConnectionManager.set_connection(
+            url=url, user="root", password="root", namespace="ns", database="db", reconnect=False, renew_access=False
+        )
 
         await SurrealDBConnectionManager._open_client(signin_as_configured=True)
 
@@ -117,7 +122,9 @@ class TestClientOptionsUnit:
     @pytest.mark.asyncio
     async def test_the_embedded_engine_is_built_from_its_url_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = _spy_constructor(monkeypatch)
-        SurrealDBConnectionManager.set_connection(url="mem://", namespace="ns", database="db")
+        SurrealDBConnectionManager.set_connection(
+            url="mem://", namespace="ns", database="db", reconnect=False, renew_access=False
+        )
 
         await SurrealDBConnectionManager._open_client(signin_as_configured=True)
 

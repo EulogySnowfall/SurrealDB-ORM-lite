@@ -1687,7 +1687,14 @@ class TestIntrospectionE2E:
         path.write_bytes(previous)
         async with _isp(kind), CuttableProxy() as proxy:
             SurrealDBConnectionManager.add_connection(
-                "isp_cut", url=proxy.url(kind), user="root", password="root", namespace="ns", database="isp_db"
+                "isp_cut",
+                url=proxy.url(kind),
+                user="root",
+                password="root",
+                namespace="ns",
+                database="isp_db",
+                reconnect=False,
+                renew_access=False,
             )
             try:
                 client = await SurrealDBConnectionManager.get_client("isp_cut")

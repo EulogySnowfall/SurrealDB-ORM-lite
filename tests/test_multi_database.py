@@ -38,6 +38,7 @@ from surreal_orm_lite import (
     Q,
     QueryCache,
     QuerySet,
+    ReconnectPolicy,
     Subquery,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
@@ -1731,16 +1732,26 @@ _RECORD_ACCESS = (
 
 
 @contextlib.asynccontextmanager
-async def _record_access(url: str | None = None) -> AsyncIterator[dict[str, str]]:
+async def _record_access(
+    url: str | None = None, *, reconnect: bool | ReconnectPolicy = True, renew_access: bool = True
+) -> AsyncIterator[dict[str, str]]:
     """``md_a`` registered on database ``md_a`` (through *url*, else straight to the line under test), with the
     record access ``md_account`` defined there only; the default connection on ``ns``/``db`` as root. Yields the
-    variables of a record user to sign up."""
+    variables of a record user to sign up. *reconnect* and *renew_access* are ``md_a``'s resilience settings
+    (v0.51.0)."""
     await _reset_databases(define=True)
     async with _root("md_a") as root:
         await root.query(_RECORD_ACCESS, {})
     SurrealDBConnectionManager.set_connection(url=_url("ws"), user="root", password="root", namespace="ns", database="db")
     SurrealDBConnectionManager.add_connection(
-        "md_a", url=url or _url("ws"), user="root", password="root", namespace="ns", database="md_a"
+        "md_a",
+        url=url or _url("ws"),
+        user="root",
+        password="root",
+        namespace="ns",
+        database="md_a",
+        reconnect=reconnect,
+        renew_access=renew_access,
     )
     try:
         yield {"email": f"{uuid4().hex}@example.test", "pass": "s3cret-passphrase"}
@@ -1807,7 +1818,7 @@ class TestSessionsPerConnectionE2E:
     async def test_a_dropped_unstored_session_blocks_only_its_connection(self) -> None:
         """R10: the lost-identity state is per connection and event loop, and its error names the connection."""
         router = SurrealDBConnectionManager
-        async with CuttableProxy() as proxy, _record_access(proxy.url()) as variables:
+        async with CuttableProxy() as proxy, _record_access(proxy.url(), reconnect=False, renew_access=False) as variables:
             async with router.using("md_a"):
                 await router.signup(access="md_account", variables=variables, store=False)
                 assert router.is_authenticated() is False
@@ -2624,17 +2635,27 @@ class TestLiveStreamBinding:
 
 
 @contextlib.asynccontextmanager
-async def _live_connections(md_a_url: str | None = None) -> AsyncIterator[None]:
+async def _live_connections(
+    md_a_url: str | None = None, *, reconnect: bool | ReconnectPolicy = True, renew_access: bool = True
+) -> AsyncIterator[None]:
     """``md_a`` on database ``md_a`` (through *md_a_url*, else straight to the line under test), ``md_b`` and the
     default connection on database ``md_b``, all as root over WebSocket, with ``md_event`` and ``md_note`` defined in
-    both databases (SurrealDB 3.x refuses to watch a missing table). Used with the ``unset_default`` fixture."""
+    both databases (SurrealDB 3.x refuses to watch a missing table). Used with the ``unset_default`` fixture.
+    *reconnect* and *renew_access* are ``md_a``'s resilience settings (v0.51.0)."""
     await _reset_databases(define=True)
     for database in ("md_a", "md_b"):
         async with _root(database) as root:
             await root.query("DEFINE TABLE md_event SCHEMALESS; DEFINE TABLE md_note SCHEMALESS;", {})
     SurrealDBConnectionManager.set_connection(url=_url("ws"), user="root", password="root", namespace="ns", database="md_b")
     SurrealDBConnectionManager.add_connection(
-        "md_a", url=md_a_url or _url("ws"), user="root", password="root", namespace="ns", database="md_a"
+        "md_a",
+        url=md_a_url or _url("ws"),
+        user="root",
+        password="root",
+        namespace="ns",
+        database="md_a",
+        reconnect=reconnect,
+        renew_access=renew_access,
     )
     _register("ws", "md_b", database="md_b")
     try:
@@ -2732,7 +2753,7 @@ class TestRoutedLiveE2E:
             moves.append((old, new))
             reconnected.set()
 
-        async with CuttableProxy() as proxy, _live_connections(proxy.url()):
+        async with CuttableProxy() as proxy, _live_connections(proxy.url(), reconnect=False, renew_access=False):
             default_client = await SurrealDBConnectionManager.get_client()
             async with MdEvent.objects().live(on_reconnect=on_reconnect) as stream:
                 first = await SurrealDBConnectionManager.get_client("md_a")

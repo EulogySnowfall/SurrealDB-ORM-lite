@@ -265,7 +265,14 @@ class TestRetiredClientsE2E:
     async def test_a_kept_client_of_a_removed_connection_refuses(self) -> None:
         async with CuttableProxy() as proxy:
             SurrealDBConnectionManager.add_connection(
-                "retired_named", url=proxy.url(), user="root", password="root", namespace="ns", database="db"
+                "retired_named",
+                url=proxy.url(),
+                user="root",
+                password="root",
+                namespace="ns",
+                database="db",
+                reconnect=False,
+                renew_access=False,
             )
             kept = await SurrealDBConnectionManager.get_client("retired_named")
             await SurrealDBConnectionManager.remove_connection("retired_named")
@@ -426,7 +433,13 @@ class TestResubscriptionIdentityE2E:
         async with proxied() as proxy:
             async with Reconnected.objects().watch() as stream:
                 SurrealDBConnectionManager.set_connection(
-                    url=proxy.url(), user="root", password="root", namespace="ns", database="elsewhere"
+                    url=proxy.url(),
+                    user="root",
+                    password="root",
+                    namespace="ns",
+                    database="elsewhere",
+                    reconnect=False,
+                    renew_access=False,
                 )
                 before = proxy.connections
                 proxy.cut()
@@ -490,7 +503,9 @@ class TestRefreshTokenRenewalE2E:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("scheme", ["ws", "http"])
     async def test_a_stored_refresh_token_is_still_valid_past_the_renewal_point(self, scheme: str) -> None:
-        async with auth_client(scheme=scheme) as client:
+        """With ``renew_access=False`` (the v0.50.x behaviour), nothing renews the stored pair behind the caller's
+        back: the refresh token stored at sign-in is still the one to exchange."""
+        async with auth_client(scheme=scheme, renew_access=False) as client:
             if not client.is_feature_supported(Features.REFRESH_TOKENS):
                 pytest.skip("refresh tokens need SurrealDB 3.x or later")
             await _client.query(client, _SHORT_REFRESH_ACCESS)
