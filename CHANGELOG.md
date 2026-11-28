@@ -28,10 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `id` column, dotted paths, text and collection lookups, `Range` bounds and fields of other types
   (`list[datetime]`, `datetime | str`). A `timedelta` field reads ISO 8601 (`"PT1H"`) or `"HH:MM:SS"`, as Pydantic
   does: SurrealQL text such as `"1h"` raises there (it is a `Duration` field's form).
-- Upgrading: a row whose typed column holds a string (written by `merge()` or `bulk_update()` up to v0.22.x, #221, or
-  by a raw query) matched a string lookup by type order and no longer does. Convert the column once, for example
-  `UPDATE (SELECT VALUE id FROM event WHERE at.is_string()) SET at = <datetime> at;` (`<duration>`, `<decimal>`,
-  `<uuid>` for the other types). See
+- Upgrading: keyword writes are not validated against the field yet
+  ([#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)): `merge()`, `bulk_update()` and the
+  `atomic_*()` helpers still store a string given for a typed column as a string, and so does a raw query. Such a row
+  matched a string lookup by type order and no longer does; a native value never matched it. Pass native values
+  (`datetime`, `timedelta`, `Duration`, `Decimal`, `UUID`) to these writes, and convert the rows already stored as
+  strings once, for example `UPDATE (SELECT VALUE id FROM event WHERE at.is_string()) SET at = <datetime> at;`
+  (`<duration>`, `<decimal>`, `<uuid>` for the other types). See
   [the querying guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/querying.md#string-values-on-rich-fields).
 
 ## [0.50.10] - 2026-11-19

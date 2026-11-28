@@ -359,10 +359,12 @@ Everything else is sent as before: a `str` starting with `$` (data, see
 
 <div>
 
-**Upgrading: rows stored as strings.** Up to v0.22.x <code>merge()</code> and <code>bulk\_update()</code> stored keyword strings as strings,
-even in typed columns ([#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)), and a raw query
-still can. Such a row matched a string lookup by type order and no longer does (a native value never matched it).
-Convert each such column once, with the cast of its type (<code>&lt;datetime&gt;</code>, <code>&lt;duration&gt;</code>, <code>&lt;decimal&gt;</code> or <code>&lt;uuid&gt;</code>; a
+**Upgrading: rows stored as strings.** Keyword writes are not validated against the field yet
+([#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)): <code>merge()</code>, <code>bulk\_update()</code> and the
+<code>atomic\_\*()</code> helpers still store a string given for a typed column as a string, and so does a raw query. Such a row
+matched a string lookup by type order and no longer does (a native value never matched it). Pass native values
+(<code>datetime</code>, <code>timedelta</code>, <code>Duration</code>, <code>Decimal</code>, <code>UUID</code>) to these writes, and convert each column already holding
+strings once, with the cast of its type (<code>&lt;datetime&gt;</code>, <code>&lt;duration&gt;</code>, <code>&lt;decimal&gt;</code> or <code>&lt;uuid&gt;</code>; a
 <code>date</code> column is a <code>&lt;datetime&gt;</code>), measured on SurrealDB 2.7.0, 3.3.5 and 4.0.1:
 
 </div>

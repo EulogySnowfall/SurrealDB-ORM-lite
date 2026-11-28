@@ -351,10 +351,12 @@ Everything else is sent as before: a `str` starting with `$` (data, see
 `list[datetime]`, `datetime | str` and `Range[datetime]`: pass native values there. A `Q` compiled on its own
 (`Q(...).to_sql()`) knows no model and binds its strings as they are.
 
-**Upgrading: rows stored as strings.** Up to v0.22.x `merge()` and `bulk_update()` stored keyword strings as strings,
-even in typed columns ([#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)), and a raw query
-still can. Such a row matched a string lookup by type order and no longer does (a native value never matched it).
-Convert each such column once, with the cast of its type (`<datetime>`, `<duration>`, `<decimal>` or `<uuid>`; a
+**Upgrading: rows stored as strings.** Keyword writes are not validated against the field yet
+([#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)): `merge()`, `bulk_update()` and the
+`atomic_*()` helpers still store a string given for a typed column as a string, and so does a raw query. Such a row
+matched a string lookup by type order and no longer does (a native value never matched it). Pass native values
+(`datetime`, `timedelta`, `Duration`, `Decimal`, `UUID`) to these writes, and convert each column already holding
+strings once, with the cast of its type (`<datetime>`, `<duration>`, `<decimal>` or `<uuid>`; a
 `date` column is a `<datetime>`), measured on SurrealDB 2.7.0, 3.3.5 and 4.0.1:
 
 ```surql
