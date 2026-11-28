@@ -14,6 +14,7 @@ of ``SURREALDB_PORT`` (both lines in CI), the live query on the server only.
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -37,7 +38,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition, rich_filter_type
-from tests._readme_tables import assert_server_header_sentence, assert_server_rows, doc_part, guide
+from tests._readme_tables import ROOT, assert_server_header_sentence, assert_server_rows, doc_part, guide
 from tests.conftest import orm_client
 
 
@@ -572,3 +573,14 @@ class TestTypedLookupsDocs:
         for name in ("querying.md", "fields.md"):
             text = " ".join(guide(name).split())
             assert "strings are not converted" not in text.lower(), name
+
+    def test_no_example_notebook_says_strings_are_not_converted(self) -> None:
+        notebooks = sorted((ROOT / "examples").glob("*.ipynb"))
+        assert notebooks
+        for path in notebooks:
+            cells = json.loads(path.read_text(encoding="utf-8"))["cells"]
+            for cell in cells:
+                if cell["cell_type"] != "markdown":
+                    continue
+                text = " ".join("".join(cell["source"]).split())
+                assert "strings are not converted" not in text.lower(), path.name
