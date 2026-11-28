@@ -48,6 +48,7 @@ from surreal_orm_lite import (
     QueryCache,
     QuerySet,
     Range,
+    ReconnectPolicy,
     SchemaMode,
     SchemaState,
     SearchHighlight,
@@ -408,6 +409,23 @@ def multi_database_forms() -> None:
     assert_type(RoutedMember.get_connection_name(), str)
     assert_type(ConnectionConfig("mem://", None, None, "t", "t"), ConnectionConfig)
     assert_type(ConnectionConfig(url="ws://h/rpc", user="u", password="p", namespace="n", database="d").url, str)
+
+
+def resilience_settings_forms() -> None:
+    """v0.51.0: ``reconnect=``/``renew_access=`` are keyword-only and typed; ``ConnectionConfig`` carries them."""
+    policy = ReconnectPolicy(attempts=None, delay=0.05, max_delay=0.2)
+    assert_type(policy.attempts, int | None)
+    assert_type(policy.delay, float)
+    SurrealDBConnectionManager.set_connection("ws://h/rpc", "u", "p", "n", "d", reconnect=policy, renew_access=False)
+    SurrealDBConnectionManager.set_connection("ws://h/rpc", "u", "p", "n", "d", reconnect=False)
+    SurrealDBConnectionManager.add_connection(
+        "z", url="ws://h/rpc", user="u", password="p", namespace="n", database="d", reconnect=True, renew_access=True
+    )
+    config = SurrealDBConnectionManager.get_config("z")
+    if config is not None:
+        assert_type(config.reconnect, bool | ReconnectPolicy)
+        assert_type(config.renew_access, bool)
+    assert_type(ConnectionConfig("mem://", None, None, "t", "t", policy, False), ConnectionConfig)
 
 
 async def multi_database_blocks() -> None:

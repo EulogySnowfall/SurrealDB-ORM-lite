@@ -839,9 +839,19 @@ class TestConnectionConfig:
             ConnectionConfig(url="mem://", user=None, namespace="t", database="t")  # type: ignore[call-arg]
 
     def test_the_full_orms_fields_in_order_without_defaults(self) -> None:
+        """The full ORM's five fields first, in order and without defaults; v0.51.0 appends ``reconnect`` and
+        ``renew_access`` after them, with defaults (``tests/test_resilience.py``)."""
         fields = dataclasses.fields(ConnectionConfig)
-        assert [field.name for field in fields] == ["url", "user", "password", "namespace", "database"]
-        for field in fields:
+        assert [field.name for field in fields] == [
+            "url",
+            "user",
+            "password",
+            "namespace",
+            "database",
+            "reconnect",
+            "renew_access",
+        ]
+        for field in fields[:5]:
             assert field.default is dataclasses.MISSING, field.name
             assert field.default_factory is dataclasses.MISSING, field.name
 

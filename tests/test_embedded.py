@@ -486,12 +486,18 @@ class TestSetConnectionCredentials:
             await SurrealDBConnectionManager.unset_connection()
 
     def test_signature(self) -> None:
-        """D1: positional order unchanged; the four settings after the URL default to ``None``."""
+        """D1: positional order unchanged; the four settings after the URL default to ``None``. v0.51.0 appends the
+        keyword-only ``reconnect`` and ``renew_access``, both ``True`` by default."""
         parameters = inspect.signature(SurrealDBConnectionManager.set_connection).parameters
-        assert list(parameters) == ["url", "user", "password", "namespace", "database"]
+        assert list(parameters) == ["url", "user", "password", "namespace", "database", "reconnect", "renew_access"]
         assert parameters["url"].default is inspect.Parameter.empty
+        for name in ("url", "user", "password", "namespace", "database"):
+            assert parameters[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
         for name in ("user", "password", "namespace", "database"):
             assert parameters[name].default is None, name
+        for name in ("reconnect", "renew_access"):
+            assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+            assert parameters[name].default is True, name
 
 
 def _set_refused(url: str, *, credentials: bool) -> None:

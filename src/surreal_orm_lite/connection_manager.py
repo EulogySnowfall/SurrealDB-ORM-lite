@@ -61,6 +61,7 @@ from .live import (
     release_subscribers,
     require_websocket,
 )
+from .resilience import ReconnectPolicy
 from .routing import check_call_transaction, check_name
 from .schema import (
     Event,
@@ -149,7 +150,8 @@ class _ManagerState:
 
     Taken and restored by :meth:`SurrealDBConnectionManager._enter_embedded_block` and
     :meth:`SurrealDBConnectionManager._exit_embedded_block`: the settings, the stored session, the event loops in
-    the lost-identity state and the embedded slot (an outer engine is detached for the block, not closed).
+    the lost-identity state and the embedded slot (an outer engine is detached for the block, not closed). v0.51.0
+    adds the connection's reconnect policy and renewal setting.
     """
 
     url: str | None
@@ -167,6 +169,8 @@ class _ManagerState:
     embedded_owner_user: bool = False
     embedded_owner_secret: str | None = dataclasses.field(default=None, repr=False)
     embedded_closed: bool = False
+    reconnect: bool | ReconnectPolicy = True
+    renew_access: bool = True
 
 
 #: A connection's state (v0.29.0): each name-mangled state attribute of :class:`SurrealDBConnectionManager`, with
@@ -193,6 +197,14 @@ _STATE: Final[tuple[tuple[str, Callable[[], Any]], ...]] = (
     ("embedded_owner_secret", lambda: None),
     ("embedded_lock", threading.Lock),
     ("generation", lambda: 0),
+    # Connection resilience (v0.51.0)
+    ("reconnect", lambda: True),
+    ("renew_access", lambda: True),
+    ("listeners", dict),
+    ("listener_lock", threading.Lock),
+    ("settings_epoch", lambda: 0),
+    ("session_lock", threading.Lock),
+    ("renewing", lambda: None),
 )
 
 #: Which connection a routed classmethod acts on when called on the router: the current one (the
@@ -406,6 +418,20 @@ class SurrealDBConnectionManager:
     # opening, an open transaction and a change feed compare it with the one they started under.
     __generation: int = 0
 
+    # Connection resilience (v0.51.0). ``reconnect`` is ``True``, ``False`` or a ReconnectPolicy and ``renew_access`` a
+    # bool, as given to set_connection()/add_connection() (get_config() returns them). The settings epoch is bumped by
+    # set_connection() and by every setter (set_url … set_database), with or without their ``reconnect=True``: a
+    # client records the epoch it was built under, so one built under older settings is not kept across a reconnect.
+    # The listeners of on() and their lock, the lock of the stored session and the renewal in progress belong to the
+    # connection too.
+    __reconnect: bool | ReconnectPolicy = True
+    __renew_access: bool = True
+    __listeners: dict[str, list[Callable[..., Any]]] = {}
+    __listener_lock: threading.Lock = threading.Lock()
+    __settings_epoch: int = 0
+    __session_lock: threading.Lock = threading.Lock()
+    __renewing: Any = None
+
     #: The connection ``async with SurrealDBConnectionManager():`` resolved on entry, closed on exit.
     _target: "type[SurrealDBConnectionManager]"
 
@@ -490,6 +516,8 @@ class SurrealDBConnectionManager:
         password: str | None = None,
         namespace: str,
         database: str,
+        reconnect: bool | ReconnectPolicy = True,
+        renew_access: bool = True,
     ) -> None:
         """Register a named connection (v0.29.0) — the full SurrealDB-ORM's ``add_connection()``.
 
@@ -509,10 +537,13 @@ class SurrealDBConnectionManager:
         *user* and *password* required for a server URL (ws, wss, http, https) and optional on the embedded engine
         (kept and never sent, as with :meth:`set_connection`); a URL the installed SDK refuses raises at once.
 
+        *reconnect* and *renew_access* (v0.51.0) are the connection's resilience settings, as for
+        :meth:`set_connection`; they count as settings: another policy or renewal setting is a change.
+
         Registering a name again with the **same** settings changes nothing. With **different** settings (any of the
-        five), the ORM stops serving the old ones: the connection's stored session, stored-function signatures and
-        lost-identity state are forgotten (as :meth:`set_connection` does), and its server clients are retired on every
-        event loop — taken out of the cache, their cached query results dropped, their socket closed on their own loop —
+        five, or *reconnect*/*renew_access*), the ORM stops serving the old ones: the connection's stored session,
+        stored-function signatures and lost-identity state are forgotten (as :meth:`set_connection` does), and its
+        server clients are retired on every event loop — taken out of the cache, their cached query results dropped, their socket closed on their own loop —
         so the next call opens a client on the new settings. An embedded engine follows at the next call, as today (a
         new URL closes it and opens the new one; a new namespace or database resets its session).
 
@@ -536,11 +567,13 @@ class SurrealDBConnectionManager:
         :meth:`set_connection` keeps its v0.28 tolerance (its open clients keep serving until :meth:`close_connection`
         or :meth:`reconnect`).
 
-        :raises TypeError: *name* is not a ``str``.
+        :raises TypeError: *name* is not a ``str``; *reconnect* is not ``True``, ``False`` or a
+            :class:`ReconnectPolicy`; *renew_access* is not a ``bool``.
         :raises ValueError: *name* empty; *url*, *namespace* or *database* empty; a server URL without user/password.
         :raises SurrealDbConnectionError: the installed SDK refuses *url* (``rocksdb://`` …), never retryable.
         """
         name = check_name(name)
+        _check_resilience(reconnect, renew_access)
         if not url or not namespace or not database:
             raise ValueError(f"add_connection({name!r}) needs a non-empty url, namespace and database.")
         require_supported_url(url)
@@ -554,9 +587,20 @@ class SurrealDBConnectionManager:
             if connection is None:
                 connection = _REGISTRY[name] = _new_connection_class(name)
         # After the lock: never held while a method of a connection class runs.
-        if connection._settings() == (url, user, password, namespace, database):
+        if connection._settings() == (url, user, password, namespace, database) and connection._resilience_settings() == (
+            reconnect,
+            renew_access,
+        ):
             return
-        connection.set_connection(url=url, user=user, password=password, namespace=namespace, database=database)
+        connection.set_connection(
+            url=url,
+            user=user,
+            password=password,
+            namespace=namespace,
+            database=database,
+            reconnect=reconnect,
+            renew_access=renew_access,
+        )
         connection._retire_server_clients()
 
     @classmethod
@@ -614,7 +658,10 @@ class SurrealDBConnectionManager:
         if connection is None or (name == "default" and not connection.is_connection_set()):
             return None
         url, user, password, namespace, database = connection._settings()
-        return ConnectionConfig(cast(str, url), user, password, cast(str, namespace), cast(str, database))
+        reconnect, renew_access = connection._resilience_settings()
+        return ConnectionConfig(
+            cast(str, url), user, password, cast(str, namespace), cast(str, database), reconnect, renew_access
+        )
 
     @classmethod
     def list_connections(cls) -> list[str]:
@@ -672,6 +719,24 @@ class SurrealDBConnectionManager:
 
     @classmethod
     @_routed("current")
+    def _resilience_settings(cls) -> tuple[bool | ReconnectPolicy, bool]:
+        """The connection's ``(reconnect, renew_access)`` (v0.51.0), as given to :meth:`set_connection`."""
+        return (cls.__reconnect, cls.__renew_access)
+
+    @classmethod
+    @_routed("current")
+    def _settings_epoch(cls) -> int:
+        """The connection's settings epoch (v0.51.0): bumped by :meth:`set_connection` and every setter."""
+        return cls.__settings_epoch
+
+    @classmethod
+    @_routed("current")
+    def _bump_settings_epoch(cls) -> None:
+        """Mark the connection's settings as changed (v0.51.0): a client built before is not kept across a reconnect."""
+        cls.__settings_epoch += 1
+
+    @classmethod
+    @_routed("current")
     def _settings_generation(cls) -> int:
         """The connection's settings generation: the one way other modules read it (change feeds)."""
         return cls.__generation
@@ -717,6 +782,9 @@ class SurrealDBConnectionManager:
         password: str | None = None,
         namespace: str | None = None,
         database: str | None = None,
+        *,
+        reconnect: bool | ReconnectPolicy = True,
+        renew_access: bool = True,
     ) -> None:
         """
         Set the connection kwargs for the SurrealDB instance.
@@ -739,12 +807,23 @@ class SurrealDBConnectionManager:
         :param password: That user's password (server URLs; ignored by the embedded engine).
         :param namespace: The namespace to use.
         :param database: The database to use.
+        :param reconnect: How a WebSocket connection reconnects after its socket drops (v0.51.0): ``True`` for the
+            SDK's default policy (``ReconnectPolicy()``), a :class:`ReconnectPolicy` for that policy, ``False`` for the
+            v0.50.x behaviour (the ORM replaces a dropped client at the next call). Ignored for HTTP and embedded URLs.
+        :param renew_access: Whether the configured identity's access is renewed before it expires (v0.51.0).
+            Ignored on embedded URLs.
+        :raises TypeError: *reconnect* is not ``True``, ``False`` or a :class:`ReconnectPolicy`, or *renew_access* is
+            not a ``bool``; nothing is changed.
         """
+        _check_resilience(reconnect, renew_access)
         cls.__url = url
         cls.__user = user
         cls.__password = password
         cls.__namespace = namespace
         cls.__database = database
+        cls.__reconnect = reconnect
+        cls.__renew_access = renew_access
+        cls._bump_settings_epoch()
         # Re-pointing the manager is an explicit choice of identity: it ends a lost-identity state.
         cls.__lost_identity.clear()
         # Signatures belong to the server that declared them; re-pointing the connection must
@@ -779,6 +858,9 @@ class SurrealDBConnectionManager:
         cls.__password = None
         cls.__namespace = None
         cls.__database = None
+        cls.__reconnect = True
+        cls.__renew_access = True
+        cls._bump_settings_epoch()
         cls.clear_session()
         cls.clear_function_signature_cache()
         cls.__lost_identity.clear()
@@ -1724,6 +1806,8 @@ class SurrealDBConnectionManager:
                 embedded_owner=cls.__embedded_owner,
                 embedded_owner_user=cls.__embedded_owner_user,
                 embedded_owner_secret=cls.__embedded_owner_secret,
+                reconnect=cls.__reconnect,
+                renew_access=cls.__renew_access,
             )
             outer, outer_key = cls.__embedded_client, store_key(cls.__embedded_url)
             cls.__embedded_client = None  # first: see the fast path of _acquire_embedded_client()
@@ -1765,6 +1849,9 @@ class SurrealDBConnectionManager:
             cls.__password = state.password
             cls.__namespace = state.namespace
             cls.__database = state.database
+            cls.__reconnect = state.reconnect
+            cls.__renew_access = state.renew_access
+            cls._bump_settings_epoch()
             cls.__session_token = state.session_token
             cls.__refresh_token = state.refresh_token
             cls.__lost_identity.clear()
@@ -3347,9 +3434,11 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the URL when the others setting are not already set.")
 
         cls.__url = url
+        cls._bump_settings_epoch()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__url = None
+            cls._bump_settings_epoch()
             return False
 
         return True
@@ -3367,9 +3456,11 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the User when the others setting are not already set.")
 
         cls.__user = user
+        cls._bump_settings_epoch()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__user = None
+            cls._bump_settings_epoch()
             return False
 
         return True
@@ -3387,9 +3478,11 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the password when the others setting are not already set.")
 
         cls.__password = password
+        cls._bump_settings_epoch()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__password = None
+            cls._bump_settings_epoch()
             return False
 
         return True
@@ -3414,9 +3507,11 @@ class SurrealDBConnectionManager:
         if is_embedded_url(cls.__url) and namespace != cls.__namespace:
             cls.clear_session()
         cls.__namespace = namespace
+        cls._bump_settings_epoch()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__namespace = None
+            cls._bump_settings_epoch()
             return False
 
         return True
@@ -3438,9 +3533,11 @@ class SurrealDBConnectionManager:
         if is_embedded_url(cls.__url) and database != cls.__database:
             cls.clear_session()
         cls.__database = database
+        cls._bump_settings_epoch()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__database = None
+            cls._bump_settings_epoch()
             return False
 
         return True
@@ -3519,6 +3616,18 @@ class SurrealDBConnectionManager:
             return len(cls.__clients) > 0 or cls.__embedded_client is not None
 
         return cls.__clients.get(loop) is not None or cls.__embedded_client is not None
+
+
+def _check_resilience(reconnect: Any, renew_access: Any) -> None:
+    """Refuse a *reconnect* that is not ``True``, ``False`` or a :class:`ReconnectPolicy`, and a *renew_access* that
+    is not a ``bool`` (v0.51.0), before anything is stored.
+
+    :raises TypeError: either has another type.
+    """
+    if not isinstance(reconnect, bool | ReconnectPolicy):
+        raise TypeError(f"reconnect must be True, False or a ReconnectPolicy, not {type(reconnect).__name__}.")
+    if not isinstance(renew_access, bool):
+        raise TypeError(f"renew_access must be True or False, not {type(renew_access).__name__}.")
 
 
 def _new_connection_class(name: str) -> type[SurrealDBConnectionManager]:

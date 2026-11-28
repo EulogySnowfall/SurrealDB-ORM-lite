@@ -75,6 +75,7 @@ from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict, get_registered_models
 from .q import Q
 from .query_set import QuerySet
+from .resilience import ReconnectPolicy
 from .schema import Event, function_ddl
 from .search import Analyzer, Index, SearchHighlight, SearchOffsets, SearchScore
 from .signals import (
@@ -106,6 +107,7 @@ __all__ = [
     # Connection
     "SurrealDBConnectionManager",
     "ConnectionConfig",
+    "ReconnectPolicy",
     "Transaction",
     "BufferedTransaction",
     "InteractiveTransaction",

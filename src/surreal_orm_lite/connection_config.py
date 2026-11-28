@@ -2,6 +2,8 @@
 
 import dataclasses
 
+from .resilience import ReconnectPolicy
+
 __all__ = ["ConnectionConfig"]
 
 
@@ -14,6 +16,9 @@ class ConnectionConfig:
     ``None`` (the embedded engine needs neither) but are never left out. The password is excluded from ``repr``;
     ``dataclasses.asdict()`` includes it — do not log that.
 
+    v0.51.0 appends ``reconnect`` (``True``, ``False`` or a :class:`ReconnectPolicy`) and ``renew_access``, as given to
+    ``set_connection()``/``add_connection()``; both default to ``True``, so every earlier construction still works.
+
     ::
 
         ConnectionConfig("mem://", None, None, "test", "test")
@@ -25,3 +30,5 @@ class ConnectionConfig:
     password: str | None = dataclasses.field(repr=False)
     namespace: str
     database: str
+    reconnect: bool | ReconnectPolicy = True
+    renew_access: bool = True

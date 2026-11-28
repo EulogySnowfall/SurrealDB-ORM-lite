@@ -43,6 +43,9 @@ replaces the ORM's former ``CBOR_NULL`` constant. The read hook takes the SDK's 
 and its tag readers (``SDK_TAG_READERS``) from ``surrealdb.data._decoder``; both are ``None`` when a later SDK moves
 them, and the hook is then not installed. The embedded engine is an optional extra (``surreal-orm-lite[embedded]``):
 ``SdkAsyncEmbeddedConnection`` is ``None`` without it, and importing the ORM never needs it.
+
+v0.51.0 adds ``ReconnectOptions`` (a top-level export of SDK 3.0): the reconnect options of a WebSocket client, which
+``resilience.ReconnectPolicy`` builds.
 """
 
 import importlib
@@ -58,6 +61,7 @@ from surrealdb import (  # noqa: F401
     Null,
     NullType,
     PreciseDatetime,
+    ReconnectOptions,
     RecordID,
     ServerError,
     StringRecordId,
@@ -196,6 +200,8 @@ __all__ = [
     "HttpStatusError",
     "TransportTimeoutError",
     "UnsupportedEngineError",
+    # Connection resilience (v0.51.0): the WebSocket client's reconnect options (``resilience.ReconnectPolicy``)
+    "ReconnectOptions",
     "SdkDecoder",
     "SDK_TAG_READERS",
     "TAG_GEOMETRY_POINT",
