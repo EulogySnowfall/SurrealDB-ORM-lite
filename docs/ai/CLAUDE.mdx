@@ -195,7 +195,9 @@ and of the
   `FROM` the model's table.
 - **`update()` for a partial change**: it replaces the record and removes the fields the instance does not hold.
   Use `merge()`. `save()` never updates: it creates.
-- **Untyped filter values on rich fields**: `filter(trial__gte=timedelta(days=7))`, not `"7d"`.
+- **SurrealQL duration text on a `timedelta` field**: `filter(trial__gte="7d")` raises `ValueError`; pass
+  `timedelta(days=7)` (an ISO string such as `"P7D"` is read as one). A `str` on a `datetime`, `date`, `Decimal` or
+  `UUID` field is read as that type.
 - **A client shared between event loops or threads**: let the manager make one per loop.
 - **Full SurrealDB-ORM code**: this project is `surreal_orm_lite`, not `surreal_orm`. It has no custom SDK, no CBOR
   protocol and no connection pool; its factories have no `Sequence`, `LazyAttribute` or `SubFactory`; its `match`

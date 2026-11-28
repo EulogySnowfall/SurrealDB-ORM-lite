@@ -121,8 +121,9 @@ to page deterministically.
 - `inside`, `outside`, `intersects` (geometry values: see [section 25](/fields#25-geospatial-fields))
 - a subquery — `Subquery(qs)` or the queryset itself — as the value of `in`, `not_in`, `containsall`, `containsany` (all its values) or `exact`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains` (its first value): see [section 28](#28-subqueries-subquery)
 
-Filter values on rich fields must be typed: `filter(trial__gte=timedelta(days=7))`, not
-`"7d"`. Strings are not converted (see [section 24](/fields#24-rich-field-types)).
+A string given for a `datetime`, `date`, `timedelta`, `Decimal`, `UUID` or `Duration` field is read as that type
+before it is sent (see [String values on rich fields](#string-values-on-rich-fields)); other values on rich fields
+are sent as they are (see [section 24](/fields#24-rich-field-types)).
 
 ### Text lookups
 
@@ -306,6 +307,69 @@ instance given to a list lookup (`customer__in=alice`: wrap it in a list). A `"t
 is **not** converted on an ordinary column, which may legitimately hold such text, and a string
 never equals a record id: pass the instance or a `RecordID`. Edge endpoints are the exception
 (see [section 23](/relations#23-typed-edges-basesurrealedge)).
+
+### String values on rich fields
+
+```python
+from datetime import datetime, timedelta
+from uuid import UUID
+
+
+class Event(BaseSurrealModel):
+    id: str | None = None
+    at: datetime
+    ttl: timedelta | None = None
+    token: UUID | None = None
+
+
+recent = await Event.objects().filter(at__gte="2026-01-01T00:00:00Z").exec()  # as datetime(2026, 1, 1, tzinfo=UTC)
+long_lived = await Event.objects().filter(ttl__gt="PT1H").exec()                # as timedelta(hours=1)
+mine = await Event.objects().filter(token__in=["0190b6c4-7c2a-7000-8000-000000000001"]).exec()
+await Event.objects().filter(at__gte="soon").exec()
+# ValueError: The filter value 'soon' given for 'at' (lookup 'gte') is not a valid datetime: …
+```
+
+SurrealDB never casts a bound string to a column's type: it compares a string with a datetime, a duration or a uuid
+by type order, so `filter(at__gte="2026-01-01T00:00:00Z")` used to match rows by that order, without an error
+([#220](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/220)). A `str` given to `exact`, `gt`, `gte`,
+`lt` or `lte`, and each `str` item of `in` and `not_in`, on a top-level field declared `datetime`, `date`,
+`timedelta`, `Decimal`, `UUID` or `Duration` (also `X | None`, `Annotated[X, …]`, and Pydantic's `AwareDatetime`,
+`NaiveDatetime`, `PastDatetime`, `FutureDatetime`, `PastDate` and `FutureDate`, read as their base type) is now read
+as that type before it is bound, and sent as the native value. The filter finds the rows the native value finds, on
+every SurrealDB line, through keyword filters, `Q` objects, the lookups of `get_or_create()` and `update_or_create()`,
+the `WHERE` of `bulk_update()` and `bulk_delete()`, subqueries and live queries. An `exact` string criterion of
+`get_or_create()` or `update_or_create()` is also written as that type: `update_or_create(at="2025-06-01T00:00:00Z",
+defaults={...})` keeps the `datetime` of the row it found, and creates one with a `datetime`, so the next identical
+call finds that row again.
+
+The string is read as Pydantic reads the bare type, without the field's own constraints (nor the check of a marker
+such as `AwareDatetime`): ISO 8601 text or a Unix
+time for a `datetime` (to the microsecond; a naive one is UTC, as a naive `datetime` is), an ISO date for a `date`,
+ISO 8601 (`"PT1H"`) or `"HH:MM:SS"` for a `timedelta`, SurrealQL duration text (`"1h30m"`) for a `Duration`, a finite
+number for a `Decimal` and a hexadecimal uuid for a `UUID`. A string the type cannot read raises `ValueError` naming
+the field and the lookup, before any request: `"1h"` on a `timedelta` field (pass `timedelta(hours=1)`, or declare
+the field `Duration`), `"NaN"` on a `Decimal` field.
+
+Everything else is sent as before: a `str` starting with `$` (data, see
+[String filter values and `Var()`](#string-filter-values-and-var)), every value that is not a `str` (a `float` on a
+`Decimal` field stays a float), `isnull`, the `id` column, dotted paths (`at.year`), the text lookups, `contains`,
+`containsall` and `containsany`, the bounds of a `Range` given to `in`, and fields of any other type, among them
+`list[datetime]`, `datetime | str` and `Range[datetime]`: pass native values there. A `Q` compiled on its own
+(`Q(...).to_sql()`) knows no model and binds its strings as they are.
+
+<div>
+
+**Upgrading: rows stored as strings.** Up to v0.22.x <code>merge()</code> and <code>bulk\_update()</code> stored keyword strings as strings,
+even in typed columns ([#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)), and a raw query
+still can. Such a row matched a string lookup by type order and no longer does (a native value never matched it).
+Convert each such column once, with the cast of its type (<code>&lt;datetime&gt;</code>, <code>&lt;duration&gt;</code>, <code>&lt;decimal&gt;</code> or <code>&lt;uuid&gt;</code>; a
+<code>date</code> column is a <code>&lt;datetime&gt;</code>), measured on SurrealDB 2.7.0, 3.3.5 and 4.0.1:
+
+</div>
+
+```surql
+UPDATE (SELECT VALUE id FROM event WHERE at.is_string()) SET at = <datetime> at;
+```
 
 ### Fields ending in an underscore
 

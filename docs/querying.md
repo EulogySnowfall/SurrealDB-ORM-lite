@@ -327,12 +327,17 @@ SurrealDB never casts a bound string to a column's type: it compares a string wi
 by type order, so `filter(at__gte="2026-01-01T00:00:00Z")` used to match rows by that order, without an error
 ([#220](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/220)). A `str` given to `exact`, `gt`, `gte`,
 `lt` or `lte`, and each `str` item of `in` and `not_in`, on a top-level field declared `datetime`, `date`,
-`timedelta`, `Decimal`, `UUID` or `Duration` (also `X | None` and `Annotated[X, …]`) is now read as that type before
-it is bound, and sent as the native value. The filter finds the rows the native value finds, on every SurrealDB line,
-through keyword filters, `Q` objects, the lookups of `get_or_create()` and `update_or_create()`, the `WHERE` of
-`bulk_update()` and `bulk_delete()`, subqueries and live queries.
+`timedelta`, `Decimal`, `UUID` or `Duration` (also `X | None`, `Annotated[X, …]`, and Pydantic's `AwareDatetime`,
+`NaiveDatetime`, `PastDatetime`, `FutureDatetime`, `PastDate` and `FutureDate`, read as their base type) is now read
+as that type before it is bound, and sent as the native value. The filter finds the rows the native value finds, on
+every SurrealDB line, through keyword filters, `Q` objects, the lookups of `get_or_create()` and `update_or_create()`,
+the `WHERE` of `bulk_update()` and `bulk_delete()`, subqueries and live queries. An `exact` string criterion of
+`get_or_create()` or `update_or_create()` is also written as that type: `update_or_create(at="2025-06-01T00:00:00Z",
+defaults={...})` keeps the `datetime` of the row it found, and creates one with a `datetime`, so the next identical
+call finds that row again.
 
-The string is read as Pydantic reads the bare type, without the field's own constraints: ISO 8601 text or a Unix
+The string is read as Pydantic reads the bare type, without the field's own constraints (nor the check of a marker
+such as `AwareDatetime`): ISO 8601 text or a Unix
 time for a `datetime` (to the microsecond; a naive one is UTC, as a naive `datetime` is), an ISO date for a `date`,
 ISO 8601 (`"PT1H"`) or `"HH:MM:SS"` for a `timedelta`, SurrealQL duration text (`"1h30m"`) for a `Duration`, a finite
 number for a `Decimal` and a hexadecimal uuid for a `UUID`. A string the type cannot read raises `ValueError` naming

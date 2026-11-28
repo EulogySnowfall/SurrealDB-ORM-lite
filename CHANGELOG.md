@@ -14,10 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SurrealDB never casts a bound string to a column's type: it compared the string by type order, so
   `filter(at__gte="2026-01-01T00:00:00Z")`, a duration string or a uuid string matched the wrong rows, or none,
   without an error. A `str` given to `exact`, `gt`, `gte`, `lt` or `lte`, and each `str` item of `in`/`not_in`, on a
-  top-level field of one of these types (also `X | None` and `Annotated[X, …]`) now finds the rows the native value
+  top-level field of one of these types (also `X | None`, `Annotated[X, …]` and Pydantic's `AwareDatetime`,
+  `NaiveDatetime`, `PastDatetime`, `FutureDatetime`, `PastDate` and `FutureDate`) now finds the rows the native value
   finds, on SurrealDB 2.x, 3.x and 4.x, through `filter()`, `Q`, the lookups of `get_or_create()` and
-  `update_or_create()`, the `WHERE` of `bulk_update()` and `bulk_delete()`, subqueries and `live()`. A string the
-  type cannot read raises `ValueError` naming the field and the lookup, before any request.
+  `update_or_create()`, the `WHERE` of `bulk_update()` and `bulk_delete()`, subqueries and `live()`. An `exact` string
+  criterion of `get_or_create()` and `update_or_create()` is written as the field's type too, so `update_or_create()`
+  keeps the native value of the row it found and the next identical call finds it again. A string the type cannot
+  read raises `ValueError` naming the field and the lookup, before any request.
 
 ### Notes
 
