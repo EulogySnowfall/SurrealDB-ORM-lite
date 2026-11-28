@@ -28,6 +28,8 @@ from ._sdk import (
     Features,
     NotFoundError,
     ServerError,
+    TransportError,
+    UnexpectedResponseError,
     UnsupportedEngineError,
     UnsupportedFeatureError,
     UnsupportedVersionError,
@@ -2227,6 +2229,13 @@ class SurrealDBConnectionManager:
             request: dropping it logs the user out for good, with no error raised at the call
             site to warn you.
 
+        On a server URL (v0.51.0), the credentials are exchanged on a short-lived connection of
+        their own (one more connection per call), then this event loop's shared connection is
+        authenticated with the access token only: the refresh token is returned (and stored with
+        *store*), never held by a shared connection. When the exchange succeeded but the shared
+        connection could not be authenticated, the error raised carries the tokens obtained on
+        ``error.tokens``; nothing is stored and the connection's identity is unchanged.
+
         :param store: whether the resulting token becomes the identity replayed on reconnect.
             Pass ``False`` to mint a token for someone else — issuing a JWT for a web client —
             without changing what this process re-authenticates as. The connection's *current*
@@ -2235,7 +2244,10 @@ class SurrealDBConnectionManager:
             method declares ``WITH REFRESH`` (always ``None`` on 2.6.x).
         :raises ValueError: for an invalid credential combination — raised **before** any
             request is issued.
-        :raises SurrealDbAuthenticationError: if the server refuses the credentials.
+        :raises SurrealDbAuthenticationError: if the server refuses the credentials, or (with
+            ``error.tokens`` set) the new access token on the shared connection.
+        :raises SurrealDbConnectionError: if a connection cannot be opened or fails; with
+            ``error.tokens`` set when the exchange had succeeded.
         """
         payload = _encoding.encode(
             build_auth_payload(
@@ -2251,6 +2263,10 @@ class SurrealDBConnectionManager:
             )
         )
         async with cls._identity_client() as (client, embedded):
+            if not embedded:
+                return await cls._signin_exchange(
+                    client, "signin", lambda short_lived_client: short_lived_client.signin(payload), store=store
+                )
 
             async def exchange() -> Any:
                 try:
@@ -2258,8 +2274,8 @@ class SurrealDBConnectionManager:
                 except Exception as exc:
                     raise wrap_auth_error(exc, "signin") from exc
 
-            tokens = await (cls._embedded_exchange(client, exchange) if embedded else exchange())
-            return cls._adopt_tokens(tokens, store=store, operation="signin", client=client, embedded=embedded)
+            tokens = await cls._embedded_exchange(client, exchange)
+            return cls._adopt_tokens(tokens, store=store, operation="signin", client=client, embedded=True)
 
     @classmethod
     @_cache.invalidates("all")
@@ -2290,8 +2306,16 @@ class SurrealDBConnectionManager:
         raises a :class:`ValueError` explaining what is missing, rather than a bare
         ``TypeError``. Both are required in practice.
 
+        On a server URL (v0.51.0), the signup runs on a short-lived connection as :meth:`signin`
+        does. When the shared connection could not be authenticated afterwards, the record exists
+        and the error carries its tokens on ``error.tokens``: resume with
+        ``authenticate(error.tokens.access)``, not with another ``signup()``.
+
         :raises ValueError: if ``access`` or ``variables`` is missing — before any request.
-        :raises SurrealDbAuthenticationError: if the server refuses the signup.
+        :raises SurrealDbAuthenticationError: if the server refuses the signup, or (with
+            ``error.tokens`` set) the new access token on the shared connection.
+        :raises SurrealDbConnectionError: if a connection cannot be opened or fails; with
+            ``error.tokens`` set when the signup had succeeded.
         """
         payload = _encoding.encode(
             build_auth_payload(
@@ -2304,6 +2328,10 @@ class SurrealDBConnectionManager:
             )
         )
         async with cls._identity_client() as (client, embedded):
+            if not embedded:
+                return await cls._signin_exchange(
+                    client, "signup", lambda short_lived_client: short_lived_client.signup(payload), store=store
+                )
 
             async def exchange() -> Any:
                 try:
@@ -2311,27 +2339,64 @@ class SurrealDBConnectionManager:
                 except Exception as exc:
                     raise wrap_auth_error(exc, "signup") from exc
 
-            tokens = await (cls._embedded_exchange(client, exchange) if embedded else exchange())
-            return cls._adopt_tokens(tokens, store=store, operation="signup", client=client, embedded=embedded)
+            tokens = await cls._embedded_exchange(client, exchange)
+            return cls._adopt_tokens(tokens, store=store, operation="signup", client=client, embedded=True)
+
+    @classmethod
+    @_routed("current")
+    async def _signin_exchange(
+        cls, client: Any, operation: str, exchange: Callable[[Any], Awaitable[Any]], *, store: bool
+    ) -> AuthTokens:
+        """The server path of :meth:`signin` and :meth:`signup` (v0.51.0): exchange the credentials on a short-lived
+        anonymous client of the same URL (:meth:`ephemeral_client`) with *exchange* (the SDK call, given that client),
+        then put the identity on *client*, this loop's shared client, with its access token only.
+
+        So no client the manager shares ever holds a refresh token: the refresh token goes back to the caller (and to
+        the stored session with *store*), never to the shared client, which therefore never renews or spends it.
+
+        When the exchange succeeded but *client* could not take the access token, the error carries the tokens
+        obtained (``error.tokens``), nothing is stored and *client*'s identity is unchanged (:func:`_not_adopted`).
+
+        :raises SurrealDbConnectionError: the short-lived client could not be opened (``tokens`` is ``None``), or
+            *client*'s connection failed after the exchange (``tokens`` set).
+        :raises SurrealDbAuthenticationError: the server refused the credentials (``tokens`` is ``None``), or
+            refused the new access token on *client* (``tokens`` set).
+        """
+        async with cls.ephemeral_client() as short_lived_client:
+            try:
+                answer = await exchange(short_lived_client)
+            except Exception as exc:
+                raise wrap_auth_error(exc, operation) from exc
+        tokens = cls._tokens_of(answer, operation)
+        try:
+            await client.authenticate(tokens.access)
+        except Exception as exc:
+            raise _not_adopted(exc, client, operation, tokens) from exc
+        return cls._adopt_tokens(tokens, store=store, operation=operation, client=client, embedded=False)
+
+    @staticmethod
+    def _tokens_of(tokens: Any, operation: str) -> AuthTokens:
+        """The SDK's ``Tokens`` as :class:`AuthTokens`.
+
+        The SDK types ``access`` as optional; the ORM does not hand back a token-shaped object with no token in it, so
+        an empty one is an authentication failure rather than a surprise ``None`` three call frames later.
+        """
+        access = getattr(tokens, "access", None)
+        if not access:
+            raise SurrealDbAuthenticationError(f"The server returned no access token for {operation}.")
+        return AuthTokens(access=access, refresh=getattr(tokens, "refresh", None))
 
     @classmethod
     @_routed("current")
     def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str, client: Any, embedded: bool) -> AuthTokens:
-        """Convert the SDK's ``Tokens`` to :class:`AuthTokens`, optionally remembering it.
-
-        The SDK types ``access`` as optional; the ORM does not hand back a token-shaped object
-        with no token in it, so an empty one is an authentication failure rather than a
-        surprise ``None`` three call frames later.
+        """Record *tokens* (the SDK's ``Tokens`` or :class:`AuthTokens`) as *client*'s identity, optionally
+        remembering them as the stored session (:meth:`_tokens_of` refuses an empty access token).
 
         :param embedded: whether *client* is the embedded engine's shared session. An identity set
             there leaves this loop's lost-identity state as it is (:meth:`_identity_restored` is a
             server matter), as :meth:`close_connection` on an embedded URL does.
         """
-        access = getattr(tokens, "access", None)
-        if not access:
-            raise SurrealDbAuthenticationError(f"The server returned no access token for {operation}.")
-
-        adopted = AuthTokens(access=access, refresh=getattr(tokens, "refresh", None))
+        adopted = cls._tokens_of(tokens, operation)
         if store:
             cls._set_stored(adopted)
         cls._stamp_identity(client, replayable=store, kind="stored" if store else "unstored")
@@ -3852,6 +3917,28 @@ def _owner_error(text: str) -> SurrealDbConnectionError:
     raises it ``from None`` outside any ``except`` block, so it has neither ``__cause__`` nor ``__context__``."""
     error = SurrealDbConnectionError(text)
     error.retryable = False
+    return error
+
+
+def _not_adopted(
+    exc: Exception, client: Any, operation: str, tokens: AuthTokens
+) -> SurrealDbAuthenticationError | SurrealDbConnectionError:
+    """The error of a ``signin()``/``signup()`` whose exchange obtained *tokens* but whose shared *client* could not
+    take the access token (*exc*): a ``SurrealDbConnectionError`` when the connection was the problem (its
+    ``retryable`` and ``may_have_run`` as *exc*'s), otherwise a ``SurrealDbAuthenticationError``. Either carries
+    *tokens* on ``error.tokens``, never in its message: the caller can still use them, and for a ``signup()`` the
+    record exists already."""
+    error: SurrealDbAuthenticationError | SurrealDbConnectionError
+    if isinstance(exc, SurrealDbConnectionError):
+        error = SurrealDbConnectionError(f"{operation} succeeded but the connection could not be authenticated: {exc}")
+        error.retryable, error.may_have_run = exc.retryable, exc.may_have_run
+    elif isinstance(exc, TransportError | UnexpectedResponseError):
+        error = _client.connection_error(exc)
+    elif is_dead(client):
+        error = SurrealDbConnectionError(f"{operation} succeeded but the connection was lost: {exc}")
+    else:
+        error = wrap_auth_error(exc, f"{operation} (authenticating the connection with the new token)")
+    error.tokens = tokens
     return error
 
 

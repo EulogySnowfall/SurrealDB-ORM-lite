@@ -21,6 +21,7 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -39,7 +40,8 @@ from surreal_orm_lite import (
 from surreal_orm_lite.auth import AuthTokens
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
 from surreal_orm_lite.testing import embedded_database
-from tests.conftest import default_connection_class
+from tests._proxy import CuttableProxy
+from tests.conftest import default_connection_class, orm_client
 from tests.test_embedded import _embedded_engine_available
 
 #: The prefix of the manager's name-mangled private attributes.
@@ -978,3 +980,321 @@ class TestMayHaveRun:
         error = _client.connection_error(_sdk.ConnectionUnavailableError("the connection is gone"))
         assert error.may_have_run is False
         assert error.retryable is True
+
+
+# ==================== Sign-in exchange: no shared client holds a refresh token (I3) ====================
+
+_EXCHANGED = AuthTokens("exchanged-access", "exchanged-refresh")
+
+
+class _FakeExchanger:
+    """The short-lived client a ``signin()``/``signup()`` exchanges the credentials on: records the calls, answers
+    ``answer`` (SDK tokens) or raises it."""
+
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, Any]] = []
+
+    async def _answer(self, method: str, payload: Any) -> Any:
+        self.calls.append((method, payload))
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+    async def signin(self, payload: Any) -> Any:
+        return await self._answer("signin", payload)
+
+    async def signup(self, payload: Any) -> Any:
+        return await self._answer("signup", payload)
+
+
+class _FakeShared:
+    """This loop's shared client: only takes a token (it has no ``signin``/``signup``, so an exchange there fails),
+    raising *failure* when given."""
+
+    def __init__(self, failure: BaseException | None = None) -> None:
+        self.failure = failure
+        self.tokens: list[str] = []
+
+    async def authenticate(self, token: str) -> None:
+        self.tokens.append(token)
+        if self.failure is not None:
+            raise self.failure
+
+
+@pytest.fixture
+def exchange(monkeypatch: pytest.MonkeyPatch, unset_default: None, no_session: None) -> Any:
+    """The default connection set on an unreachable URL, with *shared* as this loop's client and *exchanger* as the
+    short-lived client; returns the installer."""
+    default = default_connection_class()
+    SurrealDBConnectionManager.set_connection(_UNREACHABLE, "root", "root", "ns", "db")
+
+    def install(shared: _FakeShared, exchanger: _FakeExchanger) -> None:
+        @contextlib.asynccontextmanager
+        async def identity_client(cls: Any) -> AsyncIterator[tuple[Any, bool]]:
+            yield shared, False
+
+        @contextlib.asynccontextmanager
+        async def ephemeral(cls: Any) -> AsyncIterator[Any]:
+            yield exchanger
+
+        monkeypatch.setattr(default, "_identity_client", classmethod(identity_client))
+        monkeypatch.setattr(default, "ephemeral_client", classmethod(ephemeral))
+
+    return install
+
+
+async def _sign(operation: str, *, store: bool) -> AuthTokens:
+    if operation == "signin":
+        return await SurrealDBConnectionManager.signin(access="acct", variables={"email": "e"}, store=store)
+    return await SurrealDBConnectionManager.signup(access="acct", variables={"email": "e"}, store=store)
+
+
+@pytest.mark.parametrize("store", [True, False], ids=["store", "no-store"])
+@pytest.mark.parametrize("operation", ["signin", "signup"])
+class TestSigninExchange:
+    """On a server URL the credentials are exchanged on a short-lived client, then the shared client is given the
+    access token only; when that second step fails, the error carries the tokens obtained and nothing changes."""
+
+    async def test_the_shared_client_only_gets_the_access_token(self, exchange: Any, operation: str, store: bool) -> None:
+        shared, exchanger = _FakeShared(), _FakeExchanger(_sdk.Tokens(_EXCHANGED.access, _EXCHANGED.refresh))
+        exchange(shared, exchanger)
+        events = _auth_events()
+
+        tokens = await _sign(operation, store=store)
+
+        assert tokens == _EXCHANGED
+        assert [method for method, _ in exchanger.calls] == [operation]
+        assert shared.tokens == [_EXCHANGED.access]
+        assert _stored() == (_EXCHANGED if store else None)
+        assert events == ([_EXCHANGED] if store else [])
+        stamp = SurrealDBConnectionManager._identity_of(shared)
+        assert stamp is not None and stamp.kind == ("stored" if store else "unstored")
+
+    @pytest.mark.parametrize(
+        ("failure", "raised", "retryable"),
+        [
+            (_sdk.ServerError("NotAllowed", "the token is refused"), SurrealDbAuthenticationError, None),
+            (_sdk.ConnectionUnavailableError("the connection is gone"), SurrealDbConnectionError, True),
+            (_sdk.TransportTimeoutError("no answer in time"), SurrealDbConnectionError, False),
+            (SurrealDbConnectionError("this client was retired"), SurrealDbConnectionError, True),
+        ],
+        ids=["refused", "unavailable", "timeout", "orm-refusal"],
+    )
+    async def test_a_failed_second_step_carries_the_tokens_and_changes_nothing(
+        self,
+        exchange: Any,
+        operation: str,
+        store: bool,
+        failure: BaseException,
+        raised: type[Exception],
+        retryable: bool | None,
+    ) -> None:
+        shared, exchanger = _FakeShared(failure), _FakeExchanger(_sdk.Tokens(_EXCHANGED.access, _EXCHANGED.refresh))
+        exchange(shared, exchanger)
+        SurrealDBConnectionManager._stamp_identity(shared, replayable=True, kind="configured")
+        before = SurrealDBConnectionManager._identity_of(shared)
+        events = _auth_events()
+
+        with pytest.raises(raised) as caught:
+            await _sign(operation, store=store)
+
+        assert type(caught.value) is raised
+        assert caught.value.tokens == _EXCHANGED  # type: ignore[attr-defined]
+        assert _EXCHANGED.access not in str(caught.value) and _EXCHANGED.refresh not in str(caught.value)
+        assert caught.value.__cause__ is failure
+        if retryable is not None:
+            assert caught.value.retryable is retryable  # type: ignore[attr-defined]
+            assert caught.value.may_have_run is False  # type: ignore[attr-defined]
+        assert _stored() is None
+        assert events == []
+        assert SurrealDBConnectionManager._identity_of(shared) is before
+
+    async def test_an_orm_refusal_keeps_its_flags(self, exchange: Any, operation: str, store: bool) -> None:
+        refusal = SurrealDbConnectionError("this client was closed")
+        refusal.retryable, refusal.may_have_run = False, True
+        exchange(_FakeShared(refusal), _FakeExchanger(_sdk.Tokens(_EXCHANGED.access, None)))
+
+        with pytest.raises(SurrealDbConnectionError) as caught:
+            await _sign(operation, store=store)
+
+        assert (caught.value.retryable, caught.value.may_have_run) == (False, True)
+        assert caught.value.tokens == AuthTokens(_EXCHANGED.access, None)
+
+    async def test_a_refused_exchange_never_reaches_the_shared_client(self, exchange: Any, operation: str, store: bool) -> None:
+        shared = _FakeShared()
+        exchange(shared, _FakeExchanger(_sdk.ServerError("NotAllowed", "bad credentials")))
+
+        with pytest.raises(SurrealDbAuthenticationError) as caught:
+            await _sign(operation, store=store)
+
+        assert caught.value.tokens is None
+        assert shared.tokens == []
+        assert _stored() is None
+
+    async def test_an_exchange_without_an_access_token_is_refused(self, exchange: Any, operation: str, store: bool) -> None:
+        shared = _FakeShared()
+        exchange(shared, _FakeExchanger(_sdk.Tokens(None, None)))
+
+        with pytest.raises(SurrealDbAuthenticationError, match="no access token"):
+            await _sign(operation, store=store)
+
+        assert shared.tokens == []
+
+
+_EXCHANGE_TABLE = "res_exchange_user"
+_EXCHANGE_ACCESS = "res_exchange_acct"
+_EXCHANGE_USER = "res_exchange_viewer"
+_EXCHANGE_PASSWORD = "s3cret-passphrase"
+_EXCHANGE_SIGNUP = (
+    f"SIGNUP ( CREATE {_EXCHANGE_TABLE} SET email = $email, pass = crypto::argon2::generate($pass) ) "
+    f"SIGNIN ( SELECT * FROM {_EXCHANGE_TABLE} WHERE email = $email AND crypto::argon2::compare(pass, $pass) )"
+)
+
+
+async def _define_exchange_access(client: Any) -> bool:
+    """Define the record access method of these tests, ``WITH REFRESH`` (1 h tokens) where the server parses it;
+    whether it issues refresh tokens (SurrealDB 3.x/4.x; 2.x does not)."""
+    await _client.query(client, f"REMOVE ACCESS IF EXISTS {_EXCHANGE_ACCESS} ON DATABASE;")
+    head = f"DEFINE ACCESS {_EXCHANGE_ACCESS} ON DATABASE TYPE RECORD {_EXCHANGE_SIGNUP}"
+    try:
+        await _client.query(client, f"{head} WITH REFRESH DURATION FOR TOKEN 1h, FOR SESSION 12h, FOR GRANT 30d;")
+        return True
+    except Exception as exc:
+        # Only a parse failure means the server has no refresh tokens: any other error is a real failure.
+        message = str(exc).lower()
+        if "bearer" not in message and "parse error" not in message:
+            raise
+    await _client.query(client, f"{head} DURATION FOR TOKEN 1h, FOR SESSION 12h;")
+    return False
+
+
+@contextlib.asynccontextmanager
+async def _exchange_server(scheme: str) -> AsyncIterator[tuple[CuttableProxy, Any, bool]]:
+    """The default connection, as root, through a proxy: the proxy, this loop's shared client and whether the server
+    issues refresh tokens. The access method, its table and a database viewer are removed afterwards."""
+    async with CuttableProxy() as proxy:
+        SurrealDBConnectionManager.set_connection(
+            url=proxy.url(scheme), user="root", password="root", namespace="ns", database="db"
+        )
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            for statement in (
+                f"REMOVE TABLE IF EXISTS {_EXCHANGE_TABLE};",
+                f"DEFINE TABLE {_EXCHANGE_TABLE} SCHEMALESS PERMISSIONS FULL;",
+                f"REMOVE USER IF EXISTS {_EXCHANGE_USER} ON DATABASE;",
+                f"DEFINE USER {_EXCHANGE_USER} ON DATABASE PASSWORD '{_EXCHANGE_PASSWORD}' ROLES VIEWER;",
+            ):
+                await _client.query(client, statement)
+            yield proxy, client, await _define_exchange_access(client)
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+            async with orm_client(_EXCHANGE_TABLE) as root:
+                for statement in (
+                    f"REMOVE ACCESS IF EXISTS {_EXCHANGE_ACCESS} ON DATABASE;",
+                    f"REMOVE USER IF EXISTS {_EXCHANGE_USER} ON DATABASE;",
+                ):
+                    with contextlib.suppress(Exception):
+                        await _client.query(root, statement)
+            await SurrealDBConnectionManager.unset_connection()
+
+
+def _sdk_refresh_token(client: Any) -> str | None:
+    """The refresh token the SDK client holds for its session: test-only private reads, pinned by
+    ``tests/test_identity_sdk3.py::TestSdkTokenLayout``."""
+    if isinstance(client, _sdk.SdkAsyncHttpConnection):
+        return client._refresh_token  # type: ignore[no-any-return]
+    return client._registry.root.refresh  # type: ignore[no-any-return]
+
+
+def _clients_built(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The URLs of the SDK clients the manager builds from now on, in order."""
+    built: list[str] = []
+    build = connection_manager._new_sdk_client
+
+    def counting(url: str, *, embedded: bool) -> Any:
+        built.append(url)
+        return build(url, embedded=embedded)
+
+    monkeypatch.setattr(connection_manager, "_new_sdk_client", counting)
+    return built
+
+
+def _identity_calls(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
+    """The ``signin``/``signup``/``authenticate`` calls made on *client* from now on, in order."""
+    calls: list[str] = []
+    for name in ("signin", "signup", "authenticate"):
+        method = getattr(client, name)
+
+        def recording(*args: Any, _name: str = name, _method: Any = method, **kwargs: Any) -> Any:
+            calls.append(_name)
+            return _method(*args, **kwargs)
+
+        monkeypatch.setattr(client, name, recording)
+    return calls
+
+
+async def _exchange(shape: str, email: str, *, store: bool) -> AuthTokens:
+    manager = SurrealDBConnectionManager
+    record = {"email": email, "pass": _EXCHANGE_PASSWORD}
+    if shape == "signup":
+        return await manager.signup(access=_EXCHANGE_ACCESS, variables=record, store=store)
+    if shape == "record":
+        return await manager.signin(access=_EXCHANGE_ACCESS, variables=record, store=store)
+    return await manager.signin(
+        username=_EXCHANGE_USER, password=_EXCHANGE_PASSWORD, namespace="ns", database="db", store=store
+    )
+
+
+@pytest.mark.usefixtures("no_session")
+@pytest.mark.parametrize("store", [True, False], ids=["store", "no-store"])
+@pytest.mark.parametrize("shape", ["signup", "record", "system"])
+@pytest.mark.parametrize("scheme", ["ws", "http"])
+class TestSigninExchangeE2E:
+    """AC-8: a ``signin()``/``signup()`` on a server URL runs on a connection of its own; the shared client takes the
+    access token only, so its SDK holds no refresh token and renews nothing; the refresh token returned works once."""
+
+    async def test_the_shared_client_holds_no_refresh_token(
+        self, monkeypatch: pytest.MonkeyPatch, scheme: str, shape: str, store: bool
+    ) -> None:
+        async with _exchange_server(scheme) as (proxy, client, refreshable):
+            email = f"{uuid4().hex}@example.test"
+            if shape == "record":
+                await SurrealDBConnectionManager.signup(
+                    access=_EXCHANGE_ACCESS, variables={"email": email, "pass": _EXCHANGE_PASSWORD}, store=False
+                )
+                await SurrealDBConnectionManager.signin(username="root", password="root", store=False)
+            events = _auth_events()
+            connections = proxy.connections
+            shared_log = len(proxy.log[0].requests)
+            built = _clients_built(monkeypatch)
+            on_shared = _identity_calls(monkeypatch, client)
+
+            tokens = await _exchange(shape, email, store=store)
+
+            assert await SurrealDBConnectionManager.get_client() is client
+            assert built == [proxy.url(scheme)], "the exchange runs on one client of its own"
+            assert on_shared == ["authenticate"]
+            if scheme == "ws":
+                assert proxy.connections == connections + 1
+                assert proxy.log[-1].methods()[-1] == ("signup" if shape == "signup" else "signin")
+                sent = proxy.log[0].methods()[shared_log:]
+                assert "authenticate" in sent and not {"signin", "signup"} & set(sent)
+                assert client._renewal is None
+            assert _sdk_refresh_token(client) is None
+            if shape == "system":
+                assert tokens.refresh is None
+                assert await _client.query(client, "RETURN $token.ID;") == _EXCHANGE_USER
+            else:
+                assert (tokens.refresh is not None) is refreshable
+                auth = await _client.query(client, "RETURN $auth.id;")
+                assert isinstance(auth, _sdk.RecordID) and auth.table_name == _EXCHANGE_TABLE
+            assert _stored() == (tokens if store else None)
+            assert events == ([tokens] if store else [])
+
+            if tokens.refresh is not None:
+                renewed = await SurrealDBConnectionManager.signin(access=_EXCHANGE_ACCESS, refresh=tokens.refresh)
+                assert renewed.refresh is not None and renewed.refresh != tokens.refresh
+                assert _sdk_refresh_token(client) is None
+                with pytest.raises(SurrealDbAuthenticationError):
+                    await SurrealDBConnectionManager.signin(access=_EXCHANGE_ACCESS, refresh=tokens.refresh)

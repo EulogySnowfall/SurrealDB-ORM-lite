@@ -26,6 +26,7 @@ import inspect
 import json
 import os
 import textwrap
+import time
 from typing import Any
 
 import pytest
@@ -106,6 +107,76 @@ class TestSdkLayout:
         assert not reached & {"connect", "_connect_locked", "_open_socket", "_reopen"}, (
             "SDK close() now reconnects: retire() must close before installing the connect override"
         )
+
+
+#: What a pin of the SDK's token handling says when it fails (v0.51.0).
+_TOKEN_HANDLING_CHANGED = "SDK 3.x changed the reconnect or token handling: re-measure before upgrading"
+
+
+def _expiring_jwt(seconds: float = 3600.0) -> str:
+    """An unsigned JWT whose ``exp`` is *seconds* from now: what the SDK reads to time a renewal."""
+
+    def part(value: dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    now = int(time.time())
+    return f"{part({'alg': 'HS512', 'typ': 'JWT'})}.{part({'iat': now, 'exp': now + int(seconds)})}.signature"
+
+
+def _ws_client(*, renew_access: bool) -> Any:
+    """A real SDK WebSocket client, never connected, on a port nothing listens on."""
+    return AsyncSurreal("ws://127.0.0.1:9/rpc", reconnect=False, streaming=False, renew_access=renew_access, timeout=None)
+
+
+class TestSdkTokenLayout:
+    """What the sign-in exchange (v0.51.0) relies on in the SDK: a token given to a client on its own leaves it no
+    refresh token, and a client with none on a session the caller chose arms no renewal."""
+
+    def test_a_websocket_token_given_alone_drops_the_refresh_token_of_another(self) -> None:
+        client = _ws_client(renew_access=False)
+        root = client._registry.root
+        root.access, root.refresh = "earlier-access", "earlier-refresh"
+
+        client._note_authenticated(None, "new-access")
+
+        assert (root.access, root.refresh) == ("new-access", None), _TOKEN_HANDLING_CHANGED
+
+    async def test_an_http_token_given_alone_drops_the_refresh_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = AsyncSurreal("http://127.0.0.1:9", reconnect=False, streaming=False, renew_access=False, timeout=1.0)
+        sent: list[Any] = []
+
+        async def _send(message: Any, operation: str, **kwargs: Any) -> dict[str, Any]:
+            sent.append(message)
+            return {"result": None}
+
+        monkeypatch.setattr(client, "_send", _send)
+        client.token, client._refresh_token = "earlier-access", "earlier-refresh"
+
+        await client.authenticate("new-access")
+
+        assert len(sent) == 1, _TOKEN_HANDLING_CHANGED
+        assert (client.token, client._refresh_token) == ("new-access", None), _TOKEN_HANDLING_CHANGED
+
+    async def test_no_renewal_is_armed_without_a_refresh_token_on_a_chosen_session(self) -> None:
+        client = _ws_client(renew_access=True)
+        root = client._registry.root
+        root.access, root.refresh, root.auth_chosen = _expiring_jwt(), None, True
+
+        client._root_auth_changed()
+
+        assert client._renewal is None, _TOKEN_HANDLING_CHANGED
+
+    async def test_a_renewal_is_armed_with_a_refresh_token(self) -> None:
+        """The control of the pin above: the same session holding a refresh token arms one."""
+        client = _ws_client(renew_access=True)
+        root = client._registry.root
+        root.access, root.refresh, root.auth_chosen = _expiring_jwt(), "a-refresh-token", True
+        try:
+            client._root_auth_changed()
+
+            assert client._renewal is not None, _TOKEN_HANDLING_CHANGED
+        finally:
+            client._cancel_renewal()
 
 
 # ==================== retire() ====================
