@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`<duration>`, `<decimal>`, `<uuid>` for the other types). See
   [the querying guide](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/docs/querying.md#string-values-on-rich-fields).
 
+## [0.50.13] - 2026-11-28
+
+### Security
+
+- Update the dev-only dependency `mistune` (pulled in by `nbconvert` for the example notebooks) from 3.3.3 to 3.4.0,
+  resolving GHSA-phmp-hrw4-r36r and GHSA-ww7q-mxrj-5ffg. No runtime change: the published package does not depend on
+  `mistune`.
+
 ## [0.50.10] - 2026-11-19
 
 ### Fixed
