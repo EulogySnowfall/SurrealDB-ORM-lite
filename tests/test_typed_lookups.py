@@ -518,9 +518,9 @@ _SERVER_ROW = [
     "same on both lines: read as the field's type before it is bound, so it finds the rows the native value finds; an "
     "unreadable string raises `ValueError`",
     "same on both lines (verified on 3.3.5)",
-    "v0.50.13",
+    "v0.50.14",
 ]
-_HEADER_SENTENCE = "The row added in v0.50.13 was measured on 2.7.0, 3.3.5, 4.0.1 and the embedded engine."
+_HEADER_SENTENCE = "The row added in v0.50.14 was measured on 2.7.0, 3.3.5, 4.0.1 and the embedded engine."
 
 
 class TestTypedLookupsDocs:
