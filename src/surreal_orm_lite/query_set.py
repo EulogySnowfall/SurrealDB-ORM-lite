@@ -42,6 +42,7 @@ from .utils import (
     RECORD_ID_COLUMN,
     VALID_FIELD_PATTERN,
     VARIABLE_NAME_VALUE,
+    _typed_filter_value,
     as_record_value,
     build_filter_condition,
     coerce_endpoint,
@@ -3083,7 +3084,10 @@ class QuerySet:
         ``"$admin"`` but stored ``"$$admin"``, never converging and creating a duplicate on every
         call), without a second warning (the lookup warns). A model instance is written as its
         record id, the value its lookup binds (v0.22.0): ``get_or_create(customer=alice)`` stores
-        ``customer = RecordID(...)``. A string ``"$auth"`` naming a session parameter or a variable
+        ``customer = RecordID(...)``. A ``str`` on a top-level ``datetime``, ``date``, ``timedelta``, ``Duration``,
+        ``Decimal`` or ``UUID`` field is read as that type, as the lookup reads it (#220): ``update_or_create(
+        at="2025-06-01T00:00:00Z", defaults=…)`` writes back the ``datetime`` it found, never the string, and a
+        ``str`` starting with ``$`` stays data. A string ``"$auth"`` naming a session parameter or a variable
         the lookup binds never gets here: the caller refused it before the lookup
         (:meth:`_reject_string_references`).
 
@@ -3101,6 +3105,7 @@ class QuerySet:
         """
         payload: dict[str, Any] = {}
         variables: dict[str, Any] | None = None
+        field_types = self.model._filter_types()
         for key, value in criteria.items():
             field_name, lookup = parse_lookup(key)
             if lookup != "exact":
@@ -3112,7 +3117,13 @@ class QuerySet:
                     raise SurrealDbError(_unwritable_variable(field_name, value.name))
                 payload[field_name] = as_record_value(variables[value.name])
                 continue
-            payload[field_name] = as_record_value(unescape_filter_value(value, warn=False))
+            value = as_record_value(unescape_filter_value(value, warn=False))
+            column = self.model.to_db_field(field_name)
+            if isinstance(value, str) and column in field_types:
+                # Read as the rich field's type, as the lookup's WHERE read it (#220), so merge() and the create
+                # write the native value the lookup found, never the string (#221: a write keeps a str as it is).
+                value = _typed_filter_value(value, column, lookup, field_types)
+            payload[field_name] = value
         return payload
 
     @staticmethod

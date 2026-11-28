@@ -21,7 +21,7 @@ from typing import Annotated, Any
 from uuid import UUID
 
 import pytest
-from pydantic import Field
+from pydantic import AwareDatetime, Field, FutureDate, FutureDatetime, NaiveDatetime, PastDate, PastDatetime
 from surrealdb import BoundExcluded, BoundIncluded, RecordID
 
 from surreal_orm_lite import (
@@ -36,7 +36,7 @@ from surreal_orm_lite import (
     Var,
 )
 from surreal_orm_lite.testing import embedded_database
-from surreal_orm_lite.utils import build_filter_condition
+from surreal_orm_lite.utils import build_filter_condition, rich_filter_type
 from tests._readme_tables import assert_server_header_sentence, assert_server_rows, doc_part, guide
 from tests.conftest import orm_client
 
@@ -55,6 +55,7 @@ class TlEvent(BaseSurrealModel):
     when_: Annotated[datetime | None, Field(alias="happened")] = None
     stamps: list[datetime] = []
     loose: datetime | str | None = None
+    aware: AwareDatetime | None = None
 
 
 class TlNote(BaseSurrealModel):
@@ -118,6 +119,7 @@ _READ_AS_THE_FIELD_TYPE = [
     ("token", str(_U1), _U1),
     ("token", str(_U1).upper(), _U1),
     ("when___gt", _CUTOFF, _CUTOFF_NATIVE),
+    ("aware__gte", _CUTOFF, _CUTOFF_NATIVE),
 ]
 
 
@@ -301,7 +303,25 @@ class TestOtherValuesUnchanged:
             "price": ("price", Decimal),
             "token": ("token", UUID),
             "happened": ("when_", datetime),
+            "aware": ("aware", datetime),
         }
+
+    @pytest.mark.parametrize(
+        ("annotation", "kind"),
+        [
+            (AwareDatetime, datetime),
+            (AwareDatetime | None, datetime),
+            (NaiveDatetime | None, datetime),
+            (PastDatetime, datetime),
+            (FutureDatetime | None, datetime),
+            (Annotated[AwareDatetime | None, Field(description="x")], datetime),
+            (PastDate | None, date),
+            (FutureDate, date),
+        ],
+    )
+    def test_pydantic_datetime_markers_read_as_their_base_type(self, annotation: Any, kind: type) -> None:
+        """Pydantic's ``AwareDatetime`` & co. are classes of their own at run time, not ``Annotated[datetime, …]``."""
+        assert rich_filter_type(annotation) is kind
 
 
 # --------------------------------------------------------------------------- E2E
@@ -343,6 +363,11 @@ def _ids(rows: list[Any]) -> list[str]:
     return sorted(str(row.id) for row in rows)
 
 
+def _key(row: Any) -> str:
+    """The key of *row*'s record id, whether ``id`` holds the key or the ``RecordID`` a write returned."""
+    return str(row.id).rpartition(":")[2]
+
+
 #: (string filter, native filter, the ids both find)
 _SAME_ROWS = [
     ({"at__gte": _CUTOFF}, {"at__gte": _CUTOFF_NATIVE}, ["e2"]),
@@ -357,6 +382,28 @@ _SAME_ROWS = [
     ({"token__in": [str(_U1), str(_U2)]}, {"token__in": [_U1, _U2]}, ["e1", "e2"]),
     ({"token__not_in": [str(_U1)]}, {"token__not_in": [_U1]}, ["e2"]),
 ]
+
+
+#: (field, a string standing for e1's value, that value, the SurrealQL method that checks its stored type)
+_CRITERIA_OF_E1 = [
+    ("at", "2025-06-01T00:00:00Z", datetime(2025, 6, 1, tzinfo=UTC), "is_datetime"),
+    ("token", str(_U1), _U1, "is_uuid"),
+    ("ttl", "PT30M", timedelta(minutes=30), "is_duration"),
+]
+
+#: (field, a string no seeded row holds, the SurrealQL method that checks its stored type)
+_CRITERIA_OF_NO_ROW = [
+    ("at", "2027-01-01T00:00:00Z", "is_datetime"),
+    ("token", str(_U3), "is_uuid"),
+    ("ttl", "PT1H", "is_duration"),
+]
+
+
+async def _typed_ids(client: Any, field: str, is_kind: str) -> list[str]:
+    """The ids of the rows whose *field* is stored with the SurrealDB type *is_kind* checks (``is_datetime``…)."""
+    result = await client.query(f"SELECT VALUE id FROM tl_event WHERE {field}.{is_kind}();", {})
+    rows = result[0] if result and isinstance(result[0], list) else result
+    return sorted(str(row).partition(":")[2] for row in rows)
 
 
 @pytest.mark.parametrize("kind", ["mem", "ws"])
@@ -391,6 +438,32 @@ class TestTypedLookupsE2E:
             )
             assert (updated.label, created) == ("touched", False)
             assert {row.id: row.label for row in await TlEvent.objects().all()} == {"e1": "touched", "e2": "new"}
+
+    @pytest.mark.parametrize(("field", "text", "native", "is_kind"), _CRITERIA_OF_E1)
+    async def test_update_or_create_keeps_the_stored_type(
+        self, kind: str, field: str, text: str, native: Any, is_kind: str
+    ) -> None:
+        """The ``str`` criterion of the found row is written back as the field's type: the row keeps its native
+        value, a native lookup still finds it and the next identical call updates it again (no duplicate)."""
+        async with events_db(kind) as client:
+            for label in ("touched", "again"):
+                updated, created = await TlEvent.objects().update_or_create(**{field: text}, defaults={"label": label})
+                assert (_key(updated), updated.label, created) == ("e1", label, False)
+                assert await _typed_ids(client, field, is_kind) == ["e1", "e2"]
+                assert _ids(await TlEvent.objects().filter(**{field: native}).exec()) == ["e1"]
+            assert await TlEvent.objects().count() == 2
+
+    @pytest.mark.parametrize(("field", "text", "is_kind"), _CRITERIA_OF_NO_ROW)
+    async def test_update_or_create_creates_once_with_the_field_type(
+        self, kind: str, field: str, text: str, is_kind: str
+    ) -> None:
+        async with events_db(kind) as client:
+            made, created = await TlEvent.objects().update_or_create(**{field: text}, defaults={"id": "e3"})
+            assert (_key(made), created) == ("e3", True)
+            again, created = await TlEvent.objects().update_or_create(**{field: text}, defaults={"label": "again"})
+            assert (_key(again), again.label, created) == ("e3", "again", False)
+            assert await _typed_ids(client, field, is_kind) == ["e1", "e2", "e3"]
+            assert await TlEvent.objects().count() == 3
 
     async def test_bulk_update(self, kind: str) -> None:
         async with events_db(kind):
