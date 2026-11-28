@@ -9,6 +9,7 @@ Every database call is a coroutine. Models subclass `BaseSurrealModel`; queries 
 - [Guide for AI coding assistants](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ai/CLAUDE.md): connection, models and idioms, 2.x, 3.x and 4.x, common mistakes, errors, testing
 - [README](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/README.md): overview, installation and quick start
 - [Documentation index](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/README.md): every guide and numbered section
+- [Documentation site](https://docs.page/EulogySnowfall/SurrealDB-ORM-lite): the same guides rendered as a website, for people to read
 - [Getting started](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/getting-started.md): requirements, installation, connection, a first model and CRUD
 - [Models](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/models.md): primary keys, table names, server-side values, computed fields, field aliases
 - [Field types](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/fields.md): datetimes, durations, decimals, sets, ranges, record links, geospatial fields
@@ -33,3 +34,4 @@ Every database call is a coroutine. Models subclass `BaseSurrealModel`; queries 
 - [Contributing](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/contributing.md): how to contribute
 - [Changelog](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/CHANGELOG.md): what changed in each version
 - [Roadmap](https://raw.githubusercontent.com/EulogySnowfall/SurrealDB-ORM-lite/main/docs/ROADMAP.md): every release and its design notes
+- [Documentation site index](https://docs.page/EulogySnowfall/SurrealDB-ORM-lite/llms.txt): the llms.txt the documentation site generates from its pages
