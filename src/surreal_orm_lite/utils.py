@@ -936,16 +936,30 @@ _TYPED_SEQUENCE_LOOKUPS = frozenset({"in", "not_in"})
 
 _TYPE_ADAPTERS: dict[type, pydantic.TypeAdapter[Any]] = {}
 
+# Pydantic's datetime and date markers are classes of their own at run time (``AwareDatetime.__mro__`` is
+# ``(AwareDatetime, object)``), not ``Annotated[datetime, ...]``: a field declared with one is read as its base type.
+_PYDANTIC_MARKER_TYPES: dict[Any, type] = {
+    pydantic.AwareDatetime: datetime,
+    pydantic.NaiveDatetime: datetime,
+    pydantic.PastDatetime: datetime,
+    pydantic.FutureDatetime: datetime,
+    pydantic.PastDate: date,
+    pydantic.FutureDate: date,
+}
+
 
 def rich_filter_type(annotation: Any) -> type | None:
     """The type of :data:`RICH_FILTER_TYPES` a field *annotation* declares, or ``None`` (#220).
 
     ``Annotated`` is unwrapped, then a union of exactly one type with ``None``, then ``Annotated`` again
-    (``Annotated[datetime | None, Field(...)]``, ``AwareDatetime | None``, ``condecimal()``). The type must then be
-    exactly one of :data:`RICH_FILTER_TYPES`: ``datetime | str``, ``list[datetime]``, ``Range[datetime]`` or a
-    subclass have none.
+    (``Annotated[datetime | None, Field(...)]``, ``condecimal()``). Pydantic's ``AwareDatetime``, ``NaiveDatetime``,
+    ``PastDatetime`` and ``FutureDatetime`` stand for ``datetime``, ``PastDate`` and ``FutureDate`` for ``date``
+    (``AwareDatetime | None`` gives ``datetime``): a ``str`` value is then read as the base type, without the
+    marker's own check. The type must then be exactly one of :data:`RICH_FILTER_TYPES`: ``datetime | str``,
+    ``list[datetime]``, ``Range[datetime]`` or a subclass have none.
     """
     bare = _unwrap_bound_type(annotation)
+    bare = _PYDANTIC_MARKER_TYPES.get(bare, bare)
     return bare if any(bare is kind for kind in RICH_FILTER_TYPES) else None
 
 
