@@ -46,7 +46,7 @@ class Reader(BaseSurrealModel):
 await Reader(id="ada", name="Ada", age=36).save()
 await Reader(id="bob", name="Bob", age=17).save()
 rows = await Reader.raw_query(
-    "LET $min = 18; SELECT * FROM Reader WHERE age >= $min; SELECT * FROM Reader WHERE age < $min;"
+    "LET $min = 18; SELECT * FROM Reader WHERE age >= $min; SELECT * FROM Reader WHERE $min > age;"
 )
 print([reader.name for reader in rows])  # 0.40.x: ['Ada'] and a warning
 # ['Ada', 'Bob']

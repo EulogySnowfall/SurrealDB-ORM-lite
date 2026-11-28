@@ -17,7 +17,7 @@ This ORM is designed to:
 | ------------ | ----------------------------------------------------------------------------------------- |
 | Python       | 3.11+ (tested on 3.11 to 3.15)                                                            |
 | SurrealDB    | 2.x / 3.x / 4.x (2.6, 2.7, 3.2, 3.3, 4.0), or the SDK's embedded engine with `[embedded]` |
-| Official SDK | surrealdb[pydantic]>=3.0.0,<4.0.0                                                         |
+| Official SDK | `surrealdb[pydantic]>=3.0.0,<4.0.0`                                                       |
 | Pydantic     | >=2.13.4                                                                                  |
 
 > **Note**: Since v0.50.0, Surreal ORM Lite targets the official SurrealDB Python SDK 3.0 (`surrealdb[pydantic]>=3.0.0,<4.0.0`) and supports the SurrealDB versions it supports. It is tested against SurrealDB **v2.7.0**, **v3.3.5** and **v4.0.1**; SurrealDB 3.1.5 is run as a backward-compatibility check, but a regression there does not block a release. The SDK 2.0 line (`0.40.x`) is deprecated and receives security fixes only: [Migrating to 0.50](migrating-to-0.50.md) lists what changes, and `pip install "surreal-orm-lite<0.50"` keeps SDK 2.0.
