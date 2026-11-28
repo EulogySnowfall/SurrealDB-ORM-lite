@@ -1,0 +1,477 @@
+"""The docs.page documentation site (issue #371): ``docs.json`` and the ``.mdx`` pages generated from the guides.
+
+docs.page renders only ``docs/**/*.mdx``, so ``scripts/sync_docs_site.py`` writes one ``.mdx`` page next to each guide
+the index ``docs/README.md`` links to, and ``docs/index.mdx`` from the index; the ``.md`` guides stay the single
+source. These tests check that every page is in step with its guide, that ``docs.json``'s sidebar lists exactly the
+generated pages, that every link of a page opens a page of the site (and its heading, after ``#``) or a file of the
+repository, and that no page holds what MDX would read as JSX or an expression. No server, no network, no node.
+
+docs.page anchors a heading its own way, not GitHub's (``server_values`` gives ``servervalues``, ``Relations & Graph``
+gives ``relations-graph``): the pages' links carry docs.page's anchors, checked with the script's port of its slugger,
+which :class:`TestAnchors` pins to the ids the live site gave.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+import pytest
+
+from tests._readme_tables import DOCS, GITHUB_BLOB, GITHUB_TREE, ROOT, guide_order
+
+SCRIPT = ROOT / "scripts" / "sync_docs_site.py"
+PINS_SCRIPT = ROOT / "scripts" / "sync_surrealdb_pins.py"
+DOCS_JSON = ROOT / "docs.json"
+#: The documents the index lists besides its guides (its "Other documents" part).
+OTHER_PAGES = ["ROADMAP.md", "ai/CLAUDE.md"]
+
+
+def _load() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("sync_docs_site", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+site = _load()
+
+
+def _pages() -> list[Path]:
+    return sorted(DOCS.rglob("*.mdx"))
+
+
+def _prose(text: str) -> str:
+    """*text* without its fenced blocks and inline code: what MDX parses as Markdown and JSX."""
+    text = re.sub(r"^ *(`{3,}|~{3,}).*?^ *\1[ \t]*$", "", text, flags=re.MULTILINE | re.DOTALL)
+    return re.sub(r"(`+)(?!`).*?(?<!`)\1(?!`)", "", text, flags=re.DOTALL)
+
+
+def _code_spans(text: str) -> list[str]:
+    """The inline code spans of *text*, a page, outside its fenced blocks, one block (between blank lines) at a time."""
+    text = re.sub(r"^ *(`{3,}|~{3,}).*?^ *\1[ \t]*$", "", text, flags=re.MULTILINE | re.DOTALL)
+    return [
+        match.group(0)
+        for block in re.split(r"\n[ \t]*\n", text)
+        for match in re.finditer(r"(`+)(?!`).*?(?<!`)\1(?!`)", block, flags=re.DOTALL)
+    ]
+
+
+def _fenced_lines(text: str) -> list[str]:
+    """The lines inside the fenced blocks of *text*, a page (the fences themselves left out)."""
+    return [
+        line
+        for match in re.finditer(r"^ *(`{3,}|~{3,}).*?\n(.*?)^ *\1[ \t]*$", text, flags=re.MULTILINE | re.DOTALL)
+        for line in match.group(2).split("\n")
+    ]
+
+
+def _links(text: str) -> list[str]:
+    return re.findall(r"\]\(([^)\s]+)\)", _prose(text))
+
+
+def _routes() -> dict[str, Path]:
+    """Each page of the site by its path (``/``, ``/models``, ``/ai/CLAUDE``)."""
+    return {site.route(source): site.mirror(source) for source in site.sources()}
+
+
+def _hrefs(entries: list[Any]) -> list[str]:
+    """Every ``href`` of a ``docs.json`` sidebar, nested groups included, in order."""
+    found = []
+    for entry in entries:
+        if "href" in entry:
+            found.append(entry["href"])
+        found += _hrefs(entry.get("pages", []))
+    return found
+
+
+class TestPages:
+    def test_in_sync(self) -> None:
+        """The check mode finds no missing, stale or orphaned page."""
+        result = subprocess.run([sys.executable, "-I", str(SCRIPT)], capture_output=True, text=True, timeout=60, cwd=ROOT)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_every_listed_guide_has_a_page(self) -> None:
+        """The index, every guide of its "Guides" list and its other documents each have a page; every Markdown file
+        under ``docs/`` is one of them."""
+        sources = site.sources()
+        assert set(sources) == set(DOCS.rglob("*.md")), sorted(set(DOCS.rglob("*.md")) ^ set(sources))
+        assert (DOCS / "index.mdx").is_file()
+        for name in [*guide_order(), *OTHER_PAGES]:
+            assert (DOCS / name).with_suffix(".mdx").is_file(), name
+        assert sorted(site.mirror(source) for source in sources) == _pages()
+
+    def test_front_matter_and_source_note(self) -> None:
+        """A page opens with its front matter: its title, its description and a YAML comment naming the guide to edit
+        (docs.page would show an MDX comment as text)."""
+        for source in site.sources():
+            text = site.mirror(source).read_text(encoding="utf-8")
+            relative = source.relative_to(ROOT).as_posix()
+            match = re.match(r'---\ntitle: (".*")\ndescription: (".*")\n# (.*)\n---\n\n# ', text)
+            assert match is not None, relative
+            title, description, note = json.loads(match.group(1)), json.loads(match.group(2)), match.group(3)
+            assert title == site.title(source.read_text(encoding="utf-8")), relative
+            assert title and not re.search(r"[`*\[\]]", title), (relative, title)
+            assert 0 < len(description) <= site.DESCRIPTION_MAX + 1, (relative, description)
+            assert note == f"Generated from {relative} by scripts/sync_docs_site.py. Edit the .md source.", note
+
+    @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
+    def test_no_relative_link(self, page: Path) -> None:
+        """A page links to a site path (``/…``), a heading of itself (``#…``) or an absolute URL, never to a ``.md``
+        file next to it."""
+        relative = [link for link in _links(page.read_text(encoding="utf-8")) if not re.match(r"(/|#|https?://)", link)]
+        assert relative == []
+
+    @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
+    def test_links_resolve(self, page: Path) -> None:
+        """A site link names a page and, after ``#``, one of its headings (docs.page's anchors); a repository link
+        names a file or folder of the checkout."""
+        routes = _routes()
+        text = page.read_text(encoding="utf-8")
+        broken = []
+        for link in _links(text):
+            if link.startswith(("/", "#")):
+                path, _, fragment = link.partition("#")
+                target = routes.get(path) if path else page
+                if target is None or fragment and fragment not in site.site_anchors(target.read_text(encoding="utf-8")):
+                    broken.append(link)
+            elif link.startswith((GITHUB_BLOB, GITHUB_TREE)):
+                path = link.removeprefix(GITHUB_BLOB).removeprefix(GITHUB_TREE).partition("#")[0]
+                if not (ROOT / path).exists():
+                    broken.append(link)
+        assert broken == []
+
+    def test_cross_page_links_are_checked(self) -> None:
+        """The index links to the guides' headings: the check above has links with a fragment to resolve."""
+        links = _links((DOCS / "index.mdx").read_text(encoding="utf-8"))
+        assert "/models#custom-primary-key" in links and "/getting-started#1-configure-the-connection" in links
+        assert "/writing#14-optimistic-concurrency-retryonconflict" in links, "a GitHub anchor left in a page"
+        assert f"{GITHUB_BLOB}CHANGELOG.md" in links and f"{GITHUB_TREE}examples/" in links
+
+    @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
+    def test_no_mdx_hazard(self, page: Path) -> None:
+        """Outside code, no ``<`` (written ``&lt;``) and no unescaped ``{`` or ``}``: nothing MDX would read as JSX, an
+        expression or an HTML comment. The only tags are the generated ``<code>`` elements, whose text is escaped
+        too, and the ``<div>`` lines around a paragraph holding one."""
+        text = page.read_text(encoding="utf-8")
+        body = _prose(text.split("\n---\n", 1)[1])
+        elements = re.findall(r"<code>(.*?)</code>", body)
+        assert [element for element in elements if re.search(r"<|(?<!\\)[{}]", element)] == []
+        body = re.sub(r"<code>.*?</code>", "", body)
+        hazards = [line for line in body.split("\n") if line not in ("<div>", "</div>") and re.search(r"<|(?<!\\)[{}]", line)]
+        assert hazards == []
+
+    @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
+    def test_no_less_than_in_a_code_span(self, page: Path) -> None:
+        """No inline code span of a page holds a ``<``: docs.page turns one that starts no tag into ``&lt;`` before
+        parsing, and a code span shows that entity as written (``surrealdb[pydantic]>=3.0.0,&lt;4.0.0``). The guide's
+        span is a ``<code>`` element in the page. Inline spans only: fenced blocks are
+        :meth:`test_no_escaped_less_than_in_a_fenced_block`'s."""
+        text = page.read_text(encoding="utf-8").split("\n---\n", 1)[1]
+        assert [span for span in _code_spans(text) if "<" in span] == []
+
+    @pytest.mark.parametrize("page", _pages(), ids=lambda path: path.relative_to(DOCS).as_posix())
+    def test_no_escaped_less_than_in_a_fenced_block(self, page: Path) -> None:
+        """No line of a fenced block of a page holds a ``<`` that starts no tag (not followed by a letter, ``/`` or
+        ``!``): docs.page turns it into ``&lt;`` before parsing, and the block shows that entity as written
+        (``$after.balance &lt; 0``). The guide's line is written without it (``0 > $after.balance``)."""
+        text = page.read_text(encoding="utf-8").split("\n---\n", 1)[1]
+        hazards = [line for line in _fenced_lines(text) if re.search(r"<(?![A-Za-z/!])", line)]
+        assert hazards == []
+
+    def test_a_less_than_sign_in_code_is_an_element(self) -> None:
+        """The guides' code spans holding a ``<`` reach the pages as ``<code>`` elements showing the same text."""
+        guide = (DOCS / "getting-started.md").read_text(encoding="utf-8")
+        page = (DOCS / "getting-started.mdx").read_text(encoding="utf-8")
+        assert "`surrealdb[pydantic]>=3.0.0,<4.0.0`" in guide
+        assert "<code>surrealdb\\[pydantic\\]&gt;=3.0.0,&lt;4.0.0</code>" in page
+        assert '<code>pip install "surreal-orm-lite&lt;0.50"</code>' in page
+
+
+class TestDocsJson:
+    def test_shape(self) -> None:
+        config = json.loads(DOCS_JSON.read_text(encoding="utf-8"))
+        assert config["$schema"] == "https://docs.page/schema.json"
+        assert config["name"] == "Surreal ORM Lite" and config["description"]
+        assert config["social"] == {"github": "EulogySnowfall/SurrealDB-ORM-lite"}
+        assert all(group["group"] and group["pages"] for group in config["sidebar"])
+
+    def test_sidebar_lists_exactly_the_pages(self) -> None:
+        """Every generated page once, and nothing else."""
+        hrefs = _hrefs(json.loads(DOCS_JSON.read_text(encoding="utf-8"))["sidebar"])
+        assert len(hrefs) == len(set(hrefs)), hrefs
+        assert set(hrefs) == set(_routes()), sorted(set(hrefs) ^ set(_routes()))
+
+
+class TestConversion:
+    """``scripts/sync_docs_site.py`` on short texts: links, code, MDX hazards, front matter."""
+
+    def test_links(self) -> None:
+        text = (
+            "[a](models.md#custom-primary-key) [b](README.md) [c](ai/CLAUDE.md) [d](../CHANGELOG.md#unreleased) "
+            '[e](../examples/) [f](https://example.com/x.md) [g](#local) [h](models.md "Models")'
+        )
+        assert site.convert(text, DOCS / "querying.md") == (
+            f"[a](/models#custom-primary-key) [b](/) [c](/ai/CLAUDE) [d]({GITHUB_BLOB}CHANGELOG.md#unreleased) "
+            f'[e]({GITHUB_TREE}examples/) [f](https://example.com/x.md) [g](#local) [h](/models "Models")'
+        )
+
+    def test_links_from_a_subfolder(self) -> None:
+        text = "[a](../models.md#custom-primary-key) [b](../README.md) [c](../../SECURITY.md) [d](CLAUDE.md#top)"
+        assert site.convert(text, DOCS / "ai" / "CLAUDE.md") == (
+            f"[a](/models#custom-primary-key) [b](/) [c]({GITHUB_BLOB}SECURITY.md) [d](/ai/CLAUDE#top)"
+        )
+
+    def test_a_link_out_of_the_repository_fails(self) -> None:
+        with pytest.raises(ValueError, match="leaves the repository"):
+            site.convert("[a](../../../elsewhere.md)", DOCS / "models.md")
+
+    def test_code_is_left_as_written(self) -> None:
+        """Fenced blocks (backticks or tildes, indented in a list) and code spans keep their text; prose around them
+        is converted."""
+        text = "\n".join(
+            [
+                "Use `a > b` and ``x `{y}` z`` but not a < b or {c}: [m](models.md).",
+                "```python",
+                "x = {'a': 1} if b > a else fns[0](models.md)",
+                "```",
+                "- item",
+                "  ~~~~",
+                "  <tag> {x}",
+                "  ~~~",
+                "  still {code}",
+                "  ~~~~",
+                "after {d}",
+            ]
+        )
+        assert site.convert(text, DOCS / "querying.md").split("\n") == [
+            "Use `a > b` and ``x `{y}` z`` but not a &lt; b or \\{c\\}: [m](/models).",
+            "```python",
+            "x = {'a': 1} if b > a else fns[0](models.md)",
+            "```",
+            "- item",
+            "  ~~~~",
+            "  <tag> {x}",
+            "  ~~~",
+            "  still {code}",
+            "  ~~~~",
+            "after \\{d\\}",
+        ]
+
+    def test_code_with_a_less_than_sign(self) -> None:
+        """A code span holding a ``<`` becomes a ``<code>`` element with its text escaped; a paragraph holding one is
+        wrapped in a ``<div>`` (with all its code spans as elements), a list, a table or a quote is not."""
+        text = "\n".join(
+            [
+                'Pin `pip install "x<0.50"` and `a_b`: [m](models.md).',
+                "",
+                "- Use `a<4` or `b`, and `x <",
+                "  y` across lines",
+                "",
+                "| `<\\|K\\|>` | `c` |",
+                "",
+                "> `{a} & <b>` `` `<t>` ``",
+                "",
+                "```",
+                "a > b",
+                "```",
+                "Run `` DEFINE `<t>` `` now.",
+                "",
+            ]
+        )
+        assert site.convert(text, DOCS / "querying.md").split("\n") == [
+            "<div>",
+            "",
+            'Pin <code>pip install "x&lt;0.50"</code> and <code>a\\_b</code>: [m](/models).',
+            "",
+            "</div>",
+            "",
+            "- Use <code>a&lt;4</code> or `b`, and <code>x &lt; y</code> across lines",
+            "",
+            "| <code>&lt;\\|K\\|&gt;</code> | `c` |",
+            "",
+            "> <code>\\{a\\} &amp; &lt;b&gt;</code> <code>\\`&lt;t&gt;\\`</code>",
+            "",
+            "```",
+            "a > b",
+            "```",
+            "<div>",
+            "",
+            "Run <code>DEFINE \\`&lt;t&gt;\\`</code> now.",
+            "",
+            "</div>",
+            "",
+        ]
+
+    def test_code_element(self) -> None:
+        """Markdown's markup is backslash-escaped (docs.page reads a ``<div>`` as HTML first, which would decode an
+        entity), ``<``, ``>`` and ``&`` are entities, and ``\\|`` is a ``|`` in a table row only."""
+        assert site.code_element("`*a* _b_ [c] ~d~ \\ <e> & {f}`") == (
+            "<code>\\*a\\* \\_b\\_ \\[c\\] \\~d\\~ \\\\ &lt;e&gt; &amp; \\{f\\}</code>"
+        )
+        assert site.code_element("`a\\|b`") == "<code>a\\\\\\|b</code>"
+        assert site.code_element("`a\\|b`", row=True) == "<code>a\\|b</code>"
+        assert site.code_element("``  `x`  ``") == "<code> \\`x\\` </code>"
+        assert site.code_element("`  `") == "<code>  </code>"
+
+    def test_fenced_lines_helper(self) -> None:
+        """The test helper reads the lines inside fenced blocks, fences left out, so the page check above sees them."""
+        assert _fenced_lines("a < b\n```sql\nx < 0\ny\n```\nz\n~~~\n<-w\n~~~\n") == ["x < 0", "y", "", "<-w", ""]
+
+    @pytest.mark.parametrize("line", ["x < 0", "a <= b", "->likes<-person", "<|2|>", "end <", "  <3", "a << b"])
+    def test_a_fenced_less_than_sign_fails(self, line: str) -> None:
+        """A fenced line holding a ``<`` that docs.page would show as ``&lt;`` stops the conversion, naming the guide
+        and the line; the guide is rewritten (``0 > x``) rather than published wrong."""
+        text = f"# T\n\nSome prose.\n\n```python\nok = 1\n{line}\n```\n"
+        with pytest.raises(ValueError, match=r"^docs/models\.md:7: a '<' in a fenced block") as raised:
+            site.convert(text, DOCS / "models.md")
+        assert line.strip() in str(raised.value)
+
+    @pytest.mark.parametrize("line", ['token = SurrealFunc("<string> rand::uuid::v7()")', "</div>", "<!-- c -->", "0 > x"])
+    def test_a_fenced_tag_like_less_than_sign_passes(self, line: str) -> None:
+        """A ``<`` followed by a letter, ``/`` or ``!`` shows as written on docs.page: the line is copied unchanged."""
+        assert site.convert(f"```\n{line}\n```", DOCS / "models.md") == f"```\n{line}\n```"
+
+    def test_only_lines_inside_a_fence_are_checked(self) -> None:
+        """Prose is escaped, not refused; a fence of another marker inside a block is code, and the block goes on to
+        its own closing fence."""
+        text = "a < b\n\n~~~~\n```\nok\n```\n~~~~\nc < d"
+        assert site.convert(text, DOCS / "models.md") == "a &lt; b\n\n~~~~\n```\nok\n```\n~~~~\nc &lt; d"
+        with pytest.raises(ValueError, match=r"^docs/models\.md:5: "):
+            site.convert("~~~~\n```\nok\n```\nx < 1\n~~~~", DOCS / "models.md")
+
+    def test_a_code_span_never_crosses_a_blank_line(self) -> None:
+        """A lone backtick does not open a span that would hide the next paragraph's hazards."""
+        assert site.convert("a ` b\n\nc <d", DOCS / "models.md") == "a ` b\n\nc &lt;d"
+
+    def test_escaped_characters(self) -> None:
+        """An escaped brace stays escaped; an escaped ``<`` becomes ``&lt;``, as docs.page would show ``\\&lt;``."""
+        assert site.convert("\\{a\\} \\< b <c", DOCS / "models.md") == "\\{a\\} &lt; b &lt;c"
+
+    def test_html_comment_is_dropped(self) -> None:
+        """MDX refuses an HTML comment and GitHub does not show it: the page leaves it out."""
+        assert site.convert("a <!-- note\nhere --> b `<!-- kept -->`", DOCS / "models.md") == (
+            "<div>\n\na  b <code>&lt;!-- kept --&gt;</code>\n\n</div>"
+        )
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("a <!-- note --!> b", "a  b"),
+            ("a <!-- x --!>-->", "a -->"),
+            ("a <!--> b", "a  b"),
+            ("a <!---> b", "a  b"),
+        ],
+    )
+    def test_html_comment_endings(self, text: str, expected: str) -> None:
+        """An HTML comment ends at ``-->`` or ``--!>``, the first one wins, and ``<!-->`` and ``<!--->`` are empty
+        comments (the HTML parsing rules): none of them reaches the page as text."""
+        assert site.convert(text, DOCS / "models.md") == expected
+
+    def test_title_and_description(self) -> None:
+        text = "# The `Q` guide\n\n> **Short** [summary](models.md) of `Q`.\n> Second line.\n\n## Part\n"
+        assert site.title(text) == "The Q guide"
+        assert site.description(text) == "Short summary of Q. Second line."
+
+    def test_a_long_description_is_cut(self) -> None:
+        sentence = "word " * 35 + "end."
+        assert site.description(f"# T\n\n{sentence} More text here to pass the limit.\n") == " ".join(sentence.split())
+        long = "word " * 80
+        cut = site.description(f"# T\n\n{long}\n")
+        assert cut.endswith("…") and len(cut) <= site.DESCRIPTION_MAX + 1
+
+    def test_a_table_or_heading_is_not_the_description(self) -> None:
+        assert site.description("# T\n\n## Part\n\n| a | b |\n\nThe text.\n") == "The text."
+
+
+class TestAnchors:
+    """The port of docs.page's heading anchors, pinned to the ids its site gave these headings (fetched on 2026-11-19),
+    and the translation of a guide's GitHub anchors."""
+
+    @pytest.mark.parametrize(
+        ("title", "anchor"),
+        [
+            ("Custom Primary Key", "custom-primary-key"),
+            ("Custom table name (`table_name`)", "custom-table-name-tablename"),
+            ("15. Server-side values: `SurrealFunc` + `server_values=`", "15-server-side-values-surrealfunc-servervalues"),
+            ("16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`", "16-computed-fields-computed-define-field-value"),
+            (
+                "20. Field aliases, `server_fields` and `merge(refresh=False)`",
+                "20-field-aliases-serverfields-and-mergerefreshfalse",
+            ),
+            ("7. Relations & Graph", "7-relations-graph"),
+            ("12. Upsert & get_or_create / update_or_create", "12-upsert-getorcreate-updateorcreate"),
+            ("13. Patch & atomic field/array operations", "13-patch-atomic-fieldarray-operations"),
+            ("_underscore_ emphasis", "underscore-emphasis"),
+            ("!!!", "section"),
+        ],
+    )
+    def test_site_anchor(self, title: str, anchor: str) -> None:
+        assert site.site_anchor(title) == anchor
+
+    def test_repeated_and_fenced_headings(self) -> None:
+        text = "# A\n\n## Part\n\n```\n## code\n```\n\n~~~~\n```\n## still code\n~~~~\n\n## Part\n"
+        assert site.site_anchors(text) == ["a", "part", "part-1"]
+
+    def test_anchor_map(self) -> None:
+        text = "# Guide\n\n## 1. `snake_case` & more\n\n## Part\n\n## Part\n"
+        assert site.anchor_map(text) == {
+            "guide": "guide",
+            "1-snake_case--more": "1-snakecase-more",
+            "part": "part",
+            "part-1": "part-1",
+        }
+
+    def test_links_carry_the_site_anchor(self) -> None:
+        """A link to a heading of another guide or of the same one carries docs.page's anchor; an unknown fragment is
+        left as written (the page test then reports it)."""
+        text = "[a](writing.md#14-optimistic-concurrency-retry_on_conflict) [b](#custom-table-name-table_name) [c](models.md#nowhere)"
+        assert site.convert(text, DOCS / "models.md") == (
+            "[a](/writing#14-optimistic-concurrency-retryonconflict) [b](#custom-table-name-tablename) [c](/models#nowhere)"
+        )
+
+
+class TestCheckAndFix:
+    """The check mode reports each missing, stale and orphaned page; ``--fix`` rewrites and removes them."""
+
+    def test_drift_then_fix(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        shutil.copytree(DOCS, tmp_path / "docs")
+        assert site.main([], root=tmp_path) == 0
+        with (tmp_path / "docs" / "models.md").open("a", encoding="utf-8") as handle:
+            handle.write("\nA new line {added}.\n")
+        (tmp_path / "docs" / "cli.mdx").unlink()
+        (tmp_path / "docs" / "extra.mdx").write_text("# Extra\n", encoding="utf-8")
+        capsys.readouterr()
+        assert site.main([], root=tmp_path) == 1
+        out = capsys.readouterr().out
+        for entry in ("stale docs/models.mdx", "missing docs/cli.mdx", "orphan docs/extra.mdx", "--fix"):
+            assert entry in out, out
+        assert site.main(["--fix"], root=tmp_path) == 0
+        assert site.drift(tmp_path) == []
+        assert not (tmp_path / "docs" / "extra.mdx").exists()
+        assert "A new line \\{added\\}." in (tmp_path / "docs" / "models.mdx").read_text(encoding="utf-8")
+
+    def test_a_pin_bump_carries_the_pages(self, tmp_path: Path) -> None:
+        """``sync_surrealdb_pins.py --fix`` (what the unattended version monitor runs) rewrites the pages it changes the
+        guides of, so its pull request stays in step."""
+        for name in ("README.md", ".surrealdb-version", ".surrealdb-version2x", ".surrealdb-version4x"):
+            shutil.copy2(ROOT / name, tmp_path / name)
+        for folder in ("docs", "scripts"):
+            shutil.copytree(ROOT / folder, tmp_path / folder, ignore=shutil.ignore_patterns("__pycache__"))
+        (tmp_path / ".github" / "workflows").mkdir(parents=True)
+        shutil.copy2(ROOT / ".github" / "workflows" / "ci.yml", tmp_path / ".github" / "workflows" / "ci.yml")
+        (tmp_path / ".surrealdb-version4x").write_text("4.0.99\n", encoding="utf-8")
+        script = tmp_path / "scripts" / PINS_SCRIPT.name
+        result = subprocess.run([sys.executable, "-I", str(script), "--fix"], capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "**v4.0.99**" in (tmp_path / "docs" / "getting-started.md").read_text(encoding="utf-8")
+        assert "**v4.0.99**" in (tmp_path / "docs" / "getting-started.mdx").read_text(encoding="utf-8")
+        assert site.drift(tmp_path) == []

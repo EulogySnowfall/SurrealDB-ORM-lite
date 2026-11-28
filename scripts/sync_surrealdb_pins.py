@@ -15,11 +15,13 @@ run so the docs travel in the same PR as the bump.
 
 Usage:
     python scripts/sync_surrealdb_pins.py          # Check only (exit 1 if out of sync)
-    python scripts/sync_surrealdb_pins.py --fix    # Rewrite every reference from the pins
+    python scripts/sync_surrealdb_pins.py --fix    # Rewrite every reference from the pins, then the docs.page
+                                                   # pages generated from the guides (scripts/sync_docs_site.py)
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -125,6 +127,17 @@ def rules(primary: str, legacy: str, latest: str) -> list[tuple[str, str, str]]:
     ]
 
 
+def regenerate_docs_site() -> None:
+    """Rewrite the docs.page mirrors (``docs/**/*.mdx``) from the guides just fixed, so an unattended pin bump keeps
+    them in step (``scripts/sync_docs_site.py``; ``tests/test_docs_site.py`` fails on a stale mirror)."""
+    spec = importlib.util.spec_from_file_location("sync_docs_site", Path(__file__).resolve().parent / "sync_docs_site.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for entry in module.fix(ROOT):
+        print(f"  FIXED  {entry}")
+
+
 def main() -> None:
     fix = "--fix" in sys.argv
     primary, legacy, latest = read_pin(PRIMARY_PIN), read_pin(LEGACY_PIN), read_pin(LATEST_PIN)
@@ -181,6 +194,8 @@ def main() -> None:
     else:
         print("Drift detected. Run: python scripts/sync_surrealdb_pins.py --fix")
         sys.exit(1)
+    if fix:
+        regenerate_docs_site()
 
 
 if __name__ == "__main__":

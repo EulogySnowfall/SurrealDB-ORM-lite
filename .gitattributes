@@ -1,0 +1,2 @@
+# The docs.page pages, generated from docs/**/*.md by scripts/sync_docs_site.py.
+docs/**/*.mdx linguist-generated=true

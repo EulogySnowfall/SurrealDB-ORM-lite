@@ -3353,7 +3353,7 @@ class Account(BaseSurrealModel):
             ),
             Event(
                 "no_negative_balance",
-                when="$event != 'DELETE' AND $after.balance < 0",
+                when="$event != 'DELETE' AND 0 > $after.balance",
                 then="THROW 'balance cannot be negative'",
             ),
         ],
@@ -3367,7 +3367,7 @@ class Account(BaseSurrealModel):
 for statement in Account.event_ddl():
     print(statement)
 # DEFINE EVENT OVERWRITE `email_audit` ON `account` WHEN $event = 'UPDATE' AND $before.email != $after.email THEN { CREATE audit_log SET account = $value.id, old = $before.email, new = $after.email } COMMENT 'Keeps every e-mail change';
-# DEFINE EVENT OVERWRITE `no_negative_balance` ON `account` WHEN $event != 'DELETE' AND $after.balance < 0 THEN { THROW 'balance cannot be negative' };
+# DEFINE EVENT OVERWRITE `no_negative_balance` ON `account` WHEN $event != 'DELETE' AND 0 > $after.balance THEN { THROW 'balance cannot be negative' };
 
 await Account.define_events()  # idempotent (OVERWRITE): run it at start-up
 
@@ -3388,10 +3388,10 @@ except ServerError as exc:  # the event refused the write: nothing changed
 #: Example B, exactly: it opens "Events without a model".
 _EXAMPLE_B = """\
 stock_guard = Event(
-    "stock_guard", when="$event != 'DELETE' AND $after.stock < 0", then="THROW 'stock cannot go below zero'"
+    "stock_guard", when="$event != 'DELETE' AND 0 > $after.stock", then="THROW 'stock cannot go below zero'"
 )
 print(await SurrealDBConnectionManager.define_event(stock_guard, "product"))
-# DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $event != 'DELETE' AND $after.stock < 0 THEN { THROW 'stock cannot go below zero' };
+# DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $event != 'DELETE' AND 0 > $after.stock THEN { THROW 'stock cannot go below zero' };
 
 await SurrealDBConnectionManager.remove_event("stock_guard", "product")
 await Account.remove_event("no_negative_balance")  # declared or not: removal is by name
@@ -3865,7 +3865,7 @@ class TestReadmeSection32:
             namespace.clear()
 
     async def test_section_32_guards_let_a_delete_through(self) -> None:
-        """A guard on ``$after`` skips deletes: ``$after`` is ``NONE`` after a delete and ``NONE < 0`` is true on every
+        """A guard on ``$after`` skips deletes: ``$after`` is ``NONE`` after a delete and ``0 > NONE`` is true on every
         line, so without ``$event != 'DELETE'`` example A's guard would refuse every ``delete()`` of an account and
         example B's every delete of a product. Examples A and B run as written on ``mem://``, then their guards are
         applied again (B removes both) and a record of each table is deleted."""

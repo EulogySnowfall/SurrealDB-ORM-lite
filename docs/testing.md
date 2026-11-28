@@ -42,7 +42,7 @@ class PlayerFactory(ModelFactory[Player]):
 
 
 player = PlayerFactory.build()  # no database
-assert player.get_id() is None and player.token is None and 18 <= player.age <= 80
+assert player.get_id() is None and player.token is None and 80 >= player.age >= 18
 admins = PlayerFactory.build_batch(3, role="admin")  # an override wins
 assert [admin.role for admin in admins] == ["admin"] * 3
 
