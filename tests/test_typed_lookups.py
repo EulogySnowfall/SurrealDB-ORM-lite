@@ -323,6 +323,28 @@ class TestOtherValuesUnchanged:
         """Pydantic's ``AwareDatetime`` & co. are classes of their own at run time, not ``Annotated[datetime, …]``."""
         assert rich_filter_type(annotation) is kind
 
+    @pytest.mark.parametrize(
+        "annotation",
+        [list[Annotated[int, ["x"]]], Annotated[list[Annotated[int, ["x"]]], Field(description="x")]],
+    )
+    def test_unhashable_annotation_is_no_rich_type(self, annotation: Any) -> None:
+        """An annotation that cannot be a dict key (``Annotated`` metadata holding a list) has no rich type."""
+        assert rich_filter_type(annotation) is None
+
+    def test_model_with_unhashable_annotation_still_compiles(self) -> None:
+        """Such a field does not break the queries of its model, with or without a filter."""
+
+        class TlTagged(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tl_tagged")
+
+            id: str | None = None
+            at: datetime | None = None
+            tags: list[Annotated[int, ["x"]]] = []
+
+        assert TlTagged._filter_types() == {"at": ("at", datetime)}
+        assert TlTagged.objects()._build_where() == ("", {})
+        assert TlTagged.objects().filter(at=_CUTOFF)._build_where() == (" WHERE at = $_f0", {"_f0": _CUTOFF_NATIVE})
+
 
 # --------------------------------------------------------------------------- E2E
 
@@ -476,10 +498,13 @@ class TestTypedLookupsE2E:
             assert _ids(await TlEvent.objects().all()) == ["e2"]
 
     async def test_rows_stored_as_strings_and_the_upgrade_statement(self, kind: str) -> None:
-        """A datetime stored as a string (``merge()``/``bulk_update()`` up to v0.22.x, #221) no longer matches a
-        string lookup; the one-off statement of the upgrade note converts it on every line."""
+        """A datetime stored as a string (``merge()`` still writes one, #221) no longer matches a string lookup; the
+        one-off statement of the upgrade note converts it on every line."""
         async with events_db(kind) as client:
-            await client.query("CREATE tl_event:legacy SET at = '2026-03-01T00:00:00Z', label = 'legacy';")
+            legacy = await TlEvent(id="legacy", label="legacy").save()
+            await legacy.merge(at="2026-03-01T00:00:00Z")
+            [[row]] = await client.query("SELECT at.is_string() AS text FROM tl_event:legacy;")
+            assert row == {"text": True}
             assert _ids(await TlEvent.objects().filter(at__gte=_CUTOFF).exec()) == ["e2"]
             await client.query("UPDATE (SELECT VALUE id FROM tl_event WHERE at.is_string()) SET at = <datetime> at;")
             assert _ids(await TlEvent.objects().filter(at__gte=_CUTOFF).exec()) == ["e2", "legacy"]
@@ -537,6 +562,8 @@ class TestTypedLookupsDocs:
             "raises `ValueError` naming the field and the lookup, before any request",
             "`Q(...).to_sql()`",
             "**Upgrading: rows stored as strings.**",
+            "Keyword writes are not validated against the field yet",
+            "Pass native values",
             "UPDATE (SELECT VALUE id FROM event WHERE at.is_string()) SET at = <datetime> at;",
         ):
             assert text in part, text

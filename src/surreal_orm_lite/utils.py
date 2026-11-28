@@ -956,10 +956,12 @@ def rich_filter_type(annotation: Any) -> type | None:
     ``PastDatetime`` and ``FutureDatetime`` stand for ``datetime``, ``PastDate`` and ``FutureDate`` for ``date``
     (``AwareDatetime | None`` gives ``datetime``): a ``str`` value is then read as the base type, without the
     marker's own check. The type must then be exactly one of :data:`RICH_FILTER_TYPES`: ``datetime | str``,
-    ``list[datetime]``, ``Range[datetime]`` or a subclass have none.
+    ``list[datetime]``, ``Range[datetime]`` or a subclass have none. Only a class is looked up among the markers: a
+    generic alias may not be hashable (``list[Annotated[int, ["x"]]]``) and has no rich type anyway.
     """
     bare = _unwrap_bound_type(annotation)
-    bare = _PYDANTIC_MARKER_TYPES.get(bare, bare)
+    if isinstance(bare, type):
+        bare = _PYDANTIC_MARKER_TYPES.get(bare, bare)
     return bare if any(bare is kind for kind in RICH_FILTER_TYPES) else None
 
 
