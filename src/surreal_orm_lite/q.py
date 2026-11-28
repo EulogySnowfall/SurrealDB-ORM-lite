@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any
 
-from .utils import build_filter_condition, parse_lookup
+from .utils import FieldTypes, build_filter_condition, parse_lookup
 
 if TYPE_CHECKING:
     from .subquery import SubqueryCompiler
@@ -84,6 +84,7 @@ class Q:
         *,
         subqueries: SubqueryCompiler | None = None,
         view: bool = False,
+        field_types: FieldTypes | None = None,
     ) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
@@ -113,6 +114,10 @@ class Q:
             view: The queried model is a materialized view (v0.32.0), propagated by the QuerySet and passed down to
                 child nodes (:func:`build_filter_condition`). ``False`` — an ordinary model, or a ``Q`` compiled on
                 its own — leaves every condition as before.
+            field_types: The queried model's rich fields by column (#220), propagated by the QuerySet and passed
+                down to child nodes, so ``Q(at__gte="2026-01-01T00:00:00Z")`` binds the ``datetime`` the string
+                stands for on a ``datetime`` field (:func:`build_filter_condition`). ``None`` — a ``Q`` compiled on
+                its own — binds every ``str`` as it is.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -136,6 +141,7 @@ class Q:
                     endpoint_columns=endpoint_columns,
                     subqueries=subqueries,
                     view=view,
+                    field_types=field_types,
                 )
                 filter_parts.append(sql)
                 all_variables.update(vars_)
@@ -147,7 +153,13 @@ class Q:
         # Child Q objects
         for child in self.children:
             sql, vars_, counter = child.to_sql(
-                counter, record_table, to_column, endpoint_columns, subqueries=subqueries, view=view
+                counter,
+                record_table,
+                to_column,
+                endpoint_columns,
+                subqueries=subqueries,
+                view=view,
+                field_types=field_types,
             )
             if sql:
                 all_parts.append(sql)

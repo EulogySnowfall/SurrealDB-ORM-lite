@@ -6,8 +6,10 @@ import os
 import re
 import warnings
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, SupportsIndex, TypeAlias, cast
+from uuid import UUID
 
 import pydantic
 
@@ -18,7 +20,7 @@ from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARA
 from .exceptions import SurrealDbAuthenticationError, SurrealDbConflictError, SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc, Var
 from .subquery import SubqueryCompiler, inside_a_list, lookup_refused, subquery_condition, subquery_of
-from .types import Range
+from .types import Duration, Range, _unwrap_bound_type
 
 if TYPE_CHECKING:
     from .model_base import BaseSurrealModel
@@ -920,6 +922,62 @@ def reference_hint(name: str, subqueries: SubqueryCompiler | None) -> str | None
     return None
 
 
+#: The field types a ``str`` filter value is read as (#220): a lookup on a top-level field declared with one of them
+#: (``Optional`` and ``Annotated`` stripped) validates a ``str`` value as that type before binding it.
+RICH_FILTER_TYPES: tuple[type, ...] = (datetime, date, timedelta, Decimal, UUID, Duration)
+
+#: The rich fields of a model, by column: ``{column: (python_name, type)}`` (``BaseSurrealModel._filter_types``).
+FieldTypes: TypeAlias = Mapping[str, tuple[str, type]]
+
+# The lookups whose ``str`` value is read as the field's type (#220): the scalar comparisons, and each ``str`` item of
+# ``in``/``not_in``. ``contains``, the collection and the text lookups keep their value as it is.
+_TYPED_SCALAR_LOOKUPS = frozenset({"exact", "gt", "gte", "lt", "lte"})
+_TYPED_SEQUENCE_LOOKUPS = frozenset({"in", "not_in"})
+
+_TYPE_ADAPTERS: dict[type, pydantic.TypeAdapter[Any]] = {}
+
+
+def rich_filter_type(annotation: Any) -> type | None:
+    """The type of :data:`RICH_FILTER_TYPES` a field *annotation* declares, or ``None`` (#220).
+
+    ``Annotated`` is unwrapped, then a union of exactly one type with ``None``, then ``Annotated`` again
+    (``Annotated[datetime | None, Field(...)]``, ``AwareDatetime | None``, ``condecimal()``). The type must then be
+    exactly one of :data:`RICH_FILTER_TYPES`: ``datetime | str``, ``list[datetime]``, ``Range[datetime]`` or a
+    subclass have none.
+    """
+    bare = _unwrap_bound_type(annotation)
+    return bare if any(bare is kind for kind in RICH_FILTER_TYPES) else None
+
+
+def _typed_filter_value(value: Any, field: str, lookup: str, field_types: FieldTypes, *, item: bool = False) -> Any:
+    """*value* read as the type of the rich field *field* when it is a ``str`` (#220); any other value unchanged.
+
+    A ``str`` starting with ``$`` is data compared as it is, as in v0.22.2: no rich type reads it, and the ORM's
+    warnings about variable-like values still apply. The string is validated as the bare field type, without the
+    field's own constraints (a filter bound is no stored value): ``datetime`` reads ISO 8601 text and a Unix time,
+    ``date`` an ISO date, ``timedelta`` ISO 8601 (``"PT1H"``) or ``"HH:MM:SS"``, the ORM's ``Duration`` SurrealQL
+    duration text (``"1h30m"``), ``Decimal`` a finite number, ``UUID`` a hexadecimal uuid.
+
+    Raises:
+        ValueError: a string the type cannot read, naming the field (its Python name) and the lookup.
+    """
+    if not isinstance(value, str) or value.startswith("$"):
+        return value
+    name, kind = field_types[field]
+    adapter = _TYPE_ADAPTERS.get(kind)
+    if adapter is None:
+        adapter = _TYPE_ADAPTERS[kind] = pydantic.TypeAdapter(kind)
+    try:
+        return adapter.validate_python(value)
+    except pydantic.ValidationError as exc:
+        reason = exc.errors()[0]["msg"]
+        subject = f"An item {value!r} of the filter value" if item else f"The filter value {value!r}"
+        raise ValueError(
+            f"{subject} given for '{name}' (lookup '{lookup}') is not a valid {kind.__name__}: {reason}. Pass a "
+            f"{kind.__name__}, or a string a {kind.__name__} field reads."
+        ) from None
+
+
 def build_filter_condition(
     field: str,
     lookup: str,
@@ -930,6 +988,7 @@ def build_filter_condition(
     endpoint_columns: Collection[str] = (),
     subqueries: SubqueryCompiler | None = None,
     view: bool = False,
+    field_types: FieldTypes | None = None,
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
@@ -972,6 +1031,13 @@ def build_filter_condition(
     On a view model's id column, ``in`` compiles ``$_f0 CONTAINS id``: SurrealDB 3.x answers no record to ``id IN``
     on a view table (v0.32.0).
 
+    A ``str`` value of ``exact``, ``gt``, ``gte``, ``lt`` or ``lte``, and each ``str`` item of ``in``/``not_in``, on a
+    column of *field_types* — a top-level field declared ``datetime``, ``date``, ``timedelta``, ``Decimal``, ``UUID``
+    or ``Duration`` — is read as the field's type before it is bound (#220, :func:`_typed_filter_value`), so the
+    encoding boundary sends the native value: SurrealDB never casts a bound string to a column's type, and compares a
+    string with a datetime, a duration or a uuid by type order. A ``str`` starting with ``$`` and every other value
+    are bound as before.
+
     Args:
         field: The field name.
         lookup: The lookup type (e.g. ``"exact"``, ``"gt"``, ``"in"``).
@@ -991,6 +1057,8 @@ def build_filter_condition(
         view: The queried model is a materialized view (v0.32.0), set by the QuerySet: ``in`` on the ``id``
             column compiles ``<values> CONTAINS id``, the same values bound. ``False`` leaves every condition as
             before.
+        field_types: The queried model's rich fields by column (``BaseSurrealModel._filter_types``, #220), set by
+            the QuerySet. ``None`` — a ``Q`` compiled on its own — binds every ``str`` as it is.
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
@@ -1006,7 +1074,8 @@ def build_filter_condition(
             malformed GeoJSON object. A text lookup given a value that is neither a ``str`` nor a ``Var``, or
             ``like``/``ilike`` given a ``Var`` (#251). With a subquery (v0.27.0): a lookup that takes none —
             ``isnull``, the text and the spatial lookups; a subquery as an item of a list; no *subqueries*
-            compiler; and the inner queryset's refusals (README section 28).
+            compiler; and the inner queryset's refusals (README section 28). A ``str`` value (or item) on a rich
+            field of *field_types* that the field's type cannot read (#220).
     """
     validate_field_name(field, "filter field")
     sub = subquery_of(value)
@@ -1075,6 +1144,8 @@ def build_filter_condition(
                 return f"${var_name} CONTAINS {field}", {var_name: items}, counter + 1
         elif is_endpoint_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_endpoint(item) for item in items]
+        elif field_types and field in field_types and lookup in _TYPED_SEQUENCE_LOOKUPS:
+            items = [_typed_filter_value(item, field, lookup, field_types, item=True) for item in items]
         return f"{field} {op} ${var_name}", {var_name: items}, counter + 1
 
     value = as_record_value(value)
@@ -1084,8 +1155,13 @@ def build_filter_condition(
     variable_like = VARIABLE_NAME_VALUE.fullmatch(value) if isinstance(value, str) else None
     if subqueries is not None and variable_like is not None:
         subqueries.variable_like.append(variable_like.group(1))
+    typed = field_types is not None and field in field_types and lookup in _TYPED_SCALAR_LOOKUPS
+    if typed and isinstance(value, str) and value.startswith("$"):
+        typed = False  # data, the "$$" escape included: compared as it is, as in v0.22.2
     value = unescape_filter_value(value, warn=subqueries is None or subqueries.warn)
-    if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+    if typed:
+        value = _typed_filter_value(value, field, lookup, cast(FieldTypes, field_types))
+    elif is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
         value = coerce_record_id(value, cast(str, record_table))
     elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
         try:

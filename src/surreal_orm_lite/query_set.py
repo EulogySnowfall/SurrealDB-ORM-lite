@@ -1125,6 +1125,8 @@ class QuerySet:
         endpoint_columns = self.model._endpoint_columns()
         # A view model's id__in compiles "$_f0 CONTAINS id" (v0.32.0): SurrealDB 3.x answers no record to "id IN".
         view = self.model._is_view()
+        # A str value on a datetime, duration, decimal or uuid field is read as the field's type (#220).
+        field_types = self.model._filter_types()
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
@@ -1137,6 +1139,7 @@ class QuerySet:
                 endpoint_columns=endpoint_columns,
                 subqueries=subqueries,
                 view=view,
+                field_types=field_types,
             )
             parts.append(sql)
             variables.update(vars_)
@@ -1144,7 +1147,13 @@ class QuerySet:
         # Q object filters
         for q in self._q_filters:
             sql, vars_, counter = q.to_sql(
-                counter, self._model_table, self._column, endpoint_columns, subqueries=subqueries, view=view
+                counter,
+                self._model_table,
+                self._column,
+                endpoint_columns,
+                subqueries=subqueries,
+                view=view,
+                field_types=field_types,
             )
             if sql:
                 parts.append(sql)

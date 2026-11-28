@@ -101,6 +101,7 @@ _REWRITE_MODULES = frozenset(
         "tests.test_factories_docs",
         "tests.test_sdk3_values",
         "tests.test_query_order",
+        "tests.test_typed_lookups",
     }
 )
 
