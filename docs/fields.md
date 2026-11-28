@@ -193,9 +193,12 @@ open_at_noon = await Subscription.objects().filter(active_hours__contains=12).ex
 graced = await Subscription.objects().filter(grace__lte=Duration.parse("2h")).exec()
 ```
 
-Filter values on rich fields **must be typed**: they are sent exactly like field values, and
-strings are not converted. `filter(trial__gte="7d")` compares the stored duration with a string,
-which does not give the result you want: pass `timedelta(days=7)`.
+Filter values on rich fields are sent exactly like field values. A string given to `exact`, `gt`, `gte`, `lt`,
+`lte`, `in` or `not_in` on a `datetime`, `date`, `timedelta`, `Decimal`, `UUID` or `Duration` field is first read as
+that type (`filter(trial__gte="P7D")` is `timedelta(days=7)`), and one it cannot read raises `ValueError`
+(`filter(trial__gte="7d")`: SurrealQL duration text is a `Duration`'s); see
+[String values on rich fields](querying.md#string-values-on-rich-fields). Other lookups and the bounds of a `Range`
+take native values.
 
 `in` and `not_in` take a `Range`, the ORM's or the SDK's, and bind it as one value; a builtin
 `range` keeps its meaning, the list of its integers. On the record-id column `id` and on an edge's
@@ -649,8 +652,7 @@ await pizza.update()
 Give geometry objects wherever the field does not validate the value. The values of the other
 lookups (`exact`, `contains`, …) are bound as given, and keyword writes (`merge()`, `bulk_update()`, the `atomic_*`
 helpers) are not validated against the field
-([#220](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/220),
-[#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)): a
+([#221](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/221)): a
 `(longitude, latitude)` pair or a GeoJSON dict there is sent as an array or an object, which
 matches nothing or is stored as such. Models do not validate assignments, so
 `pizza.entrance = (-73.9877, 40.7546)` keeps the tuple, which Pydantic warns about when it

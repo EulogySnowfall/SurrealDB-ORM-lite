@@ -112,6 +112,7 @@ from .utils import (
     format_record_id,
     merge_extra_vars,
     replace_content,
+    rich_filter_type,
     statement_rows,
     user_namespace,
     user_stacklevel,
@@ -141,6 +142,8 @@ _ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
 _SERVER_FIELDS: dict[type, frozenset[str]] = {}
 # The read kinds of v0.23.0 (``BaseSurrealModel._read_kinds``), filled once Pydantic completed the class.
 _READ_KINDS: dict[type, dict[str, str]] = {}
+# The rich fields a str filter value is read as (#220, ``BaseSurrealModel._filter_types``), by column.
+_FILTER_TYPES: dict[type, dict[str, tuple[str, type]]] = {}
 # The fields a write sync validates (#228): their annotations (``BaseSurrealModel._sync_fields``) and
 # the adapters built from them on first use, ``None`` for one that cannot be built (``_sync_adapter``).
 _SYNC_FIELDS: dict[type, dict[str, Any]] = {}
@@ -2818,6 +2821,32 @@ class BaseSurrealModel(BaseModel):
         if cls.__pydantic_complete__:
             _READ_KINDS[cls] = kinds
         return kinds
+
+    @classmethod
+    def _filter_types(cls) -> dict[str, tuple[str, type]]:
+        """Return the rich field of each column a ``str`` filter value is read as, cached per class (#220).
+
+        ``{"at": ("at", datetime), "happened": ("when_", datetime)}``: keyed by the column a filter compiles against
+        (``QuerySet._column``), each with its Python name (for the error message) and its type, a top-level field
+        declared ``datetime``, ``date``, ``timedelta``, ``Decimal``, ``UUID`` or ``Duration`` (``Optional`` and
+        ``Annotated`` stripped, :func:`~surreal_orm_lite.utils.rich_filter_type`). The record id column is never in
+        it: a lookup on ``id`` compares record ids. A model without such a field gets ``{}``. Cached once Pydantic
+        has completed the class, like :meth:`_read_kinds`; never mutate the returned dict.
+        """
+        cached = _FILTER_TYPES.get(cls)
+        if cached is not None:
+            return cached
+        forward = cls._alias_maps()[0]
+        types: dict[str, tuple[str, type]] = {}
+        for name, info in cls.model_fields.items():
+            kind = rich_filter_type(info.annotation)
+            column = forward.get(name, name)
+            if kind is None or column == "id":
+                continue
+            types[column] = (name, kind)
+        if cls.__pydantic_complete__:
+            _FILTER_TYPES[cls] = types
+        return types
 
     @classmethod
     def _sync_fields(cls) -> dict[str, Any]:
